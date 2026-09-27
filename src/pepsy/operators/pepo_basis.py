@@ -976,6 +976,28 @@ class PauliPEPOBasis:
             )
         return result
 
+    def _localized_ordered_products(self, localized, records, *, like, batch_size=8):
+        """Batch equal-size finite-cluster targets, preserving factor order.
+
+        Actual finite embeddings share matrix size, but not coefficients.
+        Batching avoids per-cluster backend dispatch and uses Torch's batched
+        exponential path, which is more accurate than its low-degree scalar
+        shortcut for small onsite matrices in tested Torch versions.
+        """
+        results = []
+        for start in range(0, len(records), batch_size):
+            chunk = records[start:start + batch_size]
+            result = None
+            for basis, beta, site_components, edge_components in localized:
+                hamiltonians = ar.do("stack", tuple(
+                    basis._localized_cluster_hamiltonian(
+                        record, site_components, edge_components, like=like)
+                    for record in chunk), axis=0)
+                local_exp = _backend_expm(ar.do("multiply", -beta, hamiltonians))
+                result = local_exp if result is None else ar.do("matmul", result, local_exp)
+            results.extend(result[i] for i in range(len(chunk)))
+        return tuple(results)
+
     @staticmethod
     def _localized_tree_topology(edges, nsites):
         """Choose a deterministic spanning tree and a low-width root."""
@@ -1227,14 +1249,7 @@ class PauliPEPOBasis:
             for basis, beta, site_components, edge_components in localized
         ]
         cluster_records = self._localized_cluster_records()
-        one_exps = tuple(
-            self._localized_ordered_product(
-                localized,
-                record,
-                like=reference,
-            )
-            for record in cluster_records[1]
-        )
+        one_exps = self._localized_ordered_products(localized, cluster_records[1], like=reference)
         blocks = {
             site: {
                 (0,) * len(self.site_directions[site]): one_exps[site_index]
@@ -1257,12 +1272,9 @@ class PauliPEPOBasis:
                     for site, site_blocks in blocks.items()
                 },
             )
-            for record in cluster_records[cluster_order]:
-                exact = self._localized_ordered_product(
-                    localized,
-                    record,
-                    like=reference,
-                )
+            records = cluster_records[cluster_order]
+            exact_products = self._localized_ordered_products(localized, records, like=reference)
+            for record, exact in zip(records, exact_products):
                 lower = _contract_active_support_backend(
                     lower_active,
                     record.sites,

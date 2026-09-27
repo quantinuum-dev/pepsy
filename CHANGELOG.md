@@ -12,7 +12,21 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Added
+
+- `ActivePEPOBlocks.to_trace_network()` closes physical blocks before dense
+  materialization, returning an unnormalized `TensorNetwork2D` with preserved
+  NumPy/Torch/JAX values. `trace_nbytes` reports its dense site storage.
+
 ### Fixed
+
+- Inspect active PEPO dense-storage size with differentiable Torch blocks
+  without converting them to NumPy. Use Python integer products for dense
+  size estimates so large virtual dimensions cannot overflow a machine integer.
+- Batch located equal-size cluster products, preserving factor order and
+  coefficient gradients while avoiding repeated scalar exponential dispatch.
+  This also avoids measured small-matrix Torch exponential inaccuracies in
+  the covered batches; local targets and cluster orders are unchanged.
 
 - Preserve resolved Torch SVD derivatives under `stabilized=True`: replace
   global Lorentzian damping with compact relative stabilization, retaining

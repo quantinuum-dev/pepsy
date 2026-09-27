@@ -11,7 +11,8 @@ but the active containers do not depend on the cluster planner.
 from __future__ import annotations
 
 from collections.abc import Hashable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import prod
 
 import autoray as ar
 import numpy as np
@@ -27,6 +28,10 @@ _DIRECTION_VECTORS = {"u": (1, 0), "r": (0, 1), "d": (-1, 0), "l": (0, -1)}
 
 
 def _backend_dtype_itemsize(value):
+    # Torch dtype objects are not NumPy dtypes. Inspect scalar storage metadata
+    # without converting differentiable blocks (or transferring device data).
+    if hasattr(value, "element_size"):
+        return int(value.element_size())
     try:
         return np.dtype(value.dtype).itemsize
     except (TypeError, ValueError):
@@ -184,15 +189,8 @@ class ActivePEPOBlocks:
         itemsize = _backend_dtype_itemsize(reference)
         sector_maps = _local_bond_sector_maps(self)
         return sum(
-            int(
-                np.prod(
-                    [
-                        len(sector_maps[(site, direction)])
-                        for direction in self.site_directions[site]
-                    ],
-                    dtype=int,
-                )
-            )
+            prod(len(sector_maps[(site, direction)])
+                 for direction in self.site_directions[site])
             * self.physical_dim**2
             * itemsize
             for site in self.blocks
@@ -205,6 +203,33 @@ class ActivePEPOBlocks:
             leg: len(mapping)
             for leg, mapping in _local_bond_sector_maps(self).items()
         }
+
+    @property
+    def trace_nbytes(self):
+        """Dense site storage after closing physical legs, excluding workspace."""
+        return self.dense_nbytes // self.physical_dim**2
+
+    def to_trace_network(self):
+        """Return an unnormalized scalar TensorNetwork2D without dense PEPO legs.
+
+        Trace each active physical block before site materialization. For
+        physical dimension d this needs d**2 fewer dense site entries. Keep
+        every structural history channel, including zero trace blocks, so
+        coefficient changes do not select a different autodiff topology.
+        This dense bosonic trace is not a native graded fermionic trace.
+        """
+        traced = replace(self, physical_dim=1, blocks={
+            site: {key: ar.do("reshape", ar.do("trace", block), (1, 1))
+                   for key, block in blocks.items()}
+            for site, blocks in self.blocks.items()
+        }).to_pepo()
+        for site in self.blocks:
+            traced[traced.site_tag(*site)].trace(
+                traced.upper_ind(*site), traced.lower_ind(*site), inplace=True)
+        traced.view_as_(qtn.TensorNetwork2D, Lx=traced.Lx, Ly=traced.Ly,
+                        site_tag_id=traced.site_tag_id,
+                        x_tag_id=traced.x_tag_id, y_tag_id=traced.y_tag_id)
+        return traced
 
     @property
     def active_nbytes(self):

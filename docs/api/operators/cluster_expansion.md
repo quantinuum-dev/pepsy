@@ -347,6 +347,31 @@ Pass `materialize=False` to `product.exp(...)` or `compiled.exp(...)` to
 receive `ActivePEPOBlocks` before allocating dense Quimb site tensors. This is
 useful for checking `bond_dimensions` and `dense_nbytes`; `compress=True`
 requires materialization.
+Storage estimates inspect shape/dtype metadata without detaching or converting
+Torch blocks, so they can guard dense allocation during autodiff. The estimate
+covers dense site tensors, not the contraction or backward graph.
+
+For a trace-only observable, close the active physical blocks first:
+
+```python
+active = compiled.exp(0.01, materialize=False)
+print(active.dense_nbytes, active.trace_nbytes)
+trace_network = active.to_trace_network()
+trace = trace_network.contract(all, optimize="greedy")
+normalized_trace = trace / 2**(active.lx * active.ly)
+```
+
+The returned `TensorNetwork2D` is an **unnormalized** trace of the same PEPO.
+It uses `physical_dim**2` fewer dense site entries than materializing both
+physical legs. All structural channels remain, including zero trace blocks;
+there is no value-based pruning or detached coefficient graph. This is a
+dense bosonic trace, not a graded fermionic trace. Boundary contraction adds
+its own approximation and workspace beyond these storage estimates.
+
+Located cluster targets are evaluated in bounded batches of equal matrix
+size. Each batch keeps the complete ordered factor sequence and independent
+coefficients; it does not imply translation symmetry or split noncommuting
+generators.
 
 The order `p` controls local dimension: for physical dimension `d`, each
 `p`-site target is a `(d**p) x (d**p)` matrix, or `d**(2*p)` coefficients.
