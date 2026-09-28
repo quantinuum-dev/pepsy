@@ -57,5 +57,8 @@ def test_convergence_check_uses_temporary_chains_and_rng_state():
     assert report.n_samples_per_chain >= 4
     assert report.energy is not None
     assert report.energy.split_r_hat is not None
+    assert report.energy.tau is report.energy.integrated_autocorrelation_time
+    assert report.energy.tau_max is report.energy.max_integrated_autocorrelation_time
+    assert report.energy.rhat is report.energy.r_hat
     assert torch.equal(driver.configs, configs_before)
     assert torch.equal(driver.generator.get_state(), rng_before)

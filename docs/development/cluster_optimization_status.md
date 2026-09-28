@@ -50,6 +50,18 @@ Detailed records:
 - [Dependency merge and successful publication](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-26-cluster-api-dependency-sync.md)
 - [Current downstream ledger](https://github.com/rezaquant/gaugy/blob/develop/DEVELOPMENT_STATUS.md)
 
+## 2026-09-28 local readability follow-up
+
+The dense square `ClusterExpansionPlan.build` now delegates cluster families
+and report assembly to private methods, preserving a shared sector allocator
+and the original subtraction order. This is included in the local readability
+and diagnostics commit on `develop`, based on `f410fa0`, alongside FIT/BP/Torch
+VMC/MPO edits. It does not change the published backend or downstream status
+above. The [commit handoff](../../history/2026-09-28-readability-commit.md)
+records the combined validation and remaining limits; the
+[four-domain handoff](../../history/2026-09-28-bp-vmc-mpo-pepo-readability.md)
+retains the earlier focused evidence.
+
 ## Tracking future work
 
 Keep API behavior in the owning guide, implementation ownership in module

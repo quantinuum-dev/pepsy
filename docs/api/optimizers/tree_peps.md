@@ -451,6 +451,11 @@ replay begins. `TreePepsOptimizer.find_tree_layout(...)` and
 `convergence_sweep(...)` provide the corresponding layout and bond-cap
 convenience entry points.
 
+Bond diagnostics also support two-layer path compression. There,
+`transient_max_bond` describes the uncompressed operator/state bond products
+without constructing a fused intermediate; `live_max_bond_after` reports the
+resulting state's maximum bond dimension.
+
 Pass `progbar=True` to `run()` for a replay bar matching the MPS optimizer's
 compression readout. It reports the active mode, exact two-qubit gate count
 `2q`, cumulative retained fidelity as `~F`, and the live maximum bond as `bnd`;

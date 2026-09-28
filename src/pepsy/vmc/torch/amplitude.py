@@ -1311,9 +1311,37 @@ class TorchPEPSAmplitude:
     ):
         """Evaluate amplitudes for Hamiltonian-connected configurations.
 
-        Diagonal connections reuse the already available parent amplitudes.
-        Future boundary-environment reuse can specialize this method without
-        changing :func:`local_energy_from_connections` or the VMC driver API.
+        Parameters
+        ----------
+        configs : array_like, shape (n_samples, n_sites)
+            Parent configurations in this model's site order and physical
+            encoding. A single row of shape (n_sites,) is also accepted.
+        amplitudes : torch.Tensor, shape (n_samples,)
+            Parent amplitudes evaluated with the current model parameters.
+            Recompute these after changing parameters or contraction settings.
+        connections : TorchConnections
+            Target rows in ``configs`` with shape (n_connections, n_sites)
+            and parent row indices in ``batch_ids``. Keep both on the same
+            device as the input configurations and model. ``coeffs`` are
+            used by the local estimator, not by amplitude evaluation.
+        chunk_size : int, optional
+            Forwarded to amplitude evaluation for targets that need a call.
+        reuse_diagonal : bool, optional
+            Reuse the supplied amplitude when a target equals its parent.
+
+        Returns
+        -------
+        torch.Tensor, shape (n_connections,)
+            Raw target amplitudes in the original connection-row order,
+            including repeated rows; an empty tensor for no connections.
+
+        Notes
+        -----
+        Inputs are not modified. Supply parent amplitudes with the model's
+        amplitude dtype; paths that combine reused and evaluated values
+        allocate the result with that dtype. This call uses the current Torch
+        grad mode. For measurement, call under ``torch.no_grad()``; for a
+        differentiable estimator, parent amplitudes must retain their graph.
         """
         return _default_connected_amplitudes(
             configs,
@@ -2887,7 +2915,35 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         chunk_size=None,
         reuse_diagonal=True,
     ):
-        """Evaluate connected amplitudes with parent boundary environments."""
+        """Evaluate target amplitudes while reusing parent boundary environments.
+
+        The input and return contract is the same as
+        :meth:`TorchPEPSAmplitude.connected_amplitudes`: parent ``configs``
+        have shape (n_samples, n_sites), ``amplitudes`` has shape (n_samples,),
+        and the returned tensor has one value per row of ``connections.configs``.
+        ``connections.batch_ids`` selects the parent of each target row.
+        Inputs must share the model's site order, physical encoding, and device;
+        parent amplitudes must match its current parameters and contraction
+        settings. The result contains raw amplitudes, without coefficients
+        or division by parent amplitudes.
+
+        ``reuse_diagonal=True`` reuses unchanged parent amplitudes. Other
+        targets use supported row/column environment reuse, batched evaluation,
+        or a full-amplitude fallback. ``chunk_size`` is forwarded to fallback
+        amplitude calls; compiled reuse uses its configured batch size.
+
+        This call updates internal caches and ``last_connected_reuse_stats``
+        and resets ``last_amplitude_cache_stats`` before evaluating targets.
+        Input tensors are not modified. Parameter version changes invalidate
+        cached environments. For a new autograd graph, clear the boundary
+        cache and recompute parent amplitudes; graph lifetime is not tracked
+        by the parameter-version cache key. Compiled boundary reuse and CPU
+        worker threads are used only with gradients disabled.
+
+        For measurement, evaluate both parents and targets inside
+        ``torch.no_grad()``. The contraction's existing ``chi`` and ``cutoff``
+        determine approximation accuracy; environment reuse retains them.
+        """
         torch = _require_torch()
         configs = _as_long_matrix(configs)
         amplitudes = torch.as_tensor(amplitudes, device=configs.device)

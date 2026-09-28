@@ -3227,6 +3227,363 @@ class MpoOptimizer:
         self._last_dmrg_fit_diagnostics = record
         return record
 
+    def _run_dmrg_single_window(
+        self,
+        p,
+        gate,
+        bra_gate,
+        where,
+        idx,
+        *,
+        G_seq,
+        n_iter,
+        cutoff,
+        cutoff_mode,
+        fit_block_size,
+        target_cutoff,
+        fit_target_strategy,
+        fit_mpo_guess,
+        fit_mpo_guess_order,
+        fit_init_strategy,
+        fit_init_rand_strength,
+        fit_init_seed,
+        fit_overlap_diagnostics,
+        run_local_fit_transactional,
+    ):
+        """Fit one gate pair and record its canonical norm and diagnostics.
+
+        Build the exact target separately from the guess, then delegate the
+        update to ``run_local_fit_transactional``. That callback owns rollback
+        and fallback; this method records successful FIT norms and metadata.
+        Return the live MPO, next stream index, and number of consumed entries.
+        """
+        xmin, xmax = sorted(where)
+        self.canonize_mpo(p, (xmin, xmax))
+        p_g = self._timed_call(
+            "dmrg.target",
+            self._build_dmrg_target,
+            p,
+            gate,
+            where,
+            bra_gate,
+            cutoff,
+            cutoff_mode,
+            target_cutoff=target_cutoff,
+            target_strategy=fit_target_strategy,
+        )
+
+        expected_norm = self._timed_call(
+            "norm.expected",
+            self._expected_target_norm,
+            p,
+            gate,
+            where,
+            bra_gate,
+            target=p_g,
+            target_cutoff=target_cutoff,
+            target_strategy=fit_target_strategy,
+            cutoff_mode=cutoff_mode,
+        )
+        requested_fit_block_size = min(
+            fit_block_size,
+            xmax - xmin + 1,
+        )
+        self._validate_dmrg1_iteration_budget(
+            p,
+            xmin,
+            xmax,
+            n_iter=n_iter,
+            block_size=requested_fit_block_size,
+        )
+        active_fit_block_size = self._resolve_dmrg_fit_block_size(
+            p,
+            xmin,
+            xmax,
+            fit_block_size,
+        )
+        fit_initialization = self._timed_call(
+            "dmrg.fit_guess",
+            self._prepare_fit_initial_guess,
+            p,
+            [G_seq[idx]],
+            [where],
+            block_size=active_fit_block_size,
+            strategy=fit_init_strategy,
+            fit_mpo_guess=fit_mpo_guess,
+            rand_strength=fit_init_rand_strength,
+            seed=(
+                int(fit_init_seed)
+                + 1000003 * int(idx)
+                + 1009 * int(xmin)
+                + int(xmax)
+            ),
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            layer_order=fit_mpo_guess_order,
+        )
+        fit_guess = fit_initialization["fit_guess"]
+        fit = FIT(
+            p_g,
+            p=fit_guess,
+            cutoffs=cutoff,
+            contraction_opt=self.contraction_opt,
+            retag=False,
+            range_int=[xmin, xmax],
+            inplace=True,
+            copy_target=False,
+        )
+        p, fit_result = run_local_fit_transactional(
+            fit,
+            active_fit_block_size,
+            step_start=idx,
+            step_end=idx + 1,
+            where=where,
+        )
+        if fit_result is None:
+            idx += 1
+            advanced = 1
+        else:
+            final_center = fit.final_center_site
+            if final_center is None:
+                final_center = p.calc_current_orthog_center()[-1]
+            observed_norm = self._timed_call(
+                "norm.observed",
+                self._canonical_norm_measurement,
+                p,
+                final_center,
+            )
+            self.info_c["cur_orthog"] = (
+                int(final_center),
+                int(final_center),
+            )
+            self._timed_call(
+                "norm.record",
+                self._record_norm_event,
+                "dmrg_compression",
+                expected_norm=expected_norm,
+                observed_norm=observed_norm,
+                target_norm=expected_norm,
+                where=(xmin, xmax),
+                unitary=(
+                    self._is_unitary_gate_pair(gate, bra_gate)
+                    and self._unitary_norm_guard_supported(p)
+                ),
+            )
+            fit_overlap = (
+                self._fit_overlap_diagnostics(p_g, fit.p)
+                if fit_overlap_diagnostics
+                else {}
+            )
+            self._record_fit_diagnostics(
+                fit,
+                where=(xmin, xmax),
+                block_size=active_fit_block_size,
+                step=idx + 1,
+                mpo_fit_guess_used=fit_initialization[
+                    "svd_guess_used"
+                ],
+                mpo_fit_guess_order=(
+                    fit_mpo_guess_order
+                    if fit_initialization["svd_guess_used"]
+                    else None
+                ),
+                fit_initialization=fit_initialization,
+                fit_overlap=fit_overlap,
+                fit_overlap_diagnostics=fit_overlap_diagnostics,
+            )
+            self._maybe_lock_dmrg1_one_site_phase()
+            self._last_dmrg_fit_diagnostics[
+                "dmrg1_one_site_locked"
+            ] = bool(self._dmrg1_one_site_locked)
+            idx += 1
+            advanced = 1
+        if fit_result is None:
+            self._maybe_lock_dmrg1_one_site_phase()
+            if self._last_dmrg_fit_diagnostics is not None:
+                self._last_dmrg_fit_diagnostics[
+                    "dmrg1_one_site_locked"
+                ] = bool(self._dmrg1_one_site_locked)
+        return p, idx, advanced
+
+    def _run_dmrg_batch_window(
+        self,
+        p,
+        batch_G,
+        batch_where,
+        idx,
+        *,
+        n_iter,
+        cutoff,
+        cutoff_mode,
+        fit_block_size,
+        target_cutoff,
+        fit_target_strategy,
+        fit_mpo_guess,
+        fit_mpo_guess_order,
+        fit_init_strategy,
+        fit_init_rand_strength,
+        fit_init_seed,
+        fit_overlap_diagnostics,
+        next_idx,
+        run_local_fit_transactional,
+    ):
+        """Fit a collected gate batch with one shared target and recovery point.
+
+        Keep expected-target norms and the all-gates unitary check specific to
+        the batch. The supplied transaction callback owns rollback/fallback;
+        successful FIT records its terminal center before norm measurement.
+        Return the live MPO, next stream index, and number of consumed entries.
+        """
+        batch_span_sites = [site for where_i in batch_where for site in where_i]
+        xmin, xmax = min(batch_span_sites), max(batch_span_sites)
+        self.canonize_mpo(p, (xmin, xmax))
+        p_g = self._timed_call(
+            "dmrg.target",
+            self._build_dmrg_batch_target,
+            p,
+            batch_G,
+            batch_where,
+            cutoff,
+            cutoff_mode,
+            target_cutoff=target_cutoff,
+            target_strategy=fit_target_strategy,
+        )
+
+        expected_norm = self._timed_call(
+            "norm.expected",
+            self._expected_batch_target_norm,
+            p,
+            batch_G,
+            batch_where,
+            target=p_g,
+            cutoff_mode=cutoff_mode,
+        )
+        requested_fit_block_size = min(
+            fit_block_size,
+            xmax - xmin + 1,
+        )
+        self._validate_dmrg1_iteration_budget(
+            p,
+            xmin,
+            xmax,
+            n_iter=n_iter,
+            block_size=requested_fit_block_size,
+        )
+        active_fit_block_size = self._resolve_dmrg_fit_block_size(
+            p,
+            xmin,
+            xmax,
+            fit_block_size,
+        )
+        fit_initialization = self._timed_call(
+            "dmrg.fit_guess",
+            self._prepare_fit_initial_guess,
+            p,
+            batch_G,
+            batch_where,
+            block_size=active_fit_block_size,
+            strategy=fit_init_strategy,
+            fit_mpo_guess=fit_mpo_guess,
+            rand_strength=fit_init_rand_strength,
+            seed=(
+                int(fit_init_seed)
+                + 1000003 * int(idx)
+                + 1009 * int(xmin)
+                + int(xmax)
+            ),
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            layer_order=fit_mpo_guess_order,
+        )
+        fit_guess = fit_initialization["fit_guess"]
+        fit = FIT(
+            p_g,
+            p=fit_guess,
+            cutoffs=cutoff,
+            contraction_opt=self.contraction_opt,
+            retag=False,
+            range_int=[xmin, xmax],
+            inplace=True,
+            copy_target=False,
+        )
+        p, fit_result = run_local_fit_transactional(
+            fit,
+            active_fit_block_size,
+            step_start=idx,
+            step_end=next_idx,
+            where=(xmin, xmax),
+        )
+        if fit_result is None:
+            advanced = next_idx - idx
+            idx = next_idx
+        else:
+            final_center = fit.final_center_site
+            if final_center is None:
+                final_center = p.calc_current_orthog_center()[-1]
+            observed_norm = self._timed_call(
+                "norm.observed",
+                self._canonical_norm_measurement,
+                p,
+                final_center,
+            )
+            self.info_c["cur_orthog"] = (
+                int(final_center),
+                int(final_center),
+            )
+            self._timed_call(
+                "norm.record",
+                self._record_norm_event,
+                "dmrg_compression",
+                expected_norm=expected_norm,
+                observed_norm=observed_norm,
+                target_norm=expected_norm,
+                where=(xmin, xmax),
+                unitary=(
+                    all(
+                        self._is_unitary_gate_pair(
+                            *self._parse_gate_entry(gate_i, where_i)[:2]
+                        )
+                        for gate_i, where_i in zip(batch_G, batch_where)
+                    )
+                    and self._unitary_norm_guard_supported(p)
+                ),
+            )
+            fit_overlap = (
+                self._fit_overlap_diagnostics(p_g, fit.p)
+                if fit_overlap_diagnostics
+                else {}
+            )
+            self._record_fit_diagnostics(
+                fit,
+                where=(xmin, xmax),
+                block_size=active_fit_block_size,
+                step=idx + 1,
+                mpo_fit_guess_used=fit_initialization[
+                    "svd_guess_used"
+                ],
+                mpo_fit_guess_order=(
+                    fit_mpo_guess_order
+                    if fit_initialization["svd_guess_used"]
+                    else None
+                ),
+                fit_initialization=fit_initialization,
+                fit_overlap=fit_overlap,
+                fit_overlap_diagnostics=fit_overlap_diagnostics,
+            )
+            self._maybe_lock_dmrg1_one_site_phase()
+            self._last_dmrg_fit_diagnostics[
+                "dmrg1_one_site_locked"
+            ] = bool(self._dmrg1_one_site_locked)
+            advanced = next_idx - idx
+            idx = next_idx
+        if fit_result is None:
+            self._maybe_lock_dmrg1_one_site_phase()
+            if self._last_dmrg_fit_diagnostics is not None:
+                self._last_dmrg_fit_diagnostics[
+                    "dmrg1_one_site_locked"
+                ] = bool(self._dmrg1_one_site_locked)
+        return p, idx, advanced
+
     def _run_dmrg(
         self,
         G_seq,
@@ -3272,6 +3629,11 @@ class MpoOptimizer:
         requested sweep sequence. Named DMRG modes additionally pass FIT's
         adaptive block schedule so the larger block is followed by fixed-rank
         one-site refinement.
+
+        The local callbacks own FIT scheduling and per-update recovery. Window
+        helpers prepare targets/guesses and record successful fits. This driver
+        owns channel dispatch, batch collection, stream counters, sampled norm
+        traces, and progress reporting.
         """
         if k_2q_batch < 1:
             raise ValueError("k_2q_batch must be >= 1.")
@@ -3491,152 +3853,27 @@ class MpoOptimizer:
             elif n_sites == 2:
                 if k_2q_batch == 1:
                     two_qubit_count += 1
-                    xmin, xmax = sorted(where)
-                    self.canonize_mpo(p, (xmin, xmax))
-                    p_g = self._timed_call(
-                        "dmrg.target",
-                        self._build_dmrg_target,
+                    p, idx, advanced = self._run_dmrg_single_window(
                         p,
                         gate,
-                        where,
                         bra_gate,
-                        cutoff,
-                        cutoff_mode,
-                        target_cutoff=target_cutoff,
-                        target_strategy=fit_target_strategy,
-                    )
-
-                    expected_norm = self._timed_call(
-                        "norm.expected",
-                        self._expected_target_norm,
-                        p,
-                        gate,
                         where,
-                        bra_gate,
-                        target=p_g,
-                        target_cutoff=target_cutoff,
-                        target_strategy=fit_target_strategy,
-                        cutoff_mode=cutoff_mode,
-                    )
-                    requested_fit_block_size = min(
-                        fit_block_size,
-                        xmax - xmin + 1,
-                    )
-                    self._validate_dmrg1_iteration_budget(
-                        p,
-                        xmin,
-                        xmax,
+                        idx,
+                        G_seq=G_seq,
                         n_iter=n_iter,
-                        block_size=requested_fit_block_size,
-                    )
-                    active_fit_block_size = self._resolve_dmrg_fit_block_size(
-                        p,
-                        xmin,
-                        xmax,
-                        fit_block_size,
-                    )
-                    fit_initialization = self._timed_call(
-                        "dmrg.fit_guess",
-                        self._prepare_fit_initial_guess,
-                        p,
-                        [G_seq[idx]],
-                        [where],
-                        block_size=active_fit_block_size,
-                        strategy=fit_init_strategy,
-                        fit_mpo_guess=fit_mpo_guess,
-                        rand_strength=fit_init_rand_strength,
-                        seed=(
-                            int(fit_init_seed)
-                            + 1000003 * int(idx)
-                            + 1009 * int(xmin)
-                            + int(xmax)
-                        ),
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
-                        layer_order=fit_mpo_guess_order,
+                        fit_block_size=fit_block_size,
+                        target_cutoff=target_cutoff,
+                        fit_target_strategy=fit_target_strategy,
+                        fit_mpo_guess=fit_mpo_guess,
+                        fit_mpo_guess_order=fit_mpo_guess_order,
+                        fit_init_strategy=fit_init_strategy,
+                        fit_init_rand_strength=fit_init_rand_strength,
+                        fit_init_seed=fit_init_seed,
+                        fit_overlap_diagnostics=fit_overlap_diagnostics,
+                        run_local_fit_transactional=run_local_fit_transactional,
                     )
-                    fit_guess = fit_initialization["fit_guess"]
-                    fit = FIT(
-                        p_g,
-                        p=fit_guess,
-                        cutoffs=cutoff,
-                        contraction_opt=self.contraction_opt,
-                        retag=False,
-                        range_int=[xmin, xmax],
-                        inplace=True,
-                        copy_target=False,
-                    )
-                    p, fit_result = run_local_fit_transactional(
-                        fit,
-                        active_fit_block_size,
-                        step_start=idx,
-                        step_end=idx + 1,
-                        where=where,
-                    )
-                    if fit_result is None:
-                        idx += 1
-                        advanced = 1
-                    else:
-                        final_center = fit.final_center_site
-                        if final_center is None:
-                            final_center = p.calc_current_orthog_center()[-1]
-                        observed_norm = self._timed_call(
-                            "norm.observed",
-                            self._canonical_norm_measurement,
-                            p,
-                            final_center,
-                        )
-                        self.info_c["cur_orthog"] = (
-                            int(final_center),
-                            int(final_center),
-                        )
-                        self._timed_call(
-                            "norm.record",
-                            self._record_norm_event,
-                            "dmrg_compression",
-                            expected_norm=expected_norm,
-                            observed_norm=observed_norm,
-                            target_norm=expected_norm,
-                            where=(xmin, xmax),
-                            unitary=(
-                                self._is_unitary_gate_pair(gate, bra_gate)
-                                and self._unitary_norm_guard_supported(p)
-                            ),
-                        )
-                        fit_overlap = (
-                            self._fit_overlap_diagnostics(p_g, fit.p)
-                            if fit_overlap_diagnostics
-                            else {}
-                        )
-                        self._record_fit_diagnostics(
-                            fit,
-                            where=(xmin, xmax),
-                            block_size=active_fit_block_size,
-                            step=idx + 1,
-                            mpo_fit_guess_used=fit_initialization[
-                                "svd_guess_used"
-                            ],
-                            mpo_fit_guess_order=(
-                                fit_mpo_guess_order
-                                if fit_initialization["svd_guess_used"]
-                                else None
-                            ),
-                            fit_initialization=fit_initialization,
-                            fit_overlap=fit_overlap,
-                            fit_overlap_diagnostics=fit_overlap_diagnostics,
-                        )
-                        self._maybe_lock_dmrg1_one_site_phase()
-                        self._last_dmrg_fit_diagnostics[
-                            "dmrg1_one_site_locked"
-                        ] = bool(self._dmrg1_one_site_locked)
-                        idx += 1
-                        advanced = 1
-                    if fit_result is None:
-                        self._maybe_lock_dmrg1_one_site_phase()
-                        if self._last_dmrg_fit_diagnostics is not None:
-                            self._last_dmrg_fit_diagnostics[
-                                "dmrg1_one_site_locked"
-                            ] = bool(self._dmrg1_one_site_locked)
                 else:
                     batch_G, batch_where, two_qubit_in_batch, next_idx = (
                         self._collect_dmrg_batch(
@@ -3651,154 +3888,26 @@ class MpoOptimizer:
                         raise RuntimeError("DMRG batch unexpectedly contains no two-qubit gates.")
 
                     two_qubit_count += two_qubit_in_batch
-                    batch_span_sites = [site for where_i in batch_where for site in where_i]
-                    xmin, xmax = min(batch_span_sites), max(batch_span_sites)
-                    self.canonize_mpo(p, (xmin, xmax))
-                    p_g = self._timed_call(
-                        "dmrg.target",
-                        self._build_dmrg_batch_target,
+                    p, idx, advanced = self._run_dmrg_batch_window(
                         p,
                         batch_G,
                         batch_where,
-                        cutoff,
-                        cutoff_mode,
-                        target_cutoff=target_cutoff,
-                        target_strategy=fit_target_strategy,
-                    )
-
-                    expected_norm = self._timed_call(
-                        "norm.expected",
-                        self._expected_batch_target_norm,
-                        p,
-                        batch_G,
-                        batch_where,
-                        target=p_g,
-                        cutoff_mode=cutoff_mode,
-                    )
-                    requested_fit_block_size = min(
-                        fit_block_size,
-                        xmax - xmin + 1,
-                    )
-                    self._validate_dmrg1_iteration_budget(
-                        p,
-                        xmin,
-                        xmax,
+                        idx,
                         n_iter=n_iter,
-                        block_size=requested_fit_block_size,
-                    )
-                    active_fit_block_size = self._resolve_dmrg_fit_block_size(
-                        p,
-                        xmin,
-                        xmax,
-                        fit_block_size,
-                    )
-                    fit_initialization = self._timed_call(
-                        "dmrg.fit_guess",
-                        self._prepare_fit_initial_guess,
-                        p,
-                        batch_G,
-                        batch_where,
-                        block_size=active_fit_block_size,
-                        strategy=fit_init_strategy,
-                        fit_mpo_guess=fit_mpo_guess,
-                        rand_strength=fit_init_rand_strength,
-                        seed=(
-                            int(fit_init_seed)
-                            + 1000003 * int(idx)
-                            + 1009 * int(xmin)
-                            + int(xmax)
-                        ),
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
-                        layer_order=fit_mpo_guess_order,
+                        fit_block_size=fit_block_size,
+                        target_cutoff=target_cutoff,
+                        fit_target_strategy=fit_target_strategy,
+                        fit_mpo_guess=fit_mpo_guess,
+                        fit_mpo_guess_order=fit_mpo_guess_order,
+                        fit_init_strategy=fit_init_strategy,
+                        fit_init_rand_strength=fit_init_rand_strength,
+                        fit_init_seed=fit_init_seed,
+                        fit_overlap_diagnostics=fit_overlap_diagnostics,
+                        next_idx=next_idx,
+                        run_local_fit_transactional=run_local_fit_transactional,
                     )
-                    fit_guess = fit_initialization["fit_guess"]
-                    fit = FIT(
-                        p_g,
-                        p=fit_guess,
-                        cutoffs=cutoff,
-                        contraction_opt=self.contraction_opt,
-                        retag=False,
-                        range_int=[xmin, xmax],
-                        inplace=True,
-                        copy_target=False,
-                    )
-                    p, fit_result = run_local_fit_transactional(
-                        fit,
-                        active_fit_block_size,
-                        step_start=idx,
-                        step_end=next_idx,
-                        where=(xmin, xmax),
-                    )
-                    if fit_result is None:
-                        advanced = next_idx - idx
-                        idx = next_idx
-                    else:
-                        final_center = fit.final_center_site
-                        if final_center is None:
-                            final_center = p.calc_current_orthog_center()[-1]
-                        observed_norm = self._timed_call(
-                            "norm.observed",
-                            self._canonical_norm_measurement,
-                            p,
-                            final_center,
-                        )
-                        self.info_c["cur_orthog"] = (
-                            int(final_center),
-                            int(final_center),
-                        )
-                        self._timed_call(
-                            "norm.record",
-                            self._record_norm_event,
-                            "dmrg_compression",
-                            expected_norm=expected_norm,
-                            observed_norm=observed_norm,
-                            target_norm=expected_norm,
-                            where=(xmin, xmax),
-                            unitary=(
-                                all(
-                                    self._is_unitary_gate_pair(
-                                        *self._parse_gate_entry(gate_i, where_i)[:2]
-                                    )
-                                    for gate_i, where_i in zip(batch_G, batch_where)
-                                )
-                                and self._unitary_norm_guard_supported(p)
-                            ),
-                        )
-                        fit_overlap = (
-                            self._fit_overlap_diagnostics(p_g, fit.p)
-                            if fit_overlap_diagnostics
-                            else {}
-                        )
-                        self._record_fit_diagnostics(
-                            fit,
-                            where=(xmin, xmax),
-                            block_size=active_fit_block_size,
-                            step=idx + 1,
-                            mpo_fit_guess_used=fit_initialization[
-                                "svd_guess_used"
-                            ],
-                            mpo_fit_guess_order=(
-                                fit_mpo_guess_order
-                                if fit_initialization["svd_guess_used"]
-                                else None
-                            ),
-                            fit_initialization=fit_initialization,
-                            fit_overlap=fit_overlap,
-                            fit_overlap_diagnostics=fit_overlap_diagnostics,
-                        )
-                        self._maybe_lock_dmrg1_one_site_phase()
-                        self._last_dmrg_fit_diagnostics[
-                            "dmrg1_one_site_locked"
-                        ] = bool(self._dmrg1_one_site_locked)
-                        advanced = next_idx - idx
-                        idx = next_idx
-                    if fit_result is None:
-                        self._maybe_lock_dmrg1_one_site_phase()
-                        if self._last_dmrg_fit_diagnostics is not None:
-                            self._last_dmrg_fit_diagnostics[
-                                "dmrg1_one_site_locked"
-                            ] = bool(self._dmrg1_one_site_locked)
             else:
                 raise ValueError("Each gate location must have one or two sites.")
 

@@ -8,7 +8,7 @@ see the [BP API guide](../../api/bp.md).
 | --- | --- |
 | `relay.py` | Plain and relay BP solves and convergence records |
 | `cluster.py` | Tensor-region loop-cluster expansion |
-| `_series_geometry.py` | Edge terms, graph/corridor discovery, enumeration limits |
+| `_series_geometry.py` | Observable support parsing, edge terms, graph/corridor discovery, enumeration limits |
 | `series.py` | Loop-series caches, route selection, projectors, contractions, diagnostics |
 | `pne.py` | Partitioned network expansion |
 | `compression.py` | Selected-bond and loop-series compression |
@@ -23,6 +23,14 @@ Geometry discovery does not solve BP or contract tensors. The public
 and `pepsy.bp`; historical serialized globals still resolve. Cache objects
 remain in `series.py` and retain topology validation and all-or-nothing cache
 installation after successful enumeration.
+
+The open-series entry points validate options and prepare BP normalization
+before dispatching to `_contract_open_rho_cluster` / `_contract_open_rho_edges`
+or their scalar-expectation counterparts. Each execution helper owns its
+route's caches, budget decisions, and diagnostics. The native cyclic route
+retains graded cluster contractions; the explicit-edge route retains its
+projector terms. `observables.py` and `series.py` share `_term_sites` through
+the geometry module, which does not import either contraction owner.
 
 Native cyclic fermion route selection remains with the contraction layer.
 Moving graph algorithms must not change that route, collapse parallel seam

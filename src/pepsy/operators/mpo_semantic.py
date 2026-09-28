@@ -1828,7 +1828,6 @@ def _term_from_input(term):
                 )
             else:
                 coefficient = 1.0
-        coefficient = coefficient
         matrix = _as_square_operator(operators)
         normalized_sites = normalize_integer_tuple(
             sites,

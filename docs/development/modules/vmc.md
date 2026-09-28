@@ -12,6 +12,9 @@ NetKet setup/driver orchestration. Within its amplitude factories:
   scalar, logarithm, or mantissa/exponent pair.
 - JIT factories retain native JAX indices and `vmap`. The eager evaluator's
   Python integer conversions must not be moved into a traced path.
+- `_make_jax_scaled_contractor` supplies the identical contraction dispatch
+  for both JIT factories. It returns a mantissa and base-10 exponent; each
+  adapter retains its configuration mapping, fermion phase, and output format.
 
 The evaluator captures only the supplied ansatz and contraction settings;
 it does not own sampler state, observables, or optimizer updates. JAX/NetKet
@@ -51,3 +54,18 @@ now have physically-owned modules. `_common.py` owns the shared leaf helpers;
 `_core.py` keeps compatibility imports and cross-workflow dispatch. New code
 should use the public symbols from `pepsy.vmc` or `pepsy.vmc.torch`, and the
 proposal entry point `TorchVMCDriver.measure_from_proposal(...)`.
+
+Within `driver.py`, retained-sample measurement has three preparation stages:
+`_resolve_measurement_source` validates provenance and distributed ownership,
+`_measurement_configurations` preserves chain axes while moving configurations
+to the model device, and `_measurement_amplitudes` reuses or refreshes parent
+amplitudes. Weighting, observable connections, and result assembly remain in
+`measure_samples`. Both sampling estimators use `_run_sampling_sweeps`; each
+caller owns its cumulative counters, profiling dictionary, and progress bar.
+
+`TorchPEPSAmplitude.connected_amplitudes` documents parent/target row shapes,
+site encoding, device/dtype, ordering, and amplitude ownership. The boundary
+subclass adds cache and diagnostic mutation, fallback/chunking behavior, and
+the cache lifetime required when starting a new autograd graph. See the
+[connected-amplitude contract](../../api/vmc.md#connected-amplitude-contract)
+for a small measurement example.

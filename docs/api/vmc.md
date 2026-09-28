@@ -570,6 +570,53 @@ Local-energy evaluation also coalesces repeated `(walker, configuration)`
 connections and batches each unique off-diagonal target amplitude once before
 scattering the values back to the Hamiltonian terms.
 
+### Connected-amplitude contract
+
+`model.connected_amplitudes(configs, amplitudes, connections)` evaluates
+the target configurations for a local estimator:
+
+| Input or result | Shape and meaning |
+| --- | --- |
+| `configs` | `(n_samples, n_sites)` parent configurations in model site order and physical encoding |
+| `amplitudes` | `(n_samples,)` parent amplitudes from the current model parameters and contraction settings |
+| `connections.configs` | `(n_connections, n_sites)` target configurations |
+| `connections.batch_ids` | `(n_connections,)` parent row index for each target |
+| Return | `(n_connections,)` raw target amplitudes, preserving connection order and repetitions |
+
+Keep configurations and connection indices on the model device and supply
+parent amplitudes with its amplitude dtype. `connections.coeffs` belongs to
+the estimator: this method does not multiply coefficients or divide by parent
+amplitudes. Empty connections produce an empty result. Inputs are not modified.
+
+For example, this small CPU measurement evaluates two connected targets:
+
+```python
+import quimb.tensor as qtn
+import torch
+from pepsy.vmc.torch import TorchConnections, TorchPEPSBoundaryAmplitude
+
+peps = qtn.PEPS.rand(2, 2, bond_dim=2, seed=7, dtype="float64")
+model = TorchPEPSBoundaryAmplitude(peps, chi=4, dtype=torch.float64)
+configs = torch.tensor([[0, 0, 0, 0], [1, 0, 0, 0]])
+connections = TorchConnections(
+    configs=configs.flip(0),
+    coeffs=torch.ones(2, dtype=torch.float64),
+    batch_ids=torch.arange(2),
+)
+with torch.no_grad():
+    parents = model(configs)
+    targets = model.connected_amplitudes(configs, parents, connections)
+print(targets.shape)  # torch.Size([2])
+```
+
+`reuse_diagonal=True` reuses the supplied parent amplitude when a target is
+unchanged. `chunk_size` controls forwarded amplitude calls; compiled boundary
+reuse retains its separately configured batch size. Boundary evaluation updates
+caches and reuse statistics. Parameter updates invalidate cached environments;
+before building a new autograd graph, call `model.clear_boundary_cache()` and
+recompute parent amplitudes because the cache key tracks parameter versions,
+not graph lifetime. Measurement calls should use `torch.no_grad()`.
+
 For boundary-MPS contractions, `make_torch_peps_amplitude_model(...,
 contraction="boundary")` now constructs `TorchPEPSBoundaryAmplitude`. It
 reuses bounded row or column environment caches for local Hamiltonian
@@ -753,7 +800,11 @@ building, all requested observable contractions, and final statistics.
 
 `local_observables({"energy": ham.terms, "eta": eta_terms})` provides the
 same connected-amplitude sharing for the driver's current walkers without a
-sampling pass. For one observable, pass `profile=True` to
+sampling pass. It returns a dictionary of local-value tensors, each with
+shape `(n_configs,)`; it does not compute chain statistics or weighted
+averages. Explicit `configs` use shape `(n_configs, n_sites)` and the model's
+site/basis order; supplied `amplitudes` must match that batch and the current
+model parameters. For one observable, pass `profile=True` to
 `estimate_observable` or `step` to record phase timings and the available PEPS
 boundary-cache counters.
 
@@ -776,6 +827,13 @@ observables = driver.measure_samples(
 )
 print(energy.energy_mean, energy.chain_diagnostics)
 ```
+
+Saved Markov samples carry model/contraction provenance. After changing that
+state, draw fresh Markov samples; `measure_samples` rejects a stale batch.
+Saved `TorchImportanceSamples` instead describe an external proposal and can
+be reused: target amplitudes refresh when the target provenance changes.
+Raw configuration tensors carry no provenance, so the caller is responsible
+for their sampling distribution. Measurement does not advance the sampler.
 
 For repeated runs with a fixed walker shape, set `compile_kernels=True` on
 `TorchVMCDriver`, `TorchFermionVMC`, or `TorchMetropolisSampler`. It only
@@ -1064,6 +1122,14 @@ samples = bp_mcmc.sample(
 Each proposal uses
 
 `min(1, |psi(y)|**2 q_BP(x) / (|psi(x)|**2 q_BP(y)))`.
+
+`bp_mcmc.sample_sweep(n_sweeps=k)` returns the final chain state with
+`n_proposed` and `n_accepted` summed over all `k` sweeps, as does `burn_in(k)`.
+These totals include every BP proposal attempt, including sector rejections.
+BP proposes whole configurations: local-move diagnostics
+(`track_proposal_stats=True`) and `warmup_proposal_mix()` are unsupported and
+raise `ValueError` before drawing proposals. Use the aggregate counters and
+`acceptance_rate` to monitor BP sampling.
 
 The BP adapter supports four-state spinful fermion PEPS with `U1`, `U1U1`,
 `Z2`, and `Z2Z2` physical symmetries. Since Quimb's current D2BP interface
@@ -1438,6 +1504,10 @@ report = vmc.check_mc_convergence(
 print(report.reliable, report.recommended_sweep_size)
 print(report.energy.split_r_hat, report.energy.tau_max)
 ```
+
+Each observable estimate exposes `tau` as a shorthand for
+`integrated_autocorrelation_time`, and `tau_max` for the maximum per-chain
+value.
 
 The live progress display is sampling acceptance only. The check uses a
 cloned random stream, leaves the active walker configurations and RNG state

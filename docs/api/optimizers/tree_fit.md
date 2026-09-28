@@ -12,7 +12,7 @@ payloads and the direct, density-matrix, SRC, SDC, and zipup alternatives.
 `pepsy.fitting.TreeFIT` is the cached local variational fitting kernel for a
 `TreeTensorNetwork`. It has the same separation of target, disposable initial
 guess, bounded local updates, ownership controls, and diagnostics as
-`pepsy.FIT`, but replaces the chain's left/right environments with one cached
+`pepsy.fitting.FIT`, but replaces the chain's left/right environments with one cached
 directed overlap message for each tree edge:
 
 ```python
@@ -242,11 +242,13 @@ same-phase norm samples; the counter resets when the block size changes.
 still gate early stopping. This criterion measures relative change in the
 retained canonical-center norm, not a bound on the global state error.
 
-As with MpsOptimizer's non-unitary policy, automatic tolerance stopping is
-disabled during `run(non_unitary=True)`. It is also disabled for updates with
+TreeOptimizer disables automatic tolerance stopping during
+`run(non_unitary=True)`. It is also disabled for updates with
 `track_norm=False`, whose target norm is not assumed known. Explicit numeric
 `fit_rtol` remains honored in those cases. Optimizer FIT diagnostics report
 both `fit_rtol_requested` and the effective `fit_rtol` for each update.
+MpsOptimizer keeps its automatic tolerance during non-unitary replay; the
+shared dtype thresholds do not imply identical stopping policies.
 Standalone TreeFIT retains `rtol=None` and its fixed-block defaults. All three
 entry points accept `two_site_transition_sweeps=0`; set this to one with
 `block_size=3, adaptive_block_sweeps=2` to request the new transition explicitly.

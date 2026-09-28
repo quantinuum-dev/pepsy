@@ -3176,6 +3176,40 @@ def pack_fermionic_peps_ansatz(peps, *, lattice_shape=None, orbital_sites=None):
     )
 
 
+def _make_jax_scaled_contractor(*, contraction, chi, cutoff, method_opts, jnp, real_dtype):
+    """Build contraction dispatch shared by the JAX spin and fermion adapters.
+
+    Return a mantissa and base-10 exponent without converting traced values
+    to Python scalars. Each adapter owns physical indices and fermion phases.
+    """
+    def contract_mantissa_exponent(tnx):
+        if contraction == "hotrg":
+            return tnx.contract_hotrg(
+                max_bond=chi,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **method_opts,
+            )
+        if contraction == "ctmrg":
+            return _contract_ctmrg_for_vmc(
+                tnx,
+                max_bond=chi,
+                cutoff=cutoff,
+                method_opts=method_opts,
+            )
+        if contraction == "boundary":
+            return _contract_boundary_for_vmc(
+                tnx,
+                max_bond=chi,
+                cutoff=cutoff,
+                method_opts=method_opts,
+            )
+        amp = tnx.contract(all)
+        return amp, jnp.zeros((), dtype=real_dtype)
+
+    return contract_mantissa_exponent
+
+
 def _make_peps_batched_amplitude_apply(
     ansatz,
     config_map=None,
@@ -3227,30 +3261,14 @@ def _make_peps_batched_amplitude_apply(
             for k, site in enumerate(ansatz.sites)
         })
 
-    def contract_mantissa_exponent(tnx):
-        if contraction == "hotrg":
-            return tnx.contract_hotrg(
-                max_bond=chi,
-                cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
-            )
-        if contraction == "ctmrg":
-            return _contract_ctmrg_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        if contraction == "boundary":
-            return _contract_boundary_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        amp = tnx.contract(all)
-        return amp, jnp.zeros((), dtype=real_dtype)
+    contract_mantissa_exponent = _make_jax_scaled_contractor(
+        contraction=contraction,
+        chi=chi,
+        cutoff=cutoff,
+        method_opts=method_opts,
+        jnp=jnp,
+        real_dtype=real_dtype,
+    )
 
     def log_from_mantissa_exponent(mantissa, exponent):
         return (
@@ -3622,30 +3640,14 @@ def _make_fermionic_peps_batched_amplitude_apply(
             for k, site in enumerate(ansatz.sites)
         })
 
-    def contract_mantissa_exponent(tnx):
-        if contraction == "hotrg":
-            return tnx.contract_hotrg(
-                max_bond=chi,
-                cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
-            )
-        if contraction == "ctmrg":
-            return _contract_ctmrg_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        if contraction == "boundary":
-            return _contract_boundary_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        amp = tnx.contract(all)
-        return amp, jnp.zeros((), dtype=real_dtype)
+    contract_mantissa_exponent = _make_jax_scaled_contractor(
+        contraction=contraction,
+        chi=chi,
+        cutoff=cutoff,
+        method_opts=method_opts,
+        jnp=jnp,
+        real_dtype=real_dtype,
+    )
 
     def log_from_mantissa_exponent(mantissa, exponent):
         return (

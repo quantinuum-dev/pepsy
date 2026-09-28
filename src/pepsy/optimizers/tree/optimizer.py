@@ -50,7 +50,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from ..._internal.cutoff import dtype_auto_cutoff
+from ..._internal.cutoff import dtype_auto_cutoff, resolve_fit_rtol
 from ...fitting import TreeFIT
 from ...fitting.tree import (
     _build_layered_operator_state_target,
@@ -779,26 +779,8 @@ class TreeOptimizer:
 
     def _resolve_fit_rtol(self, value):
         """Resolve the same dtype-aware stopping tolerance as MpsOptimizer."""
-        if value == "auto":
-            dtype = str(self.backend_dtype).lower()
-            if "16" in dtype:
-                return 1e-3
-            if "32" in dtype or "complex64" in dtype:
-                return 1e-5
-            return 1e-9
-        if value is None:
-            return None
-        try:
-            value = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "fit_rtol must be 'auto', a non-negative number, or None."
-            ) from exc
-        if not np.isfinite(value) or value < 0.0:
-            raise ValueError(
-                "fit_rtol must be 'auto', a non-negative number, or None."
-            )
-        return value
+        dtype = self.backend_dtype if value == "auto" else None
+        return resolve_fit_rtol(value, dtype=dtype)
 
     def __init__(self, gates=None, n=None, *, chi=64,
                  cutoff=_DEFAULT_CUTOFF,

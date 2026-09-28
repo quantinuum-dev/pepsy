@@ -135,6 +135,399 @@ def _metadata_key(value):
     return ("value", value)
 
 
+def _normalize_product_terms(
+    L,
+    terms,
+    phys_dim,
+):
+    """Validate product supports and retain backend-native operator arrays."""
+    records = []
+    for term_index, term in enumerate(tuple(terms)):
+        if isinstance(term, Mapping):
+            sites = term.get("sites", term.get("locations"))
+            operators = term.get("operators", term.get("paulis"))
+            coefficient = term.get("coefficient", 1.0)
+            string_operators = term.get(
+                "string_operators",
+                term.get("string_paulis"),
+            )
+            charge = term.get("charge")
+        elif hasattr(term, "sites") and hasattr(term, "operators"):
+            sites = term.sites
+            operators = term.operators
+            coefficient = getattr(term, "coefficient", 1.0)
+            string_operators = getattr(term, "string_operators", None)
+            charge = getattr(term, "charge", None)
+        elif isinstance(term, (tuple, list)) and len(term) in (2, 3):
+            sites, operators = term[:2]
+            coefficient = term[2] if len(term) == 3 else 1.0
+            string_operators = None
+            charge = None
+        else:
+            raise TypeError(
+                "product terms must provide sites and operators, or be "
+                "(sites, operators) pairs."
+            )
+
+        if sites is None or operators is None:
+            raise ValueError("each product term needs sites and operators.")
+        sites = tuple(sites)
+        operators = tuple(operators)
+        if not sites or len(sites) != len(operators):
+            raise ValueError(
+                "product-term sites and operators must be non-empty and aligned."
+            )
+        sites = normalize_integer_tuple(
+            sites,
+            name="product-term sites",
+            allow_scalar=False,
+        )
+        if any(site < 0 or site >= L for site in sites):
+            raise ValueError(
+                f"product-term sites must lie in [0, {L - 1}], got {sites!r}."
+            )
+        if any(left >= right for left, right in zip(sites, sites[1:])):
+            raise ValueError("product-term sites must be strictly increasing.")
+        _check_scalar(coefficient, name="coefficient")
+
+        shapes = [_operator_shape(operator) for operator in operators]
+        if any(
+            len(shape) != 2 or shape[0] != shape[1]
+            for shape in shapes
+        ):
+            raise ValueError("product-term operators must be square matrices.")
+        if any(shape != shapes[0] for shape in shapes[1:]):
+            raise ValueError(
+                "all product-term operators must have the same square shape."
+            )
+        term_phys_dim = shapes[0][0]
+        if phys_dim is None:
+            phys_dim = term_phys_dim
+        if tuple(shapes[0]) != (int(phys_dim), int(phys_dim)):
+            raise ValueError(
+                f"operators have shape {shapes[0]}, expected "
+                f"({phys_dim}, {phys_dim})."
+            )
+
+        gap_count = sum(
+            right - left - 1 for left, right in zip(sites, sites[1:])
+        )
+        if string_operators is None:
+            identity = ar.do("eye", int(phys_dim), like=operators[0])
+            string_operators = (identity,) * gap_count
+        else:
+            string_operators = tuple(string_operators)
+            if len(string_operators) != gap_count:
+                raise ValueError(
+                    f"string_operators must have length {gap_count}, "
+                    f"got {len(string_operators)}."
+                )
+            string_shapes = [
+                _operator_shape(operator) for operator in string_operators
+            ]
+            if any(
+                shape != (int(phys_dim), int(phys_dim))
+                for shape in string_shapes
+            ):
+                raise ValueError(
+                    "string_operators must have the same square shape as "
+                    "operators."
+                )
+        records.append({
+            "term_index": term_index,
+            "sites": sites,
+            "operators": operators,
+            "coefficient": coefficient,
+            "string_operators": string_operators,
+            "charge": charge,
+        })
+
+    if not records:
+        raise ValueError("terms must contain at least one product term.")
+    return records, phys_dim
+
+
+def _product_term_prefixes(
+    L,
+    records,
+    start_state,
+    done_state,
+    return_slots,
+):
+    """Build channels for shared prefixes in input term order."""
+    # First build a prefix trie. Each non-boundary trie node is a virtual
+    # channel on one cut. In slot mode coefficients are assigned later to
+    # term-unique path edges, so paths can share both prefixes and suffixes
+    # without coupling their parameter values.
+    states_by_cut = [[] for _ in range(max(L - 1, 0))]
+    state_keys = [{} for _ in range(max(L - 1, 0))]
+    state_charges = {}
+    state_counter = 0
+    edge_records = []
+    unweighted_edges = set()
+
+    def new_state(cut, key, charge):
+        nonlocal state_counter
+        state = ("shared-term", int(cut), state_counter)
+        state_counter += 1
+        state_keys[cut][key] = state
+        states_by_cut[cut].append(state)
+        state_charges[state] = charge
+        return state
+
+    def add_edge(
+        site,
+        left_state,
+        right_state,
+        operator,
+        *,
+        weighted,
+        term_index=None,
+        structural_operator=None,
+    ):
+        if structural_operator is None:
+            structural_operator = operator
+        if not weighted and not return_slots:
+            edge_key = (
+                int(site),
+                left_state,
+                right_state,
+                _operator_key(operator),
+            )
+            if edge_key in unweighted_edges:
+                return
+            unweighted_edges.add(edge_key)
+        edge_records.append((
+            int(site),
+            left_state,
+            right_state,
+            operator,
+            bool(weighted),
+            term_index,
+            structural_operator,
+        ))
+
+    for record in records:
+        sites = record["sites"]
+        operators = record["operators"]
+        string_operators = record["string_operators"]
+        coefficient = record["coefficient"]
+        charge = record["charge"]
+        term_index = record["term_index"]
+        support_positions = {site: pos for pos, site in enumerate(sites)}
+        current = start_state
+        string_pos = 0
+
+        for site in range(sites[0], sites[-1] + 1):
+            if site in support_positions:
+                position = support_positions[site]
+                structural_operator = operators[position]
+                edge_operator = structural_operator
+                weighted = False
+            else:
+                structural_operator = string_operators[string_pos]
+                edge_operator = structural_operator
+                weighted = False
+                string_pos += 1
+
+            is_final = site == sites[-1]
+            if is_final:
+                if not return_slots:
+                    edge_operator = _multiply_scalar(coefficient, edge_operator)
+                add_edge(
+                    site,
+                    current,
+                    done_state,
+                    edge_operator,
+                    weighted=False,
+                    term_index=term_index if return_slots else None,
+                    structural_operator=structural_operator,
+                )
+                continue
+
+            state_key = (
+                current,
+                _operator_key(structural_operator),
+                _metadata_key(charge),
+            )
+            target = state_keys[site].get(state_key)
+            if target is None:
+                target = new_state(site, state_key, charge)
+            add_edge(
+                site,
+                current,
+                target,
+                edge_operator,
+                weighted=weighted,
+                term_index=term_index if return_slots else None,
+                structural_operator=structural_operator,
+            )
+            current = target
+    return states_by_cut, state_charges, edge_records
+
+
+def _product_term_state_maps(
+    L,
+    states_by_cut,
+    state_charges,
+    edge_records,
+):
+    """Identify channels with exactly matching future continuations."""
+    # Merge states with identical future continuations. Together with
+    # the prefix trie above, this shares both repeated prefixes and exact
+    # suffixes while keeping all operator paths unchanged.
+    state_maps = [{} for _ in range(max(L - 1, 0))]
+    for cut in range(L - 2, -1, -1):
+        signatures = {}
+        for state in states_by_cut[cut]:
+            outgoing = set()
+            for (
+                site,
+                left,
+                right,
+                _operator,
+                _weighted,
+                _term_index,
+                structural_operator,
+            ) in edge_records:
+                if site != cut + 1 or left != state:
+                    continue
+                target = right
+                if cut + 1 < L - 1:
+                    target = state_maps[cut + 1].get(right, right)
+                outgoing.add((_operator_key(structural_operator), target))
+            signature = (
+                _metadata_key(state_charges[state]),
+                tuple(sorted(outgoing, key=repr)),
+            )
+            canonical = signatures.setdefault(signature, state)
+            state_maps[cut][state] = canonical
+    return state_maps
+
+
+def _product_term_transitions(
+    L,
+    edge_records,
+    state_maps,
+    start_state,
+    done_state,
+    return_slots,
+):
+    """Emit shared transitions and choose independent coefficient slots."""
+    transitions = [[] for _ in range(L)]
+    aggregated_edges = {}
+    aggregate_descriptors = {}
+    rebuilt_edges = set()
+    slots = {}
+    mapped_records = []
+    descriptor_terms = {}
+    term_paths = {}
+    for (
+        site,
+        left,
+        right,
+        operator,
+        weighted,
+        term_index,
+        _structural_operator,
+    ) in edge_records:
+        mapped_left = left
+        mapped_right = right
+        if site > 0 and left not in {start_state, done_state}:
+            mapped_left = state_maps[site - 1][left]
+        if site < L - 1 and right not in {start_state, done_state}:
+            mapped_right = state_maps[site][right]
+        descriptor = (
+            site,
+            mapped_left,
+            mapped_right,
+            _operator_key(_structural_operator),
+        )
+        mapped_records.append((
+            site,
+            mapped_left,
+            mapped_right,
+            operator,
+            term_index,
+            _structural_operator,
+            descriptor,
+        ))
+        if return_slots and term_index is not None:
+            descriptor_terms.setdefault(descriptor, set()).add(term_index)
+            term_paths.setdefault(term_index, []).append(descriptor)
+
+    selected_slots = {}
+    if return_slots:
+        for term_index, path in term_paths.items():
+            unique = [
+                descriptor
+                for descriptor in path
+                if descriptor_terms[descriptor] == {term_index}
+            ]
+            # Identical terms have no term-unique edge, so they share the
+            # final slot and their scalar coefficients are summed there.
+            selected_slots[term_index] = unique[0] if unique else path[-1]
+
+    for (
+        site,
+        mapped_left,
+        mapped_right,
+        operator,
+        term_index,
+        structural_operator,
+        descriptor,
+    ) in mapped_records:
+        is_slot = (
+            return_slots
+            and term_index is not None
+            and descriptor == selected_slots[term_index]
+        )
+        if is_slot:
+            aggregate_key = (site, mapped_left, mapped_right)
+            aggregate_pos = aggregated_edges.get(aggregate_key)
+            if aggregate_pos is None:
+                aggregate_pos = len(transitions[site])
+                aggregated_edges[aggregate_key] = aggregate_pos
+                aggregate_descriptors[aggregate_key] = {descriptor}
+                transitions[site].append(
+                    MPOTransition(mapped_left, mapped_right, structural_operator)
+                )
+            elif descriptor not in aggregate_descriptors[aggregate_key]:
+                aggregate_descriptors[aggregate_key].add(descriptor)
+                previous = transitions[site][aggregate_pos]
+                reference = _backend_reference(
+                    (previous.operator, structural_operator),
+                )
+                combined = ar.do(
+                    "add",
+                    _as_backend(previous.operator, like=reference),
+                    _as_backend(structural_operator, like=reference),
+                )
+                transitions[site][aggregate_pos] = MPOTransition(
+                    mapped_left,
+                    mapped_right,
+                    combined,
+                )
+            if term_index is not None:
+                slots[term_index] = (site, aggregate_pos)
+            continue
+        if not return_slots:
+            edge_key = descriptor
+            if edge_key in rebuilt_edges:
+                continue
+            rebuilt_edges.add(edge_key)
+        else:
+            if descriptor in rebuilt_edges:
+                continue
+            rebuilt_edges.add(descriptor)
+        transitions[site].append(
+            MPOTransition(mapped_left, mapped_right, operator)
+        )
+        if term_index is not None and not return_slots:
+            slots[term_index] = (site, len(transitions[site]) - 1)
+    return transitions, slots
+
+
 @dataclass(frozen=True)
 class MPOChannel:
     """A virtual MPO state on one bond.
@@ -391,10 +784,15 @@ class MPOAutomaton:
         L : int
             Number of sites.
         terms : iterable
-            Objects or mappings with ``sites``, ``operators``,
-            ``coefficient``, ``string_operators``, and optional ``charge``
-            attributes. ``(sites, operators)`` and
-            ``(sites, operators, coefficient)`` pairs are also accepted.
+            Objects or mappings with aligned ``sites`` and ``operators``;
+            ``coefficient``, ``string_operators``, and ``charge`` are optional.
+            Sites must be strictly increasing integers in ``[0, L)``. All
+            operators have shape ``(d, d)``. Gaps use identity matrices unless
+            one string operator per intervening site is supplied.
+            ``(sites, operators)`` and ``(sites, operators, coefficient)``
+            tuples are also accepted. Input arrays are not modified.
+        phys_dim : int, optional
+            Local dimension ``d``; inferred from the first term when omitted.
         share_channels : bool, default=True
             Share equal product prefixes and identical suffix continuations.
             This is an exact structural transformation; it does not use a
@@ -404,6 +802,14 @@ class MPOAutomaton:
             Also return ``(site, transition_index)`` coefficient slots. This
             is intended for reusable parameterized bases; ordinary callers
             should keep the default and receive only the automaton.
+
+        Returns
+        -------
+        MPOAutomaton or tuple[MPOAutomaton, tuple]
+            With ``return_slots=True``, slots follow input term order. Shared
+            construction leaves coefficients out of the slot operators for
+            later parameter binding; identical terms can share a slot.
+            Unshared construction retains the supplied coefficients.
 
         Notes
         -----
@@ -418,109 +824,11 @@ class MPOAutomaton:
         if L < 1:
             raise ValueError("L must be >= 1.")
 
-        records = []
-        for term_index, term in enumerate(tuple(terms)):
-            if isinstance(term, Mapping):
-                sites = term.get("sites", term.get("locations"))
-                operators = term.get("operators", term.get("paulis"))
-                coefficient = term.get("coefficient", 1.0)
-                string_operators = term.get(
-                    "string_operators",
-                    term.get("string_paulis"),
-                )
-                charge = term.get("charge")
-            elif hasattr(term, "sites") and hasattr(term, "operators"):
-                sites = term.sites
-                operators = term.operators
-                coefficient = getattr(term, "coefficient", 1.0)
-                string_operators = getattr(term, "string_operators", None)
-                charge = getattr(term, "charge", None)
-            elif isinstance(term, (tuple, list)) and len(term) in (2, 3):
-                sites, operators = term[:2]
-                coefficient = term[2] if len(term) == 3 else 1.0
-                string_operators = None
-                charge = None
-            else:
-                raise TypeError(
-                    "product terms must provide sites and operators, or be "
-                    "(sites, operators) pairs."
-                )
-
-            if sites is None or operators is None:
-                raise ValueError("each product term needs sites and operators.")
-            sites = tuple(sites)
-            operators = tuple(operators)
-            if not sites or len(sites) != len(operators):
-                raise ValueError(
-                    "product-term sites and operators must be non-empty and aligned."
-                )
-            sites = normalize_integer_tuple(
-                sites,
-                name="product-term sites",
-                allow_scalar=False,
-            )
-            if any(site < 0 or site >= L for site in sites):
-                raise ValueError(
-                    f"product-term sites must lie in [0, {L - 1}], got {sites!r}."
-                )
-            if any(left >= right for left, right in zip(sites, sites[1:])):
-                raise ValueError("product-term sites must be strictly increasing.")
-            _check_scalar(coefficient, name="coefficient")
-
-            shapes = [_operator_shape(operator) for operator in operators]
-            if any(
-                len(shape) != 2 or shape[0] != shape[1]
-                for shape in shapes
-            ):
-                raise ValueError("product-term operators must be square matrices.")
-            if any(shape != shapes[0] for shape in shapes[1:]):
-                raise ValueError(
-                    "all product-term operators must have the same square shape."
-                )
-            term_phys_dim = shapes[0][0]
-            if phys_dim is None:
-                phys_dim = term_phys_dim
-            if tuple(shapes[0]) != (int(phys_dim), int(phys_dim)):
-                raise ValueError(
-                    f"operators have shape {shapes[0]}, expected "
-                    f"({phys_dim}, {phys_dim})."
-                )
-
-            gap_count = sum(
-                right - left - 1 for left, right in zip(sites, sites[1:])
-            )
-            if string_operators is None:
-                identity = ar.do("eye", int(phys_dim), like=operators[0])
-                string_operators = (identity,) * gap_count
-            else:
-                string_operators = tuple(string_operators)
-                if len(string_operators) != gap_count:
-                    raise ValueError(
-                        f"string_operators must have length {gap_count}, "
-                        f"got {len(string_operators)}."
-                    )
-                string_shapes = [
-                    _operator_shape(operator) for operator in string_operators
-                ]
-                if any(
-                    shape != (int(phys_dim), int(phys_dim))
-                    for shape in string_shapes
-                ):
-                    raise ValueError(
-                        "string_operators must have the same square shape as "
-                        "operators."
-                    )
-            records.append({
-                "term_index": term_index,
-                "sites": sites,
-                "operators": operators,
-                "coefficient": coefficient,
-                "string_operators": string_operators,
-                "charge": charge,
-            })
-
-        if not records:
-            raise ValueError("terms must contain at least one product term.")
+        records, phys_dim = _normalize_product_terms(
+            L,
+            terms,
+            phys_dim,
+        )
 
         automaton = cls(
             L,
@@ -543,256 +851,29 @@ class MPOAutomaton:
                 slots.append((site, slot))
             return (automaton, tuple(slots)) if return_slots else automaton
 
-        # First build a prefix trie. Each non-boundary trie node is a virtual
-        # channel on one cut. In slot mode coefficients are assigned later to
-        # term-unique path edges, so paths can share both prefixes and suffixes
-        # without coupling their parameter values.
-        states_by_cut = [[] for _ in range(max(L - 1, 0))]
-        state_keys = [{} for _ in range(max(L - 1, 0))]
-        state_charges = {}
-        state_counter = 0
-        edge_records = []
-        unweighted_edges = set()
+        states_by_cut, state_charges, edge_records = _product_term_prefixes(
+            L,
+            records,
+            start_state,
+            done_state,
+            return_slots,
+        )
 
-        def new_state(cut, key, charge):
-            nonlocal state_counter
-            state = ("shared-term", int(cut), state_counter)
-            state_counter += 1
-            state_keys[cut][key] = state
-            states_by_cut[cut].append(state)
-            state_charges[state] = charge
-            return state
+        state_maps = _product_term_state_maps(
+            L,
+            states_by_cut,
+            state_charges,
+            edge_records,
+        )
 
-        def add_edge(
-            site,
-            left_state,
-            right_state,
-            operator,
-            *,
-            weighted,
-            term_index=None,
-            structural_operator=None,
-        ):
-            if structural_operator is None:
-                structural_operator = operator
-            if not weighted and not return_slots:
-                edge_key = (
-                    int(site),
-                    left_state,
-                    right_state,
-                    _operator_key(operator),
-                )
-                if edge_key in unweighted_edges:
-                    return
-                unweighted_edges.add(edge_key)
-            edge_records.append((
-                int(site),
-                left_state,
-                right_state,
-                operator,
-                bool(weighted),
-                term_index,
-                structural_operator,
-            ))
-
-        for record in records:
-            sites = record["sites"]
-            operators = record["operators"]
-            string_operators = record["string_operators"]
-            coefficient = record["coefficient"]
-            charge = record["charge"]
-            term_index = record["term_index"]
-            support_positions = {site: pos for pos, site in enumerate(sites)}
-            current = start_state
-            string_pos = 0
-
-            for site in range(sites[0], sites[-1] + 1):
-                if site in support_positions:
-                    position = support_positions[site]
-                    structural_operator = operators[position]
-                    edge_operator = structural_operator
-                    weighted = False
-                else:
-                    structural_operator = string_operators[string_pos]
-                    edge_operator = structural_operator
-                    weighted = False
-                    string_pos += 1
-
-                is_final = site == sites[-1]
-                if is_final:
-                    if not return_slots:
-                        edge_operator = _multiply_scalar(coefficient, edge_operator)
-                    add_edge(
-                        site,
-                        current,
-                        done_state,
-                        edge_operator,
-                        weighted=False,
-                        term_index=term_index if return_slots else None,
-                        structural_operator=structural_operator,
-                    )
-                    continue
-
-                state_key = (
-                    current,
-                    _operator_key(structural_operator),
-                    _metadata_key(charge),
-                )
-                target = state_keys[site].get(state_key)
-                if target is None:
-                    target = new_state(site, state_key, charge)
-                add_edge(
-                    site,
-                    current,
-                    target,
-                    edge_operator,
-                    weighted=weighted,
-                    term_index=term_index if return_slots else None,
-                    structural_operator=structural_operator,
-                )
-                current = target
-
-        # Merge states with identical future continuations. Together with
-        # the prefix trie above, this shares both repeated prefixes and exact
-        # suffixes while keeping all operator paths unchanged.
-        state_maps = [{} for _ in range(max(L - 1, 0))]
-        for cut in range(L - 2, -1, -1):
-            signatures = {}
-            for state in states_by_cut[cut]:
-                outgoing = set()
-                for (
-                    site,
-                    left,
-                    right,
-                    _operator,
-                    _weighted,
-                    _term_index,
-                    structural_operator,
-                ) in edge_records:
-                    if site != cut + 1 or left != state:
-                        continue
-                    target = right
-                    if cut + 1 < L - 1:
-                        target = state_maps[cut + 1].get(right, right)
-                    outgoing.add((_operator_key(structural_operator), target))
-                signature = (
-                    _metadata_key(state_charges[state]),
-                    tuple(sorted(outgoing, key=repr)),
-                )
-                canonical = signatures.setdefault(signature, state)
-                state_maps[cut][state] = canonical
-
-        transitions = [[] for _ in range(L)]
-        aggregated_edges = {}
-        aggregate_descriptors = {}
-        rebuilt_edges = set()
-        slots = {}
-        mapped_records = []
-        descriptor_terms = {}
-        term_paths = {}
-        for (
-            site,
-            left,
-            right,
-            operator,
-            weighted,
-            term_index,
-            _structural_operator,
-        ) in edge_records:
-            mapped_left = left
-            mapped_right = right
-            if site > 0 and left not in {start_state, done_state}:
-                mapped_left = state_maps[site - 1][left]
-            if site < L - 1 and right not in {start_state, done_state}:
-                mapped_right = state_maps[site][right]
-            descriptor = (
-                site,
-                mapped_left,
-                mapped_right,
-                _operator_key(_structural_operator),
-            )
-            mapped_records.append((
-                site,
-                mapped_left,
-                mapped_right,
-                operator,
-                term_index,
-                _structural_operator,
-                descriptor,
-            ))
-            if return_slots and term_index is not None:
-                descriptor_terms.setdefault(descriptor, set()).add(term_index)
-                term_paths.setdefault(term_index, []).append(descriptor)
-
-        selected_slots = {}
-        if return_slots:
-            for term_index, path in term_paths.items():
-                unique = [
-                    descriptor
-                    for descriptor in path
-                    if descriptor_terms[descriptor] == {term_index}
-                ]
-                # Identical terms have no term-unique edge, so they share the
-                # final slot and their scalar coefficients are summed there.
-                selected_slots[term_index] = unique[0] if unique else path[-1]
-
-        for (
-            site,
-            mapped_left,
-            mapped_right,
-            operator,
-            term_index,
-            structural_operator,
-            descriptor,
-        ) in mapped_records:
-            is_slot = (
-                return_slots
-                and term_index is not None
-                and descriptor == selected_slots[term_index]
-            )
-            if is_slot:
-                aggregate_key = (site, mapped_left, mapped_right)
-                aggregate_pos = aggregated_edges.get(aggregate_key)
-                if aggregate_pos is None:
-                    aggregate_pos = len(transitions[site])
-                    aggregated_edges[aggregate_key] = aggregate_pos
-                    aggregate_descriptors[aggregate_key] = {descriptor}
-                    transitions[site].append(
-                        MPOTransition(mapped_left, mapped_right, structural_operator)
-                    )
-                elif descriptor not in aggregate_descriptors[aggregate_key]:
-                    aggregate_descriptors[aggregate_key].add(descriptor)
-                    previous = transitions[site][aggregate_pos]
-                    reference = _backend_reference(
-                        (previous.operator, structural_operator),
-                    )
-                    combined = ar.do(
-                        "add",
-                        _as_backend(previous.operator, like=reference),
-                        _as_backend(structural_operator, like=reference),
-                    )
-                    transitions[site][aggregate_pos] = MPOTransition(
-                        mapped_left,
-                        mapped_right,
-                        combined,
-                    )
-                if term_index is not None:
-                    slots[term_index] = (site, aggregate_pos)
-                continue
-            if not return_slots:
-                edge_key = descriptor
-                if edge_key in rebuilt_edges:
-                    continue
-                rebuilt_edges.add(edge_key)
-            else:
-                if descriptor in rebuilt_edges:
-                    continue
-                rebuilt_edges.add(descriptor)
-            transitions[site].append(
-                MPOTransition(mapped_left, mapped_right, operator)
-            )
-            if term_index is not None and not return_slots:
-                slots[term_index] = (site, len(transitions[site]) - 1)
+        transitions, slots = _product_term_transitions(
+            L,
+            edge_records,
+            state_maps,
+            start_state,
+            done_state,
+            return_slots,
+        )
 
         channels = []
         for cut, states in enumerate(states_by_cut):

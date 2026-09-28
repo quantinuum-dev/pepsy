@@ -25,6 +25,70 @@ class _TreeBatch:
         self.probs = [1.0]
 
 
+def test_bp_sweeps_accumulate_counters_and_reject_local_move_tracking():
+    torch = pytest.importorskip("torch")
+    from pepsy.vmc.torch import TorchBPMetropolisSampler
+
+    class Proposal:
+        def __init__(self):
+            self.calls = 0
+
+        def sample(self, *, samples, progbar=False):
+            assert samples == 2
+            self.calls += 1
+            return SimpleNamespace(
+                configs=torch.tensor([[0, 1], [1, 0]]),
+                omegas=(
+                    torch.full((2,), 0.25, dtype=torch.float64),
+                    torch.zeros(2, dtype=torch.float64),
+                ),
+            )
+
+    def make_sampler():
+        return TorchBPMetropolisSampler(
+            lambda configs: torch.ones(len(configs), dtype=torch.float64),
+            [(0, 1)],
+            Proposal(),
+            configs=torch.zeros((2, 2), dtype=torch.long),
+            initial_log_q=torch.full((2,), 0.25, dtype=torch.float64).log(),
+            valid_config_fn=lambda configs: configs[:, 0] == 0,
+            seed=17,
+        )
+
+    sampler = make_sampler()
+    reference = make_sampler()
+    expected = [reference.sample_sweep() for _ in range(3)]
+    result = sampler.sample_sweep(n_sweeps=3)
+
+    assert result.n_proposed == sum(step.n_proposed for step in expected) == 6
+    # Each sweep rejects the second proposal through the validity mask.
+    assert result.n_accepted == sum(step.n_accepted for step in expected) == 3
+    assert result.acceptance_rate == pytest.approx(0.5)
+    assert torch.equal(result.configs, reference.configs)
+    assert torch.equal(result.amplitudes, reference.amplitudes)
+    assert torch.equal(sampler.generator.get_state(), reference.generator.get_state())
+    assert result.proposal_stats is None
+    assert torch.equal(
+        sampler.log_proposal_probabilities, reference.log_proposal_probabilities
+    )
+    warmed = make_sampler().burn_in(3)
+    assert (warmed.n_proposed, warmed.n_accepted) == (6, 3)
+
+    configs_before = sampler.configs.clone()
+    rng_before = sampler.generator.get_state().clone()
+    for advance in (
+        sampler.sample_sweep,
+        lambda **options: sampler.burn_in(1, **options),
+        lambda **options: sampler.sample(n_samples=2, **options),
+        lambda **options: sampler.warmup_proposal_mix(n_sweeps=1),
+    ):
+        with pytest.raises(ValueError, match="local-move statistics"):
+            advance(track_proposal_stats=True)
+    assert sampler.proposal_sampler.calls == 3
+    assert torch.equal(sampler.configs, configs_before)
+    assert torch.equal(sampler.generator.get_state(), rng_before)
+
+
 def _driver(torch, *, zero_first=False):
     from pepsy.vmc import FermionSiteEncoding, TorchVMCDriver
 

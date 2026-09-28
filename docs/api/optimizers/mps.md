@@ -750,9 +750,9 @@ the complete variational problem. The default
 `fit_single_pair_fast_path=False` honors `n_iter` and `fit_rtol`; set it to
 `True` to stop after one effective-tensor SVD, even when `fit_rtol=None`.
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
-non-finite sweep; for compatibility, non-unitary DMRG retains fixed sweeps
-when `fit_rtol="auto"`, while an explicit numeric tolerance enables
-adaptive stopping there too. With `finite_check=True`, mixed DMRG and its
+non-finite sweep. Non-unitary MPS DMRG keeps the dtype-aware automatic
+tolerance because convergence uses relative norm change; use `fit_rtol=None`
+to request fixed sweeps. With `finite_check=True`, mixed DMRG and its
 direct/MPO exact or fallback transactions validate the retained
 canonical-center norm and represented exponent before commit. Default replay
 skips that validation; enable

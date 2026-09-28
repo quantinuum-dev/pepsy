@@ -890,11 +890,22 @@ class TorchBPMetropolisSampler(TorchMetropolisSampler):
         self._validate_current_support()
         return self
 
-    def sample_sweep(self, *, n_sweeps=1):
-        """Advance all chains with BP independence proposals."""
+    def sample_sweep(self, *, n_sweeps=1, track_proposal_stats=False):
+        """Advance BP chains and return counters summed over all sweeps.
+
+        BP proposes whole configurations, so the local exchange/hopping
+        move counters and proposal-mix tuning do not apply to this sampler.
+        """
+        if track_proposal_stats:
+            raise ValueError(
+                "BP independence proposals do not provide local-move statistics; "
+                "use n_proposed, n_accepted, and acceptance_rate instead."
+            )
         torch = _require_torch()
         n_sweeps = _check_positive_int("n_sweeps", n_sweeps)
         result = None
+        n_proposed = 0
+        n_accepted = 0
         with torch.no_grad():
             for _ in range(n_sweeps):
                 proposed, proposed_log_q = self._proposal_sample(self.n_chains)
@@ -1003,7 +1014,8 @@ class TorchBPMetropolisSampler(TorchMetropolisSampler):
                         < log_ratio
                     )
                 )
-                n_accepted = int(accept.sum().item())
+                n_proposed += self.n_chains
+                n_accepted += int(accept.sum().item())
                 self.configs[accept] = proposed[accept]
                 self.amplitudes[accept] = proposed_amplitudes[accept]
                 self.log_proposal_probabilities[accept] = proposed_log_q[accept]
@@ -1013,7 +1025,7 @@ class TorchBPMetropolisSampler(TorchMetropolisSampler):
                 result = TorchMetropolisResult(
                     configs=self.configs,
                     amplitudes=self.amplitudes,
-                    n_proposed=self.n_chains,
+                    n_proposed=n_proposed,
                     n_accepted=n_accepted,
                     log_abs_amplitudes=(
                         self.log_abs_amplitudes

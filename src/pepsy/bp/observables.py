@@ -16,6 +16,7 @@ from typing import Any
 import autoray as ar
 
 from ..boundary._measurements import compute_peps_local_expectation
+from ._series_geometry import _term_sites
 from ._symmray import (
     is_symmray_array as _is_symmray_array,
     uses_symmray as _uses_symmray,
@@ -34,22 +35,6 @@ def _validate_terms(terms):
     if not terms:
         raise ValueError("terms must contain at least one operator")
     return terms
-
-
-def _term_sites(tn, where):
-    """Normalize a Quimb local-term key to an ordered site tuple."""
-    has_site = getattr(tn, "has_site", None)
-    if callable(has_site) and has_site(where):
-        return (where,)
-    if isinstance(where, (str, bytes)):
-        return (where,)
-    try:
-        sites = tuple(where)
-    except TypeError:
-        return (where,)
-    if not sites:
-        raise ValueError("a local expectation term must have at least one site")
-    return sites
 
 
 def _squeeze_native_singleton_bonds(tn):

@@ -881,6 +881,21 @@ class TorchVMCDriver:
         :func:`torch_hamiltonian_connections`. A value of ``None`` reuses the
         observable configured on this driver. Matching connected target
         configurations are contracted once across all names.
+
+        ``configs`` has shape ``(n_configs, n_sites)`` in the model's site and
+        local-basis order; it defaults to the current walkers. Explicit
+        configurations are converted to integer Torch data and should be on
+        the model's device. A one-dimensional configuration is treated as a
+        batch of one. ``amplitudes`` has shape ``(n_configs,)`` and must
+        correspond to those configurations at the current model parameters.
+        When omitted, current-walker amplitudes are reused; amplitudes for
+        explicit configurations are evaluated as needed.
+
+        Returns a dictionary mapping each name to a Torch tensor of local
+        estimator values with shape ``(n_configs,)``. Values can be complex.
+        Local values are computed without gradient recording. The sampler
+        does not advance. Use :meth:`measure_samples` for chain statistics or weighted
+        averages of a saved batch.
         """
         configs = self.configs if configs is None else _as_long_matrix(configs)
         if amplitudes is None:
@@ -1310,59 +1325,23 @@ class TorchVMCDriver:
         start = time.perf_counter()
         model_device = _model_device(self.model)
 
-        sample_object = samples if hasattr(samples, "configs") else None
-        sample_distributed = getattr(sample_object, "distributed", None)
-        if distributed is None:
-            distributed = sample_distributed is not None
-        distributed_runtime = resolve_torch_distributed(distributed)
-        if distributed_runtime is not None and sample_distributed is not None:
-            if (
-                sample_distributed.rank != distributed_runtime.rank
-                or sample_distributed.world_size != distributed_runtime.world_size
-            ):
-                raise RuntimeError(
-                    "The supplied samples belong to a different distributed "
-                    "rank layout than the active torch.distributed process group."
-                )
-        if distributed_runtime is not None:
-            progress = bool(progress) and distributed_runtime.rank == 0
-        provenance = getattr(sample_object, "provenance", None)
-        if provenance is not None and provenance != _torch_sample_provenance(self.model):
-            raise RuntimeError(
-                "Samples belong to a different PEPS/model state. Call "
-                "sample(...) again after modifying the model or its "
-                "contraction settings."
-            )
-        target_provenance = getattr(sample_object, "target_provenance", None)
-        refresh_proposal_amplitudes = (
-            target_provenance is not None
-            and target_provenance != _torch_sample_provenance(self.model)
+        (
+            sample_object, distributed_runtime, progress,
+            refresh_proposal_amplitudes,
+        ) = self._resolve_measurement_source(
+            samples=samples,
+            distributed=distributed,
+            progress=progress,
         )
-        raw_configs = (
-            getattr(sample_object, "configs", None)
-            if sample_object is not None
-            else samples
+        (
+            chain_configs, flat_configs, n_steps,
+            n_chains,
+        ) = self._measurement_configurations(
+            samples=samples,
+            torch=torch,
+            model_device=model_device,
+            sample_object=sample_object,
         )
-        if raw_configs is None:
-            raise TypeError(
-                "samples must be a TorchMCMCSamples instance or an integer "
-                "tensor of configurations."
-            )
-        raw_configs = torch.as_tensor(raw_configs, dtype=torch.long)
-        if raw_configs.ndim == 2:
-            chain_configs = raw_configs.reshape(1, *raw_configs.shape)
-        elif raw_configs.ndim == 3:
-            chain_configs = raw_configs
-        else:
-            raise ValueError(
-                "samples must have shape (n_samples_per_chain, n_chains, "
-                "n_sites) or (n_chains, n_sites)."
-            )
-        chain_configs = chain_configs.to(device=model_device)
-        n_steps, n_chains, n_sites = (int(value) for value in chain_configs.shape)
-        if n_steps <= 0 or n_chains <= 0 or n_sites <= 0:
-            raise ValueError("samples must contain at least one configuration.")
-        flat_configs = chain_configs.reshape(-1, n_sites)
         global_n_chains = (
             distributed_sum_int(
                 n_chains,
@@ -1386,72 +1365,21 @@ class TorchVMCDriver:
                     "amplitude_cache must be a TorchAmplitudeCache or None."
                 )
 
-        if amplitudes is None and sample_object is not None:
-            amplitudes = getattr(sample_object, "amplitudes", None)
-        if refresh_proposal_amplitudes:
-            amplitudes = None
-        parent_amplitude_source = (
-            "stored" if amplitudes is not None else "refreshed"
-            if refresh_proposal_amplitudes else "contracted"
+        (
+            chain_amplitudes, flat_amplitudes, parent_amplitude_source,
+        ) = self._measurement_amplitudes(
+            amplitudes=amplitudes,
+            deduplicate=deduplicate,
+            amplitude_cache=amplitude_cache,
+            torch=torch,
+            model_device=model_device,
+            sample_object=sample_object,
+            refresh_proposal_amplitudes=refresh_proposal_amplitudes,
+            n_steps=n_steps,
+            n_chains=n_chains,
+            flat_configs=flat_configs,
+            unique_parent_count=unique_parent_count,
         )
-        if amplitudes is None:
-            with torch.no_grad():
-                if deduplicate and unique_parent_count < flat_configs.shape[0]:
-                    unique_configs, inverse = _unique_config_rows(flat_configs)
-                    if amplitude_cache is None:
-                        unique_amplitudes = _call_amplitude_fn(
-                            self.model,
-                            unique_configs,
-                            chunk_size=self.chunk_size,
-                        )
-                    else:
-                        unique_amplitudes = amplitude_cache.evaluate(
-                            self.model,
-                            unique_configs,
-                            chunk_size=self.chunk_size,
-                        )
-                    flat_amplitudes = unique_amplitudes[inverse]
-                else:
-                    if amplitude_cache is None:
-                        flat_amplitudes = _call_amplitude_fn(
-                            self.model,
-                            flat_configs,
-                            chunk_size=self.chunk_size,
-                        )
-                    else:
-                        flat_amplitudes = amplitude_cache.evaluate(
-                            self.model,
-                            flat_configs,
-                            chunk_size=self.chunk_size,
-                        )
-            chain_amplitudes = flat_amplitudes.reshape(n_steps, n_chains)
-        else:
-            amplitudes = torch.as_tensor(amplitudes, device=model_device)
-            if amplitudes.ndim == 1:
-                if tuple(amplitudes.shape) != (n_chains,):
-                    raise ValueError(
-                        "one-dimensional amplitudes must have one value per "
-                        "chain."
-                    )
-                chain_amplitudes = amplitudes.reshape(1, n_chains)
-                if n_steps != 1:
-                    raise ValueError(
-                        "one-dimensional amplitudes are only valid for one "
-                        "sample per chain."
-                    )
-            elif amplitudes.ndim == 2:
-                if tuple(amplitudes.shape) != (n_steps, n_chains):
-                    raise ValueError(
-                        "amplitudes must match the first two sample dimensions: "
-                        f"expected {(n_steps, n_chains)}, got "
-                        f"{tuple(amplitudes.shape)}."
-                    )
-                chain_amplitudes = amplitudes
-            else:
-                raise ValueError(
-                    "amplitudes must have shape (n_samples_per_chain, n_chains)."
-                )
-            flat_amplitudes = chain_amplitudes.reshape(-1)
 
         if weights is None and sample_object is not None:
             weights = getattr(sample_object, "weights", None)
@@ -1729,11 +1657,205 @@ class TorchVMCDriver:
             phase_bar.close()
         return results if return_mapping else results["observable"]
 
+    def _resolve_measurement_source(
+        self,
+        *,
+        samples,
+        distributed,
+        progress,
+    ):
+        """Validate retained-sample provenance and resolve rank-local progress."""
+        sample_object = samples if hasattr(samples, "configs") else None
+        sample_distributed = getattr(sample_object, "distributed", None)
+        if distributed is None:
+            distributed = sample_distributed is not None
+        distributed_runtime = resolve_torch_distributed(distributed)
+        if distributed_runtime is not None and sample_distributed is not None:
+            if (
+                sample_distributed.rank != distributed_runtime.rank
+                or sample_distributed.world_size != distributed_runtime.world_size
+            ):
+                raise RuntimeError(
+                    "The supplied samples belong to a different distributed "
+                    "rank layout than the active torch.distributed process group."
+                )
+        if distributed_runtime is not None:
+            progress = bool(progress) and distributed_runtime.rank == 0
+        provenance = getattr(sample_object, "provenance", None)
+        if provenance is not None and provenance != _torch_sample_provenance(self.model):
+            raise RuntimeError(
+                "Samples belong to a different PEPS/model state. Call "
+                "sample(...) again after modifying the model or its "
+                "contraction settings."
+            )
+        target_provenance = getattr(sample_object, "target_provenance", None)
+        refresh_proposal_amplitudes = (
+            target_provenance is not None
+            and target_provenance != _torch_sample_provenance(self.model)
+        )
+        return sample_object, distributed_runtime, progress, refresh_proposal_amplitudes
+
+    def _measurement_configurations(
+        self,
+        *,
+        samples,
+        torch,
+        model_device,
+        sample_object,
+    ):
+        """Keep the chain axes while preparing the estimator batch on the model device."""
+        raw_configs = (
+            getattr(sample_object, "configs", None)
+            if sample_object is not None
+            else samples
+        )
+        if raw_configs is None:
+            raise TypeError(
+                "samples must be a TorchMCMCSamples instance or an integer "
+                "tensor of configurations."
+            )
+        raw_configs = torch.as_tensor(raw_configs, dtype=torch.long)
+        if raw_configs.ndim == 2:
+            chain_configs = raw_configs.reshape(1, *raw_configs.shape)
+        elif raw_configs.ndim == 3:
+            chain_configs = raw_configs
+        else:
+            raise ValueError(
+                "samples must have shape (n_samples_per_chain, n_chains, "
+                "n_sites) or (n_chains, n_sites)."
+            )
+        chain_configs = chain_configs.to(device=model_device)
+        n_steps, n_chains, n_sites = (int(value) for value in chain_configs.shape)
+        if n_steps <= 0 or n_chains <= 0 or n_sites <= 0:
+            raise ValueError("samples must contain at least one configuration.")
+        flat_configs = chain_configs.reshape(-1, n_sites)
+        return chain_configs, flat_configs, n_steps, n_chains
+
+    def _measurement_amplitudes(
+        self,
+        *,
+        amplitudes,
+        deduplicate,
+        amplitude_cache,
+        torch,
+        model_device,
+        sample_object,
+        refresh_proposal_amplitudes,
+        n_steps,
+        n_chains,
+        flat_configs,
+        unique_parent_count,
+    ):
+        """Reuse valid parent amplitudes or evaluate the current model without gradients."""
+        if amplitudes is None and sample_object is not None:
+            amplitudes = getattr(sample_object, "amplitudes", None)
+        if refresh_proposal_amplitudes:
+            amplitudes = None
+        parent_amplitude_source = (
+            "stored" if amplitudes is not None else "refreshed"
+            if refresh_proposal_amplitudes else "contracted"
+        )
+        if amplitudes is None:
+            with torch.no_grad():
+                if deduplicate and unique_parent_count < flat_configs.shape[0]:
+                    unique_configs, inverse = _unique_config_rows(flat_configs)
+                    if amplitude_cache is None:
+                        unique_amplitudes = _call_amplitude_fn(
+                            self.model,
+                            unique_configs,
+                            chunk_size=self.chunk_size,
+                        )
+                    else:
+                        unique_amplitudes = amplitude_cache.evaluate(
+                            self.model,
+                            unique_configs,
+                            chunk_size=self.chunk_size,
+                        )
+                    flat_amplitudes = unique_amplitudes[inverse]
+                else:
+                    if amplitude_cache is None:
+                        flat_amplitudes = _call_amplitude_fn(
+                            self.model,
+                            flat_configs,
+                            chunk_size=self.chunk_size,
+                        )
+                    else:
+                        flat_amplitudes = amplitude_cache.evaluate(
+                            self.model,
+                            flat_configs,
+                            chunk_size=self.chunk_size,
+                        )
+            chain_amplitudes = flat_amplitudes.reshape(n_steps, n_chains)
+        else:
+            amplitudes = torch.as_tensor(amplitudes, device=model_device)
+            if amplitudes.ndim == 1:
+                if tuple(amplitudes.shape) != (n_chains,):
+                    raise ValueError(
+                        "one-dimensional amplitudes must have one value per "
+                        "chain."
+                    )
+                chain_amplitudes = amplitudes.reshape(1, n_chains)
+                if n_steps != 1:
+                    raise ValueError(
+                        "one-dimensional amplitudes are only valid for one "
+                        "sample per chain."
+                    )
+            elif amplitudes.ndim == 2:
+                if tuple(amplitudes.shape) != (n_steps, n_chains):
+                    raise ValueError(
+                        "amplitudes must match the first two sample dimensions: "
+                        f"expected {(n_steps, n_chains)}, got "
+                        f"{tuple(amplitudes.shape)}."
+                    )
+                chain_amplitudes = amplitudes
+            else:
+                raise ValueError(
+                    "amplitudes must have shape (n_samples_per_chain, n_chains)."
+                )
+            flat_amplitudes = chain_amplitudes.reshape(-1)
+        return chain_amplitudes, flat_amplitudes, parent_amplitude_source
+
     def energy_estimate(self):
         """Return ``(mean, variance, local_energies)`` for current walkers."""
         local_energies = self.local_energies()
         energy_mean, energy_variance = _energy_mean_and_variance(local_energies)
         return energy_mean, energy_variance, local_energies
+
+    def _run_sampling_sweeps(
+        self,
+        count,
+        *,
+        n_proposed,
+        n_accepted,
+        sampling_elapsed,
+        profile,
+        cache_profile,
+        bar,
+    ):
+        """Advance walkers and accumulate one measurement call's counters.
+
+        The caller owns cumulative counters, profiling data, and progress.
+        Updating them per sweep preserves proposal order and elapsed sums.
+        """
+        for _ in range(count):
+            sweep_start = time.perf_counter()
+            sample = self.sample_sweep(n_sweeps=1)
+            sampling_elapsed += time.perf_counter() - sweep_start
+            n_proposed += sample.n_proposed
+            n_accepted += sample.n_accepted
+            proposal_stats = getattr(
+                self.model,
+                "last_proposal_cache_stats",
+                None,
+            )
+            if profile and proposal_stats is not None:
+                _accumulate_cache_profile(
+                    cache_profile,
+                    {"proposal": proposal_stats},
+                )
+            if bar is not None:
+                bar.update(1)
+        return n_proposed, n_accepted, sampling_elapsed
 
     def estimate_observable(
         self,
@@ -1941,24 +2063,15 @@ class TorchVMCDriver:
 
         def run_sweeps(count):
             nonlocal n_proposed, n_accepted, sampling_elapsed
-            for _ in range(count):
-                sweep_start = time.perf_counter()
-                sample = self.sample_sweep(n_sweeps=1)
-                sampling_elapsed += time.perf_counter() - sweep_start
-                n_proposed += sample.n_proposed
-                n_accepted += sample.n_accepted
-                proposal_stats = getattr(
-                    self.model,
-                    "last_proposal_cache_stats",
-                    None,
-                )
-                if profile and proposal_stats is not None:
-                    _accumulate_cache_profile(
-                        cache_profile,
-                        {"proposal": proposal_stats},
-                    )
-                if bar is not None:
-                    bar.update(1)
+            n_proposed, n_accepted, sampling_elapsed = self._run_sampling_sweeps(
+                count,
+                n_proposed=n_proposed,
+                n_accepted=n_accepted,
+                sampling_elapsed=sampling_elapsed,
+                profile=profile,
+                cache_profile=cache_profile,
+                bar=bar,
+            )
 
         run_sweeps(burn_in)
         measurements = []
@@ -2363,24 +2476,15 @@ class TorchVMCDriver:
 
         def run_sweeps(count):
             nonlocal n_proposed, n_accepted, sampling_elapsed
-            for _ in range(count):
-                sweep_start = time.perf_counter()
-                sample = self.sample_sweep(n_sweeps=1)
-                sampling_elapsed += time.perf_counter() - sweep_start
-                n_proposed += sample.n_proposed
-                n_accepted += sample.n_accepted
-                proposal_stats = getattr(
-                    self.model,
-                    "last_proposal_cache_stats",
-                    None,
-                )
-                if profile and proposal_stats is not None:
-                    _accumulate_cache_profile(
-                        cache_profile,
-                        {"proposal": proposal_stats},
-                    )
-                if bar is not None:
-                    bar.update(1)
+            n_proposed, n_accepted, sampling_elapsed = self._run_sampling_sweeps(
+                count,
+                n_proposed=n_proposed,
+                n_accepted=n_accepted,
+                sampling_elapsed=sampling_elapsed,
+                profile=profile,
+                cache_profile=cache_profile,
+                bar=bar,
+            )
 
         run_sweeps(burn_in)
         measurements = {name: [] for name, _ in observable_items}

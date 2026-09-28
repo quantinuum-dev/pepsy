@@ -127,3 +127,188 @@ signatures. No upstream call signature or compression policy changed.
 - **Defer:** dependency upgrades and upstream numerical/default changes. The
   unreleased Quimb changes do not authorize modifying this refactor's cutoff
   defaults or operator conventions.
+
+## Remaining-code review and FIT pass — baseline `f410fa0`
+
+The earlier parser/MPO/noise/NetKet batch was committed and pushed as
+`f410fa0`. A fresh AST inventory covers all **212 Python source modules**.
+Manual follow-up examined FIT execution, BP observable support parsing and
+open-series orchestration, Torch measurement/sampling closures, MPO product
+term normalization, PEPO construction, and the published alias contracts.
+This remains structural coverage plus selected manual review, rather than a
+claim that every implementation line has been reviewed.
+
+### Ranked findings
+
+Body lengths below exclude leading docstrings and refer to this baseline.
+
+| Rank | Concrete problem | Decision and check |
+| --- | --- | --- |
+| 1 | `FIT.run_gate` mixes validation, scheduling, convergence, failure timing, and final polish across 604 lines; `run_eff` mixes three execution routes across 446. | Implemented this pass: named execution methods and one shared native-kernel dispatcher. Keep numerical kernels, validation order, wrappers, and public signatures. Check existing schedule, cache, gradient, and fermion regressions. |
+| 2 | FIT's gate docstring says fixed sweeps by default despite `rtol="auto"`; the guide describes `run_eff` as exclusively fixed despite its explicit stopping controls. Return/mutation contracts are hard to find. | Implemented: correct stopping descriptions, document `fit.p` ownership and returns, provide a small executable example, and compare chain/tree controls. |
+| 3 | BP `series._term_sites` and `observables._term_sites` have identical bodies; the open expectation and partial-trace orchestrators are 551 and 437 lines. | Next BP pass: choose a small existing owner for support parsing after checking import boundaries; separate route/budget preparation from execution. Preserve observable ordering, normalization, cache keys, and budget outcomes. |
+| 4 | Torch `measure_samples` has a 422-line body combining sample provenance, weights, connections, distributed work, and result assembly; two `run_sweeps` closures duplicate sampling/profiling counters. | Separate input/provenance preparation first. Share sampling bookkeeping only with explicit state ownership; validate saved Markov versus importance samples, gradients, chain shapes, and distributed reductions. |
+| 5 | `MPOAutomaton.from_product_terms` combines term parsing, exact channel sharing, and emission across 409 lines. | Extract term normalization before channel assembly. Preserve exact backend-aware fingerprints and coefficient-slot ordering; compare dense operators and parameterized bases. |
+| 6 | Dense PEPO plan `build` has a one-line docstring and 525-line body covering distinct cluster families and report assembly. | Document return/materialization contracts, then separate cluster-family assembly with shared allocator ownership explicit. Validate topology, residuals, symmetry, and dense references. |
+
+MPS `_run_dmrg` (843 lines) and MPO `_run_dmrg` (553) remain large numerical
+kernels. The completed public MPS/MPO orchestration refactors do not imply that
+these kernels were reviewed line by line. Their numerical changes should be
+reviewed separately from the FIT orchestration pass.
+
+### Implemented boundaries and API decisions
+
+- `run_gate` now has a **164-line implementation body** and `run_eff` has
+  **98**, including their preserved validation. Gate scheduling and polish
+  have separate owners. Full-chain block, cached one-site, and fermionic
+  compatibility execution each have a named method.
+- The common dispatcher performs no tensor conversion and adds no policy.
+  Existing one-/two-/three-site kernels are called through `self`, preserving
+  overrides and instrumentation. Convergence and rank/cache phase transitions
+  remain with their original schedules.
+- Removed dead commented-out norm calculations and replaced a misleading
+  "normalize" comment with the reason scale must be retained. Added explicit
+  input index/backend, mutation, return, and stopping contracts to FIT docs.
+- Chain/tree argument differences are documented rather than renamed in this
+  compatibility-preserving pass: inclusive chain intervals versus connected
+  tree regions, one directional sweep versus paired passes, and `None` versus
+  `self` returns. Both expose the fitted network as `fit.p`.
+- Updated fitting examples to `from pepsy.fitting import FIT`. Reviewed root
+  alias exports, API tests, and the migration guide. Searches of the available
+  Pepsy examples, Gaugy, Gaugy examples, Tensy, and Tensy examples Python/notebook
+  files found no selected FIT/legacy FIT-option aliases; that is not evidence
+  that external users have migrated. Existing root aliases and named deprecated
+  aliases retain their documented compatibility window. No public alias was
+  removed and no replacement facade was added.
+- Identical `flush`/`run_sweeps` closures capture mutable replay/sampling state.
+  Their text alone is insufficient reason to introduce a general runner.
+
+The upstream sources linked above were rechecked. Installed versions remain
+the same; Symmray's array page is still unavailable. Installed `Tensor.split`,
+`MatrixProductState.canonize`, and `Tensor.modify` signatures were inspected.
+**Adopt:** existing native kernels and shared dispatch. **Defer:** upstream
+upgrades/default changes and algorithm changes. No compatibility shim is needed
+for this extraction; explicit FIT cutoff settings remain unchanged.
+
+Validation and publication status for this pass are recorded in the
+[FIT readability handoff](../../../history/2026-09-28-fit-readability.md).
+
+## BP, Torch VMC, MPO, and PEPO follow-up
+
+The user explicitly approved the four remaining domains from the ranking.
+This pass builds on the uncommitted FIT work at `f410fa0` and implements all
+four proposed extraction boundaries:
+
+| Domain | Implemented boundary | Entry-point body before → after |
+| --- | --- | --- |
+| BP | One support parser in `_series_geometry`; separate native-cluster and explicit-edge executors for reduced densities and scalar expectations | Reduced density 437 → 150; scalar expectation 551 → 141 |
+| Torch VMC | Retained-sample provenance, chain configuration, and amplitude preparation helpers; one sweep-counter implementation for both estimators | `measure_samples` 422 → 335 |
+| MPO | Product-term validation, prefix construction, suffix equivalence, and transition/slot emission | `from_product_terms` 409 → 84 |
+| Dense PEPO | Pair, star, path, and plaquette helpers with one shared allocator; separate report assembly | `build` 525 → 185 |
+
+These lengths exclude leading docstrings and include orchestration calls;
+they describe navigation improvements, not a runtime speedup. Helpers remain
+in their owning modules. No dependency, configuration class, public alias,
+test, or module was added to implement the extraction.
+
+BP route checks, cache keys, budget outcomes, and graded cyclic contractions
+retain their original owners and order. Torch distinguishes stale Markov
+provenance from reusable importance proposals and preserves chain axes,
+weighting, and distributed reductions. MPO keeps exact backend-aware sharing
+and input-order coefficient slots. PEPO shares one allocator across cluster
+families so residual subtraction sees the same previously assembled blocks.
+
+The API guides now explain saved-sample ownership, MPO product-term shapes
+and slot semantics, and PEPO returns, NumPy construction, report mutation,
+and materialization. A direct comparison also confirmed the existing C4
+restriction for complex evolution; this is documented rather than relaxed.
+
+The upstream sources above were rechecked without changing dependencies.
+Torch is `2.9.1`; the listed Quimb/Autoray/Cotengra/Symmray versions remain
+unchanged. Inspected installed `D2BP.normalize_message_pairs`,
+`D2BP.normalize_tensors`, `TensorNetwork.contract`, and `Tensor.split`.
+**Adopt:** shared parsing/bookkeeping and explicit construction stages.
+**Defer:** dependency upgrades and numerical/default changes. No new shim.
+
+Validation and commit status are recorded in the
+[four-domain handoff](../../../history/2026-09-28-bp-vmc-mpo-pepo-readability.md).
+
+## Shared FIT tolerance follow-up
+
+Continuing the user's readability cleanup, another AST scan found identical
+`_resolve_fit_rtol` implementations in ordinary MPS, tree, and stabilizer-MPS
+optimizers. Their scalar policy now lives in the existing
+`pepsy._internal.cutoff.resolve_fit_rtol`; each optimizer retains its method
+as a dispatch hook and reads its backend dtype only for `"auto"`.
+The helper preserves float conversion, finite/nonnegative validation, error
+text, and the three precision thresholds. Truncation cutoffs retain their own
+thresholds in `dtype_auto_cutoff`. No source module or dependency was added.
+
+Reviewing the callers exposed stale documentation: MPS non-unitary DMRG
+keeps its automatic tolerance, while tree replay disables automatic stopping
+for non-unitary/unknown-target-norm updates. Existing regressions explicitly
+cover both behaviors. The API guides now describe the distinction; the
+execution policies are unchanged.
+
+Other identical bodies found by this scan include the two tree thread-limit
+contexts, MPS/stabilizer random FIT data adapters, and two NetKet contraction
+closures. They remain candidates for separate ownership/backend review.
+This pass does not consolidate them based on textual similarity alone.
+
+Validation and commit status are recorded in the
+[tolerance handoff](../../../history/2026-09-28-fit-tolerance-policy.md).
+
+## Shared random initialization and JAX contraction dispatch
+
+The next pass reviewed two of the duplicate bodies identified above. Dense
+MPS and stabilizer-MPS random FIT draws now use `fit_random_array` in the
+existing private random utility. Both optimizer hooks remain. Each optimizer
+still owns seed creation, tensor visitation order, and disposable guess
+construction, including the separate native Symmray/fermionic route.
+Sharing a draw helper does not imply identical random guesses across domains
+or backends.
+
+NetKet's spin and fermion JIT factories now share
+`_make_jax_scaled_contractor`. The extracted closure preserves exact, HOTRG,
+CTMRG, and boundary dispatch and the real dtype of the exponent. Configuration
+mapping, fermion signs, output formatting, and `vmap` remain in the adapters.
+The eager path retains its separate implementation and Python index handling.
+
+**Adopt:** remove these identical policy/dispatch bodies in their existing
+owning modules. **Defer:** numerical changes, dependency upgrades, and the
+tree thread-limit contexts pending a separate ownership review. There is no
+new compatibility shim. The continuing-task upstream audit remains applicable;
+installed Autoray generator and random-array signatures were rechecked.
+
+Validation and commit status are recorded in the
+[random/JAX handoff](../../../history/2026-09-28-random-jax-readability.md).
+
+## DMRG replay stages and connected-amplitude contracts
+
+Following the user's Quimb comparison, MPS and MPO now separate their DMRG
+replay drivers from single-window and batch-window transactions. The existing
+optimizer modules retain ownership; no source module, generic configuration
+object, or public alias was added. Helpers have explicit inputs and call
+existing instance hooks. MPS retains its local rollback and represented-norm
+policy; MPO retains its transaction callbacks, channel handling, and
+operator-layer norm diagnostics.
+
+The MPS driver body is now 250 lines, previously 843; MPO is 300, previously
+553. Measurements exclude leading docstrings and describe code organization,
+not speed. Individual window helpers still contain substantial domain logic;
+this is not a claim that every numerical kernel is now small.
+
+The Torch connected-amplitude docstrings now state input and output shapes,
+ordering, parent-amplitude ownership, device/dtype requirements, mutation,
+chunking, and cache/gradient lifetime. The API guide includes a small CPU
+example. Both executable method bodies are unchanged.
+
+The organizing pattern follows Quimb's
+[DMRG driver/sweep/local-update separation](https://github.com/jcmgray/quimb/blob/main/quimb/tensor/tn1d/dmrg.py)
+and its explicit numerical contracts. **Adopt:** named private execution
+stages and useful contract documentation. **Defer:** numerical/default changes,
+dependency changes, and broad API redesign. The continuing-task upstream audit
+is reused; these extractions introduce no upstream calls or new shim.
+
+Validation and commit status are recorded in the
+[DMRG stages handoff](../../../history/2026-09-28-dmrg-stages-readability.md).

@@ -160,6 +160,15 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Torch VMC convergence estimates now resolve the `tau` property correctly.
+  BP Metropolis sweeps report acceptance/proposal totals across every requested
+  sweep. Unsupported local-move statistics raise a descriptive `ValueError`
+  before drawing BP proposals.
+
+- Tree-PEPS two-layer compression now initializes transient bond diagnostics
+  consistently. Enabling `track_bond_diagnostics=True` no longer raises
+  `UnboundLocalError` after applying the operator.
+
 - PEPS amplitude cache initialization can be retried after preparation fails.
   Sample-result log and weight accessors reject mismatched field lengths rather
   than silently broadcasting; weight diagnostics avoid duplicate host transfers.

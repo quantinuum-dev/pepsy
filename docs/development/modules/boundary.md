@@ -21,6 +21,30 @@ option, not a change to FIT/DMRG, CTMRG, SU, or native symmetry policies.
 
 ## Core flow
 
+### Shared chain fitting engine
+
+Boundary and sampling fits use `pepsy.fitting.FIT`, implemented in
+`fitting/local.py`. The public `run_eff()` validates full-chain controls and
+selects one of three execution methods:
+
+- `_run_eff_block_sweeps`: native block growth and optional one-site refinement.
+- `_run_eff_one_site_sweeps`: cached one-site updates, including optional
+  tolerance stopping.
+- `_run_eff_fermionic_sweeps`: the physical-ket, fixed-sweep compatibility path.
+
+Circuit fits use `run_gate()` to validate an inclusive active window, followed
+by `_run_gate_sweeps` for the schedule and `_run_gate_polish` for optional final
+one-site passes. `_run_cached_gate_sweep` dispatches shared one-/two-/three-site
+kernels through the live solver. Schedule methods own counters, convergence,
+and cache transitions; kernels own contractions and writeback.
+
+The public fermionic wrappers surround the complete call, including failures,
+so the physical ket is restored after all extracted stages. Keep the full-chain
+and active-window scopes distinct. Their public contracts and examples are in
+the [FIT guide](../../api/fitting/local.md).
+
+### Boundary construction
+
 The standard Pepsy boundary path is:
 
 ```text

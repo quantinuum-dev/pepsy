@@ -18,6 +18,11 @@ important downstream time-compression consumer that depends on Pepsy behavior.
     `run()` prepares the layout, resolves mode options, then executes the
     prepared stream; shot routing and the empty-stream path stay at the entry
     point.
+    `_run_dmrg` owns stream counters, normalization cadence, quality checks,
+    and progress. `_run_dmrg_single_window` and `_run_dmrg_batch_window` own
+    exact-target/guess preparation, FIT, rollback, and the norm/center commit
+    for their respective windows. They retain calls through the optimizer's
+    existing hooks.
   - `_execution.py`: mode dispatch, control-delimited gate replay, and the
     execution scope that restores temporary layouts on success or failure.
     Its operations are bound onto `MpsOptimizer` and call the live instance's
@@ -56,6 +61,12 @@ important downstream time-compression consumer that depends on Pepsy behavior.
     rollback handling. Numerical kernels and canonical state stay on the
     optimizer. `_replay_policy` resolves the finite-check alias and scopes
     temporary caches before entering `run()`.
+    Within `_run_dmrg`, local callbacks own FIT schedules and per-update
+    recovery. `_run_dmrg_single_window` and `_run_dmrg_batch_window` prepare
+    targets and guesses, invoke that transaction, and record successful FIT
+    norms and diagnostics. Channel events, batching, sample points, and
+    progress remain in the driver. These helpers are separate from the MPS
+    helpers because operator-layer norms and recovery have different contracts.
   - `targets.py`: extraction target for gate-pair and DMRG target builders.
   - `compression.py`: extraction target for compression backends.
 - `tree/`: `TreeOptimizer` gate replay and controls, `TreeTensorNetwork` state

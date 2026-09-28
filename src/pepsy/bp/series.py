@@ -69,6 +69,7 @@ from ._symmray import (
 )
 
 from ._series_geometry import (  # noqa: F401 -- historical aliases
+    _term_sites,
     OpenLoopEnumerationLimitError,
     LoopSeriesTerm,
     _OpenEnumerationLimits,
@@ -1990,22 +1991,6 @@ def _contract_with_cost_limits(
     )
 
 
-def _term_sites(tn, where):
-    """Normalize a Quimb local-term key to an ordered site tuple."""
-    has_site = getattr(tn, "has_site", None)
-    if callable(has_site) and has_site(where):
-        return (where,)
-    if isinstance(where, (str, bytes)):
-        return (where,)
-    try:
-        sites = tuple(where)
-    except TypeError:
-        return (where,)
-    if not sites:
-        raise ValueError("a local expectation term must have at least one site")
-    return sites
-
-
 def _resolve_open_observable_operator(operator):
     """Resolve the small descriptor forms accepted by open measurement."""
     if isinstance(operator, OpenLoopObservableTerm):
@@ -3430,95 +3415,203 @@ def _partial_trace_open_loop_series(
         # See the scalar counterpart below.  This preserves a native
         # fermionic rho on cyclic graphs while avoiding the unsupported mixed
         # P/Q contraction path in Symmray.
-        cluster_info = {}
-        rho = _partial_trace_loop_cluster(
-            bp,
-            where,
-            cluster_size,
-            combine="sum",
+        return _contract_open_rho_cluster(
+            bp=bp,
+            where=where,
+            cluster_size=cluster_size,
             normalized=normalized,
-            autocomplete=True,
-            grow_from="alldangle",
-            strict_size=False,
             optimize=optimize,
             contract_opts=contract_opts,
-            info=cluster_info,
+            info=info,
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
+            max_terms=max_terms,
+            max_loop_terms=max_loop_terms,
+            max_enumeration_time=max_enumeration_time,
+            max_enumeration_memory=max_enumeration_memory,
+            mode=mode,
+            diagnostic_support=diagnostic_support,
+            on_budget=on_budget,
+            tids=tids,
+            inner_bonds=inner_bonds,
+            where_key=where_key,
+            route_selection=route_selection,
         )
-        cluster_region_costs = {
-            (where_key, region): cost
-            for region, cost in cluster_info.get(
-                "cluster_rho_term_costs", {}
-            ).items()
-        }
-        cluster_region_skipped = {
-            (where_key, region): cost
-            for region, cost in cluster_info.get(
-                "cluster_rho_skipped_terms", {}
-            ).items()
-        }
-        if info is not None:
-            info["open_rho_requested_terms"] = ()
-            info["open_rho_terms_list"] = ()
-            info["open_rho_term_costs"] = dict(
-                cluster_info.get("cluster_rho_term_costs", {})
-            )
-            info["open_rho_skipped_terms"] = dict(
-                cluster_info.get("cluster_rho_skipped_terms", {})
-            )
-            info["open_rho_cost_limits"] = {
-                "max_flops_log10": max_flops_log10,
-                "max_peak_memory_log2": max_peak_memory_log2,
-            }
-            info["open_rho_edge_term_costs"] = {}
-            info["open_rho_edge_skipped_terms"] = {}
-            info["open_rho_cluster_region_costs"] = cluster_region_costs
-            info[
-                "open_rho_cluster_region_skipped_terms"
-            ] = cluster_region_skipped
-            info["open_rho_weights"] = {}
-            info["open_rho_term_families"] = {}
-            info["open_rho_family_counts"] = {}
-            info["open_rho_family_weights"] = {}
-            info["open_rho_base_weight"] = _rho_trace(rho)
-            info["open_rho_support_tids"] = tids
-            info["open_rho_excluded_edges"] = inner_bonds
-            info["open_rho_native_route"] = "graded_cluster_compatible"
-            info["open_rho_route"] = route_selection["route"]
-            info["open_rho_edge_cutoff"] = None
-            info["open_rho_cluster_size"] = cluster_size
-            info["open_rho_enumeration_limits"] = {
-                "max_terms": max_terms,
-                "max_loop_terms": max_loop_terms,
-                "max_enumeration_time": max_enumeration_time,
-                "max_enumeration_memory": max_enumeration_memory,
-            }
-            info["open_rho_mode"] = mode
-            info["open_rho_support_distance"] = route_selection[
-                "support_distance"
-            ]
-            info["open_rho_diagnostic"] = (
-                None
-                if diagnostic_support is None
-                else dict(diagnostic_support)
-            )
-            complete, omitted = _apply_budget_policy(
-                cluster_region_skipped,
-                on_budget=on_budget,
-                info=info,
-                kind="open_rho",
-            )
-            info["open_rho_omitted_terms"] = omitted
-        else:
-            _apply_budget_policy(
-                cluster_region_skipped,
-                on_budget=on_budget,
-                info=None,
-                kind="open_rho",
-            )
-        return rho
 
+    return _contract_open_rho_edges(
+        bp=bp,
+        where=where,
+        edge_cutoff=edge_cutoff,
+        normalized=normalized,
+        optimize=optimize,
+        contract_opts=contract_opts,
+        cache=cache,
+        info=info,
+        max_flops_log10=max_flops_log10,
+        max_peak_memory_log2=max_peak_memory_log2,
+        max_terms=max_terms,
+        max_loop_terms=max_loop_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+        path_edge_weights=path_edge_weights,
+        mode=mode,
+        diagnostic_support=diagnostic_support,
+        on_budget=on_budget,
+        tids=tids,
+        inner_bonds=inner_bonds,
+        kix=kix,
+        where_key=where_key,
+        bix=bix,
+        partial_trace_map=partial_trace_map,
+        output_inds=output_inds,
+        route_selection=route_selection,
+        corridor_options=corridor_options,
+    )
+
+
+def _contract_open_rho_cluster(
+    bp,
+    where,
+    cluster_size,
+    normalized,
+    optimize,
+    contract_opts,
+    info,
+    max_flops_log10,
+    max_peak_memory_log2,
+    max_terms,
+    max_loop_terms,
+    max_enumeration_time,
+    max_enumeration_memory,
+    mode,
+    diagnostic_support,
+    on_budget,
+    tids,
+    inner_bonds,
+    where_key,
+    route_selection,
+):
+    """Execute the validated cyclic native route and report its budget decisions."""
+    cluster_info = {}
+    rho = _partial_trace_loop_cluster(
+        bp,
+        where,
+        cluster_size,
+        combine="sum",
+        normalized=normalized,
+        autocomplete=True,
+        grow_from="alldangle",
+        strict_size=False,
+        optimize=optimize,
+        contract_opts=contract_opts,
+        info=cluster_info,
+        max_flops_log10=max_flops_log10,
+        max_peak_memory_log2=max_peak_memory_log2,
+    )
+    cluster_region_costs = {
+        (where_key, region): cost
+        for region, cost in cluster_info.get(
+            "cluster_rho_term_costs", {}
+        ).items()
+    }
+    cluster_region_skipped = {
+        (where_key, region): cost
+        for region, cost in cluster_info.get(
+            "cluster_rho_skipped_terms", {}
+        ).items()
+    }
+    if info is not None:
+        info["open_rho_requested_terms"] = ()
+        info["open_rho_terms_list"] = ()
+        info["open_rho_term_costs"] = dict(
+            cluster_info.get("cluster_rho_term_costs", {})
+        )
+        info["open_rho_skipped_terms"] = dict(
+            cluster_info.get("cluster_rho_skipped_terms", {})
+        )
+        info["open_rho_cost_limits"] = {
+            "max_flops_log10": max_flops_log10,
+            "max_peak_memory_log2": max_peak_memory_log2,
+        }
+        info["open_rho_edge_term_costs"] = {}
+        info["open_rho_edge_skipped_terms"] = {}
+        info["open_rho_cluster_region_costs"] = cluster_region_costs
+        info[
+            "open_rho_cluster_region_skipped_terms"
+        ] = cluster_region_skipped
+        info["open_rho_weights"] = {}
+        info["open_rho_term_families"] = {}
+        info["open_rho_family_counts"] = {}
+        info["open_rho_family_weights"] = {}
+        info["open_rho_base_weight"] = _rho_trace(rho)
+        info["open_rho_support_tids"] = tids
+        info["open_rho_excluded_edges"] = inner_bonds
+        info["open_rho_native_route"] = "graded_cluster_compatible"
+        info["open_rho_route"] = route_selection["route"]
+        info["open_rho_edge_cutoff"] = None
+        info["open_rho_cluster_size"] = cluster_size
+        info["open_rho_enumeration_limits"] = {
+            "max_terms": max_terms,
+            "max_loop_terms": max_loop_terms,
+            "max_enumeration_time": max_enumeration_time,
+            "max_enumeration_memory": max_enumeration_memory,
+        }
+        info["open_rho_mode"] = mode
+        info["open_rho_support_distance"] = route_selection[
+            "support_distance"
+        ]
+        info["open_rho_diagnostic"] = (
+            None
+            if diagnostic_support is None
+            else dict(diagnostic_support)
+        )
+        complete, omitted = _apply_budget_policy(
+            cluster_region_skipped,
+            on_budget=on_budget,
+            info=info,
+            kind="open_rho",
+        )
+        info["open_rho_omitted_terms"] = omitted
+    else:
+        _apply_budget_policy(
+            cluster_region_skipped,
+            on_budget=on_budget,
+            info=None,
+            kind="open_rho",
+        )
+    return rho
+
+
+def _contract_open_rho_edges(
+    bp,
+    where,
+    edge_cutoff,
+    normalized,
+    optimize,
+    contract_opts,
+    cache,
+    info,
+    max_flops_log10,
+    max_peak_memory_log2,
+    max_terms,
+    max_loop_terms,
+    max_enumeration_time,
+    max_enumeration_memory,
+    path_edge_weights,
+    mode,
+    diagnostic_support,
+    on_budget,
+    tids,
+    inner_bonds,
+    kix,
+    where_key,
+    bix,
+    partial_trace_map,
+    output_inds,
+    route_selection,
+    corridor_options,
+):
+    """Contract validated explicit-edge terms, retaining numerical caches and budgets."""
     corridor_info = (
         None
         if info is None
@@ -4019,101 +4112,209 @@ def _local_expectation_open_loop_series(
         # that Symmray does not currently support. The direct cluster form is
         # algebraically equivalent at this level and keeps the gate inside
         # the graded ket/bra contraction, so it is a safe native fallback.
-        cluster_info = {}
-        value, normalization = _local_expectation_loop_cluster(
-            bp,
-            where,
-            gate,
-            cluster_size,
-            combine="sum",
+        return _contract_open_scalar_cluster(
+            bp=bp,
+            where=where,
+            gate=gate,
+            cluster_size=cluster_size,
             normalized=normalized,
-            autocomplete=True,
-            grow_from="alldangle",
-            strict_size=False,
             optimize=optimize,
             contract_opts=contract_opts,
-            info=cluster_info,
+            info=info,
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
+            max_terms=max_terms,
+            max_loop_terms=max_loop_terms,
+            max_enumeration_time=max_enumeration_time,
+            max_enumeration_memory=max_enumeration_memory,
+            mode=mode,
+            diagnostic_support=diagnostic_support,
+            on_budget=on_budget,
+            inner_bonds=inner_bonds,
+            where_key=where_key,
+            fermionic_q=fermionic_q,
+            route_selection=route_selection,
         )
-        cluster_region_skipped = {
+
+    return _contract_open_scalar_edges(
+        bp=bp,
+        where=where,
+        gate=gate,
+        edge_cutoff=edge_cutoff,
+        normalized=normalized,
+        optimize=optimize,
+        contract_opts=contract_opts,
+        cache=cache,
+        info=info,
+        max_flops_log10=max_flops_log10,
+        max_peak_memory_log2=max_peak_memory_log2,
+        max_terms=max_terms,
+        max_loop_terms=max_loop_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+        path_edge_weights=path_edge_weights,
+        mode=mode,
+        diagnostic_support=diagnostic_support,
+        on_budget=on_budget,
+        tids=tids,
+        inner_bonds=inner_bonds,
+        kix=kix,
+        where_key=where_key,
+        fermionic_q=fermionic_q,
+        route_selection=route_selection,
+        corridor_options=corridor_options,
+    )
+
+
+def _contract_open_scalar_cluster(
+    bp,
+    where,
+    gate,
+    cluster_size,
+    normalized,
+    optimize,
+    contract_opts,
+    info,
+    max_flops_log10,
+    max_peak_memory_log2,
+    max_terms,
+    max_loop_terms,
+    max_enumeration_time,
+    max_enumeration_memory,
+    mode,
+    diagnostic_support,
+    on_budget,
+    inner_bonds,
+    where_key,
+    fermionic_q,
+    route_selection,
+):
+    """Execute the validated cyclic native route and report its budget decisions."""
+    cluster_info = {}
+    value, normalization = _local_expectation_loop_cluster(
+        bp,
+        where,
+        gate,
+        cluster_size,
+        combine="sum",
+        normalized=normalized,
+        autocomplete=True,
+        grow_from="alldangle",
+        strict_size=False,
+        optimize=optimize,
+        contract_opts=contract_opts,
+        info=cluster_info,
+        max_flops_log10=max_flops_log10,
+        max_peak_memory_log2=max_peak_memory_log2,
+    )
+    cluster_region_skipped = {
+        (where_key, region): cost
+        for region, cost in cluster_info.get(
+            "cluster_scalar_skipped_terms", {}
+        ).items()
+    }
+    if info is not None:
+        cluster_region_costs = {
             (where_key, region): cost
             for region, cost in cluster_info.get(
-                "cluster_scalar_skipped_terms", {}
+                "cluster_scalar_term_costs", {}
             ).items()
         }
-        if info is not None:
-            cluster_region_costs = {
-                (where_key, region): cost
-                for region, cost in cluster_info.get(
-                    "cluster_scalar_term_costs", {}
-                ).items()
-            }
-            info["open_scalar_requested_terms"] = ()
-            info["open_scalar_terms"] = ()
-            info["open_scalar_skipped_terms"] = dict(
-                cluster_info.get("cluster_scalar_skipped_terms", {})
-            )
-            info["open_scalar_term_costs"] = dict(
-                cluster_info.get("cluster_scalar_term_costs", {})
-            )
-            info["open_scalar_norm_weights"] = {}
-            info["open_scalar_gate_terms"] = {}
-            info["open_scalar_term_families"] = {}
-            info["open_scalar_family_counts"] = {}
-            info["open_scalar_family_weights"] = {}
-            info["open_scalar_base_weight"] = normalization
-            info["open_scalar_numerator"] = value * normalization
-            info["open_scalar_denominator"] = normalization
-            info["open_scalar_excluded_edges"] = inner_bonds
-            info["open_scalar_native_route"] = (
-                "graded_cluster_compatible"
-            )
-            info["open_scalar_route"] = route_selection["route"]
-            info["open_scalar_fermionic_q_phase"] = fermionic_q
-            info["open_scalar_cost_limits"] = {
-                "max_flops_log10": max_flops_log10,
-                "max_peak_memory_log2": max_peak_memory_log2,
-            }
-            info["open_scalar_edge_term_costs"] = {}
-            info["open_scalar_edge_skipped_terms"] = {}
-            info["open_scalar_cluster_region_costs"] = cluster_region_costs
-            info[
-                "open_scalar_cluster_region_skipped_terms"
-            ] = cluster_region_skipped
-            info["open_scalar_edge_cutoff"] = None
-            info["open_scalar_cluster_size"] = cluster_size
-            info["open_scalar_enumeration_limits"] = {
-                "max_terms": max_terms,
-                "max_loop_terms": max_loop_terms,
-                "max_enumeration_time": max_enumeration_time,
-                "max_enumeration_memory": max_enumeration_memory,
-            }
-            info["open_scalar_mode"] = mode
-            info["open_scalar_support_distance"] = route_selection[
-                "support_distance"
-            ]
-            info["open_scalar_diagnostic"] = (
-                None
-                if diagnostic_support is None
-                else dict(diagnostic_support)
-            )
-            complete, omitted = _apply_budget_policy(
-                cluster_region_skipped,
-                on_budget=on_budget,
-                info=info,
-                kind="open_scalar",
-            )
-            info["open_scalar_omitted_terms"] = omitted
-        else:
-            _apply_budget_policy(
-                cluster_region_skipped,
-                on_budget=on_budget,
-                info=None,
-                kind="open_scalar",
-            )
-        return value, normalization
+        info["open_scalar_requested_terms"] = ()
+        info["open_scalar_terms"] = ()
+        info["open_scalar_skipped_terms"] = dict(
+            cluster_info.get("cluster_scalar_skipped_terms", {})
+        )
+        info["open_scalar_term_costs"] = dict(
+            cluster_info.get("cluster_scalar_term_costs", {})
+        )
+        info["open_scalar_norm_weights"] = {}
+        info["open_scalar_gate_terms"] = {}
+        info["open_scalar_term_families"] = {}
+        info["open_scalar_family_counts"] = {}
+        info["open_scalar_family_weights"] = {}
+        info["open_scalar_base_weight"] = normalization
+        info["open_scalar_numerator"] = value * normalization
+        info["open_scalar_denominator"] = normalization
+        info["open_scalar_excluded_edges"] = inner_bonds
+        info["open_scalar_native_route"] = (
+            "graded_cluster_compatible"
+        )
+        info["open_scalar_route"] = route_selection["route"]
+        info["open_scalar_fermionic_q_phase"] = fermionic_q
+        info["open_scalar_cost_limits"] = {
+            "max_flops_log10": max_flops_log10,
+            "max_peak_memory_log2": max_peak_memory_log2,
+        }
+        info["open_scalar_edge_term_costs"] = {}
+        info["open_scalar_edge_skipped_terms"] = {}
+        info["open_scalar_cluster_region_costs"] = cluster_region_costs
+        info[
+            "open_scalar_cluster_region_skipped_terms"
+        ] = cluster_region_skipped
+        info["open_scalar_edge_cutoff"] = None
+        info["open_scalar_cluster_size"] = cluster_size
+        info["open_scalar_enumeration_limits"] = {
+            "max_terms": max_terms,
+            "max_loop_terms": max_loop_terms,
+            "max_enumeration_time": max_enumeration_time,
+            "max_enumeration_memory": max_enumeration_memory,
+        }
+        info["open_scalar_mode"] = mode
+        info["open_scalar_support_distance"] = route_selection[
+            "support_distance"
+        ]
+        info["open_scalar_diagnostic"] = (
+            None
+            if diagnostic_support is None
+            else dict(diagnostic_support)
+        )
+        complete, omitted = _apply_budget_policy(
+            cluster_region_skipped,
+            on_budget=on_budget,
+            info=info,
+            kind="open_scalar",
+        )
+        info["open_scalar_omitted_terms"] = omitted
+    else:
+        _apply_budget_policy(
+            cluster_region_skipped,
+            on_budget=on_budget,
+            info=None,
+            kind="open_scalar",
+        )
+    return value, normalization
 
+
+def _contract_open_scalar_edges(
+    bp,
+    where,
+    gate,
+    edge_cutoff,
+    normalized,
+    optimize,
+    contract_opts,
+    cache,
+    info,
+    max_flops_log10,
+    max_peak_memory_log2,
+    max_terms,
+    max_loop_terms,
+    max_enumeration_time,
+    max_enumeration_memory,
+    path_edge_weights,
+    mode,
+    diagnostic_support,
+    on_budget,
+    tids,
+    inner_bonds,
+    kix,
+    where_key,
+    fermionic_q,
+    route_selection,
+    corridor_options,
+):
+    """Contract validated explicit-edge terms, retaining numerical caches and budgets."""
     corridor_info = (
         None
         if info is None

@@ -55,6 +55,15 @@ active = plan.build(0.05, materialize=False)
 pepo = active.to_pepo()
 ```
 
+`build(beta)` uses the `exp(-beta * H)` convention with real or complex
+`beta`. It rebuilds numerical blocks using NumPy and the combined dtype of
+the plan and `beta`, reusing the planned geometry. Input operators are not
+modified. The default result is a Quimb `PEPO`; `materialize=False` returns
+`ActivePEPOBlocks`. Every successful block assembly updates `plan.last_report`
+before optional dense materialization.
+The C4 path requires a real/Hermitian reshuffled edge residual; complex
+evolution that violates this condition needs a plan with `symmetry=None`.
+
 Use `return_report=True` to receive local residual and storage diagnostics
 alongside the result. For a four-site path, `max_tree_rank` optionally caps
 the internal path SVD rank:

@@ -1,5 +1,50 @@
 # `pepsy.fitting.local`
 
+Import the solver from its owning namespace:
+
+```python
+import quimb.tensor as qtn
+from pepsy.fitting import FIT
+
+target = qtn.MPS_computational_state("01")
+fit = FIT(target, p=target.copy(), range_int=(0, 1))
+fit.run_gate(n_iter=2, max_bond=2, rtol=None)
+compressed = fit.p
+```
+
+The target and guess describe the same physical sites and index spaces.
+MPS tensors have one physical index per site; MPO tensors have input/output
+indices. Their virtual bond dimensions can differ. FIT follows the arrays'
+backend and dtype, including native symmetry tensors. The constructor's
+`backend` argument is compatibility metadata, not an array-conversion request.
+
+All chain FIT sweep methods return `None`; read the result from `fit.p`.
+`inplace=False` copies the guess, while `inplace=True` updates the supplied
+guess. `copy_target=True` protects the supplied target. With `False`, FIT
+can reindex and retag that target during setup. Fitting preserves absolute
+scale and does not normalize the result.
+
+## Controls shared by the fitting APIs
+
+| Control or result | Chain `FIT` | `TreeFIT` |
+| --- | --- | --- |
+| Working state | `fit.p` | `fit.p` |
+| Sweep-method return | `None` | The solver (`self`) |
+| Active region | Constructor `range_int=(start, stop)`, inclusive | `run_gate(region)` with connected tree nodes |
+| Iteration unit | One directional pass | Both inward/outward passes |
+| Direction | `R`, `L`, or a sequence such as `RL` | `inward-outward` or `outward-inward` |
+| Bond cap and cutoff | `run_gate` / `run_eff`: `max_bond`, `cutoff`; constructor fallback `cutoffs` | Constructor `max_bond`, `cutoffs` |
+| Default gate stopping | `rtol="auto"` | `rtol=None` |
+| Full-chain/tree default | One-site updates with fixed sweeps | One-node updates with fixed iterations |
+| Optional stopping | Explicit `rtol` on `run_eff`; gate default is adaptive | Explicit `rtol` |
+
+These existing contracts are retained. Read `fit.p` consistently in code that
+uses both solvers. A matching keyword name does not make chain and tree
+iteration counts interchangeable. See [tree FIT](../optimizers/tree_fit.md)
+for tree-specific region and diagnostic meanings.
+
+## Choose a sweep method
+
 `FIT.run_gate(finite_check=False)` skips per-sweep active-array finite scans
 and scalar non-finite detection by default. These optional diagnostics are
 not required for normal optimization. Enabling `finite_check=True` (or a
@@ -123,7 +168,9 @@ ownership safely.
 For circuit compression, set `range_int=(xmin, xmax)` and use:
 
 ```python
-fit = pepsy.FIT(
+from pepsy.fitting import FIT
+
+fit = FIT(
     target,
     p=current,
     range_int=(xmin, xmax),
@@ -170,9 +217,9 @@ Direct `FIT.run_gate()` defaults to `n_iter=8`, `block_size=2`,
 `1e-5` for float32/complex64, and `1e-9` for higher precision.
 Split diagnostics default to `False`; callers that need them must enable
 `collect_split_diagnostics=True`. `rtol=None` requests fixed sweeps.
-Standalone FIT does not classify the gate as unitary or non-unitary; unlike
-MpsOptimizer's non-unitary replay policy, it always resolves `rtol="auto"`
-to a numeric tolerance.
+Standalone FIT resolves `rtol="auto"` to a numeric tolerance for both unitary
+and non-unitary targets. MpsOptimizer also retains automatic tolerance
+during non-unitary replay.
 With `block_size=3`, `two_site_transition_sweeps=1` inserts one two-site sweep
 after the three-site phase, before one-site refinement. Set it to zero for
 the previous direct handoff. The transition consumes the same `n_iter` budget.
@@ -373,8 +420,8 @@ FIT also exposes
 `convergence_reason`, allowing an optimizer to reuse the known canonical
 center without a redundant sweep.
 
-Those adaptive stopping and detailed timing fields belong to `run_gate()`. The
-`run()` and `run_eff()` solvers remain fixed-sweep numerical paths and are not
-silently changed by the gate-window controls. PEPS boundary results describe
-them as `convergence_reason="fixed_sweeps"` and can collect one coarse elapsed
-time per boundary fit without altering either solver's update sequence.
+Detailed per-site timing belongs to `run_gate()`. `run()` uses fixed sweeps;
+`run_eff()` defaults to fixed sweeps and supports explicit `rtol` stopping
+and block warm-up controls as described above. Gate-window options do not
+change either full-chain solver implicitly. Boundary integrations can collect
+coarse elapsed time and report the actual stopping policy and iterations.

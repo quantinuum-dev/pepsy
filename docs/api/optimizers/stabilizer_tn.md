@@ -29,8 +29,11 @@ uses `"rsum2"` for FIT while leaving native MPO methods on Quimb's method
 default. `run()` accepts the ordinary MPS FIT controls, including `n_iter`,
 `fit_min_iter`, `fit_rtol`, `fit_patience`, `fit_block_size`,
 `fit_adaptive_sweeps`, `fit_sweep_sequence`, `finite_check`, and optional
-`fit_overlap_diagnostics`. `fit_rtol="auto"` is dtype-aware; `None` requests
-fixed sweeps. The default FIT warm start is `fit_init_strategy="guess-src"`.
+`fit_overlap_diagnostics`. `fit_rtol="auto"` uses `1e-3` for 16-bit data,
+`1e-5` for float32/complex64, and `1e-9` for higher precision. These are FIT
+stopping thresholds; `cutoff` controls singular-value truncation separately.
+`fit_rtol=None` requests fixed sweeps. The default FIT warm start is
+`fit_init_strategy="guess-src"`.
 Optional performance diagnostics are disabled by default: `finite_check=False`,
 `fit_overlap_diagnostics=False`, and `timing=False`. Untimed replay performs no
 profiling clock reads and leaves `get_run_timing()` unset. Per-update STN

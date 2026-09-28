@@ -79,3 +79,29 @@ changing its backend-specific charge handling in the first migration step.
 approximate bond truncation is wanted, call Quimb's `mpo.compress(...)` as a
 separate, visible operation after inspecting or recording the raw bond
 dimensions.
+
+## Build from product terms
+
+`from_product_terms` validates the complete term list, then shares exact
+prefixes and suffixes before emitting transitions:
+
+```python
+automaton = MPOAutomaton.from_product_terms(
+    3,
+    [((0, 1), (z, z), 0.5), ((1, 2), (z, z), 0.5), ((1,), (x,), 0.2)],
+)
+mpo = automaton.to_mpo()
+```
+
+Sites must be strictly increasing integers in `[0, L)`. All operators have
+the same square shape `(d, d)`; omitted sites between endpoints use identity
+operators unless `string_operators` are supplied in a term mapping. Inputs
+are not modified. Backend arrays remain native, and sharing uses conservative
+object identity when host fingerprinting would disrupt tracing or gradients.
+`share_channels=False` keeps a separate path for each term.
+
+The default result is an `MPOAutomaton`. `return_slots=True` additionally
+returns coefficient slots in input term order for parameterized builders.
+In shared mode, slot operators omit the supplied scalar coefficients so they
+can be bound later; identical terms can share a slot. Unshared mode retains
+the coefficients. Ordinary operator construction should use the default.

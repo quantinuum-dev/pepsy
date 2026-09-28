@@ -69,8 +69,8 @@ from ...backends import (
     infer_backend_signature,
 )
 from ...fitting.local import FIT
-from ..._internal.cutoff import dtype_auto_cutoff
-from ..._internal.random import backend_random_array
+from ..._internal.cutoff import dtype_auto_cutoff, resolve_fit_rtol
+from ..._internal.random import fit_random_array
 from ..._internal.quimb import (
     require_quimb_1d_compression_method as _require_quimb_compression_method,
     run_seeded_quimb as _run_seeded_quimb,
@@ -718,26 +718,8 @@ class StabilizerMpsSimulator:
 
     def _resolve_fit_rtol(self, value):
         """Resolve the ordinary MPS dtype-aware FIT relative tolerance."""
-        if value == "auto":
-            dtype = str(self.backend_dtype).lower()
-            if "16" in dtype:
-                return 1e-3
-            if "32" in dtype or "complex64" in dtype:
-                return 1e-5
-            return 1e-9
-        if value is None:
-            return None
-        try:
-            value = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "fit_rtol must be 'auto', a non-negative number, or None."
-            ) from exc
-        if not np.isfinite(value) or value < 0.0:
-            raise ValueError(
-                "fit_rtol must be 'auto', a non-negative number, or None."
-            )
-        return value
+        dtype = self.backend_dtype if value == "auto" else None
+        return resolve_fit_rtol(value, dtype=dtype)
 
     @staticmethod
     def _validate_positive_int(value, name):
@@ -4824,22 +4806,7 @@ class StabilizerMpsSimulator:
     @staticmethod
     def _fit_random_data(data, shape, *, strength, rng):
         """Generate backend-compatible random data for a disposable FIT guess."""
-        dtype_name = str(getattr(data, "dtype", "float64"))
-        if "complex64" in dtype_name:
-            random_dtype = np.complex64
-        elif "complex" in dtype_name:
-            random_dtype = np.complex128
-        elif "float32" in dtype_name:
-            random_dtype = np.float32
-        else:
-            random_dtype = np.float64
-        return backend_random_array(
-            shape,
-            like=data,
-            dtype=random_dtype,
-            scale=float(strength),
-            rng=rng,
-        )
+        return fit_random_array(data, shape, strength=strength, rng=rng)
 
     def _fit_randomized_guess(self, p, where, *, block_size, expand):
         """Build a deterministic dense random FIT guess when rank can grow."""

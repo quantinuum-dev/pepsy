@@ -4641,7 +4641,35 @@ class ClusterExpansionPlan:
         )
 
     def build(self, beta, *, materialize=True, return_report=False):
-        """Build at ``beta`` using the cached topology and symmetry plan."""
+        """Build the cluster approximation to ``exp(-beta * H)``.
+
+        Parameters
+        ----------
+        beta : scalar
+            Real or complex evolution parameter. Construction uses NumPy
+            arrays with the combined dtype of the plan and ``beta``.
+            C4 reduction requires a real/Hermitian reshuffled edge residual;
+            use ``symmetry=None`` when complex evolution violates that condition.
+        materialize : bool, default=True
+            Allocate dense site tensors and return a Quimb ``PEPO``. Set to
+            ``False`` to return ``ActivePEPOBlocks`` without dense site allocation.
+        return_report : bool, default=False
+            Return ``(result, ClusterExpansionReport)`` instead of just result.
+
+        Notes
+        -----
+        Each call rebuilds numerical blocks while reusing cached geometry and
+        symmetry orbits. Input operators are not modified. ``last_report`` is
+        updated before optional materialization; its local residuals are not
+        a global approximation error bound.
+
+        Examples
+        --------
+        Keep sparse blocks across the construction/materialization boundary::
+
+            active, report = plan.build(0.05, materialize=False, return_report=True)
+            pepo = active.to_pepo()
+        """
         work_dtype = np.result_type(self.dtype, np.asarray(beta).dtype)
         onesite_op = np.asarray(self.onesite_op, dtype=work_dtype)
         twosite_op = np.asarray(self.twosite_op, dtype=work_dtype)
@@ -4659,29 +4687,18 @@ class ClusterExpansionPlan:
             )
             end_factors = start_factors.copy()
 
-        pair_tensors = {}
-        pair_residuals = []
-        pair_targets = []
-        if self.order >= 3 and start_factors.shape[0]:
-            for representative, orbit in self.pair_orbits:
-                tensor, residual_norm, target_norm = _solve_three_site_pair(
-                    representative,
-                    twosite_op,
-                    onesite_op,
-                    one_site_exp,
-                    start_factors,
-                    end_factors,
-                    beta,
-                )
-                pair_tensors[representative] = tensor
-                pair_residuals.append(residual_norm)
-                pair_targets.append(target_norm)
-                for pair in orbit[1:]:
-                    pair_tensors[pair] = _rotate_pair_tensor(
-                        representative,
-                        pair,
-                        tensor,
-                    )
+        (
+            pair_tensors,
+            pair_residuals,
+            pair_targets,
+        ) = self._build_pair_clusters(
+            beta=beta,
+            twosite_op=twosite_op,
+            onesite_op=onesite_op,
+            one_site_exp=one_site_exp,
+            start_factors=start_factors,
+            end_factors=end_factors,
+        )
 
         blocks = _initialize_blocks(
             self.lx, self.ly, one_site_exp, self.site_directions
@@ -4715,282 +4732,57 @@ class ClusterExpansionPlan:
         loop_rank = 0
         solved_tree_groups = 0
         if self.order >= 4 and start_factors.shape[0]:
-            star_tensors = {}
-            for representative, orbit in self.triple_orbits:
-                if not any(
-                    all(direction in directions for direction in star)
-                    for star in orbit
-                    for directions in self.site_directions.values()
-                ):
-                    continue
-                tensor, residual_norm, target_norm = _solve_four_star(
-                    representative,
-                    twosite_op,
-                    onesite_op,
-                    one_site_exp,
-                    start_factors,
-                    end_factors,
-                    pair_tensors,
-                    beta,
-                )
-                star_tensors[representative] = tensor
-                star_residuals.append(residual_norm)
-                star_targets.append(target_norm)
-                solved_tree_groups += 1
-                for directions in orbit[1:]:
-                    star_tensors[directions] = _rotate_direction_tensor(
-                        representative, directions, tensor
-                    )
+            # All families allocate from the same sector space. Plaquettes
+            # must see the tree blocks when subtracting lower-order terms.
+            (
+                star_residuals,
+                star_targets,
+                solved_tree_groups,
+            ) = self._add_star_clusters(
+                blocks=blocks,
+                allocator=allocator,
+                beta=beta,
+                twosite_op=twosite_op,
+                onesite_op=onesite_op,
+                one_site_exp=one_site_exp,
+                start_factors=start_factors,
+                end_factors=end_factors,
+                pair_tensors=pair_tensors,
+            )
 
-            for directions, tensor in star_tensors.items():
-                sectors = allocator.allocate(start_factors.shape[0])
-                _add_triple_blocks(
-                    blocks, self.site_directions, directions, tensor, sectors
-                )
-                for direction in directions:
-                    _add_single_direction_blocks(
-                        blocks,
-                        self.site_directions,
-                        self.lx,
-                        self.ly,
-                        _OPPOSITE_DIRECTION[direction],
-                        sectors,
-                        end_factors
-                        if direction in _POSITIVE_DIRECTIONS
-                        else start_factors,
-                        source=False,
-                        cyclic=self.cyclic,
-                    )
+            (
+                path_residuals,
+                path_targets,
+                path_ranks,
+                solved_tree_groups,
+            ) = self._add_path_clusters(
+                blocks=blocks,
+                allocator=allocator,
+                beta=beta,
+                twosite_op=twosite_op,
+                onesite_op=onesite_op,
+                one_site_exp=one_site_exp,
+                start_factors=start_factors,
+                end_factors=end_factors,
+                pair_tensors=pair_tensors,
+                solved_tree_groups=solved_tree_groups,
+            )
 
-            for representative, orbit in self.path_orbits:
-                if not any(
-                    _path_start_sites(steps, self.lx, self.ly, self.cyclic)
-                    for steps in orbit
-                ):
-                    continue
-                left, right, residual_norm, target_norm = _solve_four_path(
-                    representative,
-                    twosite_op,
-                    onesite_op,
-                    one_site_exp,
-                    start_factors,
-                    end_factors,
-                    pair_tensors,
-                    beta,
-                    self.max_tree_rank,
-                )
-                path_residuals.append(residual_norm)
-                path_targets.append(target_norm)
-                path_ranks.append(left.shape[1])
-                solved_tree_groups += 1
-                path_channel_rank = left.shape[1]
-                if not left.shape[1]:
-                    continue
-                representative_left_dirs = tuple(
-                    sorted(
-                        (_OPPOSITE_DIRECTION[representative[0]], representative[1]),
-                        key=_DIRECTIONS.index,
-                    )
-                )
-                representative_left_role = (
-                    _OPPOSITE_DIRECTION[representative[0]],
-                    representative[1],
-                )
-                representative_right_dirs = tuple(
-                    sorted(
-                        (_OPPOSITE_DIRECTION[representative[1]], representative[2]),
-                        key=_DIRECTIONS.index,
-                    )
-                )
-                representative_right_role = (
-                    _OPPOSITE_DIRECTION[representative[1]],
-                    representative[2],
-                )
-                if representative_left_role != representative_left_dirs:
-                    left = left.transpose(1, 0, 2, 3)
-                if representative_right_role != representative_right_dirs:
-                    right = right.transpose(1, 0, 2, 3)
-                for steps in orbit:
-                    if steps == representative:
-                        rotated_left, rotated_right = left, right
-                    else:
-                        target_left_dirs = tuple(
-                            sorted(
-                                (_OPPOSITE_DIRECTION[steps[0]], steps[1]),
-                                key=_DIRECTIONS.index,
-                            )
-                        )
-                        target_right_dirs = tuple(
-                            sorted(
-                                (_OPPOSITE_DIRECTION[steps[1]], steps[2]),
-                                key=_DIRECTIONS.index,
-                            )
-                        )
-                        rotated_left = _rotate_direction_tensor(
-                            representative_left_dirs, target_left_dirs, left
-                        )
-                        rotated_right = _rotate_direction_tensor(
-                            representative_right_dirs, target_right_dirs, right
-                        )
-                    first_sectors = allocator.allocate(start_factors.shape[0])
-                    middle_sectors = allocator.allocate(path_channel_rank)
-                    last_sectors = allocator.allocate(end_factors.shape[0])
-                    first_factor = (
-                        start_factors
-                        if steps[0] in _POSITIVE_DIRECTIONS
-                        else end_factors
-                    )
-                    last_factor = (
-                        end_factors
-                        if steps[2] in _POSITIVE_DIRECTIONS
-                        else start_factors
-                    )
-                    _add_single_direction_blocks(
-                        blocks,
-                        self.site_directions,
-                        self.lx,
-                        self.ly,
-                        steps[0],
-                        first_sectors,
-                        first_factor,
-                        source=True,
-                        cyclic=self.cyclic,
-                    )
-                    _add_single_direction_blocks(
-                        blocks,
-                        self.site_directions,
-                        self.lx,
-                        self.ly,
-                        _OPPOSITE_DIRECTION[steps[2]],
-                        last_sectors,
-                        last_factor,
-                        source=False,
-                        cyclic=self.cyclic,
-                    )
-                    back = _OPPOSITE_DIRECTION[steps[0]]
-                    forward = steps[1]
-                    left_role = (back, forward)
-                    left_dirs = tuple(sorted(left_role, key=_DIRECTIONS.index))
-                    left_tensor = rotated_left
-                    if left_role != left_dirs:
-                        left_tensor = left_tensor.transpose(1, 0, 2, 3)
-                    _add_pair_blocks(
-                        blocks,
-                        self.site_directions,
-                        left_role,
-                        left_tensor,
-                        (first_sectors, middle_sectors),
-                    )
-                    back = _OPPOSITE_DIRECTION[steps[1]]
-                    forward = steps[2]
-                    right_role = (back, forward)
-                    right_dirs = tuple(sorted(right_role, key=_DIRECTIONS.index))
-                    right_tensor = rotated_right
-                    if right_role != right_dirs:
-                        right_tensor = right_tensor.transpose(1, 0, 2, 3)
-                    _add_pair_blocks(
-                        blocks,
-                        self.site_directions,
-                        right_role,
-                        right_tensor,
-                        (middle_sectors, last_sectors),
-                    )
-
-            if self.plaquette_starts:
-                loop_edges = _plaquette_edges()
-                exact_loop, _ = _lower_loop_residual(
-                    loop_edges,
-                    twosite_op,
-                    onesite_op,
-                    beta,
-                    one_site_exp,
-                    start_factors,
-                    end_factors,
-                    pair_tensors,
-                )
-                loop_rank = one_site_exp.shape[0] ** 4
-                for start in self.plaquette_starts:
-                    upper = _site_after(
-                        start,
-                        "u",
-                        self.lx,
-                        self.ly,
-                        self.cyclic,
-                    )
-                    right = _site_after(
-                        start,
-                        "r",
-                        self.lx,
-                        self.ly,
-                        self.cyclic,
-                    )
-                    diagonal = _site_after(
-                        upper,
-                        "r",
-                        self.lx,
-                        self.ly,
-                        self.cyclic,
-                    )
-                    loop_sites = (start, upper, diagonal, right)
-                    lower_loop = _cycle_active_operator(
-                        blocks,
-                        self.site_directions,
-                        loop_sites,
-                        one_site_exp.shape[0],
-                    )
-                    lower_loop = _permute_operator_sites(
-                        lower_loop,
-                        (0, 1, 3, 2),
-                        one_site_exp.shape[0],
-                    )
-                    loop_residual = exact_loop - lower_loop
-                    loop_tensor = _operator_tensor(
-                        loop_residual,
-                        4,
-                        one_site_exp.shape[0],
-                    )
-                    loop_tensors = _dense_loop_tensors(
-                        loop_tensor,
-                        one_site_exp.shape[0],
-                    )
-                    loop_residuals.append(np.linalg.norm(loop_residual))
-                    loop_targets.append(np.linalg.norm(loop_residual))
-                    lower_bond = allocator.allocate(loop_rank)
-                    right_bond = allocator.allocate(loop_rank)
-                    upper_bond = allocator.allocate(loop_rank)
-                    left_bond = allocator.allocate(loop_rank)
-                    _add_pair_block_at_site(
-                        blocks,
-                        self.site_directions,
-                        loop_sites[0],
-                        ("r", "u"),
-                        loop_tensors[0],
-                        (left_bond, lower_bond),
-                    )
-                    _add_pair_block_at_site(
-                        blocks,
-                        self.site_directions,
-                        loop_sites[1],
-                        ("d", "r"),
-                        loop_tensors[1],
-                        (lower_bond, right_bond),
-                    )
-                    _add_pair_block_at_site(
-                        blocks,
-                        self.site_directions,
-                        loop_sites[2],
-                        ("l", "d"),
-                        loop_tensors[2],
-                        (right_bond, upper_bond),
-                    )
-                    _add_pair_block_at_site(
-                        blocks,
-                        self.site_directions,
-                        loop_sites[3],
-                        ("u", "l"),
-                        loop_tensors[3],
-                        (upper_bond, left_bond),
-                    )
+            (
+                loop_residuals,
+                loop_targets,
+                loop_rank,
+            ) = self._add_plaquette_clusters(
+                blocks=blocks,
+                allocator=allocator,
+                beta=beta,
+                twosite_op=twosite_op,
+                onesite_op=onesite_op,
+                one_site_exp=one_site_exp,
+                start_factors=start_factors,
+                end_factors=end_factors,
+                pair_tensors=pair_tensors,
+            )
 
         generic_residuals = {}
         generic_targets = {}
@@ -5035,6 +4827,431 @@ class ClusterExpansionPlan:
                 )
             ),
         )
+        report = self._build_report(
+            beta=beta,
+            onesite_op=onesite_op,
+            twosite_op=twosite_op,
+            one_site_exp=one_site_exp,
+            start_factors=start_factors,
+            end_factors=end_factors,
+            pair_residuals=pair_residuals,
+            pair_targets=pair_targets,
+            star_residuals=star_residuals,
+            star_targets=star_targets,
+            path_residuals=path_residuals,
+            path_targets=path_targets,
+            path_ranks=path_ranks,
+            loop_residuals=loop_residuals,
+            loop_targets=loop_targets,
+            loop_rank=loop_rank,
+            solved_tree_groups=solved_tree_groups,
+            generic_residuals=generic_residuals,
+            generic_targets=generic_targets,
+            generic_ranks=generic_ranks,
+            generic_cluster_counts=generic_cluster_counts,
+            generic_loop_ranks=generic_loop_ranks,
+            active=active,
+        )
+        self.last_report = report
+        result = active.to_pepo() if materialize else active
+        return (result, report) if return_report else result
+
+    def _build_pair_clusters(
+        self,
+        *,
+        beta,
+        twosite_op,
+        onesite_op,
+        one_site_exp,
+        start_factors,
+        end_factors,
+    ):
+        """Solve three-site representatives and rotate their center tensors."""
+        pair_tensors = {}
+        pair_residuals = []
+        pair_targets = []
+        if self.order >= 3 and start_factors.shape[0]:
+            for representative, orbit in self.pair_orbits:
+                tensor, residual_norm, target_norm = _solve_three_site_pair(
+                    representative,
+                    twosite_op,
+                    onesite_op,
+                    one_site_exp,
+                    start_factors,
+                    end_factors,
+                    beta,
+                )
+                pair_tensors[representative] = tensor
+                pair_residuals.append(residual_norm)
+                pair_targets.append(target_norm)
+                for pair in orbit[1:]:
+                    pair_tensors[pair] = _rotate_pair_tensor(
+                        representative,
+                        pair,
+                        tensor,
+                    )
+        return pair_tensors, pair_residuals, pair_targets
+
+    def _add_star_clusters(
+        self,
+        *,
+        blocks,
+        allocator,
+        beta,
+        twosite_op,
+        onesite_op,
+        one_site_exp,
+        start_factors,
+        end_factors,
+        pair_tensors,
+    ):
+        """Add four-site stars using the shared sector allocator."""
+        star_residuals = []
+        star_targets = []
+        solved_tree_groups = 0
+        star_tensors = {}
+        for representative, orbit in self.triple_orbits:
+            if not any(
+                all(direction in directions for direction in star)
+                for star in orbit
+                for directions in self.site_directions.values()
+            ):
+                continue
+            tensor, residual_norm, target_norm = _solve_four_star(
+                representative,
+                twosite_op,
+                onesite_op,
+                one_site_exp,
+                start_factors,
+                end_factors,
+                pair_tensors,
+                beta,
+            )
+            star_tensors[representative] = tensor
+            star_residuals.append(residual_norm)
+            star_targets.append(target_norm)
+            solved_tree_groups += 1
+            for directions in orbit[1:]:
+                star_tensors[directions] = _rotate_direction_tensor(
+                    representative, directions, tensor
+                )
+
+        for directions, tensor in star_tensors.items():
+            sectors = allocator.allocate(start_factors.shape[0])
+            _add_triple_blocks(
+                blocks, self.site_directions, directions, tensor, sectors
+            )
+            for direction in directions:
+                _add_single_direction_blocks(
+                    blocks,
+                    self.site_directions,
+                    self.lx,
+                    self.ly,
+                    _OPPOSITE_DIRECTION[direction],
+                    sectors,
+                    end_factors
+                    if direction in _POSITIVE_DIRECTIONS
+                    else start_factors,
+                    source=False,
+                    cyclic=self.cyclic,
+                )
+        return star_residuals, star_targets, solved_tree_groups
+
+    def _add_path_clusters(
+        self,
+        *,
+        blocks,
+        allocator,
+        beta,
+        twosite_op,
+        onesite_op,
+        one_site_exp,
+        start_factors,
+        end_factors,
+        pair_tensors,
+        solved_tree_groups,
+    ):
+        """Add four-site paths without changing endpoint roles or sector order."""
+        path_residuals = []
+        path_targets = []
+        path_ranks = []
+        for representative, orbit in self.path_orbits:
+            if not any(
+                _path_start_sites(steps, self.lx, self.ly, self.cyclic)
+                for steps in orbit
+            ):
+                continue
+            left, right, residual_norm, target_norm = _solve_four_path(
+                representative,
+                twosite_op,
+                onesite_op,
+                one_site_exp,
+                start_factors,
+                end_factors,
+                pair_tensors,
+                beta,
+                self.max_tree_rank,
+            )
+            path_residuals.append(residual_norm)
+            path_targets.append(target_norm)
+            path_ranks.append(left.shape[1])
+            solved_tree_groups += 1
+            path_channel_rank = left.shape[1]
+            if not left.shape[1]:
+                continue
+            representative_left_dirs = tuple(
+                sorted(
+                    (_OPPOSITE_DIRECTION[representative[0]], representative[1]),
+                    key=_DIRECTIONS.index,
+                )
+            )
+            representative_left_role = (
+                _OPPOSITE_DIRECTION[representative[0]],
+                representative[1],
+            )
+            representative_right_dirs = tuple(
+                sorted(
+                    (_OPPOSITE_DIRECTION[representative[1]], representative[2]),
+                    key=_DIRECTIONS.index,
+                )
+            )
+            representative_right_role = (
+                _OPPOSITE_DIRECTION[representative[1]],
+                representative[2],
+            )
+            if representative_left_role != representative_left_dirs:
+                left = left.transpose(1, 0, 2, 3)
+            if representative_right_role != representative_right_dirs:
+                right = right.transpose(1, 0, 2, 3)
+            for steps in orbit:
+                if steps == representative:
+                    rotated_left, rotated_right = left, right
+                else:
+                    target_left_dirs = tuple(
+                        sorted(
+                            (_OPPOSITE_DIRECTION[steps[0]], steps[1]),
+                            key=_DIRECTIONS.index,
+                        )
+                    )
+                    target_right_dirs = tuple(
+                        sorted(
+                            (_OPPOSITE_DIRECTION[steps[1]], steps[2]),
+                            key=_DIRECTIONS.index,
+                        )
+                    )
+                    rotated_left = _rotate_direction_tensor(
+                        representative_left_dirs, target_left_dirs, left
+                    )
+                    rotated_right = _rotate_direction_tensor(
+                        representative_right_dirs, target_right_dirs, right
+                    )
+                first_sectors = allocator.allocate(start_factors.shape[0])
+                middle_sectors = allocator.allocate(path_channel_rank)
+                last_sectors = allocator.allocate(end_factors.shape[0])
+                first_factor = (
+                    start_factors
+                    if steps[0] in _POSITIVE_DIRECTIONS
+                    else end_factors
+                )
+                last_factor = (
+                    end_factors
+                    if steps[2] in _POSITIVE_DIRECTIONS
+                    else start_factors
+                )
+                _add_single_direction_blocks(
+                    blocks,
+                    self.site_directions,
+                    self.lx,
+                    self.ly,
+                    steps[0],
+                    first_sectors,
+                    first_factor,
+                    source=True,
+                    cyclic=self.cyclic,
+                )
+                _add_single_direction_blocks(
+                    blocks,
+                    self.site_directions,
+                    self.lx,
+                    self.ly,
+                    _OPPOSITE_DIRECTION[steps[2]],
+                    last_sectors,
+                    last_factor,
+                    source=False,
+                    cyclic=self.cyclic,
+                )
+                back = _OPPOSITE_DIRECTION[steps[0]]
+                forward = steps[1]
+                left_role = (back, forward)
+                left_dirs = tuple(sorted(left_role, key=_DIRECTIONS.index))
+                left_tensor = rotated_left
+                if left_role != left_dirs:
+                    left_tensor = left_tensor.transpose(1, 0, 2, 3)
+                _add_pair_blocks(
+                    blocks,
+                    self.site_directions,
+                    left_role,
+                    left_tensor,
+                    (first_sectors, middle_sectors),
+                )
+                back = _OPPOSITE_DIRECTION[steps[1]]
+                forward = steps[2]
+                right_role = (back, forward)
+                right_dirs = tuple(sorted(right_role, key=_DIRECTIONS.index))
+                right_tensor = rotated_right
+                if right_role != right_dirs:
+                    right_tensor = right_tensor.transpose(1, 0, 2, 3)
+                _add_pair_blocks(
+                    blocks,
+                    self.site_directions,
+                    right_role,
+                    right_tensor,
+                    (middle_sectors, last_sectors),
+                )
+        return path_residuals, path_targets, path_ranks, solved_tree_groups
+
+    def _add_plaquette_clusters(
+        self,
+        *,
+        blocks,
+        allocator,
+        beta,
+        twosite_op,
+        onesite_op,
+        one_site_exp,
+        start_factors,
+        end_factors,
+        pair_tensors,
+    ):
+        """Subtract the assembled lower clusters before adding each plaquette."""
+        loop_residuals = []
+        loop_targets = []
+        loop_rank = 0
+        if self.plaquette_starts:
+            loop_edges = _plaquette_edges()
+            exact_loop, _ = _lower_loop_residual(
+                loop_edges,
+                twosite_op,
+                onesite_op,
+                beta,
+                one_site_exp,
+                start_factors,
+                end_factors,
+                pair_tensors,
+            )
+            loop_rank = one_site_exp.shape[0] ** 4
+            for start in self.plaquette_starts:
+                upper = _site_after(
+                    start,
+                    "u",
+                    self.lx,
+                    self.ly,
+                    self.cyclic,
+                )
+                right = _site_after(
+                    start,
+                    "r",
+                    self.lx,
+                    self.ly,
+                    self.cyclic,
+                )
+                diagonal = _site_after(
+                    upper,
+                    "r",
+                    self.lx,
+                    self.ly,
+                    self.cyclic,
+                )
+                loop_sites = (start, upper, diagonal, right)
+                lower_loop = _cycle_active_operator(
+                    blocks,
+                    self.site_directions,
+                    loop_sites,
+                    one_site_exp.shape[0],
+                )
+                lower_loop = _permute_operator_sites(
+                    lower_loop,
+                    (0, 1, 3, 2),
+                    one_site_exp.shape[0],
+                )
+                loop_residual = exact_loop - lower_loop
+                loop_tensor = _operator_tensor(
+                    loop_residual,
+                    4,
+                    one_site_exp.shape[0],
+                )
+                loop_tensors = _dense_loop_tensors(
+                    loop_tensor,
+                    one_site_exp.shape[0],
+                )
+                loop_residuals.append(np.linalg.norm(loop_residual))
+                loop_targets.append(np.linalg.norm(loop_residual))
+                lower_bond = allocator.allocate(loop_rank)
+                right_bond = allocator.allocate(loop_rank)
+                upper_bond = allocator.allocate(loop_rank)
+                left_bond = allocator.allocate(loop_rank)
+                _add_pair_block_at_site(
+                    blocks,
+                    self.site_directions,
+                    loop_sites[0],
+                    ("r", "u"),
+                    loop_tensors[0],
+                    (left_bond, lower_bond),
+                )
+                _add_pair_block_at_site(
+                    blocks,
+                    self.site_directions,
+                    loop_sites[1],
+                    ("d", "r"),
+                    loop_tensors[1],
+                    (lower_bond, right_bond),
+                )
+                _add_pair_block_at_site(
+                    blocks,
+                    self.site_directions,
+                    loop_sites[2],
+                    ("l", "d"),
+                    loop_tensors[2],
+                    (right_bond, upper_bond),
+                )
+                _add_pair_block_at_site(
+                    blocks,
+                    self.site_directions,
+                    loop_sites[3],
+                    ("u", "l"),
+                    loop_tensors[3],
+                    (upper_bond, left_bond),
+                )
+        return loop_residuals, loop_targets, loop_rank
+
+    def _build_report(
+        self,
+        *,
+        beta,
+        onesite_op,
+        twosite_op,
+        one_site_exp,
+        start_factors,
+        end_factors,
+        pair_residuals,
+        pair_targets,
+        star_residuals,
+        star_targets,
+        path_residuals,
+        path_targets,
+        path_ranks,
+        loop_residuals,
+        loop_targets,
+        loop_rank,
+        solved_tree_groups,
+        generic_residuals,
+        generic_targets,
+        generic_ranks,
+        generic_cluster_counts,
+        generic_loop_ranks,
+        active,
+    ):
+        """Summarize local residuals, ranks, and storage after block assembly."""
         residual_norms = {}
         relative_residuals = {}
         if self.order >= 2:
@@ -5164,9 +5381,7 @@ class ClusterExpansionPlan:
             dense_nbytes=active.dense_nbytes,
             generic_loop_rank=max(generic_loop_ranks_flat, default=0),
         )
-        self.last_report = report
-        result = active.to_pepo() if materialize else active
-        return (result, report) if return_report else result
+        return report
 
     def build_composed(
         self,

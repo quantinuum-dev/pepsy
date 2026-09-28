@@ -22,6 +22,13 @@ store only nonzero virtual-sector blocks; `to_pepo()` is the explicit dense
 materialization boundary for square tensors, while graph blocks use
 `to_tensor_network()`.
 
+The square plan's `build()` orchestrates pair, star, path, and plaquette
+helpers, then the existing generic higher-order solver and report assembly.
+All insertion helpers receive the same sector allocator and block mapping.
+Their order matters: plaquette and generic residuals subtract the lower-order
+blocks already assembled. `_build_report` owns the residual/rank/storage
+summary, and `build()` updates `last_report` before optional materialization.
+
 Square `ActivePEPOBlocks.to_trace_network()` traces each physical block before
 dense site allocation and returns an unnormalized bosonic `TensorNetwork2D`.
 Located exact Pauli trees certify their identity-subtree sectors through

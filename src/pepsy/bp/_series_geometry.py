@@ -16,6 +16,22 @@ from typing import Any
 import numpy as np
 
 
+def _term_sites(tn, where):
+    """Normalize a Quimb local-term key to an ordered site tuple."""
+    has_site = getattr(tn, "has_site", None)
+    if callable(has_site) and has_site(where):
+        return (where,)
+    if isinstance(where, (str, bytes)):
+        return (where,)
+    try:
+        sites = tuple(where)
+    except TypeError:
+        return (where,)
+    if not sites:
+        raise ValueError("a local expectation term must have at least one site")
+    return sites
+
+
 class OpenLoopEnumerationLimitError(RuntimeError):
     """Raised when bounded open-series term discovery reaches a limit.
 
