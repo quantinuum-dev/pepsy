@@ -197,7 +197,13 @@ def test_peps_4x4_end_to_end(backend, dtype, engine, chi, chip, cutoff, repair, 
 def test_peps_4x4_actual_row_cache_and_refresh(monkeypatch):
     state, psi, _, _ = _oracle("complex128")
     state = state.copy()
-    options = dict(chi=0, chi_prime=2, boundary_engine="quimb-mps", contraction_opt="greedy")
+    options = dict(
+        chi=0,
+        chi_prime=2,
+        boundary_engine="quimb-mps",
+        contraction_opt="greedy",
+        row_cache_mode="dense",
+    )
     cached = PepsSampler(state, row_cache_max_bytes=64 * 2**20, **options)
     reference = PepsSampler(state, **options)
     builds, build = [], cached._build_row_transfer_cache

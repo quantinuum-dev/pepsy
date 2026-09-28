@@ -44,3 +44,16 @@
   stabilizer, and qMERA checks: **3 passed**. Ruff and `git diff --check`
   passed.
 - Commit status: being committed on `develop`; no push requested or performed.
+
+## Post-commit verification
+
+- Full suite with `MPLBACKEND=Agg`: **5,163 passed, 129 skipped, 1 failed**.
+  The only failure was the dense transfer-cache regression test relying on the
+  default row-cache mode, which is `factored`. The test now explicitly requests
+  `row_cache_mode="dense"`, matching its transfer-mode assertions; isolated
+  rerun: **1 passed**. The full suite was not rerun after this test-only fix.
+- A full run without `Agg` aborted in Matplotlib's macOS GUI backend during a
+  schematic test; the `Agg` run passed that test.
+- `python -m ruff check src tests` passed before the test-only fix; focused Ruff
+  on the corrected test and `git diff --check` passed afterward.
+- Commit status: follow-up test correction ready to commit on `develop`; no push.
