@@ -1,8 +1,8 @@
 # API starting points
 
 Choose the task you want to perform. Each guide explains the main API and
-its options; the <a href="reference/index.html">generated reference</a> lists
-full signatures and source locations in the built documentation.
+its options. Import examples use the owning `pepsy` namespace; see the
+[package map](package.md) when you need help finding one.
 
 ## Choose by task
 

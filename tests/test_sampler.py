@@ -134,20 +134,9 @@ def test_sampler_public_exports_resolve():
 
 def test_stabilizer_mps_sampler_public_exports_resolve():
     """The STN physical sampler is available from both public namespaces."""
-    from pepsy.sampling.stabilizer import MpsStabSampler, StabilizerMpsSampler
+    from pepsy.sampling.stabilizer import StabilizerMpsSampler
 
     assert pepsy.StabilizerMpsSampler is StabilizerMpsSampler
-    assert MpsStabSampler is StabilizerMpsSampler
-
-
-def test_stabilizer_mps_sampler_legacy_alias_warns_and_matches_canonical():
-    import pepsy.sampling as sampling
-
-    sampling.__dict__.pop("MpsStabSampler", None)
-    with pytest.warns(DeprecationWarning, match="StabilizerMpsSampler"):
-        old_name = sampling.MpsStabSampler
-
-    assert old_name is sampling.StabilizerMpsSampler
 
 
 def test_mps_sampler_rejects_incomplete_site_map():

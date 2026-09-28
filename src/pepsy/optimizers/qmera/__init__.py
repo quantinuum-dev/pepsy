@@ -54,7 +54,6 @@ _SYMBOL_MODULES = {
     "select_lightcone": ".lightcones",
     "site_tags_for_where": ".lightcones",
     "QMeraEnergyOptimizer": ".parametric",
-    "QMeraParametricEnergyOptimizer": ".parametric",
     "QMeraPrototypeLayout": ".prototype",
     "load_qmera_prototype_layout": ".prototype",
     "QMeraBlockSpec": ".schedules",
@@ -115,7 +114,6 @@ __all__ = [
     "QMeraLightconeTN",
     "QMeraLightconeGroup",
     "QMeraParametricLightconeChunk",
-    "QMeraParametricEnergyOptimizer",
     "QMeraPairSpec",
     "QMeraPrototypeLayout",
     "QMeraSchedule",
@@ -239,7 +237,7 @@ if TYPE_CHECKING:
         select_lightcone,
         site_tags_for_where,
     )
-    from .parametric import QMeraEnergyOptimizer, QMeraParametricEnergyOptimizer  # noqa: F401
+    from .parametric import QMeraEnergyOptimizer  # noqa: F401
     from .prototype import QMeraPrototypeLayout, load_qmera_prototype_layout  # noqa: F401
     from .schedules import (  # noqa: F401
         QMeraBlockSpec,

@@ -21,7 +21,7 @@ __all__ = [
     "ps_to_peps", "ps_to_3dpeps", "bell_to_mps", "ps_to_mps", "ps_to_ttn",
     "hrs_to_ttn",
     "ps_to_pepo", "ps_to_mpo", "random_haar_qubit", "haar_random_state",
-    "hrs_to_peps", "hrs_to_mps", "hrps_to_peps", "hrps_to_mps", "hrps_to_ttn",
+    "hrs_to_peps", "hrs_to_mps", "hrps_to_peps", "hrps_to_mps",
 ]
 
 
@@ -1914,4 +1914,3 @@ def hrs_to_mps(
 # Backwards-compatible aliases for the original longer spelling.
 hrps_to_peps = hrs_to_peps
 hrps_to_mps = hrs_to_mps
-hrps_to_ttn = hrs_to_ttn

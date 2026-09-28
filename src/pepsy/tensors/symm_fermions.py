@@ -52,7 +52,6 @@ __all__ = [
     "Fermion",
     "FermionLatticeSetup",
     "SpinfulFermion",
-    "SpinfulFermionHubbard",
     "fermion_density_param_gen",
     "fermion_hopping_param_gen",
     "fermion_interaction_param_gen",
@@ -3148,7 +3147,6 @@ class SpinfulFermion(Fermion):
             raise TypeError("SpinfulFermion always uses spinful=True.")
         super().__init__(*args, spinful=True, **kwargs)
 
-SpinfulFermionHubbard = SpinfulFermion
 
 
 class SymmFermions:

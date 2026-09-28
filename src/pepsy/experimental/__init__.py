@@ -6,11 +6,9 @@ their implementation details part of the default API contract.
 """
 
 from importlib import import_module
-import warnings
 
 _MODULES = {
     "bp": "pepsy.bp",
-    "mera": "pepsy.optimizers.qmera",
     "qmera": "pepsy.optimizers.qmera",
     "stabilizer": "pepsy.optimizers.stabilizer_tn",
     "symmetry": "pepsy.tensors.symmetric",
@@ -32,13 +30,6 @@ def __getattr__(name):
     target = _MODULES.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    if name == "mera":
-        warnings.warn(
-            "pepsy.experimental.mera is a compatibility alias; use "
-            "pepsy.experimental.qmera instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
     module = import_module(target)
     globals()[name] = module
     return module

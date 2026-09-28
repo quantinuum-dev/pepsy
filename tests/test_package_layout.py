@@ -30,7 +30,6 @@ from pepsy.optimizers import (
     QMeraEnergyOptimizer,
     QMeraGeometry,
     QMeraLayoutFinder,
-    QMeraParametricEnergyOptimizer,
     SimulatorCandidate,
     SimulatorPlan,
     SimulatorPlanner,
@@ -48,18 +47,20 @@ from pepsy.tensors import (
     Fermion,
     OneDMap,
     SpinfulFermion,
-    SpinfulFermionHubbard,
     SymmFermions,
     SymGateStream,
     SymMPS,
     SymPEPS,
-    backend_torch,
     default_physical_sectors,
     haar_random_state,
     hrs_to_ttn,
     ps_to_3dpeps,
     ps_to_peps,
     ps_to_ttn,
+    site_charge_from_occupations,
+)
+from pepsy.backends import (
+    backend_torch,
     reg_complex_qr_torch,
     reg_complex_svd_jax,
     reg_complex_svd_torch,
@@ -72,7 +73,6 @@ from pepsy.tensors import (
     reg_rel_svd_torch,
     register_jax_linalg,
     reset_linalg_registrations,
-    site_charge_from_occupations,
 )
 from pepsy.vmc import (
     ContractionConfig,
@@ -132,7 +132,6 @@ def test_new_namespace_imports_resolve():
     assert QMeraEnergyOptimizer is not None
     assert QMeraGeometry is not None
     assert QMeraLayoutFinder is not None
-    assert QMeraParametricEnergyOptimizer is not None
     assert SimulatorCandidate is not None
     assert SimulatorPlan is not None
     assert SimulatorPlanner is not None
@@ -151,7 +150,6 @@ def test_new_namespace_imports_resolve():
     assert OneDMap is not None
     assert Fermion is not None
     assert SpinfulFermion is not None
-    assert SpinfulFermionHubbard is not None
     assert SymmFermions is not None
     assert SymGateStream is not None
     assert SymMPS is not None
@@ -226,6 +224,23 @@ def test_optional_dependency_profiles_are_declared():
         (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
     )
     extras = metadata["project"]["optional-dependencies"]
+    base_dependencies = {
+        Requirement(value).name for value in metadata["project"]["dependencies"]
+    }
+    assert not {
+        "torch",
+        "jax",
+        "netket",
+        "flax",
+        "optax",
+        "symmray",
+        "stim",
+        "mpi4py",
+        "nlopt",
+        "nevergrad",
+        "guppylang",
+        "matplotlib",
+    } & base_dependencies
     assert {
         "layout",
         "contraction",

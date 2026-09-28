@@ -23,7 +23,6 @@ _SYMBOL_MODULES = {
     "QMeraLayoutFinder": ".qmera",
     "QMeraLayoutReport": ".qmera",
     "QMeraLayoutScore": ".qmera",
-    "QMeraParametricEnergyOptimizer": ".qmera",
     "QMeraPrototypeLayout": ".qmera",
     "QMeraScaleSpec": ".qmera",
     "QMeraUnitarySpec": ".qmera",
@@ -151,7 +150,6 @@ _SUBMODULES = (
 __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 
 _DEPRECATED_ALIASES = {
-    "QMeraParametricEnergyOptimizer": "QMeraEnergyOptimizer",
     "MpsStabOptimizer": "StabilizerMpsSimulator",
     "TreeStabOptimizer": "StabilizerTreeSimulator",
 }

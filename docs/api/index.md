@@ -2,8 +2,6 @@
 
 Choose a workflow in [API starting points](start_here.md), or find imports
 in the [package map](package.md). The guides below explain behavior and options.
-The built site also provides a <a href="reference/index.html">generated
-reference</a> with full signatures, members, and source links.
 
 ## Core
 
@@ -15,6 +13,7 @@ reference</a> with full signatures, members, and source links.
 - [Tensor maps](tensors/maps.md)
 - [Tensor constructors](tensors/constructors.md)
 - [Tensor contractions](tensors/contractions.md)
+- [Tensor core compatibility helpers](tensors/core.md)
 - [Tensor observables](tensors/observables.md)
 - [Symmetric tensors](tensors/symmetric.md)
 - [Fitting](fitting/local.md)
@@ -29,6 +28,7 @@ reference</a> with full signatures, members, and source links.
 - [Hamiltonians](operators/hamiltonians.md)
 - [Solvers](solvers/gradient.md), [finite differences](solvers/finite_difference.md)
 - [Sampling](sampling/samplers.md), [tree sampling](sampling/tree.md)
+- [Stabilizer sampling](sampling/stabilizer.md)
 
 ## Optimization and advanced workflows
 
@@ -49,52 +49,3 @@ reference</a> with full signatures, members, and source links.
 - [Tree PEPS states](optimizers/tree_peps.md)
 - [Tree stabilizer optimization](optimizers/tree_stabilizer.md)
 - [VMC](vmc.md)
-
-```{toctree}
-:hidden:
-
-start_here
-package
-boundary/metrics
-boundary/states
-boundary/sweeps
-boundary/compression
-tensors/maps
-tensors/constructors
-tensors/contractions
-tensors/observables
-tensors/core
-tensors/symmetric
-fitting/local
-operators/gates
-operators/automaton
-operators/higher_order_mpo
-operators/mpo_cluster
-operators/pauli_mpo
-operators/cluster_expansion
-operators/exponentials
-interop
-operators/hamiltonians
-solvers/gradient
-solvers/finite_difference
-sampling/samplers
-sampling/stabilizer
-sampling/tree
-bp
-optimizers/mps
-optimizers/gibbs_mps
-optimizers/mpo
-optimizers/peps
-optimizers/sweep
-optimizers/global_opt
-optimizers/energy
-optimizers/qmera
-optimizers/noise
-optimizers/planning
-optimizers/stabilizer_tn
-optimizers/sym_dmrg
-optimizers/tree
-optimizers/tree_peps
-optimizers/tree_stabilizer
-vmc
-```

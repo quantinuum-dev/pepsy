@@ -25,19 +25,3 @@ sampling, and variational Monte Carlo. The Python package is `pepsy`.
 
 The API guides cover MPS, PEPS, tree networks, operators, sampling, symmetry,
 belief propagation, and VMC. Optional features list their installation extras.
-
-```{toctree}
-:hidden:
-
-installation
-getting_started
-quickstart
-tutorials/index
-howto/index
-examples
-api/index
-stability
-development/package_layout
-development/README
-development/fermi_hubbard_u1u1_mpo_notes
-```

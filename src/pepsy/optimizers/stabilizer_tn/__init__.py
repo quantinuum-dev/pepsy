@@ -60,7 +60,6 @@ __all__ = [
     "NormEventRecord",
     "STNState",
     "StabilizerMpsSettingsAdvice",
-    "StabilizerMps",
     "StabilizerMpsRunResult",
     "StabilizerTreeRunResult",
     "StreamAnalysisRecord",
@@ -71,7 +70,7 @@ __all__ = [
 ]
 
 
-_DEPRECATED_ALIASES = {'MpsStabOptimizer': 'StabilizerMpsSimulator', 'StabilizerMps': 'StabilizerMpsSimulator'}
+_DEPRECATED_ALIASES = {'MpsStabOptimizer': 'StabilizerMpsSimulator'}
 
 if TYPE_CHECKING:
     from .records import (  # noqa: F401 -- public aliases

@@ -37,9 +37,8 @@ Session handoffs live in the repository's
   section links to long pages; keep numerical assumptions and limitations.
 - Label proposals, measurements, and historical results clearly. Preserve
   completed session records and add a dated correction when decisions change.
-- Add new pages to the nearest index and Sphinx toctree. Check links and run
-  the [strict documentation build](../installation.md#build-the-documentation).
-  Generated `docs/api/reference/` pages are build output, not editing targets.
+- Add new pages to the nearest Markdown index and link them with relative
+  Markdown links. Check that each link points to an existing page.
 
 ## Release distribution
 
@@ -52,19 +51,3 @@ These are GitHub Actions artifacts; the workflow does not create a GitHub
 Release entry. Commits after a version tag are development changes until a
 new version is selected and tagged. Do not move an existing release tag to
 include subsequent cleanup.
-
-```{toctree}
-:hidden:
-
-plans/README
-notes/README
-modules/README
-references/README
-package_layout
-fermi_hubbard_u1u1_mpo_notes
-plot_policy
-api-migration
-api-surface
-import-weight
-cluster_optimization_status
-```

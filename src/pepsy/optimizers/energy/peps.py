@@ -21,7 +21,8 @@ from ...backends import (
     infer_backend_converter_from_sample,
     TorchLinalgConfig,
 )
-from ...tensors import build_optimizer, reg_rel_svd_jax
+from ...backends import reg_rel_svd_jax
+from ...tensors import build_optimizer
 from ..global_opt import GlobalOptimizer
 
 __all__ = ["EnergyEstimate", "MpsEnergyOptimizer", "PepsEnergyOptimizer"]

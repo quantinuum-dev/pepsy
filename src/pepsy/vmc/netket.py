@@ -2073,7 +2073,7 @@ def _maybe_register_stable_jax_svd(contraction):
     if _CONTRACTION_ALIASES.get(key) not in {"hotrg", "ctmrg", "boundary"}:
         return
     try:
-        from ..tensors import reg_rel_svd_jax  # pylint: disable=import-outside-toplevel
+        from ..backends import reg_rel_svd_jax  # pylint: disable=import-outside-toplevel
 
         reg_rel_svd_jax()
     except ImportError:
@@ -2387,7 +2387,7 @@ def prepare_fermionic_peps_for_netket(peps, *, device=None):
             stacklevel=2,
         )
 
-    from ..tensors import backend_jax  # pylint: disable=import-outside-toplevel
+    from ..backends import backend_jax  # pylint: disable=import-outside-toplevel
 
     if device is None:
         device = os.environ.get("PEPSY_FH_JAX_DEVICE")

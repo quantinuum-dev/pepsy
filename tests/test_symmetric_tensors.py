@@ -19,7 +19,6 @@ from pepsy.tensors import (
     FermionLatticeSetup,
     OneDMap,
     SpinfulFermion,
-    SpinfulFermionHubbard,
     SymmFermions,
     SymGateStream,
     SymHamiltonian,
@@ -66,7 +65,6 @@ def test_spinful_fermion_helper_bundles_symmetry_aware_building_blocks(
     """The convenience helper should cover the native U1 and U1U1 workflows."""
     fermions = SpinfulFermion(symmetry=symmetry)
 
-    assert SpinfulFermionHubbard is SpinfulFermion
     assert not hasattr(fermions, "t")
     assert not hasattr(fermions, "U")
     assert not hasattr(fermions, "V")
@@ -114,7 +112,6 @@ def test_spinful_fermion_helper_bundles_symmetry_aware_building_blocks(
 
 def test_spinful_fermion_compatibility_constructors_enforce_spinful_space():
     """Legacy spellings must not accidentally construct a spinless helper."""
-    assert SpinfulFermionHubbard is SpinfulFermion
     assert SpinfulFermion(symmetry="U1").spinful
     assert SymmFermions.spinful(symmetry="U1").spinful
 

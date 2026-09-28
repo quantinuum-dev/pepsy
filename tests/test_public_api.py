@@ -146,25 +146,12 @@ def test_root_aliases_resolve_from_canonical_namespaces():
     assert not missing, f"aliases without canonical exports: {missing}"
 
 
-def test_deprecated_backend_alias_warns_and_matches_canonical_namespace():
-    """The old tensor backend path remains lazy and explicitly deprecated."""
-    import pepsy.backends as backends
-    import pepsy.tensors as tensors
-
-    tensors.__dict__.pop("backend_numpy", None)
-    with pytest.warns(DeprecationWarning, match="pepsy.backends.backend_numpy"):
-        alias = tensors.backend_numpy
-    assert alias is backends.backend_numpy
-
-
 @pytest.mark.parametrize(
     ("alias_name", "canonical_name"),
     [
         ("build_contraction", "build_optimizer"),
-        ("SpinfulFermionHubbard", "SpinfulFermion"),
         ("hrps_to_mps", "hrs_to_mps"),
         ("hrps_to_peps", "hrs_to_peps"),
-        ("hrps_to_ttn", "hrs_to_ttn"),
     ],
 )
 def test_deprecated_tensor_aliases_warn(alias_name, canonical_name):
@@ -195,7 +182,6 @@ def test_deprecated_boundary_aliases_warn(alias_name, canonical_name):
 @pytest.mark.parametrize(
     ("alias_name", "canonical_name"),
     [
-        ("QMeraParametricEnergyOptimizer", "QMeraEnergyOptimizer"),
         ("MpsStabOptimizer", "StabilizerMpsSimulator"),
         ("TreeStabOptimizer", "StabilizerTreeSimulator"),
     ],
@@ -210,47 +196,19 @@ def test_deprecated_optimizer_aliases_warn(alias_name, canonical_name):
     assert alias is getattr(optimizers, canonical_name)
 
 
-def test_deprecated_stabilizer_alias_warns():
-    """The briefly used stabilizer class spelling remains a lazy alias."""
-    import pepsy.optimizers.stabilizer_tn as stabilizer_tn
-
-    stabilizer_tn.__dict__.pop("StabilizerMps", None)
-    with pytest.warns(DeprecationWarning, match="StabilizerMpsSimulator"):
-        alias = stabilizer_tn.StabilizerMps
-    assert alias is stabilizer_tn.StabilizerMpsSimulator
-
-
-def test_deprecated_mera_alias_warns_and_matches_qmera():
-    """The old MERA discovery name remains a lazy QMERA compatibility alias."""
-    import pepsy.experimental as experimental
-
-    experimental.__dict__.pop("mera", None)
-    with pytest.warns(DeprecationWarning, match="experimental.qmera"):
-        alias = experimental.mera
-    assert alias is experimental.qmera
-
-
 def test_deprecated_aliases_are_documented():
     """Every active deprecation has a migration entry for users."""
     migration = _API_MIGRATION_DOC.read_text(encoding="utf-8")
-    tensor_aliases = pepsy.tensors._BACKEND_COMPATIBILITY_ALIASES
-    assert all(f"`pepsy.tensors.{name}`" in migration for name in tensor_aliases)
     for alias in (
         "build_contraction",
-        "SpinfulFermionHubbard",
         "hrps_to_mps",
         "hrps_to_peps",
-        "hrps_to_ttn",
     ):
         assert f"`pepsy.tensors.{alias}`" in migration
     assert "`pepsy.boundary.normalize`" in migration
     assert "`pepsy.boundary.infidelity`" in migration
-    assert "`pepsy.optimizers.QMeraParametricEnergyOptimizer`" in migration
     assert "`pepsy.optimizers.MpsStabOptimizer`" in migration
     assert "`pepsy.optimizers.TreeStabOptimizer`" in migration
-    assert "`pepsy.sampling.MpsStabSampler`" in migration
-    assert "`pepsy.optimizers.stabilizer_tn.StabilizerMps`" in migration
-    assert "`pepsy.experimental.mera`" in migration
     assert "`pepsy.optimizers.mera`" in migration
 
 
@@ -288,7 +246,7 @@ _EXPECTED_IN_ALL = [
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "hrs_to_mps", "hrs_to_peps", "hrs_to_ttn", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "ps_to_ttn", "make_numpy_array_caster", "backend_infer", "to_float", "SweepOptimizer",
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "MpoChannelEvent", "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult",
-    "PepsSampler", "PepsBpSampler", "MpsSampler", "MpsStabSampler", "StabilizerMpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "compress_all_gauge", "one_norm_bp", "tn_fidelity", "tn_norm",
+    "PepsSampler", "PepsBpSampler", "MpsSampler", "StabilizerMpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "compress_all_gauge", "one_norm_bp", "tn_fidelity", "tn_norm",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
     "MpsStabOptimizer", "StabilizerMpsSimulator", "STNState",
     "SimulatorCandidate", "SimulatorPlan", "SimulatorPlanner", "recommend_simulator",
@@ -307,7 +265,7 @@ _EXPECTED_IN_ALL = [
     "CoherentCrosstalkModel", "TrajectoryChannel", "TrajectoryEvent", "TrajectoryMeasurementRecord", "TrajectoryOutcome", "TrajectoryRecord", "TrajectorySample", "TrajectoryShotResult",
     "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "TreeNoisy", "run_noisy_shots", "run_mpi_shots", "run_stabilizer_mps_stream", "run_stim_shots", "run_trajectory_shots",
     "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
-    "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
+    "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
     "default_physical_sectors", "draw_symmray_blocks", "draw_symmray_mps", "draw_symmray_mpo", "draw_symmray_peps",
     "fermi_hubbard_u1u1_gate_stream", "fermi_hubbard_u1u1_hopping_gate_stream",
     "fermi_hubbard_u1u1_interaction_gate_stream", "fermi_hubbard_u1u1_light_pulse_gate_stream",
@@ -377,7 +335,7 @@ _CALLABLE_EXPORTS = [
     "StabilizerTreeSimulator",
     "TreeTensorNetwork",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
-    "tn_fidelity", "tn_norm", "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
+    "tn_fidelity", "tn_norm", "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
     "default_physical_sectors", "draw_symmray_blocks", "draw_symmray_mps", "draw_symmray_mpo", "draw_symmray_peps",
     "fermi_hubbard_u1u1_gate_stream", "fermi_hubbard_u1u1_hopping_gate_stream",
     "fermi_hubbard_u1u1_interaction_gate_stream", "fermi_hubbard_u1u1_light_pulse_gate_stream",
@@ -444,23 +402,22 @@ def test_vmc_torch_package_preserves_lazy_public_exports():
 
 
 def test_optional_linalg_registrations_resolve():
-    """Linalg registrations resolve under tensor namespaces and public wrappers."""
+    """Optional linalg helpers resolve from their owning backend namespace."""
     has_torch = importlib.util.find_spec("torch") is not None
     has_jax = importlib.util.find_spec("jax") is not None
-    assert callable(pepsy.tensors.core.reg_stop_gradient_torch)
-    assert callable(pepsy.tensors.core.stop_grad)
-    assert callable(pepsy.tensors.reg_stop_gradient_torch)
-    assert callable(pepsy.tensors.stop_grad)
-    assert pepsy.reg_rel_svd_torch is pepsy.tensors.reg_rel_svd_torch
-    assert pepsy.reg_real_svd_torch is pepsy.tensors.reg_real_svd_torch
-    assert pepsy.reg_complex_svd_torch is pepsy.tensors.reg_complex_svd_torch
-    assert pepsy.reg_native_svd_torch is pepsy.tensors.reg_native_svd_torch
-    assert pepsy.reg_native_svd_jax is pepsy.tensors.reg_native_svd_jax
-    assert pepsy.reg_real_qr_torch is pepsy.tensors.reg_real_qr_torch
-    assert pepsy.reg_complex_qr_torch is pepsy.tensors.reg_complex_qr_torch
-    assert pepsy.reg_rel_svd_jax is pepsy.tensors.reg_rel_svd_jax
-    assert pepsy.reg_real_svd_jax is pepsy.tensors.reg_real_svd_jax
-    assert pepsy.reg_complex_svd_jax is pepsy.tensors.reg_complex_svd_jax
+    for name in (
+        "reg_rel_svd_torch",
+        "reg_real_svd_torch",
+        "reg_complex_svd_torch",
+        "reg_native_svd_torch",
+        "reg_native_svd_jax",
+        "reg_real_qr_torch",
+        "reg_complex_qr_torch",
+        "reg_rel_svd_jax",
+        "reg_real_svd_jax",
+        "reg_complex_svd_jax",
+    ):
+        assert callable(getattr(pepsy.backends, name))
     assert pepsy.register_jax_linalg is pepsy.backends.register_jax_linalg
     assert pepsy.register_torch_linalg is pepsy.backends.register_torch_linalg
     assert pepsy.TorchLinalgConfig is pepsy.backends.TorchLinalgConfig
@@ -469,34 +426,14 @@ def test_optional_linalg_registrations_resolve():
     if has_torch:
         import torch
 
-        assert callable(pepsy.tensors.core.reg_rel_svd_torch)
-        assert callable(pepsy.tensors.reg_rel_svd_torch)
-        assert callable(pepsy.tensors.core.reg_native_svd_torch)
-        assert callable(pepsy.tensors.reg_native_svd_torch)
-        assert callable(pepsy.tensors.core.reg_real_svd_torch)
-        assert callable(pepsy.tensors.reg_real_svd_torch)
-        assert callable(pepsy.tensors.core.reg_complex_svd_torch)
-        assert callable(pepsy.tensors.reg_complex_svd_torch)
-        assert callable(pepsy.tensors.core.reg_real_qr_torch)
-        assert callable(pepsy.tensors.reg_real_qr_torch)
-        assert callable(pepsy.tensors.core.reg_complex_qr_torch)
-        assert callable(pepsy.tensors.reg_complex_qr_torch)
+        assert callable(pepsy.backends.reg_rel_svd_torch)
         x = torch.tensor([1.0], dtype=torch.float64, requires_grad=True)
-        y = pepsy.tensors.stop_grad(x)
+        y = pepsy.backends.stop_grad(x)
         assert not y.requires_grad
         assert y is not x
         assert y.data_ptr() != x.data_ptr()
     if has_jax:
-        assert callable(pepsy.tensors.core.reg_rel_svd_jax)
-        assert callable(pepsy.tensors.reg_rel_svd_jax)
-        assert callable(pepsy.tensors.core.reg_real_svd_jax)
-        assert callable(pepsy.tensors.reg_real_svd_jax)
-        assert callable(pepsy.tensors.core.reg_complex_svd_jax)
-        assert callable(pepsy.tensors.reg_complex_svd_jax)
-        assert callable(pepsy.tensors.core.reg_native_svd_jax)
-        assert callable(pepsy.tensors.reg_native_svd_jax)
-        assert callable(pepsy.tensors.core.register_jax_linalg)
-        assert callable(pepsy.tensors.register_jax_linalg)
+        assert callable(pepsy.backends.reg_rel_svd_jax)
 
 
 def test_direct_peps_sampler_owning_namespace_exports():

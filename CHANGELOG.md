@@ -12,6 +12,14 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Changed
+
+- Removed duplicate backend and linalg exports from `pepsy.tensors` and
+  `pepsy.tensors.core`; import them from `pepsy.backends`. Also removed unused
+  compatibility aliases for `experimental.mera`, `QMeraParametricEnergyOptimizer`,
+  `MpsStabSampler`, `StabilizerMps`, `SpinfulFermionHubbard`, and
+  `hrps_to_ttn`. See the [API migration guide](docs/development/api-migration.md).
+
 ### Added
 
 - Boundary PepsSampler now defaults to FIT-style factored numerical row

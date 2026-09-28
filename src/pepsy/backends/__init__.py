@@ -32,6 +32,18 @@ _SYMBOL_MODULES = {
     "set_default_array_backend": ".config",
     "set_default_grad_backend": ".config",
     "TorchLinalgConfig": ".config",
+    "reg_native_svd_torch": ".config",
+    "reg_native_svd_jax": ".config",
+    "reg_rel_svd_torch": ".config",
+    "reg_real_svd_torch": ".config",
+    "reg_complex_svd_torch": ".config",
+    "reg_real_qr_torch": ".config",
+    "reg_complex_qr_torch": ".config",
+    "reg_rel_svd_jax": ".config",
+    "reg_real_svd_jax": ".config",
+    "reg_complex_svd_jax": ".config",
+    "reg_stop_gradient_torch": ".config",
+    "stop_grad": ".config",
 }
 
 __all__ = list(_SYMBOL_MODULES)

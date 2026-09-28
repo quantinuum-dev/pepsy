@@ -376,8 +376,8 @@ the native Symmray gate directly. ``imaginary=True`` changes the evolution to
 ``exp(-dt H)``. The local exponential must be neutral so it remains in one
 conserved charge sector.
 
-``SpinfulFermion`` and ``SpinfulFermionHubbard`` remain compatibility
-constructors that fix ``spinful=True``. ``SymmFermions.spinless(...)`` and
+``SpinfulFermion`` is the spinful constructor and fixes ``spinful=True``.
+``SymmFermions.spinless(...)`` and
 ``SymmFermions.spinful(...)`` are factory-style alternatives with the same
 local-space guarantees.
 

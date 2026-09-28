@@ -28,8 +28,7 @@ registry alongside its namespace-loading logic.
 
 ## Redundancy identified
 
-These backend helpers currently appear in both `pepsy.backends` and
-`pepsy.tensors`:
+These backend helpers belong only to `pepsy.backends`:
 
 `backend_cupy`, `backend_jax`, `backend_numpy`, `backend_torch`,
 `build_backend`, `get_default_array_backend`, `get_default_grad_backend`,
@@ -38,22 +37,19 @@ These backend helpers currently appear in both `pepsy.backends` and
 `set_default_array_backend`, `set_default_grad_backend`, and
 `TorchLinalgConfig`.
 
-The canonical home for all of them is `pepsy.backends`. The
-`pepsy.tensors` exports remain functional as deprecated compatibility aliases
-for the current 0.x line and are protected by the existing compatibility
-tests.
+Duplicate exports from `pepsy.tensors` and its `core` aggregator have been
+removed. Tensor modules no longer re-export backend configuration helpers.
 
-`pepsy.optimizers.mera`, `pepsy.experimental.mera`, and their `qmera`
-counterparts point to the same QMERA implementation. `qmera` is the preferred
-spelling; the two `mera` paths remain transitional compatibility aliases and
-emit deprecation warnings when accessed.
+`pepsy.optimizers.mera` remains as a lazy compatibility path because a current
+Pepsy example imports it. The unused `pepsy.experimental.mera` discovery alias
+was removed; use `pepsy.experimental.qmera`.
 
 ## Cleanup policy
 
 1. Keep the manifest guard so accidental root-surface growth is rejected.
-2. Document and deprecate redundant namespace aliases before removal.
-3. Preserve lazy compatibility imports during the current 0.x line.
-4. Remove approved redundant aliases only in a planned breaking release.
+2. Keep one canonical namespace for each responsibility.
+3. Retain compatibility aliases only when a current consumer needs them.
+4. Remove unused aliases and update the migration guide when removing them.
 
 Canonical examples:
 

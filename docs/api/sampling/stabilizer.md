@@ -5,7 +5,6 @@
 `StabilizerMpsSimulator` or the pair `(C, nu)`, maps requested local X/Y/Z
 measurements through the tableau frame, and samples the resulting Pauli
 projectors on the coefficient MPS using shared-prefix branching.
-The historical `MpsStabSampler` name remains available as a deprecated alias.
 
 ```python
 sampler = pepsy.StabilizerMpsSampler(stabilizer_optimizer)

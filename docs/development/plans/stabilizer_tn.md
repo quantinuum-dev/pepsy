@@ -202,7 +202,8 @@ new simulator features.
 - **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports the current
   stream part and MPS-compatible `infidelity`); `norm_diagnostics()` reports the same multiplicative `infidelity`
   and `fidelity` names, and `norm()` returns the `|nu>` norm.
-- `StabilizerMps` is kept as a backward-compatible alias for `StabilizerMpsSimulator`.
+- `StabilizerMps` was an unused transitional alias and has been removed; use
+  `StabilizerMpsSimulator`.
 - **Amplitude / observable API** — `amplitude(bits)`/`probability(bits)`;
   `expectation(pauli, where=None)` (also full-register strings like `"ZIZ"`);
   `expectation_pauli_sum(terms)` for `H = sum c_k P_k`; `sample(...)` (Born

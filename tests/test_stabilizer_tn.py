@@ -2272,11 +2272,9 @@ def test_run_progbar_smoke():
 def test_stabilizermps_backward_alias():
     import pepsy.optimizers.stabilizer_tn as stabilizer_tn
 
-    from pepsy.optimizers.stabilizer_tn import StabilizerMps
     with pytest.warns(DeprecationWarning, match="StabilizerMpsSimulator"):
         old_name = stabilizer_tn.MpsStabOptimizer
 
-    assert StabilizerMps is StabilizerMpsSimulator
     assert old_name is StabilizerMpsSimulator
 
 

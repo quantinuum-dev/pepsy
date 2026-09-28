@@ -17,7 +17,7 @@ from .vector import (
     _validate_sample_count,
 )
 
-__all__ = ["StabilizerMpsSampler", "MpsStabSampler"]
+__all__ = ["StabilizerMpsSampler"]
 
 
 _DEFAULT_SAMPLE_CHUNK_SIZE = 4096
@@ -1205,6 +1205,3 @@ class StabilizerMpsSampler:
                 shuffle=shuffle,
                 chunk_size=count,
             )
-
-
-MpsStabSampler = StabilizerMpsSampler

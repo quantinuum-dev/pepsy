@@ -51,7 +51,6 @@ __all__ = (
     "QMeraLightconeTN",
     "QMeraLightconeGroup",
     "QMeraParametricLightconeChunk",
-    "QMeraParametricEnergyOptimizer",
     "QMeraPrototypeLayout",
     "QMeraSchedule",
     "QMeraScaleSpec",

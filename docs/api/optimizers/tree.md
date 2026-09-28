@@ -133,14 +133,3 @@ See [Readout](tree_readout.md#readout).
 ## Performance and stability
 
 See [Performance and stability](tree_replay.md#performance-and-stability).
-
-```{toctree}
-:hidden:
-
-tree_layout
-tree_state
-tree_operators
-tree_replay
-tree_fit
-tree_readout
-```

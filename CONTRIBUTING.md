@@ -66,19 +66,20 @@ needed for your change. The full VMC profile requires `.[vmc]` in addition to
 
 ## What CI checks
 
-[CI](.github/workflows/ci.yml) runs three lightweight jobs on pushes and pull
+[CI](.github/workflows/ci.yml) runs two lightweight jobs on pushes and pull
 requests, using Python 3.12 on Linux:
 
 | Job | Coverage |
 | --- | --- |
-| Core checks | Smoke and core tests without optional/slow cases, Ruff, focused type checks, and agent guidance. The five direct core dependencies use minimums read from `pyproject.toml`. |
+| Core checks | The same small smoke selection as `python -m pytest -q`, Ruff, focused type checks, and agent guidance. The five direct core dependencies use minimums read from `pyproject.toml`. |
 | Package | Build a source archive and a wheel from that archive; validate metadata, imports, and a small numerical example in clean installations. |
-| Docs | Build documentation with warnings treated as errors. |
 
 Pip downloads are cached separately per job. Superseded runs on the same ref
 are cancelled, and each job has a ten-minute timeout. Tools and transitive
 dependencies resolve normally. Routine CI does not install Torch, JAX,
-NetKet, or MPI.
+NetKet, MPI, or documentation-builder packages. Users install backend extras
+only when their own workflows need them; the ordinary package install stays
+on the base dependency profile.
 
 The [nightly workflow](.github/workflows/nightly.yml) runs the full collection
 with `.[test-extended,contraction,vmc]` and a **60% whole-package coverage gate**.

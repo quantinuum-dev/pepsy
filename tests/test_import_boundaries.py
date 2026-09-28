@@ -303,14 +303,13 @@ from pepsy.tensors import symmetric, symm_fermions, symmetric_diagnostics
 
 for owner in (symm_fermions, symmetric_diagnostics):
     for name in owner.__all__:
-        if name in ('SymmFermions', 'SpinfulFermionHubbard'):
+        if name == 'SymmFermions':
             continue
         value = getattr(owner, name)
         assert value is getattr(symmetric, name)
         assert value is getattr(tensors, name) is getattr(pepsy, name)
         legacy = ('cpepsy.tensors.symmetric\\n' + name + '\\n.').encode()
         assert pickle.loads(legacy) is value
-assert symmetric.SpinfulFermionHubbard is symm_fermions.SpinfulFermion
 print(*sorted(name for name in sys.modules if name in {{
     'symmray', 'matplotlib.pyplot', 'pepsy.tensors.symmetric_states',
 }}))

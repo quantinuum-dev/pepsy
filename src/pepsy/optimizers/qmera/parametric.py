@@ -9,7 +9,7 @@ from typing import Any
 from ...backends import backend_jax, backend_torch
 from ...solvers import GradientOptimizer, GradSolverResult
 
-__all__ = ["QMeraEnergyOptimizer", "QMeraParametricEnergyOptimizer"]
+__all__ = ["QMeraEnergyOptimizer"]
 
 
 def _solver_backend(solver):
@@ -292,8 +292,3 @@ class QMeraEnergyOptimizer:
         return result
 
     optimize = run
-
-
-# Compatibility name retained for callers of the original parameter-dict
-# qMERA API.  The canonical public name is now QMeraEnergyOptimizer.
-QMeraParametricEnergyOptimizer = QMeraEnergyOptimizer

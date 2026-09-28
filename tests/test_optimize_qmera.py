@@ -18,7 +18,6 @@ from pepsy.optimizers.qmera import (
     QMeraLightconeGroup,
     QMeraLightconeTN,
     QMeraSchematicBlock,
-    QMeraParametricEnergyOptimizer,
     QMeraParametricLightconeChunk,
     QMeraPairSpec,
     QMeraPrototypeLayout,
@@ -2764,9 +2763,7 @@ def test_qmera_parametric_optimizer_runs_compiled_torch_solver():
         compiled=True,
     )
 
-    assert isinstance(opt, QMeraParametricEnergyOptimizer)
     assert isinstance(opt, QMeraEnergyOptimizer)
-    assert QMeraEnergyOptimizer is QMeraParametricEnergyOptimizer
     assert opt.loss_kwargs["normalized"] is False
     assert np.isfinite(float(initial))
     assert result.solver == "torch-adam"

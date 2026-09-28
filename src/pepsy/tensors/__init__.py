@@ -64,7 +64,6 @@ _register(
     "fermion_interaction_param_gen",
     "Fermion",
     "SpinfulFermion",
-    "SpinfulFermionHubbard",
     "SymmFermions",
 )
 _register(
@@ -78,7 +77,6 @@ _register(
     "hrs_to_ttn",
     "hrps_to_mps",
     "hrps_to_peps",
-    "hrps_to_ttn",
     "id_to_mpo",
     "id_to_pepo",
     "ps_to_3dpeps",
@@ -108,36 +106,6 @@ _register(
 _register(".mps_transfer", "MpsTransferSpectrum", "mps_transfer_spectrum", "mps_correlation_length")
 _register(".conversions", "mps_to_ttn", "mps_to_treepeps")
 _register(".validation", "validate_tensor_network_tags")
-_register(
-    "..backends.config",
-    "backend_cupy",
-    "backend_jax",
-    "backend_numpy",
-    "backend_torch",
-    "build_backend",
-    "get_default_array_backend",
-    "get_default_grad_backend",
-    "get_torch_linalg_config",
-    "register_jax_linalg",
-    "register_torch_linalg",
-    "reset_linalg_registrations",
-    "reset_default_backends",
-    "set_default_array_backend",
-    "set_default_grad_backend",
-    "reg_complex_qr_torch",
-    "reg_native_svd_jax",
-    "reg_native_svd_torch",
-    "reg_complex_svd_jax",
-    "reg_complex_svd_torch",
-    "reg_real_qr_torch",
-    "reg_real_svd_jax",
-    "reg_real_svd_torch",
-    "reg_rel_svd_jax",
-    "reg_rel_svd_torch",
-    "reg_stop_gradient_torch",
-    "stop_grad",
-    "TorchLinalgConfig",
-)
 
 _SUBMODULES = (
     "constructors",
@@ -152,33 +120,10 @@ _SUBMODULES = (
     "core",
 )
 
-_BACKEND_COMPATIBILITY_ALIASES = frozenset(
-    {
-        "backend_cupy",
-        "backend_jax",
-        "backend_numpy",
-        "backend_torch",
-        "build_backend",
-        "get_default_array_backend",
-        "get_default_grad_backend",
-        "get_torch_linalg_config",
-        "register_jax_linalg",
-        "register_torch_linalg",
-        "reset_default_backends",
-        "reset_linalg_registrations",
-        "set_default_array_backend",
-        "set_default_grad_backend",
-        "TorchLinalgConfig",
-    }
-)
-
 _DEPRECATED_ALIASES = {
-    **{name: f"pepsy.backends.{name}" for name in _BACKEND_COMPATIBILITY_ALIASES},
     "build_contraction": "pepsy.tensors.build_optimizer",
-    "SpinfulFermionHubbard": "pepsy.tensors.SpinfulFermion",
     "hrps_to_mps": "pepsy.tensors.hrs_to_mps",
     "hrps_to_peps": "pepsy.tensors.hrs_to_peps",
-    "hrps_to_ttn": "pepsy.tensors.hrs_to_ttn",
 }
 
 __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
