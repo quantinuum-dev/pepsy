@@ -17,7 +17,9 @@ python -m ruff check src tests
 ```
 
 The default test command runs the small `smoke` selection. It does not run
-every core or domain test.
+every core or domain test. Backend-specific numerical checks run in the
+optional/full suite; smoke still checks the public API, import boundaries, and
+package layout without loading that backend matrix.
 
 ## Choose a test scope
 
@@ -84,8 +86,8 @@ on the base dependency profile.
 The [nightly workflow](.github/workflows/nightly.yml) runs the full collection
 with `.[test-extended,contraction,vmc]` and a **60% whole-package coverage gate**.
 It checks backend imports first and stops on the first failure. A second job
-runs MPI unit tests, then integration and benchmark smoke tests with two and
-three ranks, sharing one installation. Full tests have a 90-minute timeout;
+runs MPI unit tests, then integration tests with two and three ranks,
+sharing one installation. Full tests have a 90-minute timeout;
 MPI has ten minutes.
 
 The nightly schedule is **03:30 UTC** on the repository's default branch.

@@ -57,3 +57,33 @@
 - `python -m ruff check src tests` passed before the test-only fix; focused Ruff
   on the corrected test and `git diff --check` passed afterward.
 - Commit status: follow-up test correction ready to commit on `develop`; no push.
+
+## Test-tier follow-up
+
+- Kept all backend and domain regressions in the optional/nightly collection,
+  but removed the 69-test backend matrix from the default smoke selection.
+  The backend tests remain in the broader `core` and `optional` marker tiers.
+- Updated the smoke-test guidance in `CONTRIBUTING.md` to make this boundary
+  explicit.
+- The corrected full-suite rerun completed: **5,164 passed, 129 skipped** in
+  13m08s. The earlier 1-failure/not-rerun statements above describe the state
+  before this successful rerun.
+
+## Final review before publication
+
+- Scope: the user approved reviewing and committing the remaining test-tier
+  changes, running smoke tests, and pushing `develop`.
+- Baseline: `ec6fd1b`, which includes the separately validated MPS refactor
+  recorded in [its handoff](2026-09-28-mps-execution-extraction.md).
+- Corrected the README's obsolete documentation-builder link and the
+  contributing guide's stale claim that the MPI job runs benchmark smoke tests.
+- Fresh default smoke run: **89 passed, 2 deprecation warnings** in **26.91s**.
+- Full collection: **5,297 tests**. All **69 backend tests** remain collected
+  under both `core` and `optional`; nightly clears default `addopts` and retains
+  the complete collection, including slow tests. This was a collection check,
+  not another full-suite execution.
+- Ruff, the two CI mypy targets, the skill catalog, and `git diff --check`
+  passed. Routine CI still installs only base dependencies and check tools.
+- These test-tier and documentation changes are included in the commit
+  containing this update. Publication is authorized; hosted CI results must
+  be checked after the push and are not established by these local checks.

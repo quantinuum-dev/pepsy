@@ -60,6 +60,5 @@ Prefer imports from the owning namespace, such as `pepsy.tensors` or
 `pepsy.optimizers`. The top-level `pepsy` aliases remain available for
 compatibility.
 
-Documentation lives in [docs/](docs/index.md). See the
-[build instructions](docs/installation.md#build-the-documentation) for a
-searchable HTML site with generated API pages.
+Documentation lives in [docs/](docs/index.md) as linked Markdown pages;
+reading it requires no documentation builder or extra packages.

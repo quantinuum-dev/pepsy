@@ -46,7 +46,6 @@ if str(SRC) not in sys.path:
 # ``pytest -o addopts=''`` when an extended validation pass is needed.
 _SMOKE_MODULES = frozenset(
     {
-        "test_backends.py",
         "test_contraction_dependencies.py",
         "test_import_boundaries.py",
         "test_package_layout.py",
@@ -79,6 +78,9 @@ _INTEGRATION_MODULES = frozenset(
 _CORE_MODULES = frozenset(
     {
         *_SMOKE_MODULES,
+        # Keep the optional-backend contract tests in the broader core tier,
+        # while leaving their numerical matrix out of routine smoke runs.
+        "test_backends.py",
         "test_energy_tree.py",
         "test_factorized_pair_mpo.py",
         "test_gate.py",
