@@ -4299,6 +4299,102 @@ def _contract_open_scalar_cluster(
     return value, normalization
 
 
+def _contract_open_scalar_baseline(
+    bp, gate, kix, tids, inner_bonds, where_key, fermionic_q, *,
+    info, optimize, contract_opts, path_cache, max_flops_log10,
+    max_peak_memory_log2, compressed_corridor_opts,
+):
+    """Contract the unexcited norm and gate; neither may be omitted by a budget."""
+    base_key = (where_key, tuple(kix), tids, inner_bonds, fermionic_q)
+    base_norm_path_key = (
+        "base-norm",
+        where_key,
+        tuple(sorted(tids, key=repr)),
+        tuple(sorted(inner_bonds, key=repr)),
+        fermionic_q,
+    )
+    base_cache = (
+        {} if info is None else info.setdefault("open_scalar_base_terms", {})
+    )
+    try:
+        base_norm = base_cache[base_key]
+    except KeyError:
+        base_network = _get_d2_edge_partial_trace_excited(
+            bp,
+            tids,
+            exclude=inner_bonds,
+            projector_layout=(
+                "open" if _uses_symmray(bp.tn) else "series"
+            ),
+            fermionic_q=fermionic_q,
+            index_namespace=("open-scalar", *base_norm_path_key),
+        )
+        accepted, base_norm, base_cost = _contract_with_cost_limits(
+            base_network,
+            optimize=optimize,
+            contract_opts=contract_opts,
+            max_flops_log10=max_flops_log10,
+            max_peak_memory_log2=max_peak_memory_log2,
+            path_cache=path_cache,
+            path_cache_key=base_norm_path_key,
+            compress_opts=compressed_corridor_opts,
+        )
+        if not accepted:
+            raise ValueError(
+                "the unexcited open scalar configuration exceeds the "
+                "contraction cost limits: "
+                f"{base_cost!r}"
+            )
+        if info is not None:
+            base_cache[base_key] = base_norm
+
+    base_gate_network = _get_d2_edge_partial_trace_excited(
+        bp,
+        tids,
+        exclude=inner_bonds,
+        gate=gate,
+        gate_inds=kix,
+        projector_layout=(
+            "open" if _uses_symmray(bp.tn) else "series"
+        ),
+        gate_as_operator=True,
+        fermionic_q=fermionic_q,
+        index_namespace=(
+            "open-scalar",
+            "base-gate",
+            where_key,
+            tuple(sorted(tids, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)),
+            fermionic_q,
+        ),
+    )
+    base_gate_path_key = (
+        "base-gate",
+        where_key,
+        tuple(sorted(tids, key=repr)),
+        tuple(sorted(inner_bonds, key=repr)),
+        fermionic_q,
+    )
+    accepted, base_value, base_gate_cost = _contract_with_cost_limits(
+        base_gate_network,
+        optimize=optimize,
+        contract_opts=contract_opts,
+        max_flops_log10=max_flops_log10,
+        max_peak_memory_log2=max_peak_memory_log2,
+        path_cache=path_cache,
+        path_cache_key=base_gate_path_key,
+        compress_opts=compressed_corridor_opts,
+    )
+    if not accepted:
+        raise ValueError(
+            "the unexcited open scalar gate configuration exceeds the "
+            "contraction cost limits: "
+            f"{base_gate_cost!r}"
+        )
+
+    return base_norm, base_value
+
+
 def _contract_open_scalar_edges(
     bp,
     where,
@@ -4536,92 +4632,13 @@ def _contract_open_scalar_edges(
         kind="open_scalar",
     )
 
-    base_key = (where_key, tuple(kix), tids, inner_bonds, fermionic_q)
-    base_norm_path_key = (
-        "base-norm",
-        where_key,
-        tuple(sorted(tids, key=repr)),
-        tuple(sorted(inner_bonds, key=repr)),
-        fermionic_q,
-    )
-    base_cache = (
-        {} if info is None else info.setdefault("open_scalar_base_terms", {})
-    )
-    try:
-        base_norm = base_cache[base_key]
-    except KeyError:
-        base_network = _get_d2_edge_partial_trace_excited(
-            bp,
-            tids,
-            exclude=inner_bonds,
-            projector_layout=(
-                "open" if _uses_symmray(bp.tn) else "series"
-            ),
-            fermionic_q=fermionic_q,
-            index_namespace=("open-scalar", *base_norm_path_key),
-        )
-        accepted, base_norm, base_cost = _contract_with_cost_limits(
-            base_network,
-            optimize=optimize,
-            contract_opts=contract_opts,
-            max_flops_log10=max_flops_log10,
-            max_peak_memory_log2=max_peak_memory_log2,
-            path_cache=path_cache,
-            path_cache_key=base_norm_path_key,
-            compress_opts=compressed_corridor_opts,
-        )
-        if not accepted:
-            raise ValueError(
-                "the unexcited open scalar configuration exceeds the "
-                "contraction cost limits: "
-                f"{base_cost!r}"
-            )
-        if info is not None:
-            base_cache[base_key] = base_norm
-
-    base_gate_network = _get_d2_edge_partial_trace_excited(
-        bp,
-        tids,
-        exclude=inner_bonds,
-        gate=gate,
-        gate_inds=kix,
-        projector_layout=(
-            "open" if _uses_symmray(bp.tn) else "series"
-        ),
-        gate_as_operator=True,
-        fermionic_q=fermionic_q,
-        index_namespace=(
-            "open-scalar",
-            "base-gate",
-            where_key,
-            tuple(sorted(tids, key=repr)),
-            tuple(sorted(inner_bonds, key=repr)),
-            fermionic_q,
-        ),
-    )
-    base_gate_path_key = (
-        "base-gate",
-        where_key,
-        tuple(sorted(tids, key=repr)),
-        tuple(sorted(inner_bonds, key=repr)),
-        fermionic_q,
-    )
-    accepted, base_value, base_gate_cost = _contract_with_cost_limits(
-        base_gate_network,
-        optimize=optimize,
-        contract_opts=contract_opts,
-        max_flops_log10=max_flops_log10,
+    base_norm, base_value = _contract_open_scalar_baseline(
+        bp, gate, kix, tids, inner_bonds, where_key, fermionic_q,
+        info=info, optimize=optimize, contract_opts=contract_opts,
+        path_cache=path_cache, max_flops_log10=max_flops_log10,
         max_peak_memory_log2=max_peak_memory_log2,
-        path_cache=path_cache,
-        path_cache_key=base_gate_path_key,
-        compress_opts=compressed_corridor_opts,
+        compressed_corridor_opts=compressed_corridor_opts,
     )
-    if not accepted:
-        raise ValueError(
-            "the unexcited open scalar gate configuration exceeds the "
-            "contraction cost limits: "
-            f"{base_gate_cost!r}"
-        )
 
     norm = base_norm + sum(norm_terms.values())
     raw_value = base_value + sum(gate_terms.values())

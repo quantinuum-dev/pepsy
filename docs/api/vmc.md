@@ -632,7 +632,24 @@ environments and unchanged tensor data. The cache is keyed by the parent and
 target configurations and automatically invalidated when torch PEPS leaves
 change. The optional VMC profile exposes `num_groups`,
 `num_compiled_groups`, `num_compiled_connections`, `num_strip_cache_hits`, and
-`num_strip_builds` alongside reuse/fallback counts:
+`num_strip_builds` alongside reuse/fallback counts.
+
+Recovered boundary-reuse exceptions are available in
+`model.last_connected_reuse_stats["fallback_errors"]`; proposal retries use
+`model.last_proposal_cache_stats["fallback_errors"]`. Each record contains a
+`stage` and an `error` string with the exception type and message. Each call
+keeps at most eight records, with at most 400 characters per error, and
+`num_fallback_errors` counts all recovered exceptions. A clean call resets
+these per-call records. Counts include failed attempts recovered by another
+axis, so they differ from `num_fallback`, which describes the existing
+route-specific fallback counter. Opt-in accumulated profiles sum the error
+count; detailed strings are available on the model for the latest call.
+
+Sparse cutoff retries also retain their latest reason in
+`model.cutoff_fallback_error`, alongside the cumulative `cutoff_fallbacks`.
+Diagnostics store strings rather than exceptions, keeping autograd graphs
+and traceback frames out of the retained records. They do not change retry
+choices, truncation settings, or propagation of a failed final contraction.
 
 ```python
 model = pvmc.TorchPEPSBoundaryAmplitude(

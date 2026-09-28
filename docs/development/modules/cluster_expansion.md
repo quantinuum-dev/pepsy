@@ -29,6 +29,12 @@ Their order matters: plaquette and generic residuals subtract the lower-order
 blocks already assembled. `_build_report` owns the residual/rank/storage
 summary, and `build()` updates `last_report` before optional materialization.
 
+Within generic higher orders, `_fit_generic_cluster_residual` owns method
+selection, deterministic fit seeds, the adaptive rank schedule, warm starts,
+and the local stopping criterion. The assembly loop still snapshots the
+complete lower-order operator before computing that order's residuals and
+owns sector allocation and block insertion.
+
 Square `ActivePEPOBlocks.to_trace_network()` traces each physical block before
 dense site allocation and returns an unnormalized bosonic `TensorNetwork2D`.
 Located exact Pauli trees certify their identity-subtree sectors through

@@ -45,6 +45,42 @@ __all__ = [
 ]
 
 
+def _connected_reuse_stats(**counts):
+    """Use one counter schema for empty, full, batched and reused evaluations."""
+    stats = {
+        "num_requests": 0,
+        "num_diagonal": 0,
+        "num_reused": 0,
+        "num_batched": 0,
+        "num_parallel": 0,
+        "num_groups": 0,
+        "num_grouped_connections": 0,
+        "num_compiled_groups": 0,
+        "num_compiled_connections": 0,
+        "num_environment_compiled": 0,
+        "num_environment_cache_hits": 0,
+        "num_environment_builds": 0,
+        "num_strip_cache_hits": 0,
+        "num_strip_builds": 0,
+        "num_alternative_axis_reused": 0,
+        "num_fallback": 0,
+        "num_fallback_errors": 0,
+        "fallback_errors": [],
+    }
+    stats.update(counts)
+    return stats
+
+
+def _record_boundary_fallback(stats, stage, error):
+    """Keep bounded diagnostics without retaining exception tracebacks or tensors."""
+    if stats is None:
+        return
+    stats["num_fallback_errors"] += 1
+    if len(stats["fallback_errors"]) < 8:
+        message = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+        stats["fallback_errors"].append({"stage": stage, "error": message[:400]})
+
+
 def _as_torch_scalar(value, reference):
     torch = _require_torch()
     if isinstance(value, torch.Tensor):
@@ -387,6 +423,7 @@ class TorchPEPSAmplitude:
             raise ValueError(f"site_order contains site(s) not in PEPS: {missing!r}")
         self.site_inds = tuple(tn.site_ind(site) for site in self.sites)
         self.cutoff_fallbacks = 0
+        self.cutoff_fallback_error = None
         # Count outer CTMRG contractions, not the internal CTMRG iterations
         # performed by Quimb. This is useful for estimating the cost of a
         # stored-sample replay.
@@ -922,9 +959,10 @@ class TorchPEPSAmplitude:
 
         try:
             return finish(fn(*args, **kwargs))
-        except Exception:  # pragma: no cover - exact upstream exception varies
+        except Exception as exc:  # exact upstream exception varies
             if not self.symmray_tensor_ids or self.cutoff <= 0.0:
                 raise
+            self.cutoff_fallback_error = f"{type(exc).__name__}: {exc}"[:400]
             retry_kwargs = dict(kwargs)
             retry_kwargs["cutoff"] = 0.0
             compress_opts = retry_kwargs.get("compress_opts")
@@ -1883,6 +1921,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         target_configs,
         *,
         log=False,
+        fallback_stats=None,
     ):
         """Evaluate proposal rows through compiled geometry classes."""
         torch = _require_torch()
@@ -1948,7 +1987,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                         indices,
                         log=log,
                     )
-                except Exception:  # pragma: no cover - backend-specific fallback
+                except Exception as exc:  # backend-specific fallback
+                    _record_boundary_fallback(fallback_stats, "compiled_proposal", exc)
                     result = None
                 if result is None:
                     continue
@@ -2434,6 +2474,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         parent_config,
         target_config,
         reference,
+        *,
+        fallback_stats=None,
     ):
         """Evaluate one local proposal using the parent's cached boundaries."""
         if self._boundary_geometry is None:
@@ -2471,7 +2513,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                     envs,
                     reference,
                 )
-            except Exception:  # pragma: no cover - upstream exceptions vary
+            except Exception as exc:  # upstream exceptions vary
+                _record_boundary_fallback(fallback_stats, "proposal_window", exc)
                 continue
             if reused:
                 num_environment_hits += 1
@@ -2532,6 +2575,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             raise ValueError(
                 "current_amplitudes must have one value per proposal."
             )
+        self.last_proposal_cache_stats = None
         if self.contraction != "boundary" or self._boundary_geometry is None:
             return _call_amplitude_fn(
                 self,
@@ -2543,6 +2587,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         out = current_amplitudes.clone()
         stats = {
             "num_requests": int(parent_configs.shape[0]),
+            "num_fallback_errors": 0,
+            "fallback_errors": [],
             "num_vmapped": 0,
             "num_vmap_fallback": 0,
             "num_compiled_groups": 0,
@@ -2559,6 +2605,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         compiled_result = self._compiled_boundary_proposals(
             parent_configs[changed],
             target_configs[changed],
+            fallback_stats=stats,
         )
         if compiled_result is not None:
             compiled_values, compiled_handled, compiled_stats = compiled_result
@@ -2626,6 +2673,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                     parent_config,
                     target_config,
                     reference,
+                    fallback_stats=stats,
                 )
                 stats["num_environment_cache_hits"] += num_environment_hits
                 stats["num_environment_builds"] += num_environment_builds
@@ -2649,17 +2697,24 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         torch = _require_torch()
         parent_configs = _as_long_matrix(parent_configs)
         target_configs = _as_long_matrix(target_configs)
+        stats = {
+            "num_fallback_errors": 0,
+            "fallback_errors": [],
+        }
         compiled_result = self._compiled_boundary_proposals(
             parent_configs,
             target_configs,
             log=True,
+            fallback_stats=stats,
         )
         if compiled_result is None:
-            return super().proposal_log_amplitudes(
+            result = super().proposal_log_amplitudes(
                 parent_configs,
                 target_configs,
                 chunk_size=chunk_size,
             )
+            self.last_proposal_cache_stats = stats
+            return result
 
         (compiled_phase, compiled_log_abs), handled, _stats = compiled_result
         phases = torch.empty(
@@ -2683,6 +2738,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             )
             phases[unresolved] = fallback_phase
             log_abs[unresolved] = fallback_log_abs
+        stats.update(_stats)
+        self.last_proposal_cache_stats = stats
         return phases, log_abs
 
     def _infer_boundary_geometry(self, tn):
@@ -2906,204 +2963,11 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             reference,
         )
 
-    def connected_amplitudes(
-        self,
-        configs,
-        amplitudes,
-        connections,
-        *,
-        chunk_size=None,
-        reuse_diagonal=True,
+    def _reuse_compiled_connections(
+        self, configs, connections, compiled_groups, groups, out, stats,
     ):
-        """Evaluate target amplitudes while reusing parent boundary environments.
-
-        The input and return contract is the same as
-        :meth:`TorchPEPSAmplitude.connected_amplitudes`: parent ``configs``
-        have shape (n_samples, n_sites), ``amplitudes`` has shape (n_samples,),
-        and the returned tensor has one value per row of ``connections.configs``.
-        ``connections.batch_ids`` selects the parent of each target row.
-        Inputs must share the model's site order, physical encoding, and device;
-        parent amplitudes must match its current parameters and contraction
-        settings. The result contains raw amplitudes, without coefficients
-        or division by parent amplitudes.
-
-        ``reuse_diagonal=True`` reuses unchanged parent amplitudes. Other
-        targets use supported row/column environment reuse, batched evaluation,
-        or a full-amplitude fallback. ``chunk_size`` is forwarded to fallback
-        amplitude calls; compiled reuse uses its configured batch size.
-
-        This call updates internal caches and ``last_connected_reuse_stats``
-        and resets ``last_amplitude_cache_stats`` before evaluating targets.
-        Input tensors are not modified. Parameter version changes invalidate
-        cached environments. For a new autograd graph, clear the boundary
-        cache and recompute parent amplitudes; graph lifetime is not tracked
-        by the parameter-version cache key. Compiled boundary reuse and CPU
-        worker threads are used only with gradients disabled.
-
-        For measurement, evaluate both parents and targets inside
-        ``torch.no_grad()``. The contraction's existing ``chi`` and ``cutoff``
-        determine approximation accuracy; environment reuse retains them.
-        """
+        """Fill supported compiled groups and queue failed groups for eager reuse."""
         torch = _require_torch()
-        configs = _as_long_matrix(configs)
-        amplitudes = torch.as_tensor(amplitudes, device=configs.device)
-        # A previous parent/fallback amplitude call must not be mistaken for
-        # the cache statistics of this connected-target measurement.
-        self.last_amplitude_cache_stats = None
-        if connections.configs.numel() == 0:
-            self.last_connected_reuse_stats = {
-                "num_requests": 0,
-                "num_diagonal": 0,
-                "num_reused": 0,
-                "num_batched": 0,
-                "num_parallel": 0,
-                "num_groups": 0,
-                "num_grouped_connections": 0,
-                "num_compiled_groups": 0,
-                "num_compiled_connections": 0,
-                "num_environment_compiled": 0,
-                "num_strip_cache_hits": 0,
-                "num_strip_builds": 0,
-                "num_alternative_axis_reused": 0,
-                "num_fallback": 0,
-            }
-            return torch.empty(0, dtype=amplitudes.dtype, device=configs.device)
-
-        if self.contraction != "boundary" or self._boundary_geometry is None:
-            num_diagonal = (
-                int(_diagonal_connection_mask(configs, connections).sum().item())
-                if reuse_diagonal
-                else 0
-            )
-            result = super().connected_amplitudes(
-                configs,
-                amplitudes,
-                connections,
-                chunk_size=chunk_size,
-                reuse_diagonal=reuse_diagonal,
-            )
-            self.last_connected_reuse_stats = {
-                "num_requests": int(connections.configs.shape[0]),
-                "num_diagonal": num_diagonal,
-                "num_reused": 0,
-                "num_batched": 0,
-                "num_parallel": 0,
-                "num_groups": 0,
-                "num_grouped_connections": 0,
-                "num_compiled_groups": 0,
-                "num_compiled_connections": 0,
-                "num_environment_compiled": 0,
-                "num_strip_cache_hits": 0,
-                "num_strip_builds": 0,
-                "num_alternative_axis_reused": 0,
-                "num_fallback": int(connections.configs.shape[0]) - num_diagonal,
-            }
-            return result
-
-        diag = (
-            _diagonal_connection_mask(configs, connections)
-            if reuse_diagonal
-            else torch.zeros(
-                connections.configs.shape[0],
-                dtype=torch.bool,
-                device=configs.device,
-            )
-        )
-        offdiag = (~diag).nonzero(as_tuple=True)[0]
-        if (
-            self.amplitude_batching != "serial"
-            and self._connection_vmap_enabled
-            and offdiag.numel() >= _BOUNDARY_VMAP_CONNECTION_THRESHOLD
-        ):
-            previous_vmap_state = self._vmap_forward_enabled
-            self._vmap_forward_enabled = True
-            try:
-                result = super().connected_amplitudes(
-                    configs,
-                    amplitudes,
-                    connections,
-                    chunk_size=chunk_size,
-                    reuse_diagonal=reuse_diagonal,
-                )
-            finally:
-                self._vmap_forward_enabled = previous_vmap_state
-            self.last_connected_reuse_stats = {
-                "num_requests": int(connections.configs.shape[0]),
-                "num_diagonal": int(diag.sum().item()),
-                "num_reused": 0,
-                "num_batched": int(offdiag.numel()),
-                "num_parallel": 0,
-                "num_groups": 0,
-                "num_grouped_connections": 0,
-                "num_strip_cache_hits": 0,
-                "num_strip_builds": 0,
-                "num_alternative_axis_reused": 0,
-                "num_fallback": 0,
-            }
-            return result
-
-        out = torch.empty(
-            connections.configs.shape[0],
-            dtype=amplitudes.dtype,
-            device=configs.device,
-        )
-        if bool(torch.any(diag)):
-            out[diag] = amplitudes[connections.batch_ids[diag]]
-
-        self._ensure_boundary_cache_current()
-        tn = self._unpack_tn()
-        reference = self._reference_tensor()
-        stats = {
-            "num_requests": int(connections.configs.shape[0]),
-            "num_diagonal": int(diag.sum().item()),
-            "num_reused": 0,
-            "num_batched": 0,
-            "num_parallel": 0,
-            "num_groups": 0,
-            "num_grouped_connections": 0,
-            "num_compiled_groups": 0,
-            "num_compiled_connections": 0,
-            "num_environment_compiled": 0,
-            "num_environment_cache_hits": 0,
-            "num_environment_builds": 0,
-            "num_strip_cache_hits": 0,
-            "num_strip_builds": 0,
-            "num_alternative_axis_reused": 0,
-            "num_fallback": 0,
-        }
-
-        # Group by the first/cheapest boundary strip. Compiled geometry
-        # classes are shared across parent walkers, matching the paper's
-        # batched reuse path. Unsupported or over-sized groups retain the
-        # parent-local eager reuse implementation below.
-        compiled_reuse = getattr(self, "_compiled_boundary_reuse", {})
-        groups = {}
-        compiled_groups = {}
-        fallback_indices = []
-        for conn_idx_tensor in offdiag:
-            conn_idx = int(conn_idx_tensor)
-            parent_idx = int(connections.batch_ids[conn_idx].item())
-            parent_config = configs[parent_idx]
-            target_config = connections.configs[conn_idx]
-            windows = self._changed_axis_windows(parent_config, target_config)
-            if not windows:
-                fallback_indices.append(conn_idx)
-                stats["num_fallback"] += 1
-                continue
-            axis, indices = windows[0]
-            reuse_key = (axis, indices)
-            if (
-                not torch.is_grad_enabled()
-                and reuse_key in compiled_reuse
-            ):
-                compiled_groups.setdefault(reuse_key, []).append(
-                    (conn_idx, parent_idx, windows)
-                )
-            else:
-                groups.setdefault((parent_idx, axis, indices), []).append(
-                    (conn_idx, windows)
-                )
-
         # A compiled environment builder is also fixed-shape. Populate the
         # ordinary cache first so both compiled reuse and eager fallback see
         # one consistent environment snapshot for this local-energy batch.
@@ -3112,7 +2976,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 stats["num_environment_compiled"] += (
                     self._populate_compiled_boundary_environments(configs, axis)
                 )
-            except Exception:  # pragma: no cover - backend-specific fallback
+            except Exception as exc:  # backend-specific fallback
+                _record_boundary_fallback(stats, "compiled_environment", exc)
                 continue
 
         # Dispatch each geometry class as one full-batch compiled call. A
@@ -3141,7 +3006,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                         axis,
                         indices,
                     )
-                except Exception:  # pragma: no cover - backend-specific fallback
+                except Exception as exc:  # backend-specific fallback
+                    _record_boundary_fallback(stats, "compiled_reuse", exc)
                     compiled_values = None
                 if compiled_values is None:
                     for conn_idx, parent_idx, windows in entries_chunk:
@@ -3158,6 +3024,62 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 stats["num_batched"] += len(entries_chunk)
                 stats["num_reused"] += len(entries_chunk)
 
+    def _connected_boundary_context(
+        self, tn, parent_idx, parent_config, axis, indices,
+        parent_tns, contexts, stats,
+    ):
+        """Build each parent/window context once, including failed attempts."""
+        cache_key = (parent_idx, axis, indices)
+        if cache_key in contexts:
+            return contexts[cache_key]
+        try:
+            parent_key = self._configuration_key(parent_config)
+            environment_key = (axis, parent_key)
+            strip_key = (axis, tuple(indices), parent_key)
+            envs = self._boundary_environment_cache.get(environment_key)
+            strip_tn = self._boundary_strip_cache.get(strip_key)
+            environment_reused = envs is not None
+            strip_reused = strip_tn is not None
+            if not (environment_reused and strip_reused):
+                parent_tn = parent_tns.get(parent_idx)
+                if parent_tn is None:
+                    parent_tn = self._select_config(tn, parent_config)
+                    parent_tns[parent_idx] = parent_tn
+                if not environment_reused:
+                    envs, environment_reused = (
+                        self._cached_boundary_environments(
+                            tn,
+                            parent_config,
+                            axis,
+                            parent_tn=parent_tn,
+                        )
+                    )
+                if not strip_reused:
+                    strip_tn, strip_reused = self._cached_boundary_strip(
+                        tn,
+                        parent_config,
+                        axis,
+                        indices,
+                        parent_tn=parent_tn,
+                    )
+        except Exception as exc:  # upstream exceptions vary
+            _record_boundary_fallback(stats, "context", exc)
+            contexts[cache_key] = None
+            return None
+        stats[
+            "num_environment_cache_hits" if environment_reused
+            else "num_environment_builds"
+        ] += 1
+        stats["num_strip_cache_hits" if strip_reused else "num_strip_builds"] += 1
+        contexts[cache_key] = (envs, strip_tn)
+        return contexts[cache_key]
+
+    def _reuse_eager_connections(
+        self, tn, reference, configs, connections, groups, out, stats,
+    ):
+        """Reuse parent strips; keep cache writes and alternative retries serial."""
+        torch = _require_torch()
+        fallback_indices = []
         stats["num_groups"] = len(groups)
         stats["num_grouped_connections"] = sum(
             len(entries) for entries in groups.values()
@@ -3166,49 +3088,10 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         contexts = {}
 
         def get_context(parent_idx, parent_config, axis, indices):
-            cache_key = (parent_idx, axis, indices)
-            if cache_key in contexts:
-                return contexts[cache_key]
-            try:
-                parent_key = self._configuration_key(parent_config)
-                environment_key = (axis, parent_key)
-                strip_key = (axis, tuple(indices), parent_key)
-                envs = self._boundary_environment_cache.get(environment_key)
-                strip_tn = self._boundary_strip_cache.get(strip_key)
-                environment_reused = envs is not None
-                strip_reused = strip_tn is not None
-                if not (environment_reused and strip_reused):
-                    parent_tn = parent_tns.get(parent_idx)
-                    if parent_tn is None:
-                        parent_tn = self._select_config(tn, parent_config)
-                        parent_tns[parent_idx] = parent_tn
-                    if not environment_reused:
-                        envs, environment_reused = (
-                            self._cached_boundary_environments(
-                                tn,
-                                parent_config,
-                                axis,
-                                parent_tn=parent_tn,
-                            )
-                        )
-                    if not strip_reused:
-                        strip_tn, strip_reused = self._cached_boundary_strip(
-                            tn,
-                            parent_config,
-                            axis,
-                            indices,
-                            parent_tn=parent_tn,
-                        )
-            except Exception:  # pragma: no cover - upstream exceptions vary
-                contexts[cache_key] = None
-                return None
-            stats[
-                "num_environment_cache_hits" if environment_reused
-                else "num_environment_builds"
-            ] += 1
-            stats["num_strip_cache_hits" if strip_reused else "num_strip_builds"] += 1
-            contexts[cache_key] = (envs, strip_tn)
-            return contexts[cache_key]
+            return self._connected_boundary_context(
+                tn, parent_idx, parent_config, axis, indices,
+                parent_tns, contexts, stats,
+            )
 
         # Build all primary contexts before dispatching work. This keeps cache
         # mutation and boundary-environment construction on the caller thread;
@@ -3253,9 +3136,9 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                     strip_tn,
                     reference,
                 )
-            except Exception:  # pragma: no cover - upstream exceptions vary
-                return job, None, False
-            return job, value, True
+            except Exception as exc:  # upstream exceptions vary
+                return job, None, f"{type(exc).__name__}: {exc}"[:400]
+            return job, value, None
 
         def contract_primary_no_grad(job):
             # Torch's grad mode is thread-local; explicitly carry the
@@ -3289,22 +3172,24 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                     contract_primary_no_grad,
                     primary_jobs,
                 )
-                for job, value, value_found in primary_results:
-                    if value_found:
+                for job, value, error in primary_results:
+                    if error is None:
                         conn_idx = job[0]
                         out[conn_idx] = value
                         stats["num_reused"] += 1
                     else:
+                        _record_boundary_fallback(stats, "primary_window", error)
                         alternative_jobs.append(job)
             stats["num_parallel"] = len(primary_jobs)
         else:
             for job in primary_jobs:
-                job, value, value_found = contract_primary(job)
-                if value_found:
+                job, value, error = contract_primary(job)
+                if error is None:
                     conn_idx = job[0]
                     out[conn_idx] = value
                     stats["num_reused"] += 1
                 else:
+                    _record_boundary_fallback(stats, "primary_window", error)
                     alternative_jobs.append(job)
 
         # Alternative-axis retries stay serial because they may create new
@@ -3335,7 +3220,8 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                         strip_tn,
                         reference,
                     )
-                except Exception:  # pragma: no cover - upstream exceptions vary
+                except Exception as exc:  # upstream exceptions vary
+                    _record_boundary_fallback(stats, "alternative_window", exc)
                     continue
                 value_found = True
                 stats["num_reused"] += 1
@@ -3345,6 +3231,169 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             if not value_found:
                 fallback_indices.append(conn_idx)
                 stats["num_fallback"] += 1
+
+        return fallback_indices
+
+    def connected_amplitudes(
+        self,
+        configs,
+        amplitudes,
+        connections,
+        *,
+        chunk_size=None,
+        reuse_diagonal=True,
+    ):
+        """Evaluate target amplitudes while reusing parent boundary environments.
+
+        The input and return contract is the same as
+        :meth:`TorchPEPSAmplitude.connected_amplitudes`: parent ``configs``
+        have shape (n_samples, n_sites), ``amplitudes`` has shape (n_samples,),
+        and the returned tensor has one value per row of ``connections.configs``.
+        ``connections.batch_ids`` selects the parent of each target row.
+        Inputs must share the model's site order, physical encoding, and device;
+        parent amplitudes must match its current parameters and contraction
+        settings. The result contains raw amplitudes, without coefficients
+        or division by parent amplitudes.
+
+        ``reuse_diagonal=True`` reuses unchanged parent amplitudes. Other
+        targets use supported row/column environment reuse, batched evaluation,
+        or a full-amplitude fallback. ``chunk_size`` is forwarded to fallback
+        amplitude calls; compiled reuse uses its configured batch size.
+
+        This call updates internal caches and ``last_connected_reuse_stats``
+        and resets ``last_amplitude_cache_stats`` before evaluating targets.
+        Recovered exceptions increment ``num_fallback_errors`` and retain at
+        most eight stage/error strings in ``fallback_errors`` (400 characters
+        per error). These records never retain exceptions or autograd graphs.
+        Input tensors are not modified. Parameter version changes invalidate
+        cached environments. For a new autograd graph, clear the boundary
+        cache and recompute parent amplitudes; graph lifetime is not tracked
+        by the parameter-version cache key. Compiled boundary reuse and CPU
+        worker threads are used only with gradients disabled.
+
+        For measurement, evaluate both parents and targets inside
+        ``torch.no_grad()``. The contraction's existing ``chi`` and ``cutoff``
+        determine approximation accuracy; environment reuse retains them.
+        """
+        torch = _require_torch()
+        configs = _as_long_matrix(configs)
+        amplitudes = torch.as_tensor(amplitudes, device=configs.device)
+        # A previous parent/fallback amplitude call must not be mistaken for
+        # the cache statistics of this connected-target measurement.
+        self.last_amplitude_cache_stats = None
+        if connections.configs.numel() == 0:
+            self.last_connected_reuse_stats = _connected_reuse_stats()
+            return torch.empty(0, dtype=amplitudes.dtype, device=configs.device)
+
+        if self.contraction != "boundary" or self._boundary_geometry is None:
+            num_diagonal = (
+                int(_diagonal_connection_mask(configs, connections).sum().item())
+                if reuse_diagonal
+                else 0
+            )
+            result = super().connected_amplitudes(
+                configs,
+                amplitudes,
+                connections,
+                chunk_size=chunk_size,
+                reuse_diagonal=reuse_diagonal,
+            )
+            self.last_connected_reuse_stats = _connected_reuse_stats(
+                num_requests=int(connections.configs.shape[0]),
+                num_diagonal=num_diagonal,
+                num_fallback=int(connections.configs.shape[0]) - num_diagonal,
+            )
+            return result
+
+        diag = (
+            _diagonal_connection_mask(configs, connections)
+            if reuse_diagonal
+            else torch.zeros(
+                connections.configs.shape[0],
+                dtype=torch.bool,
+                device=configs.device,
+            )
+        )
+        offdiag = (~diag).nonzero(as_tuple=True)[0]
+        if (
+            self.amplitude_batching != "serial"
+            and self._connection_vmap_enabled
+            and offdiag.numel() >= _BOUNDARY_VMAP_CONNECTION_THRESHOLD
+        ):
+            previous_vmap_state = self._vmap_forward_enabled
+            self._vmap_forward_enabled = True
+            try:
+                result = super().connected_amplitudes(
+                    configs,
+                    amplitudes,
+                    connections,
+                    chunk_size=chunk_size,
+                    reuse_diagonal=reuse_diagonal,
+                )
+            finally:
+                self._vmap_forward_enabled = previous_vmap_state
+            self.last_connected_reuse_stats = _connected_reuse_stats(
+                num_requests=int(connections.configs.shape[0]),
+                num_diagonal=int(diag.sum().item()),
+                num_batched=int(offdiag.numel()),
+            )
+            return result
+
+        out = torch.empty(
+            connections.configs.shape[0],
+            dtype=amplitudes.dtype,
+            device=configs.device,
+        )
+        if bool(torch.any(diag)):
+            out[diag] = amplitudes[connections.batch_ids[diag]]
+
+        self._ensure_boundary_cache_current()
+        tn = self._unpack_tn()
+        reference = self._reference_tensor()
+        stats = _connected_reuse_stats(
+            num_requests=int(connections.configs.shape[0]),
+            num_diagonal=int(diag.sum().item()),
+        )
+
+        # Group by the first/cheapest boundary strip. Compiled geometry
+        # classes are shared across parent walkers, matching the paper's
+        # batched reuse path. Unsupported or over-sized groups retain the
+        # parent-local eager reuse implementation below.
+        compiled_reuse = getattr(self, "_compiled_boundary_reuse", {})
+        groups = {}
+        compiled_groups = {}
+        fallback_indices = []
+        for conn_idx_tensor in offdiag:
+            conn_idx = int(conn_idx_tensor)
+            parent_idx = int(connections.batch_ids[conn_idx].item())
+            parent_config = configs[parent_idx]
+            target_config = connections.configs[conn_idx]
+            windows = self._changed_axis_windows(parent_config, target_config)
+            if not windows:
+                fallback_indices.append(conn_idx)
+                stats["num_fallback"] += 1
+                continue
+            axis, indices = windows[0]
+            reuse_key = (axis, indices)
+            if (
+                not torch.is_grad_enabled()
+                and reuse_key in compiled_reuse
+            ):
+                compiled_groups.setdefault(reuse_key, []).append(
+                    (conn_idx, parent_idx, windows)
+                )
+            else:
+                groups.setdefault((parent_idx, axis, indices), []).append(
+                    (conn_idx, windows)
+                )
+
+        self._reuse_compiled_connections(
+            configs, connections, compiled_groups, groups, out, stats,
+        )
+
+        fallback_indices.extend(self._reuse_eager_connections(
+            tn, reference, configs, connections, groups, out, stats,
+        ))
 
         if fallback_indices:
             fallback_indices = torch.as_tensor(

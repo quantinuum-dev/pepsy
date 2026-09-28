@@ -22,6 +22,10 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Torch boundary VMC exposes bounded stage/error records for recovered
+  connected-amplitude and proposal retries, plus the latest sparse-cutoff
+  retry reason. Numerical retry policies remain unchanged.
+
 - Boundary PepsSampler now defaults to FIT-style factored numerical row
   environments with a 64 MiB estimated cache budget and independent auto-hq
   local contractions. Right suffixes are reused and left prefixes advance

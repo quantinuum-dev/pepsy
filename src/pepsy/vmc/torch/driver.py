@@ -94,6 +94,60 @@ def apply_torch_sr_update(*args, **kwargs):
     return updater(*args, **kwargs)
 
 
+def _make_observable_estimates(
+    observable_items,
+    *,
+    sample_configs,
+    sample_amplitudes,
+    local_values,
+    acceptance_rate,
+    n_proposed,
+    n_accepted,
+    n_measurements_result,
+    elapsed,
+    profile_data,
+):
+    """Assemble named estimates from shared samples and per-observable statistics."""
+    results = {}
+    n_actual = int(sample_configs.shape[0] * sample_configs.shape[1])
+    for name, _ in observable_items:
+        values = local_values[name]
+        (
+            observable_mean,
+            observable_variance,
+            observable_stderr,
+            observable_stderr_naive,
+            effective_sample_size,
+            chain_diagnostics,
+        ) = _observable_statistics(values)
+        result_profile = None
+        if profile_data is not None:
+            result_profile = dict(profile_data)
+            result_profile["observable"] = name
+        results[name] = TorchVMCEnergyEstimate(
+            configs=sample_configs,
+            amplitudes=sample_amplitudes,
+            local_energies=values,
+            energy_mean=observable_mean,
+            energy_variance=observable_variance,
+            energy_stderr=observable_stderr,
+            acceptance_rate=acceptance_rate,
+            n_proposed=n_proposed,
+            n_accepted=n_accepted,
+            n_samples=n_actual,
+            n_measurements=n_measurements_result,
+            elapsed_seconds=elapsed,
+            samples_per_second=(
+                n_actual / elapsed if elapsed > 0 else float("inf")
+            ),
+            chain_diagnostics=chain_diagnostics,
+            profile=result_profile,
+            energy_stderr_naive=observable_stderr_naive,
+            effective_sample_size=effective_sample_size,
+        )
+    return results
+
+
 class TorchVMCDriver:
     """Small PyTorch-native VMC loop around Pepsy's torch kernels.
 
@@ -2246,57 +2300,6 @@ class TorchVMCDriver:
                 for name, terms in observable_items
             }
 
-        def make_results(
-            *,
-            sample_configs,
-            sample_amplitudes,
-            local_values,
-            acceptance_rate,
-            n_proposed,
-            n_accepted,
-            n_measurements_result,
-            elapsed,
-            profile_data,
-        ):
-            results = {}
-            n_actual = int(sample_configs.shape[0] * sample_configs.shape[1])
-            for name, _ in observable_items:
-                values = local_values[name]
-                (
-                    observable_mean,
-                    observable_variance,
-                    observable_stderr,
-                    observable_stderr_naive,
-                    effective_sample_size,
-                    chain_diagnostics,
-                ) = _observable_statistics(values)
-                result_profile = None
-                if profile_data is not None:
-                    result_profile = dict(profile_data)
-                    result_profile["observable"] = name
-                results[name] = TorchVMCEnergyEstimate(
-                    configs=sample_configs,
-                    amplitudes=sample_amplitudes,
-                    local_energies=values,
-                    energy_mean=observable_mean,
-                    energy_variance=observable_variance,
-                    energy_stderr=observable_stderr,
-                    acceptance_rate=acceptance_rate,
-                    n_proposed=n_proposed,
-                    n_accepted=n_accepted,
-                    n_samples=n_actual,
-                    n_measurements=n_measurements_result,
-                    elapsed_seconds=elapsed,
-                    samples_per_second=(
-                        n_actual / elapsed if elapsed > 0 else float("inf")
-                    ),
-                    chain_diagnostics=chain_diagnostics,
-                    profile=result_profile,
-                    energy_stderr_naive=observable_stderr_naive,
-                    effective_sample_size=effective_sample_size,
-                )
-            return results
-
         modern_sampling = (
             sampling is not None
             or sampler is not None
@@ -2424,7 +2427,8 @@ class TorchVMCDriver:
                         ),
                         "cache": _cache_profile_snapshot(self.model),
                     }
-                result = make_results(
+                result = _make_observable_estimates(
+                    observable_items,
                     sample_configs=sample_configs,
                     sample_amplitudes=sample_amplitudes,
                     local_values=local_values,
@@ -2592,7 +2596,8 @@ class TorchVMCDriver:
             sample_amplitude_records,
             dim=0,
         )
-        return make_results(
+        return _make_observable_estimates(
+            observable_items,
             sample_configs=sample_configs,
             sample_amplitudes=sample_amplitudes,
             local_values=local_values,

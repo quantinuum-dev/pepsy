@@ -69,3 +69,15 @@ subclass adds cache and diagnostic mutation, fallback/chunking behavior, and
 the cache lifetime required when starting a new autograd graph. See the
 [connected-amplitude contract](../../api/vmc.md#connected-amplitude-contract)
 for a small measurement example.
+
+The boundary implementation separates compiled group dispatch
+(`_reuse_compiled_connections`), parent/window cache construction
+(`_connected_boundary_context`), and eager/alternative-axis evaluation
+(`_reuse_eager_connections`). Worker threads return values or bounded error
+strings; the caller writes caches, output rows, and diagnostics. The public
+method retains diagonal reuse, group selection, and final batched fallback.
+
+`estimate_observables` uses `_make_observable_estimates` for both modern and
+legacy sampling. This helper assembles result records using the existing
+statistics kernels, without changing sample axes, shared amplitudes, or
+adaptive stopping rules.

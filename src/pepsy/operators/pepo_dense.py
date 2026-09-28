@@ -4150,6 +4150,65 @@ def _contract_active_support_backend(active, sites, edges):
     return _backend_operator_from_tensor(value, len(sites), local_dim)
 
 
+def _fit_generic_cluster_residual(residual, variant, plan, physical_dim, cluster_order):
+    """Fit one residual with the configured rank schedule and optional warm starts."""
+    fit_method = (
+        "als"
+        if plan.fit_method == "als" or not variant.is_tree
+        else "tree"
+    )
+    fit_seed = plan.fit_seed
+    if fit_seed is not None:
+        fit_seed += cluster_order + sum(
+            (index + 1) * (x + 17 * y)
+            for index, (x, y) in enumerate(variant.sites)
+        )
+    rank_schedule = _quimb_loop_rank_schedule(
+        physical_dim,
+        max_loop_rank=plan.max_loop_rank,
+        max_tree_rank=plan.max_tree_rank,
+        adaptive=(
+            plan.adaptive_loop_rank
+            and fit_method == "als"
+            and not variant.is_tree
+        ),
+        loop_rank_start=plan.loop_rank_start,
+        loop_rank_step=plan.loop_rank_step,
+    )
+    fitted = None
+    warm_start = None
+    for loop_rank in rank_schedule:
+        candidate = _quimb_factorize_operator(
+            residual,
+            variant.edges,
+            variant.nsites,
+            physical_dim,
+            method=fit_method,
+            max_tree_rank=plan.max_tree_rank,
+            max_loop_rank=loop_rank,
+            fit_steps=plan.fit_steps,
+            fit_tol=plan.fit_tol,
+            fit_solver_maxiter=plan.fit_solver_maxiter,
+            fit_seed=fit_seed,
+            warm_start=warm_start
+            if plan.fit_warm_start
+            else None,
+        )
+        if candidate is None:
+            break
+        fitted = candidate
+        if plan.fit_warm_start:
+            warm_start = (candidate[0], candidate[1])
+        factorization_error, factorization_target = candidate[-2:]
+        if (
+            len(rank_schedule) == 1
+            or factorization_error
+            <= plan.fit_tol * max(factorization_target, np.finfo(float).eps)
+        ):
+            break
+    return fitted
+
+
 def _add_generic_cluster_levels(
     blocks,
     allocator,
@@ -4267,60 +4326,9 @@ def _add_generic_cluster_levels(
                     continue
 
                 if plan.fit_method is not None:
-                    fit_method = (
-                        "als"
-                        if plan.fit_method == "als" or not variant.is_tree
-                        else "tree"
+                    fitted = _fit_generic_cluster_residual(
+                        residual, variant, plan, one_site_exp.shape[0], cluster_order,
                     )
-                    fit_seed = plan.fit_seed
-                    if fit_seed is not None:
-                        fit_seed += cluster_order + sum(
-                            (index + 1) * (x + 17 * y)
-                            for index, (x, y) in enumerate(variant.sites)
-                        )
-                    rank_schedule = _quimb_loop_rank_schedule(
-                        one_site_exp.shape[0],
-                        max_loop_rank=plan.max_loop_rank,
-                        max_tree_rank=plan.max_tree_rank,
-                        adaptive=(
-                            plan.adaptive_loop_rank
-                            and fit_method == "als"
-                            and not variant.is_tree
-                        ),
-                        loop_rank_start=plan.loop_rank_start,
-                        loop_rank_step=plan.loop_rank_step,
-                    )
-                    fitted = None
-                    warm_start = None
-                    for loop_rank in rank_schedule:
-                        candidate = _quimb_factorize_operator(
-                            residual,
-                            variant.edges,
-                            variant.nsites,
-                            one_site_exp.shape[0],
-                            method=fit_method,
-                            max_tree_rank=plan.max_tree_rank,
-                            max_loop_rank=loop_rank,
-                            fit_steps=plan.fit_steps,
-                            fit_tol=plan.fit_tol,
-                            fit_solver_maxiter=plan.fit_solver_maxiter,
-                            fit_seed=fit_seed,
-                            warm_start=warm_start
-                            if plan.fit_warm_start
-                            else None,
-                        )
-                        if candidate is None:
-                            break
-                        fitted = candidate
-                        if plan.fit_warm_start:
-                            warm_start = (candidate[0], candidate[1])
-                        factorization_error, factorization_target = candidate[-2:]
-                        if (
-                            len(rank_schedule) == 1
-                            or factorization_error
-                            <= plan.fit_tol * max(factorization_target, np.finfo(float).eps)
-                        ):
-                            break
                     if fitted is None:
                         continue
                     (

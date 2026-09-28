@@ -64,6 +64,13 @@ retains the earlier focused evidence.
 
 ## Tracking future work
 
+The additional 2026-09-28 local maintenance batch extracts the generic dense
+residual fit from cluster assembly, retaining rank schedules, seeds, warm
+starts, and lower-order subtraction. The
+[maintenance handoff](../../history/2026-09-28-remaining-maintenance.md) records
+validation and publication for this follow-up; it does not extend the native
+fermion or derivative support described above.
+
 Keep API behavior in the owning guide, implementation ownership in module
 maps, derivations/benchmarks in dated notes, and session/publication events
 in history. Historical "no push" or "unfixed" statements retain their
