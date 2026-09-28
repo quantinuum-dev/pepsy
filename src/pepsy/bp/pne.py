@@ -100,6 +100,7 @@ class RecursivePNEExpansionResult:
 
     @property
     def messages(self):
+        """Expose the underlying BP message mapping without copying it."""
         return self.bp.messages
 
 

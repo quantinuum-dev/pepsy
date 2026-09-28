@@ -294,6 +294,14 @@ def compute_boundary_expectation(
     Parameters are forwarded to Quimb's PEPS boundary implementation.  The
     returned value is the sum of locally normalized terms unless
     ``return_all=True``.
+
+    Dense operators use output axes followed by input axes in the support's
+    site order: ``(d, d)`` for one site, or ``(d0*d1, d0*d1)`` / equivalently
+    ``(d0, d1, d0, d1)`` for two sites. Native fermionic operators must retain
+    their graded site/basis metadata. The input PEPS and operators are not
+    updated. Backend-native scalar values are returned; ``return_all=True``
+    returns a mapping with the original term keys. With ``normalized='return'``
+    that mapping instead holds ``(numerator, local_norm)`` pairs.
     """
     _validate_terms(terms)
     if not hasattr(tn, "compute_local_expectation"):
@@ -353,6 +361,13 @@ def compute_path_cluster_expectation(
     bonds with Symmray's graded squeeze operation before Quimb performs its
     QR/SVD truncations. Thus ``optimize`` accepts Quimb/Cotengra contraction
     paths for both exact and compressed native clusters.
+
+    Operator shapes and support ordering match :func:`compute_boundary_expectation`.
+    Work is performed on selected clusters; input tensors/operators and
+    supplied SU gauges are not updated. With Boolean ``normalized``, return
+    the sum of backend scalar expectations, or a term-keyed mapping when
+    ``return_all=True``. Finite clusters and finite ``max_bond`` are explicit
+    approximations; they need not match a full-network expectation.
     """
     _validate_terms(terms)
     if not hasattr(tn, "compute_local_expectation_cluster"):

@@ -5,7 +5,10 @@ import pytest
 import quimb.tensor as qtn
 
 import pepsy
-from pepsy._internal.quimb import quimb_ctmrg_projector_canonize_available
+from pepsy._internal.quimb import (
+    call_quimb_2d,
+    quimb_ctmrg_projector_canonize_available,
+)
 from pepsy.optimizers import sym_dmrg as sym_dmrg_mod
 from pepsy.operators import gate, gate_simple
 from pepsy.optimizers.sym_dmrg import (
@@ -4473,7 +4476,8 @@ def test_sympeps_measure_delegates_to_quimb_boundary_modes():
     z_op = np.diag([1.0, -1.0])
     z_sym = state.operator_from_dense(z_op)
 
-    direct_quimb = state.tn.compute_local_expectation(
+    direct_quimb = call_quimb_2d(
+        state.tn.compute_local_expectation,
         {(1, 1): z_sym},
         max_bond=8,
         normalized=True,
@@ -4507,7 +4511,8 @@ def test_sympeps_measure_delegates_to_quimb_boundary_modes():
 
     norm = state.tn.make_norm()
     exact_norm = norm.contract(all, optimize="auto-hq")
-    ctmrg_norm = norm.contract_ctmrg(
+    ctmrg_norm = call_quimb_2d(
+        norm.contract_ctmrg,
         max_bond=8,
         mode="projector",
         final_contract=True,

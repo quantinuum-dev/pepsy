@@ -53,7 +53,7 @@ def test_build_mpo_single_site_term_works_for_ly1():
     builder = py.ham_tn(Lx=2, Ly=1, data_type="complex128")
     z_op = quimb.pauli("Z", dtype="complex128")
 
-    mpo = builder.build_mpo(
+    mpo = builder.to_mpo(
         [
             ((z_op,), ((0, 0),)),
         ],
@@ -544,14 +544,14 @@ def test_build_mpo_accepts_mapper_override():
         ((z_op,), ((1, 1),), 0.5),
     ]
 
-    mpo_from_override = builder_default.build_mpo(
+    mpo_from_override = builder_default.to_mpo(
         ints,
         compress_each=False,
         mapper=mapper,
     )
 
     builder_row_major = py.ham_tn(Lx=2, Ly=2, data_type="complex128", mapper=mapper)
-    mpo_from_mapper_builder = builder_row_major.build_mpo(ints, compress_each=False)
+    mpo_from_mapper_builder = builder_row_major.to_mpo(ints, compress_each=False)
 
     assert mpo_from_override.L == 4
     assert np.allclose(mpo_from_override.to_dense(), mpo_from_mapper_builder.to_dense())
@@ -563,14 +563,14 @@ def test_build_mpo_accepts_location_first_pauli_terms():
     x_op = quimb.pauli("X", dtype="complex128")
     z_op = quimb.pauli("Z", dtype="complex128")
 
-    pauli_mpo = builder.build_mpo(
+    pauli_mpo = builder.to_mpo(
         [
             ((0,), "x", 0.5),
             (("zz", 1.2), (0, 1)),
         ],
         compress_each=False,
     )
-    matrix_mpo = builder.build_mpo(
+    matrix_mpo = builder.to_mpo(
         [
             ((x_op,), (0,), 0.5),
             ((z_op, z_op), (0, 1), 1.2),
@@ -588,14 +588,14 @@ def test_build_mpo_accepts_bare_2d_pauli_coordinate_with_mapper():
     x_op = quimb.pauli("X", dtype="complex128")
     z_op = quimb.pauli("Z", dtype="complex128")
 
-    pauli_mpo = builder.build_mpo(
+    pauli_mpo = builder.to_mpo(
         [
             ((0, 0), "X", 0.5),
             (("ZZ", 1.2), ((0, 0), (1, 0))),
         ],
         compress_each=False,
     )
-    matrix_mpo = builder.build_mpo(
+    matrix_mpo = builder.to_mpo(
         [
             ((x_op,), ((0, 0),), 0.5),
             ((z_op, z_op), ((0, 0), (1, 0)), 1.2),
@@ -618,7 +618,7 @@ def test_build_mpo_resolves_auto_cutoff_options(monkeypatch):
     monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
 
     builder = py.ham_tn(Lx=3, Ly=1, data_type="complex64")
-    builder.build_mpo(
+    builder.to_mpo(
         [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1))],
         cutoff="auto",
         cutoff_mode="auto",
@@ -642,7 +642,7 @@ def test_ham_builder_converts_generic_mpo_to_configured_backend():
     )
     assert builder.data_type == np.dtype("complex128")
 
-    mpo = builder.build_mpo(
+    mpo = builder.to_mpo(
         [((0,), "Y", 0.5), (("ZZ", 1.2), (0, 1))],
         chi=2,
         form="left",
@@ -667,7 +667,7 @@ def test_ham_builder_automaton_preserves_shared_structure_on_backend():
         for site in range(builder.L - 1)
     ]
 
-    mpo = builder.build_mpo(
+    mpo = builder.to_mpo(
         terms,
         mode="automaton",
         chi=4,
@@ -684,8 +684,8 @@ def test_build_mpo_automaton_mode_matches_term_mode():
     builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
     terms = [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1)), ((2,), "Y", -0.3)]
 
-    term_mpo = builder.build_mpo(terms, compress_each=False, cutoff=0.0)
-    automaton_mpo = builder.build_mpo(
+    term_mpo = builder.to_mpo(terms, compress_each=False, cutoff=0.0)
+    automaton_mpo = builder.to_mpo(
         terms,
         mode="automaton",
         compress_each=False,
@@ -704,8 +704,8 @@ def test_build_mpo_automaton_coalesces_duplicate_product_terms():
         ((0, 3), "ZZ", 0.8),
     ]
 
-    term_mpo = builder.build_mpo(terms, compress_each=False, cutoff=0.0)
-    automaton_mpo = builder.build_mpo(
+    term_mpo = builder.to_mpo(terms, compress_each=False, cutoff=0.0)
+    automaton_mpo = builder.to_mpo(
         terms,
         mode="automaton",
         compress_each=False,
@@ -723,8 +723,8 @@ def test_build_mpo_automaton_removes_identity_factors():
     z_op = quimb.pauli("Z", dtype="complex128")
     terms = [((identity, z_op), (0, 3), 1.5)]
 
-    term_mpo = builder.build_mpo(terms, compress_each=False, cutoff=0.0)
-    automaton_mpo = builder.build_mpo(
+    term_mpo = builder.to_mpo(terms, compress_each=False, cutoff=0.0)
+    automaton_mpo = builder.to_mpo(
         terms,
         mode="automaton",
         compress_each=False,
@@ -752,7 +752,7 @@ def test_build_mpo_auto_falls_back_before_wide_automaton(monkeypatch):
         raise AssertionError("auto mode should select term accumulation here")
 
     monkeypatch.setattr(builder, "_compile_automaton", fail_compile)
-    mpo = builder.build_mpo(
+    mpo = builder.to_mpo(
         terms,
         mode="auto",
         max_bond=1,
@@ -777,7 +777,7 @@ def test_build_mpo_automaton_modes_compress_final_mpo_to_chi(monkeypatch, mode):
     monkeypatch.setattr(qtn.MatrixProductOperator, "compress", capture_compress)
 
     builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
-    mpo = builder.build_mpo(
+    mpo = builder.to_mpo(
         [((0,), "X", 0.5), (("ZZ", 1.2), (0, 1)), ((2,), "Y", -0.3)],
         mode=mode,
         chi=2,
@@ -810,13 +810,13 @@ def test_build_mpo_and_pepo_accept_native_fermion_terms_with_mapper():
         data_type="complex128",
     )
 
-    mpo = builder.build_mpo(
+    mpo = builder.to_mpo(
         {(left, right): term},
         fermion=fermion,
         fermionic=True,
         compress_each=False,
     )
-    pepo = builder.build_pepo(
+    pepo = builder.to_pepo(
         {(left, right): term},
         fermion=fermion,
         fermionic=True,
@@ -847,14 +847,14 @@ def test_build_mpo_and_pepo_return_mixed_charge_sectors():
     mapper = OneDMap(2, 2, mode="snake-row-major")
     builder = py.ham_tn(Lx=2, Ly=2, mapper=mapper, data_type="complex128")
 
-    mpo_sectors = builder.build_mpo(
+    mpo_sectors = builder.to_mpo(
         terms,
         fermion=fermion,
         fermionic=True,
         charge_sectors=True,
         compress_each=False,
     )
-    pepo_sectors = builder.build_pepo(
+    pepo_sectors = builder.to_pepo(
         terms,
         fermion=fermion,
         fermionic=True,
@@ -880,7 +880,7 @@ def test_build_mpo_uses_canonical_ops_sites_coeff_order():
         ((x_op,), ((1, 1),), -0.25),
     ]
 
-    mpo = builder.build_mpo(ints, compress_each=False)
+    mpo = builder.to_mpo(ints, compress_each=False)
 
     assert mpo.L == 4
 
@@ -895,7 +895,7 @@ def test_build_mpo_rejects_legacy_sites_ops_order():
     ]
 
     with pytest.raises(TypeError, match="integer chain indices or 2D coordinates"):
-        builder.build_mpo(ints_legacy, compress_each=False)
+        builder.to_mpo(ints_legacy, compress_each=False)
 
 
 def test_build_itf_lattice_ly1_has_chain_edges():
@@ -1291,7 +1291,7 @@ def test_ham_tn_supports_3d_mapping_and_mpo_terms():
     assert all(len(coord) == 3 for coord in builder.map.values())
     assert builder.map_site((1, 1, 1)) == builder.map_inv[(1, 1, 1)]
 
-    mpo = builder.build_mpo(
+    mpo = builder.to_mpo(
         [
             ((z_op,), ((0, 0, 0),)),
             ((z_op, z_op), ((0, 0, 0), (1, 0, 0)), 0.5),
@@ -1346,7 +1346,7 @@ def test_ham_tn_3d_rejects_pepo_conversion():
     """3D builders should raise a clear error for 2D-only PEPO conversion."""
     builder = py.ham_tn(Lx=2, Ly=2, Lz=2, data_type="complex128")
     z_op = quimb.pauli("Z", dtype="complex128")
-    mpo = builder.build_mpo([((z_op,), ((0, 0, 0),))], compress_each=False)
+    mpo = builder.to_mpo([((z_op,), ((0, 0, 0),))], compress_each=False)
 
     with pytest.raises(NotImplementedError, match="only available for 2D builders"):
         builder.mpo_to_pepo(mpo)

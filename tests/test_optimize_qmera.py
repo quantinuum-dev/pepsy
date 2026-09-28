@@ -1839,7 +1839,7 @@ def test_qmera_compiled_native_symmray_torch_gradients_match_explicit():
 
     assert compiled_value.requires_grad
     assert explicit_value.requires_grad
-    assert float(compiled_value) == pytest.approx(float(explicit_value))
+    assert float(compiled_value.detach()) == pytest.approx(float(explicit_value.detach()))
     for compiled_gradient, explicit_gradient in zip(
         compiled_gradients,
         explicit_gradients,
@@ -2816,7 +2816,7 @@ def test_qmera_default_1d_compiled_torch_energy_and_gradient(ansatz):
         parameter.numel() == builder.pair_ansatz.num_params
         for parameter in params.values()
     )
-    assert float(value) == pytest.approx(float(direct))
+    assert float(value.detach()) == pytest.approx(float(direct.detach()))
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
     assert any(torch.any(gradient != 0) for gradient in gradients)
 

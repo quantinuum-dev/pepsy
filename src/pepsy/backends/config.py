@@ -342,6 +342,10 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
     ``requires_grad=False`` (the default); NumPy and other inputs remain
     ordinary non-trainable tensors. Set ``requires_grad=True`` to create or
     re-leaf converted inputs explicitly.
+
+    Read-only NumPy inputs are copied before conversion so the returned
+    tensor can be written safely. Writable NumPy inputs may share storage
+    when the requested device and dtype permit it.
     """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
@@ -379,6 +383,10 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
                 out = out.to(device=device, dtype=dtype)
 
         else:
+            # Torch cannot enforce NumPy's read-only flag on shared storage.
+            # Own a writable copy before exposing that memory as a tensor.
+            if isinstance(x, np.ndarray) and not x.flags.writeable:
+                x = x.copy()
             if dtype is None:
                 out = torch.as_tensor(x, device=device)
             else:

@@ -2405,7 +2405,9 @@ def _metric_weight_factor(metric):
     scale = _metric_scale(hermitian)
     try:
         return _dag(ar.do("linalg.cholesky", hermitian))
-    except Exception:
+    except (np.linalg.LinAlgError, RuntimeError):
+        # NumPy and Torch report a singular PSD metric differently. Both
+        # permit the spectral fallback; malformed inputs should still raise.
         eigenvalues, eigenvectors = ar.do("linalg.eigh", hermitian)
         negative_tolerance = 128.0 * np.finfo(float).eps * scale
         if eigenvalues.shape[0] and _scalar_float(eigenvalues[0]) < -negative_tolerance:

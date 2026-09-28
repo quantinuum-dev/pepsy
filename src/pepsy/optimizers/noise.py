@@ -22,6 +22,7 @@ import autoray as ar
 import numpy as np
 
 from ..backends import to_float as _backend_to_float
+from .._internal.quimb import quimb_callable_option_supported
 from .mps.optimizer import MpsOptimizer
 from ._stream_events import _resolve_conditional
 from . import _stim_compile
@@ -3048,6 +3049,9 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
                             "local Kraus contraction produced an invalid probability."
                         )
                     return max(0.0, value)
+        # New Quimb names the environment selector ``route``; older builds
+        # use ``method``. Choose from the signature without changing the solve.
+        route_key = "route" if quimb_callable_option_supported(compute, "route") else "method"
         value = compute(
             # ``compute_local_expectation`` accepts scalar keys in some
             # Quimb releases, but the environment implementation used by
@@ -3056,7 +3060,7 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
             {support: gram},
             normalized=True,
             return_all=True,
-            method="envs",
+            **{route_key: "envs"},
         )
         if isinstance(value, Mapping):
             value = next(iter(value.values()))

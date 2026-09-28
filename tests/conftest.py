@@ -7,6 +7,15 @@ import sys
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def close_test_figures():
+    """Release test-created figures without importing an optional backend."""
+    yield
+    pyplot = sys.modules.get("matplotlib.pyplot")
+    if pyplot is not None:
+        pyplot.close("all")
+
+
 def pytest_runtest_logreport(report):
     """Expose CI failures as annotations even when raw job logs are unavailable."""
     if report.failed and os.environ.get("GITHUB_ACTIONS") == "true":

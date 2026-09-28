@@ -64,6 +64,27 @@ before optional dense materialization.
 The C4 path requires a real/Hermitian reshuffled edge residual; complex
 evolution that violates this condition needs a plan with `symmetry=None`.
 
+### Shapes, tensor ordering, and ownership
+
+For local dimension `d`, `onesite_op` has shape `(d, d)` and `twosite_op`
+has shape `(d**2, d**2)`. Both are matrices with output rows and input
+columns; two-site product order follows the edge's source then target.
+They must use the same local physical basis.
+
+`active.blocks[site][sector_tuple]` holds an `(output, input)` matrix of
+shape `(d, d)`. The sector tuple follows `active.site_directions[site]`.
+`active.to_pepo()` transposes each physical block into Quimb's `urdlbk`
+layout: present virtual directions up/right/down/left, then physical input
+`b` and output `k`. Missing open-boundary virtual legs are omitted. Use the
+returned tensor's named indices when manipulating arrays.
+
+Building updates the plan's report, and materialization leaves the active
+blocks unchanged. Inputs are not mutated, but input arrays can be retained
+by the plan; keep them fixed during reuse. `compact_bonds=True` remaps sector
+labels only in the returned PEPO. This structural compaction preserves the
+operator exactly; `max_tree_rank` and cutoff settings instead control
+approximations during construction.
+
 Use `return_report=True` to receive local residual and storage diagnostics
 alongside the result. For a four-site path, `max_tree_rank` optionally caps
 the internal path SVD rank:

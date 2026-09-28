@@ -28,6 +28,28 @@ def _random_peps():
     return qtn.PEPS.rand(2, 2, bond_dim=2, seed=7, dtype="complex128")
 
 
+def test_metric_factor_falls_back_only_for_numerical_failures(monkeypatch):
+    module = importlib.import_module("pepsy.bp.reduced_update")
+    metric = np.diag([2.0, 0.0])
+    original_do = module.ar.do
+
+    def check_failure(error):
+        def fail_cholesky(name, *args, **kwargs):
+            if name == "linalg.cholesky":
+                raise error
+            return original_do(name, *args, **kwargs)
+
+        monkeypatch.setattr(module.ar, "do", fail_cholesky)
+        return module._metric_weight_factor(metric)
+
+    # A singular positive metric still has an eigendecomposition factor.
+    for error in (np.linalg.LinAlgError("singular"), RuntimeError("singular")):
+        factor = check_failure(error)
+        np.testing.assert_allclose(factor.T.conj() @ factor, metric)
+    with pytest.raises(TypeError, match="invalid backend argument"):
+        check_failure(TypeError("invalid backend argument"))
+
+
 def test_reduced_loop_cluster_accepts_directed_d2bp_messages():
     peps = _random_peps()
     gate = np.asarray(py.rzz(0.07))

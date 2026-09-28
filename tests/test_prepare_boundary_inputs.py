@@ -7,6 +7,7 @@ import quimb.tensor as qtn
 
 import pepsy
 from pepsy._internal.quimb import (
+    call_quimb_2d,
     quimb_1d_callable_compression_available,
     quimb_ctmrg_mode_available,
     quimb_ctmrg_projector_canonize_available,
@@ -2549,7 +2550,8 @@ def test_contract_flat_middle_out_matches_manual_quimb_at_finite_chi():
     """The facade should exactly compose Quimb's protected-region path."""
     tn = qtn.TN2D_rand(4, 7, D=3, seed=307, dtype="complex128")
     around = tuple((x, 3) for x in range(tn.Lx))
-    reduced = tn.contract_boundary(
+    reduced = call_quimb_2d(
+        tn.contract_boundary,
         max_bond=3,
         mode="direct",
         canonize=True,

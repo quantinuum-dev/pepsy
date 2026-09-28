@@ -45,6 +45,26 @@ capability, multiple MPI ranks, or hardware unavailable on the runner before
 changing the test. Installing optional packages alone does not provide GPU
 or multi-process coverage.
 
+To exercise MPI with an installed MPI runtime and `mpi4py`, run both rank
+counts (nightly uses the same integration module):
+
+```bash
+mpiexec -n 2 python -m pytest -q -ra -o addopts="" tests/test_mpi_integration.py
+mpiexec -n 3 python -m pytest -q -ra -o addopts="" tests/test_mpi_integration.py
+```
+
+The JAX non-default-device check can use two logical CPU devices. Set the
+flag before starting Python; this checks device placement, not GPU execution:
+
+```bash
+XLA_FLAGS=--xla_force_host_platform_device_count=2 python -m pytest -q -ra -o addopts="" tests/test_peps_sampler.py::test_peps_sampler_jax_nondefault_device
+```
+
+CUDA/CuPy tests require a compatible NVIDIA GPU and runtime. Metal tests
+require an available Torch MPS device; an individual operation can still be
+unsupported. Keep these skip reasons visible rather than enabling CPU
+fallback and counting it as GPU validation.
+
 MPS and tree tests are split by responsibility:
 
 | Area | Modules |

@@ -160,6 +160,13 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Torch conversion copies read-only NumPy storage before creating a tensor,
+  preventing writes through the tensor from changing an immutable source.
+- Cold PEPS environment sweeps and MPS trajectory norm fallbacks select the
+  installed Quimb `method`/`route` keywords without deprecated calls.
+- BP reduced-update metric factorization falls back after numerical failures
+  while allowing unrelated type errors to propagate.
+
 - Torch VMC convergence estimates now resolve the `tau` property correctly.
   BP Metropolis sweeps report acceptance/proposal totals across every requested
   sweep. Unsupported local-move statistics raise a descriptive `ValueError`

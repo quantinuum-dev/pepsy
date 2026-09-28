@@ -105,3 +105,22 @@ returns coefficient slots in input term order for parameterized builders.
 In shared mode, slot operators omit the supplied scalar coefficients so they
 can be bound later; identical terms can share a slot. Unshared mode retains
 the coefficients. Ordinary operator construction should use the default.
+
+## Tensor axes and ownership
+
+`to_arrays()` returns a tuple in increasing chain-site order. With physical
+dimension `d` and neighboring channel counts `D_left`, `D_right`:
+
+| Site | Array shape / axes |
+| --- | --- |
+| Single-site chain | `(d, d)` = `(output, input)` |
+| First site | `(D_right, d, d)` |
+| Interior | `(D_left, D_right, d, d)` |
+| Last site | `(D_left, d, d)` |
+
+`to_mpo()` attaches Quimb indices using this same `lrud` convention.
+Materialization does not modify the automaton or the supplied local operators;
+Torch/JAX arrays retain their backend and differentiation graph. Structural
+methods such as `add_product_term` do modify the automaton. Treat stored
+operator payloads as shared inputs rather than assuming the builder copies
+their array storage.

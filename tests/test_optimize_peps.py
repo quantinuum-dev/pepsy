@@ -1866,6 +1866,14 @@ def test_quimb_boundary_store_resolves_auto_cutoffs_and_preserves_sweep_state():
     assert not store.envs
     assert not store.mps_b
 
+    # A cold directional sweep needs the same legacy/modern keyword adapter
+    # as update_axis; there is no complete static side to reuse here.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        store.start_sweep(norm, "Y", "left", reuse_static=False)
+    assert store.envs
+
 
 def test_quimb_boundary_store_reuses_complete_static_side_without_recompute():
     """Alternating half-sweeps should reuse the side built by the prior sweep."""

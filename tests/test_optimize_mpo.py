@@ -1973,7 +1973,7 @@ def test_fermion_build_mpo_and_ham_tn_adapter_preserve_symmetry():
     direct = fermion.build_mpo(
         edges, L=3, t=1.0, U=0.0, mu=0.0, fermionic=True,
     )
-    adapted = builder.build_mpo(
+    adapted = builder.to_mpo(
         fermion=fermion,
         edges=edges,
         phys_dim=4,
@@ -1982,7 +1982,7 @@ def test_fermion_build_mpo_and_ham_tn_adapter_preserve_symmetry():
         mu=0.0,
         fermionic=True,
     )
-    positional = builder.build_mpo(
+    positional = builder.to_mpo(
         fermion,
         edges=edges,
         t=1.0,

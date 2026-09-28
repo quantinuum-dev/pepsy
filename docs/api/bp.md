@@ -689,6 +689,41 @@ the private cluster copy, and lets Quimb perform its usual QR/SVD compressed
 contraction. Pass `optimize="auto-hq"`, another Quimb optimizer string, or a
 standard Cotengra path optimizer through either path-cluster helper.
 
+## Expectation inputs and outputs
+
+The expectation helpers above accept a term mapping. Use a tuple of sites
+as each key, in the same order as the operator's physical axes. For dense
+operators, one-site shape is `(d, d)`; two-site shape is `(d0*d1, d0*d1)`
+or `(d0, d1, d0, d1)`, with all output axes before all input axes. Native
+fermionic operators must preserve their graded basis and site order.
+
+The helpers work on private contraction networks and leave the input PEPS
+and operators unchanged. Path-cluster `gauges` supplies external SU bond
+vectors, which are also left unchanged. Returned scalars stay in the active
+array backend; they are not guaranteed to be Python floats.
+
+| Option | Result |
+| --- | --- |
+| `normalized=True`, `return_all=False` | Sum of locally normalized expectations |
+| `normalized=False`, `return_all=False` | Sum of unnormalized numerators |
+| `return_all=True` with either Boolean normalization | Mapping from the original term keys to scalar values |
+| Boundary helper with `normalized="return", return_all=True` | Mapping to `(numerator, local_norm)` pairs |
+
+For a small dense example with known expectations:
+
+```python
+import numpy as np
+import quimb.tensor as qtn
+from pepsy.bp import compute_boundary_expectation
+
+zero = np.array([1.0, 0.0])
+peps = qtn.PEPS.product_state([[zero, zero], [zero, zero]])
+z = np.diag([1.0, -1.0])
+terms = {((0, 0),): z, ((0, 0), (1, 1)): np.kron(z, z)}
+values = compute_boundary_expectation(peps, terms, max_bond=4, return_all=True)
+assert all(np.isclose(value, 1.0) for value in values.values())
+```
+
 ## Local reduced density matrices
 
 For a single route-independent entry point, use `rho_expand`. Its

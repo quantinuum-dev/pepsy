@@ -597,6 +597,12 @@ class ActivePEPOBlocks:
         global history ids are remapped independently on every physical bond;
         set ``compact_bonds=False`` only when inspecting the global sector
         labeling itself.
+
+        Active blocks use ``(output, input)`` physical axes. Materialization
+        transposes these to Quimb's ``urdlbk`` layout: present virtual axes
+        in up/right/down/left order, then input (b) and output (k). Missing
+        open-boundary virtual axes are omitted. Blocks and sector labels on
+        this object are not modified, and backend gradients are preserved.
         """
         arrays = []
         dtype = next(iter(next(iter(self.blocks.values())).values())).dtype

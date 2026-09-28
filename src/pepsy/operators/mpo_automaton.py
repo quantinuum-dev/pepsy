@@ -1569,7 +1569,14 @@ class MPOAutomaton:
         return make_block(blocks)
 
     def to_arrays(self):
-        """Materialize raw MPO arrays without compression or canonicalization."""
+        """Return raw MPO arrays in site order without modifying the automaton.
+
+        Bulk axes are ``(left, right, output, input)``. The first/last site
+        omits the absent left/right bond; a one-site chain returns a single
+        ``(d, d)`` matrix. Physical axes follow each supplied local operator.
+        Backend arrays and their differentiation graphs remain native.
+        No compression or canonicalization is performed.
+        """
         phys_dim = self.validate()
         operators = [
             transition.operator
