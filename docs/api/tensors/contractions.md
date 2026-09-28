@@ -25,6 +25,31 @@ Cotengra 0.8's automatic subtree reconfiguration remains active. Persistent
 tree caching is available through `directory=...`; the default cache is
 in memory.
 
+### Controlling search workers
+
+Use `build_optimizer(parallel=False)` for small contractions or when another
+layer of your application already runs tasks concurrently. Pass that instance
+through the operation's `optimize` or `contraction_opt` argument. The builder's
+default `parallel="auto"` delegates worker selection to Cotengra; presets such
+as `"auto-hq"` can also create a process pool. Reusing a contraction optimizer
+does not imply that its search runs in the calling process.
+
+Loky's "worker stopped" warning means a worker exited while work remained.
+It can result from an idle timeout or a memory-related restart; the warning
+alone does not identify which. Enable standard multiprocessing logging in an
+isolated reproduction to inspect worker exits:
+
+```python
+import logging
+import multiprocessing.util
+
+multiprocessing.util.log_to_stderr(logging.INFO)
+```
+
+Keep the warning visible and check that the computation completed. Select
+`parallel=False` explicitly when process search is unnecessary; changing
+global pool settings can affect other libraries using the same executor.
+
 ## Compressed contraction
 
 `contract_hypercompressed_tn(..., cutoff_mode="abs")` forwards the selected
