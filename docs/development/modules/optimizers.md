@@ -13,8 +13,15 @@ important downstream time-compression consumer that depends on Pepsy behavior.
 - `mps/`: MPS gate-stream optimization.
   - `__init__.py`: lazy public exports; selecting layout helpers does not load
     replay, Gibbs preparation, or MPO optimization.
-  - `optimizer.py`: `MpsOptimizer`, including replay scheduling, live-state
-    canonical metadata, FIT targets, and rollback.
+  - `optimizer.py`: `MpsOptimizer`, including public replay orchestration,
+    option validation, live-state canonical metadata, FIT targets, and rollback.
+    `run()` prepares the layout, resolves mode options, then executes the
+    prepared stream; shot routing and the empty-stream path stay at the entry
+    point.
+  - `_execution.py`: mode dispatch, control-delimited gate replay, and the
+    execution scope that restores temporary layouts on success or failure.
+    Its operations are bound onto `MpsOptimizer` and call the live instance's
+    hooks, so the class retains state ownership and subclass dispatch.
   - `_controls.py`: measurement, reset, cap, and conditional control execution.
   - `_norm.py`: represented scale, local normalization, and norm diagnostics.
     Both receive the live optimizer and call its hooks; canonical state remains
@@ -26,7 +33,9 @@ important downstream time-compression consumer that depends on Pepsy behavior.
     structured exact replay on supported arrays.
   - `layout.py`: gate-stream layout search and `MpsGateStreamSchedule`.
   - `_layout_execution.py`: optimizer layout installation, logical/physical
-    mapping, reordering, schedule installation, and logical readout. Functions
+    mapping, replay-queue preparation, reordering, schedule installation, and
+    logical readout. Queue preparation resolves plans and event order before
+    the live MPS is reordered. Functions
     receive the live optimizer and call its canonicalization, native-swap,
     stream-validation, and replay hooks. Public methods retain their signatures
     and documentation on `MpsOptimizer`; private method aliases preserve

@@ -499,6 +499,68 @@ def test_mps_optimizer_layout_run_restores_original_mps_order_and_stream():
     assert opt.last_layout_plan is not None
 
 
+@pytest.mark.parametrize(
+    "control, expected",
+    [(None, "0101"), ("measure", "0101"), ("cap", "001")],
+)
+def test_temporary_layout_is_restored_after_replay_failure(monkeypatch, control, expected):
+    """A failed gate restores logical order, including a register shortened by a cap."""
+    stream = []
+    if control == "measure":
+        stream.append(("measure", "Z", 0, +1))
+    elif control == "cap":
+        stream.append(("cap", 1, [0, 1]))
+    stream.append((qu.pauli("X"), 0))
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0101", dtype="complex128"),
+        gates=stream,
+        chi=8,
+        mode="svd",
+    )
+
+    def fail_gate(*args, **kwargs):
+        raise RuntimeError("injected replay failure")
+
+    monkeypatch.setattr(opt, "_run_svd", fail_gate)
+    with pytest.warns(DeprecationWarning, match="temporary reorder"):
+        with pytest.raises(RuntimeError, match="injected replay failure"):
+            opt.run(
+                layout=opt._explicit_layout_plan((3, 0, 2, 1)),
+                layout_report=False,
+                cutoff=0.0,
+            )
+
+    assert opt.logical_order == list(range(len(expected)))
+    assert opt.p.site_inds == tuple(f"k{i}" for i in range(len(expected)))
+    assert opt._persistent_layout_plan is None
+    np.testing.assert_allclose(
+        opt.to_dense().reshape(-1),
+        qtn.MPS_computational_state(expected).to_dense().reshape(-1),
+        atol=1e-12,
+    )
+
+
+def test_run_option_and_layout_warnings_point_to_the_caller():
+    """Extracted preparation helpers keep deprecations at the public call site."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("01", dtype="complex128"),
+        gates=[("h", 0)],
+        chi=2,
+        mode="svd",
+    )
+    with pytest.warns(DeprecationWarning) as caught:
+        opt.run(
+            layout=opt._explicit_layout_plan((1, 0)),
+            layout_report=False,
+            mix_fit_min_iter=2,
+        )
+
+    assert len(caught) == 2
+    assert all(warning.filename == __file__ for warning in caught)
+    assert "temporary reorder" in str(caught[0].message)
+    assert "mix_fit_min_iter is deprecated" in str(caught[1].message)
+
+
 @pytest.mark.parametrize("persistent", [False, True])
 def test_mps_optimizer_layout_remaps_conditional_gate_action(persistent):
     """Conditional actions execute on their mapped physical layout sites."""

@@ -362,6 +362,117 @@ def set_gate_schedule(self, schedule, *, reorder_product_state=True):
     return self
 
 
+def prepare_run_layout(
+    self,
+    G_seq,
+    where_seq,
+    event_seq,
+    *,
+    has_cap,
+    use_layout_finder,
+    layout,
+    layout_order,
+    layout_kwargs,
+    layout_report,
+):
+    """Plan and map a replay queue before reordering the live MPS.
+
+    Return disposable execution sequences alongside their logical labels and
+    layout plan. The caller validates mode options before installing the plan.
+    """
+    layout_request = self._coalesce_layout_request(use_layout_finder, layout)
+    persistent_layout_active = self._persistent_layout_plan is not None
+    if self.mode == "perm" and (
+        persistent_layout_active or self._layout_request_enabled(layout_request)
+    ):
+        raise ValueError(
+            "mode='perm' keeps a lazy logical-to-physical permutation; "
+            "use either the perm mode or a persistent/transient layout, "
+            "not both."
+        )
+    if has_cap and any(
+        event_type == "conditional"
+        and _control_event_contains_cap(event_type, payload)
+        for payload, event_type in zip(G_seq, event_seq)
+    ) and (persistent_layout_active or self._layout_request_enabled(layout_request)):
+        raise ValueError(
+            "layout replay does not support conditional cap events; the "
+            "active branch is needed to update the shrinking layout."
+        )
+    # Preserve the logical (pre-layout) event locations so control-event
+    # bookkeeping (e.g. recorded measurement sites) always refers to the
+    # user's site labels even when the run replays in a layout order.
+    logical_where_seq = list(where_seq)
+    if persistent_layout_active:
+        if self._layout_request_enabled(layout_request):
+            raise ValueError(
+                "a persistent layout is already installed; call run() without "
+                "use_layout_finder/layout arguments."
+            )
+        layout_plan = self._persistent_layout_plan
+        self.last_layout_plan = layout_plan
+    else:
+        if self._layout_request_enabled(layout_request):
+            warnings.warn(
+                "use_layout_finder/layout performs a temporary reorder and "
+                "swap-back; call apply_layout(...) for a persistent layout.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        _, layout_plan = self._resolve_run_layout(
+            layout_request,
+            layout_order,
+            layout_kwargs,
+        )
+    layout_order_tuple = None
+    if layout_plan is not None:
+        if layout_report and not persistent_layout_active:
+            report = self._layout_report_text(layout_plan)
+            if report:
+                print(report)
+        replay_event_order = layout_plan.get("replay_event_order")
+        if replay_event_order is not None:
+            try:
+                replay_event_order = tuple(
+                    int(index) for index in replay_event_order
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "layout replay event order must contain integer indices."
+                ) from exc
+            expected_event_order = tuple(range(len(G_seq)))
+            if (
+                len(replay_event_order) != len(G_seq)
+                or set(replay_event_order) != set(expected_event_order)
+            ):
+                raise ValueError(
+                    "layout replay event order must be a permutation of the "
+                    "queued stream events."
+                )
+            G_seq = [G_seq[index] for index in replay_event_order]
+            where_seq = [where_seq[index] for index in replay_event_order]
+            event_seq = [event_seq[index] for index in replay_event_order]
+            logical_where_seq = [
+                logical_where_seq[index] for index in replay_event_order
+            ]
+        layout_order_tuple = tuple(layout_plan["site_order"])
+        G_seq, where_seq = self._layout_run_sequences(
+            G_seq,
+            where_seq,
+            event_seq,
+            layout_plan,
+        )
+    return (
+        G_seq,
+        where_seq,
+        event_seq,
+        logical_where_seq,
+        layout_plan,
+        persistent_layout_active,
+        layout_order_tuple,
+    )
+
+
 def _resolve_run_layout(self, layout, layout_order, layout_kwargs):
     """Return ``(finder, plan)`` for a run-time layout request."""
     self.last_layout_plan = None
