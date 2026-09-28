@@ -116,6 +116,7 @@ def test_pauli_builder_uses_autoray_fallback_without_namespace(monkeypatch):
     torch.testing.assert_close(actual.to_dense(), reference.to_dense())
 
 
+@pytest.mark.filterwarnings("error:Casting complex values to real")
 def test_real_coefficient_state_keeps_y_rotation():
     torch = pytest.importorskip("torch")
     sim = StabilizerMpsSimulator(2, dtype="float64", exact_cooling=False,
@@ -124,6 +125,13 @@ def test_real_coefficient_state_keeps_y_rotation():
     np.testing.assert_allclose(sim.to_statevector(),
                                [np.cos(.37 / 2), 0., np.sin(.37 / 2), 0.], atol=1e-12)
     assert all(t.data.dtype == torch.float64 for t in sim.p.tensors)
+    # A non-Clifford X rotation needs imaginary amplitudes in this frame.
+    before = sim.to_statevector().copy()
+    with pytest.raises(ValueError, match="requires a complex dtype"):
+        sim.apply([("rx", .23, 0)])
+    np.testing.assert_array_equal(sim.to_statevector(), before)
+    with pytest.raises(ValueError, match="requires a complex dtype"):
+        sim._single_qubit_combo(0.5, 0.5, "Y")
 
 
 @pytest.mark.parametrize("simulator", [StabilizerMpsSimulator, StabilizerTreeSimulator])

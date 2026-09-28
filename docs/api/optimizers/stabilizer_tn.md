@@ -479,6 +479,14 @@ to remove round-off-sized values and expose the lower bond dimension.
 
 ## Backends (Torch / JAX / CuPy)
 
+Use a complex coefficient dtype for general circuits. A real coefficient
+state supports operations whose complete coefficient-frame matrices are
+real, including a single-site Y rotation. Its local operator builder uses
+the real matrix `-iY` directly and checks the scalar coefficients before
+assembly. Operators requiring imaginary coefficients (for example a
+non-Clifford X rotation or a Y projector in the identity frame) raise
+`ValueError` on this path rather than discarding those coefficients.
+
 Pass `to_backend=` (e.g. `pepsy.backend_torch(dtype=torch.complex128,
 device="cuda")`, `pepsy.backend_cupy(...)`, `pepsy.backend_jax(...)`) to the
 constructor or `with_injection`. The coefficient MPS `|nu>` is placed on that

@@ -1122,6 +1122,9 @@ def hrs_to_ttn(
 ):
     """Create a random product or charge-preserving Symmray TTN.
 
+    Ordinary product Haar states require a complex ``dtype`` to preserve
+    relative phases. Use :func:`ps_to_ttn` for a real product state.
+
     With ``fermion=`` the physical sites receive the model's charge sectors,
     while virtual-only internal nodes are neutral and every virtual tree edge
     is a conjugate pair of Symmray charge-sector indices. ``root_qubit`` places
@@ -1236,6 +1239,7 @@ def hrs_to_ttn(
         raise ValueError("occupations and site_charge require fermion=...")
     if to_backend is not None:
         raise ValueError("to_backend requires fermion=...")
+    _require_complex_haar_dtype(dtype)
     ttn = TreeTensorNetwork.from_plan(plan, dtype=dtype)
     if haar_params is not None:
         if len(haar_params) != n:
@@ -1378,6 +1382,15 @@ def ps_to_mpo(
     return mpo
 
 
+def _require_complex_haar_dtype(dtype):
+    """Reject storage that would discard a Haar sample's relative phase."""
+    if np.dtype(dtype).kind != "c":
+        raise TypeError(
+            "Ordinary Haar states require a complex dtype; "
+            "use ps_to_mps, ps_to_peps, or ps_to_ttn for real product states."
+        )
+
+
 def random_haar_qubit(seed=None, perturb=0.0):
     """Generate one random single-qubit Haar sample as ``(theta, phi)``.
 
@@ -1453,8 +1466,7 @@ def haar_random_state(
         )
 
     dtype = np.dtype(dtype)
-    if dtype.kind != "c":
-        raise TypeError("dtype must be a complex numpy dtype.")
+    _require_complex_haar_dtype(dtype)
 
     real_dtype = np.float32 if dtype == np.dtype("complex64") else np.float64
     rng = np.random.default_rng(seed)
@@ -1491,7 +1503,8 @@ def hrs_to_peps(
 ):
     """Create a random product or Fermion-symmetric PEPS.
 
-    Without ``fermion``, each site is an independent single-qubit Haar state.
+    Without ``fermion``, each site is an independent single-qubit Haar state
+    and requires a complex ``dtype`` to preserve its relative phase.
     With ``fermion``, construct a native charge-preserving random PEPS instead:
     ``method="direct"`` uses Symmray's direct block-filled random PEPS, with
     ``chi`` controlling the virtual bond dimension. The direct state is
@@ -1646,6 +1659,7 @@ def hrs_to_peps(
     if to_backend is not None:
         raise ValueError("to_backend requires fermion=...")
 
+    _require_complex_haar_dtype(dtype)
     peps = ps_to_peps(
         Lx=Lx,
         Ly=Ly,
@@ -1713,7 +1727,8 @@ def hrs_to_mps(
 ):
     """Create a random product or Fermion-symmetric MPS.
 
-    Without ``fermion``, each site is an independent single-qubit Haar state.
+    Without ``fermion``, each site is an independent single-qubit Haar state
+    and requires a complex ``dtype`` to preserve its relative phase.
     With ``fermion``, construct a native charge-preserving random MPS instead:
     ``method="unitary"`` (the default) starts from a random product state and
     applies random charge-preserving two-site unitaries, while
@@ -1871,6 +1886,7 @@ def hrs_to_mps(
     if to_backend is not None:
         raise ValueError("to_backend requires fermion=...")
 
+    _require_complex_haar_dtype(dtype)
     mps = ps_to_mps(
         L=L,
         dtype=dtype,

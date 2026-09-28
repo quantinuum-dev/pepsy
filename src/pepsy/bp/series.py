@@ -3173,8 +3173,21 @@ def _edge_series_suppression(
 ):
     if not multi_excitation_correct or not weights:
         return {edges: 1.0 for edges in weights}
+    # These are D2 norm weights, not observable numerators. Hermiticity makes
+    # them real, but contraction roundoff can leave a small imaginary residue.
+    # Quimb's real free-energy solver must never silently drop a larger phase.
+    real_weights = {}
+    for edges, weight in weights.items():
+        scalar = np.asarray(ar.to_numpy(weight))
+        tolerance = 64 * np.finfo(scalar.real.dtype).eps * max(1.0, abs(scalar.real))
+        if not np.isfinite(scalar) or abs(scalar.imag) > tolerance:
+            raise ValueError(
+                "D2 loop-series suppression requires finite real norm weights; "
+                "check message Hermiticity or use multi_excitation_correct=False."
+            )
+        real_weights[edges] = ar.do("real", weight)
     return _process_loop_series_weights(
-        weights,
+        real_weights,
         num_tensors=num_tensors,
         multi_excitation_correct=True,
         tol_correction=tol_correction,

@@ -808,6 +808,14 @@ energy = compute_local_expectation_edge_loop_series(
 
 `partial_trace_edge_loop_series_expand` supplies the matching diagnostic RDM.
 The scalar function is the fermion-safe choice for its supported cases.
+With `multi_excitation_correct=True`, D2 norm weights supplied to Quimb's
+real suppression solver are checked for finiteness and reality. An imaginary
+residue up to `64 * eps * max(1, abs(real_weight))` is treated as contraction
+roundoff, using the weight's precision. Larger residues raise `ValueError`;
+check message Hermiticity, or explicitly choose the unsuppressed expansion
+with `multi_excitation_correct=False`. Observable numerators, returned
+complex values, and cached input weights are preserved.
+
 Explicit terms can be passed as `LoopSeriesTerm` objects (or virtual-edge sets); at present they cannot put
 Q on a bond wholly internal to the selected observable support. A nonzero-Q
 fermionic scalar correction is currently restricted to one-site gates; the

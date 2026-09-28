@@ -5,6 +5,31 @@ import pytest
 
 from pepsy import haar_random_state
 from pepsy.tensors.constructors import haar_random_state as constructors_haar_random_state
+from pepsy.tensors import hrs_to_mps, hrs_to_peps, hrs_to_ttn, random_haar_qubit
+
+
+@pytest.mark.parametrize("constructor,shape", [
+    (hrs_to_mps, (4,)), (hrs_to_peps, (2, 2)), (hrs_to_ttn, (4,)),
+])
+def test_product_haar_preserves_phase_and_rejects_real_storage(constructor, shape):
+    """A real cast must not turn a normalized complex sample into another state."""
+    angles = [(np.pi / 2, np.pi / 2)] * 4
+    for dtype in ("float32", "float64", "int64"):
+        with pytest.raises(TypeError, match="complex dtype"):
+            constructor(*shape, dtype=dtype, haar_params=angles)
+    for dtype in ("complex64", "complex128"):
+        state = constructor(*shape, dtype=dtype, haar_params=angles)
+        expected = np.array([1.0])
+        for _ in range(4):
+            expected = np.kron(expected, [1 / np.sqrt(2), 1j / np.sqrt(2)])
+        actual = np.asarray(state.to_dense()).reshape(-1)
+        np.testing.assert_allclose(actual, expected, atol=2e-7)
+        np.testing.assert_allclose(np.vdot(actual, actual), 1, atol=2e-7)
+        assert actual.dtype == np.dtype(dtype)
+
+    seeded = constructor(*shape, seed=17)
+    explicit = constructor(*shape, haar_params=[random_haar_qubit(17 + k) for k in range(4)])
+    np.testing.assert_allclose(seeded.to_dense(), explicit.to_dense())
 
 
 def test_haar_random_state_returns_normalized_dense_vector():

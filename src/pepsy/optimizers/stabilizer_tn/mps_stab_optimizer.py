@@ -3939,19 +3939,35 @@ class StabilizerMpsSimulator:
             self.backend_info()
         cached = self._bk_cache.get(tag)
         if cached is None:
-            cached = self._to_state_backend(np.asarray(mat, dtype=self.dtype))
+            matrix = np.asarray(mat)
+            if "complex" not in self.dtype and np.iscomplexobj(matrix):
+                if np.any(matrix.imag != 0):
+                    raise ValueError(
+                        "This coefficient operator requires a complex dtype."
+                    )
+                # Pauli I/X/Z can use complex containers with exactly real data.
+                matrix = matrix.real
+            cached = self._to_state_backend(matrix.astype(self.dtype, copy=False))
             self._bk_cache[tag] = cached
         return cached
 
     def _single_qubit_combo(self, c, coef, axis):
         """Assemble changing coefficients from cached backend Pauli matrices."""
         identity = self._bk_const("PI", pauli_matrix("I"))
-        if axis == "Y" and "complex" not in self.dtype:
-            # Casting Y itself to a real dtype discards it, even though
-            # exp(-i theta Y / 2) is a perfectly real rotation. Cache -iY
-            # instead and cast only the complete combination, as before.
-            pauli = self._bk_const("minus_iPY", (-1j * pauli_matrix("Y")).real)
-            matrix = c * identity + (1j * coef) * pauli
+        if "complex" not in self.dtype:
+            # -iY is real, so a Y rotation can stay entirely in real storage.
+            # Validate the scalar coefficients before assembly: X/Z rotations
+            # and Y projectors generally require complex coefficient amplitudes.
+            pauli_coef = 1j * coef if axis == "Y" else coef
+            if complex(c).imag != 0 or complex(pauli_coef).imag != 0:
+                raise ValueError(
+                    "This coefficient operator requires a complex dtype."
+                )
+            if axis == "Y":
+                pauli = self._bk_const("minus_iPY", (-1j * pauli_matrix("Y")).real)
+            else:
+                pauli = self._bk_const("P" + axis, pauli_matrix(axis))
+            matrix = complex(c).real * identity + complex(pauli_coef).real * pauli
         else:
             matrix = c * identity + coef * self._bk_const("P" + axis, pauli_matrix(axis))
         return ar.astype(matrix, self.dtype)

@@ -160,6 +160,16 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Ordinary `hrs_to_mps`, `hrs_to_peps`, and `hrs_to_ttn` now reject real
+  storage, which previously discarded Haar phases and could reduce the norm.
+  Use a complex dtype, or `ps_to_*` for real product states. Native fermion
+  random constructors retain their existing dtype support.
+- Real stabilizer single-site Y rotations avoid zero-imaginary casts;
+  local coefficient operators requiring complex storage now raise clearly.
+- D2 edge-loop suppression validates norm weights before using Quimb's real
+  solver, accepting roundoff-sized imaginary residues and rejecting larger
+  ones instead of losing them through implicit casts.
+
 - Torch conversion copies read-only NumPy storage before creating a tensor,
   preventing writes through the tensor from changing an immutable source.
 - Cold PEPS environment sweeps and MPS trajectory norm fallbacks select the
