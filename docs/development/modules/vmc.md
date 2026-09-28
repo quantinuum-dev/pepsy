@@ -1,5 +1,24 @@
 # VMC module map
 
+## NetKet bridge
+
+`netket.py` owns packing, configuration adapters, amplitude factories, and
+NetKet setup/driver orchestration. Within its amplitude factories:
+
+- Spin and fermion adapters map their own input configurations to physical
+  indices. The fermion adapter also owns the ordering phase.
+- `_make_eager_config_evaluator` builds the shared non-JIT evaluator: select
+  physical indices, contract one network, then format the amplitude as a
+  scalar, logarithm, or mantissa/exponent pair.
+- JIT factories retain native JAX indices and `vmap`. The eager evaluator's
+  Python integer conversions must not be moved into a traced path.
+
+The evaluator captures only the supplied ansatz and contraction settings;
+it does not own sampler state, observables, or optimizer updates. JAX/NetKet
+remain optional and are resolved by the existing requirement helpers.
+
+## Torch implementation
+
 The Torch VMC package keeps the public surface in
 `pepsy.vmc.torch.__init__`. The implementation is organized by responsibility:
 

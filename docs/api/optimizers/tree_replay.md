@@ -20,6 +20,24 @@ construct-then-run sequence.
 
 ## Replay modes
 
+### Find the option you need
+
+| Purpose | Where to configure it | Lifetime |
+| --- | --- | --- |
+| Geometry and state | Constructor `tree`, `state`, `chi`, `run=False` | Retained optimizer state |
+| Truncation | Constructor `cutoff`, `cutoff_mode` | Defaults for later replay |
+| Algorithm | `run(mode=...)`, `run(compression_mode=...)` | Persistent overrides on ordinary replay |
+| Randomized compression | `compression_seed`, `max_bond_oversample`, `cutoff_oversample` | Supplied run values persist on ordinary replay |
+| Variational fitting | Constructor `fit_*` settings | See [TreeFIT options](tree_fit.md) |
+| Scale handling | Run `non_unitary`, `normalize_every`, `normalize_final` | That replay; automatic normalization requires `non_unitary=True` |
+| Diagnostics | Run `finite_check`, `track_infidelity`; constructor `track_truncation` | Finite checks apply to that run; the other settings are retained |
+| Shots | `shots`, `strategy`, `run_kwargs`, `retain` | Child trajectories preserve the parent; see [noise](noise.md) |
+
+MPS, MPO, and tree optimizers share concepts but keep their representation's
+own defaults and supported modes. In particular, tree cutoff/FIT defaults
+are constructor settings. Use this table when porting an MPS workflow rather
+than copying its entire `run()` argument list.
+
 Gates are absorbed into the tree according to the selected optimizer mode:
 
 - **ordinary `apply_gate` entries** in `auto`, `direct`, `dm`, `sdc`,

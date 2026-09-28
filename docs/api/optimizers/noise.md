@@ -5,6 +5,36 @@ where the hardware schedule says the channel acts, then choose trajectory
 sampling settings (`shots`, `seed`, independent/coalesced replay, and
 `run_kwargs`) at the runner.
 
+## Choose the workflow and interpret its result
+
+| Need | Entry point | Retained state unit |
+| --- | --- | --- |
+| Stochastic entries or custom channels | `run_trajectory_shots` | One state per shot for independent replay, or one per coalesced leaf |
+| Uniform post-gate Pauli faults | `run_noisy_shots` with `PauliErrorModel` | Independent shots |
+| Stim circuit input | `compile_stim_circuit`, then `run_stim_shots` | Independent shots with detector/observable records |
+| Shared noisy prefixes | `run_coalesced_trajectory_shots` / `run_coalesced_stim_shots` | One state per leaf, with a shot count |
+| Existing prepared optimizer | Shot-aware `optimizer.run(shots=...)` | `NoisyResult` wraps independent or coalesced storage |
+
+These functions are available from `pepsy.optimizers.noise`. Compile a Stim
+plan once and reuse it across runs. Compilation translates circuit syntax;
+the runner makes random choices and evolves optimizer state. Stim is an
+optional dependency loaded when compiling circuit input.
+
+With retained results, `estimate(values)` expects one real scalar per stored
+state: per shot for independent replay, per leaf for coalesced replay.
+For independent trajectories it computes `sum(weight * value) / shots`;
+for coalesced leaves it computes `sum(count * weight * value) / shots`.
+The denominator is the represented shot count, not the sum of weights.
+Weights are target/proposal likelihood ratios, equal to one for ordinary
+unbiased draws. `effective_sample_size` accounts for those ratios and leaf
+counts; it is not an error bar. An empty estimate returns NaN.
+
+`NoisyResult.optimizers`, `counts`, and `weights` are aligned by retained
+state. `shots` can exceed their length when branches are coalesced, and
+retention settings can omit data. Use `retain="all"` when inspecting replay
+history. Terminal bit samples have a separate row per sampled shot; their
+`leaf_indices` identify the source branch.
+
 Jump to [MPS shots](#shot-aware-mpsoptimizer-api),
 [coalesced ensembles](#exact-coalesced-ensembles-for-rare-noise),
 [MPI](#mpi-shot-ensembles), or

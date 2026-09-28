@@ -1,5 +1,47 @@
 # `pepsy.optimizers.mpo.optimizer`
 
+## Minimal replay and option groups
+
+```python
+import quimb as qu
+import quimb.tensor as qtn
+from pepsy.optimizers import MpoOptimizer
+
+opt = MpoOptimizer(
+    qtn.MPO_identity(2),
+    gates=[(qu.CNOT(), (0, 1))],
+    chi=4,
+)
+result = opt.run(cutoff=0.0)
+```
+
+`run()` updates the current MPO and returns it. Another call replays the same
+queue on that updated MPO. The operator retains its absolute scale.
+
+| Purpose | Controls | What to keep in mind |
+| --- | --- | --- |
+| Compression | `mode`, `submpo_method`, `compression_opts`, `compression_seed` | `mode` persists; compression overrides apply to this call |
+| Accuracy | Constructor `chi`; run `cutoff`, `cutoff_mode` | Bond cap and truncation rule are separate |
+| FIT schedule | `n_iter`, `fit_block_size`, `fit_adaptive_sweeps`, `fit_rtol` | Named DMRG modes determine their block schedule |
+| FIT target and guess | `target_cutoff`, `fit_target_strategy`, `fit_init_strategy` | The disposable guess does not replace the exact target |
+| Layout | `layout`, `layout_allow_lossy_reorder` | Installing a layout changes persistent ordering |
+| Failure recovery | `atomic`, `transactional_steps`, `fit_fallback` | Run rollback, local FIT rollback, and full replay fallback are distinct |
+| Diagnostics | `finite_check`, `timing`, `fit_overlap_diagnostics` | Disabled by default; enabling adds work |
+
+`atomic=True` restores optimizer state if numerical replay fails. With
+`inplace=True`, external references can already have observed changes to the
+original MPO. `transactional_steps=True` protects individual FIT updates when
+whole-run atomicity is disabled. `fit_fallback="direct"` or `"svd"` restores
+the pre-replay snapshot and replays the full queue through that backend.
+Layout installation occurs before the replay snapshot; run rollback does not
+undo an installed layout. Inspect `last_run_status`, `last_run_error`, and
+`last_run_fallback` after an attempted replay.
+
+Use `finite_check` in new code. The retained `fit_finite_check` alias is
+resolved at the public call boundary; explicitly conflicting values raise.
+
+## Supported representations and compression
+
 Dense Quimb gate replay accepts `run(compression_opts=...)` for both MPO
 physical layers. See [compression stages](../boundary/compression.md) for
 intermediate/final settings and the restrictions on native and channel replay.

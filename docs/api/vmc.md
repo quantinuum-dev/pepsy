@@ -33,6 +33,21 @@ the responsibility-specific leaf module when inspecting implementation code.
 
 ## Recommended public workflow
 
+Keep the workflow in four steps: build a setup, collect samples, measure
+those samples, and optimize only when an update is wanted. Use
+`SamplingConfig` for chain count/burn-in/thinning, `ContractionConfig` for
+amplitude approximation, and `OptimizationConfig` for update settings through
+the backend-neutral `VMC` API. The backend-specific builders retain their
+documented keyword interfaces.
+
+| Question | Inspect or configure |
+| --- | --- |
+| Which tensor/basis order is used? | Packed ansatz sites and the spin or fermion configuration adapter |
+| Which approximation evaluates amplitudes? | Exact/boundary/HOTRG/CTMRG settings, bond cap, and cutoff |
+| Are fresh samples needed? | `sample(...)`; pass a retained batch to `measure_samples(...)` to reuse it |
+| Will parameters change? | Measurement keeps parameters; optimization updates them |
+| Is execution traced? | JIT requires supported static shapes/cutoffs; eager evaluation is a separate route |
+
 Use the model-specific builders for NetKet-backed VMC:
 
 - `build_ising_vmc(...)`

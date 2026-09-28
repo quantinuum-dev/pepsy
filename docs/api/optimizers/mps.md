@@ -33,6 +33,24 @@ subclasses continue to use the same methods and layout-finder hooks.
 
 ## Replay options
 
+Start with the defaults and add options for the part of replay you need:
+
+| Purpose | Main controls | Lifetime |
+| --- | --- | --- |
+| State and bond cap | Constructor `p`, `gates`, `chi`; `set_p`, `set_gates` | Optimizer state and queued stream |
+| Compression algorithm | `mode`, `submpo_method`, `compression_opts`, `compression_seed` | `run(mode=...)` changes the retained mode; other listed run controls apply to that call |
+| Accuracy | `cutoff`, `cutoff_mode` | That replay; independent of the bond cap |
+| Variational FIT | `n_iter`, `fit_rtol`, `fit_patience`, `fit_init_strategy` | That replay; select a DMRG mode first |
+| Layout | `apply_layout(...)`, `logical_order`, `to_dense()` | Persistent physical ordering and logical readout |
+| Diagnostics | `finite_check`, `timing`, `fit_overlap_diagnostics` | Opt-in work for that replay |
+| Shot ensemble | `shots`, `seed`, `strategy`, `run_kwargs`, `retain` | Child trajectories; see the [noise guide](noise.md) |
+
+An ordinary `run()` mutates the optimizer's current state. Calling it again
+replays the queued gates again. Shot execution uses child states; explicit
+`run_kwargs` overrides the numerical settings inherited by those children.
+Use the documented `fit_*` names in new code rather than legacy `mix_fit_*`
+spellings. `finite_check=False` and `timing=False` keep extra diagnostics off.
+
 Quimb replay accepts `run(compression_opts=...)` for independently controlled
 intermediate and final compression. See [compression stages](../boundary/compression.md)
 for supported options, capability checks, and final bond-limit semantics.

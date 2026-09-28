@@ -5,6 +5,19 @@ Prefer public imports from `pepsy.sampling`. Implementations are organized in
 shared records in `sampling.results`. Historical `sampling.samplers` imports
 and serialized class references remain compatible.
 
+## Choose a sampler
+
+| State | Entry point | Read next |
+| --- | --- | --- |
+| MPS | `MpsSampler` | [MPS batch API](#mps-sampler-quick-api) |
+| Dense qubit vector | `VecSampler` | [Exact-vector API](#dense-exact-vector-sampler) |
+| PEPS | `PepsSampler` | [Direct PEPS sampler](#direct-peps-sampler) |
+| Tree tensor network | `TreeSampler` | [Tree sampling](tree.md) |
+| Stabilizer frame with coefficient MPS | `StabilizerMpsSampler` | [Stabilizer sampling](stabilizer.md) |
+
+Import these classes from `pepsy.sampling`. Result probabilities and weights
+have sampler-specific meanings; use the contract for the selected engine.
+
 ## Direct PEPS sampler
 
 `PepsSampler` has an exact reference mode and a compressed boundary-MPS mode.
@@ -473,12 +486,9 @@ lattices. The numerical-reuse policy is the default; zero budget explicitly
 selects the reference path, and dense transfers require `row_cache_mode="dense"`.
 `row_cache_stats` reports `cache_representation` and mode `factored` when used.
 
-A reproducible evolved-state CPU/GPU benchmark is
-[`benchmarks/peps_sampling.py`](../../../benchmarks/peps_sampling.py). It separates
-setup, batch throughput, synchronized stage timings, and memory measurements,
-and checks amplitudes against a dense oracle for at most 16 sites. See the
-[dated efficiency study](../../development/notes/peps_sampler_efficiency.md)
-for measured benefits and limits.
+The [dated efficiency study](../../development/notes/peps_sampler_efficiency.md)
+records earlier CPU/GPU measurements and their limits. Runnable usage examples
+are listed in the [examples guide](../../examples.md).
 
 ### Likelihoods, zero branches, and truncation limits
 
@@ -528,6 +538,8 @@ support and truncation error without relying on a repository example script.
 `MpsSampler.sample_batch(...)` is the preferred batched interface for new code:
 
 ```python
+from pepsy.sampling import MpsSampler
+
 sampler = MpsSampler(psi, one_d_to_two_d, backend="native")
 batch = sampler.sample_batch(n_samples=4096, seed=0)
 
@@ -568,7 +580,9 @@ source array backend rather than the legacy Quimb sampling copy.
 dense state vector:
 
 ```python
-sampler = pepsy.VecSampler(state, one_d_to_two_d)
+from pepsy.sampling import VecSampler
+
+sampler = VecSampler(state, one_d_to_two_d)
 batch = sampler.sample_batch(4096, seed=0, basis="random", chunk_size=1024)
 
 batch.configs       # shape (4096, n_sites)
@@ -588,6 +602,27 @@ host. It also exposes the common MPS sampler methods `sample_arrays`,
 `amplitudes`, `probabilities`, and `refresh`; `Lx`, `Ly`, `L`,
 `one_d_to_two_d`, and `resolved_backend` follow the same conventions.
 
+Raw vectors contain ``2**L`` amplitudes with site 0 as the most significant
+bit. The sampler normalizes a private vector, so amplitude queries return
+normalized amplitudes even when the source is unnormalized. The source values
+are preserved. After changing the source, call `refresh()`; pass a replacement
+state to `refresh(state)` to reuse the site map with newly inferred backend
+and dtype. The number of sites stays fixed.
+
+| Method | Result | Default array location |
+| --- | --- | --- |
+| `sample_batch(n_samples, ...)` | Batch record: `configs` `(n_samples, L)`, `probs` and `weights` `(n_samples,)` | State backend/device |
+| `sample_arrays(n_samples, ...)` | Tuple `(configs, probs)` with the same shapes | State backend/device |
+| `sample(n_samples, ...)` | Legacy lists and 2D grids | Host |
+| `amplitudes(configs, ...)` | Normalized complex amplitudes `(batch,)`, always in the computational basis | NumPy |
+| `probabilities(configs, basis=...)` | Conditional Born probabilities `(batch,)` | NumPy |
+| `probability_vector(basis=...)` | Copy of the full distribution `(2**L,)` | State backend/device |
+
+Use `to_numpy=False` on amplitude/probability queries to retain the native
+backend. Torch amplitude and batch queries need `track_grad=True` to retain
+their gradients; sampled integer configurations are not differentiable.
+Converting a result to NumPy detaches it.
+
 Use `basis="X"`, `basis="Y"`, `basis="Z"`, a per-site string such as
 `"XYZZ"`, or `basis="random"`. Random mode chooses each site's basis
 uniformly and independently once per batch, so all shots in that batch share
@@ -595,6 +630,12 @@ the resolved pattern. `sample(...)` retains the legacy list/grid result. The
 batch method avoids constructing a Python grid for every shot, and transformed
 basis distributions are cached with a bounded cache. `probability_vector(...)`
 returns the full conditional distribution for a requested resolved basis.
+To evaluate sampled configurations, use
+`sampler.probabilities(batch.configs, basis=batch.basis)`. The probability
+query's `basis="random"` uses its own fixed seed-0 pattern, so it need not
+match a previous sample call. Batch `weights` are joint basis/outcome
+probabilities, not importance ratios.
+
 For true bounded-memory processing, consume `iter_samples(...)` instead:
 
 ```python

@@ -50,7 +50,12 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `normalization.py`: empty compatibility import path with no numerical
     imports; internal normalization execution is in `_norm.py`.
 - `mpo/`: MPO gate-stream optimization.
-  - `optimizer.py`: `MpoOptimizer`.
+  - `optimizer.py`: `MpoOptimizer`. Public `run()` prepares options and the
+    replay snapshot; `_run_dmrg_replay` owns FIT scheduling, failure records,
+    and fallback; `_run_compression_replay` shares direct/SVD success and
+    rollback handling. Numerical kernels and canonical state stay on the
+    optimizer. `_replay_policy` resolves the finite-check alias and scopes
+    temporary caches before entering `run()`.
   - `targets.py`: extraction target for gate-pair and DMRG target builders.
   - `compression.py`: extraction target for compression backends.
 - `tree/`: `TreeOptimizer` gate replay and controls, `TreeTensorNetwork` state
@@ -94,6 +99,15 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   `pair_ansatz=`. `system_size=N` names the 1D
   site count; 2D and explicit-mode fermions retain their existing schedules.
 - `global_opt.py`: whole-network variational optimization helpers.
+- `noise.py`: public trajectory records, native channel parsing, independent
+  and coalesced replay, importance weights, and result aggregation.
+- `_stim_compile.py`: private Stim instruction parsing, small Clifford matrix
+  caching, and plan construction. `noise.compile_stim_circuit` is the public
+  entry point; record classes stay in `noise` for import/pickle compatibility.
+  Record constructors are imported at call time to avoid a module cycle.
+
+MPS layout and replay both use `_stream_events.py` for event-name and sub-MPO
+parsing. MPO timing reuses the dependency-free MPS diagnostics summary.
 
 Entries described as extraction targets are proposals, not implemented
 subsystems or instructions to begin a refactor. Inspect their source before

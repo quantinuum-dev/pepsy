@@ -143,18 +143,32 @@ class VecSampler:
     state : TensorNetwork, Tensor, or array-like
         The dense state. If a quimb TensorNetwork/Tensor, the physical indices
         are assumed to follow ``ind_id`` format (default ``'k{}'``). If a raw
-        array, it is reshaped to a 1D vector of length 2^L.
+        array, it is flattened to length ``2**L``, with site 0 as the most
+        significant bit. The finite, nonzero state is normalized internally;
+        the supplied amplitudes are not modified.
     one_d_to_two_d : dict[int, tuple[int, int]], optional
         Mapping from 1D site index to (x, y) lattice coordinate. If omitted,
         infer a trivial single-row map from the dense vector length or state
         object's ``L`` attribute.
     ind_id : str
         Format string for physical index names (default ``'k{}'``).
-    basis : str or sequence[str], optional
-        Sampling basis is supplied to :meth:`sample`, rather than fixed at
-        construction. It can be global ``"X"``, ``"Y"``, or ``"Z"``, the
-        string ``"random"`` for an independent random choice at each site,
-        or a length-``L`` sequence such as ``"XYZZZ"``.
+
+    Notes
+    -----
+    Supply ``basis`` when sampling or querying probabilities. It can be
+    global ``"X"``, ``"Y"``, or ``"Z"``, a length-``L`` sequence such as
+    ``"XYZZZ"``, or ``"random"``. Random sampling chooses one basis per site
+    and shares that pattern across all shots in the call.
+
+    Call :meth:`refresh` after modifying the source; cached probabilities do
+    not follow source changes automatically. Dense storage grows as ``2**L``.
+
+    Examples
+    --------
+    >>> from pepsy.sampling import VecSampler
+    >>> sampler = VecSampler([0.0, 0.0, 2.0, 0.0])
+    >>> sampler.sample_batch(2, seed=7).configs.tolist()
+    [[1, 0], [1, 0]]
     """
 
     def __init__(
@@ -193,9 +207,12 @@ class VecSampler:
     def refresh(self, state=None):
         """Refresh the cached vector and basis distributions from ``state``.
 
-        This mirrors :meth:`MpsSampler.refresh`: call it after replacing or
-        evolving the dense state vector. The site map and resolved backend are
-        fixed by the sampler's construction.
+        With ``state=None``, reread the most recently supplied source. A new
+        state must have the same ``2**L`` size: the site map stays fixed,
+        while the backend is inferred again. NumPy, Torch, and CuPy arrays
+        retain their backend; other supported inputs are converted to NumPy.
+        Normalization leaves the source amplitudes unchanged and invalidates
+        cached distributions for every measurement basis. Returns ``self``.
         """
         if state is None:
             state = self._state
@@ -378,11 +395,16 @@ class VecSampler:
         to_numpy: bool = True,
         track_grad: bool = False,
     ):
-        """Return dense-state amplitudes for computational-basis configs.
+        """Return normalized amplitudes for computational-basis configs.
 
-        The signature follows :meth:`MpsSampler.amplitudes`. ``track_grad``
-        is accepted for interface compatibility; Torch indexing preserves the
-        state graph when it is requested.
+        ``configs`` has shape ``(batch, L)`` and contains binary physical
+        indices in site order, with site 0 the most significant bit. The
+        result has shape ``(batch,)`` and uses the internally normalized state,
+        even if the supplied source was unnormalized.
+
+        By default, return a host NumPy array. Use ``to_numpy=False`` to keep
+        the state backend and device. For Torch gradients, also pass
+        ``track_grad=True``; conversion to NumPy detaches the result.
         """
         if not isinstance(track_grad, (bool, np.bool_)):
             raise TypeError("track_grad must be a boolean.")
@@ -405,9 +427,14 @@ class VecSampler:
     ):
         """Return normalized Born probabilities for batched configurations.
 
-        ``basis`` extends the MPS-compatible API to the exact sampler's Pauli
-        basis support. Configurations are interpreted as computational-basis
-        outcomes in the selected basis.
+        ``configs`` has shape ``(batch, L)`` with binary outcomes in the
+        selected Pauli basis. The result has shape ``(batch,)`` and contains
+        ``p(config | basis)``. Return host NumPy arrays by default, or retain
+        the state backend and device with ``to_numpy=False``.
+
+        Pass a sampled batch's ``basis`` to evaluate its configurations in
+        the same basis. Here ``basis="random"`` resolves a fixed pattern
+        using seed 0; it does not recover the basis of an earlier sample call.
         """
         _values, indices = self._config_indices(configs)
         resolved_basis = _resolve_measurement_basis(
@@ -433,7 +460,12 @@ class VecSampler:
         basis="Z",
         chunk_size: int | None = _DEFAULT_VEC_SAMPLE_CHUNK_SIZE,
     ):
-        """Draw samples and return raw ``(configs, probs)`` arrays."""
+        """Return ``(configs, probs)`` from :meth:`sample_batch`.
+
+        Shapes are ``(n_samples, L)`` and ``(n_samples,)``. Arrays stay on
+        the state backend unless ``to_numpy=True``. Use ``sample_batch``
+        when the resolved basis or joint basis/outcome weights are needed.
+        """
         batch = self.sample_batch(
             n_samples=n_samples,
             seed=seed,
@@ -507,6 +539,10 @@ class VecSampler:
         to_numpy: bool = False,
     ) -> Any:
         """Return the exact normalized distribution in a measurement basis.
+
+        Return a copy of shape ``(2**L,)`` on the state backend, or a host
+        NumPy array with ``to_numpy=True``. Modifying this copy does not
+        change the sampler's cached distribution.
 
         ``basis="random"`` chooses one independent X/Y/Z label per site and
         uses ``seed`` to make that pattern reproducible. The returned vector
@@ -672,6 +708,11 @@ class VecSampler:
         weights are materialized at once. In ``basis="random"`` mode, one
         independent X/Y/Z basis label is chosen per site and shared by all
         yielded chunks from this call.
+
+        Yields :class:`MpsBatchSampleResult` objects with native arrays of
+        shape ``(chunk_length, L)`` for ``configs`` and ``(chunk_length,)``
+        for ``probs`` and ``weights``. The last chunk may be shorter. Retaining
+        all yielded batches also retains all their arrays in memory.
         """
         n_samples = _validate_sample_count(n_samples)
         chunk_size = _validate_sample_chunk_size(chunk_size)
@@ -714,6 +755,21 @@ class VecSampler:
         chunk_size: int | None = _DEFAULT_VEC_SAMPLE_CHUNK_SIZE,
     ) -> MpsBatchSampleResult:
         """Draw a backend-native batch without Python per-shot loops.
+
+        ``n_samples`` must be positive. ``seed`` controls the basis choice
+        and shot draws; reproducibility is scoped to the backend, device,
+        and draw settings. ``basis="random"`` chooses one pattern per call.
+
+        Return :class:`MpsBatchSampleResult` with ``configs`` of shape
+        ``(n_samples, L)`` and ``probs``/``weights`` of shape ``(n_samples,)``.
+        ``probs`` holds ``p(config | basis)``; ``weights`` holds that value
+        times ``basis_probability`` (``3**(-L)`` for random bases, otherwise
+        one). These weights are joint probabilities, not importance ratios.
+
+        Arrays retain the state backend and device unless ``to_numpy=True``.
+        For Torch, ``track_grad=True`` keeps gradients through the returned
+        probabilities and weights; discrete sampled configurations are not
+        differentiable. Conversion to NumPy detaches the arrays.
 
         ``sample`` remains the compatibility API that also builds one 2D grid
         per shot. ``chunk_size`` bounds temporary draw allocations; the final

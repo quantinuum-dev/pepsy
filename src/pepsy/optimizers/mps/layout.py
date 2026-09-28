@@ -15,6 +15,11 @@ import numpy as np
 
 from ...operators.gates import _normalize_gate_entries
 from .._layout_orders import normalize_fixed_order
+from .._stream_events import (
+    _normalize_event_name,
+    _normalize_submpo_where,
+    _submpo_event_parts,
+)
 from .._layout_visualization import (
     coordinate_lattice_edge_keys,
     coordinate_lattice_edges,
@@ -27,7 +32,6 @@ from ...tensors.maps import OneDMap
 
 __all__ = ["MpsGateStreamLayoutFinder", "MpsGateStreamSchedule"]
 
-_SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
 _MISSING = object()
 _NUMBA_GATE_STREAM_REFINE = None
 
@@ -47,55 +51,6 @@ class MpsGateStreamSchedule:
     site_order: tuple
     layout_plan: Mapping | None = None
     metadata: Mapping | None = None
-
-
-def _normalize_event_name(name):
-    """Normalize a stream event name for matching."""
-    return str(name).replace("-", "_").strip().lower()
-
-
-def _normalize_submpo_where(where):
-    """Normalize sub-MPO support sites to a non-empty tuple of 1D ints."""
-    if isinstance(where, Integral):
-        return (int(where),)
-    if (
-        isinstance(where, (tuple, list))
-        and len(where) > 0
-        and all(isinstance(site, Integral) for site in where)
-    ):
-        return tuple(int(site) for site in where)
-    raise ValueError(
-        "subMPO event where must be a non-empty sequence of 1D sites."
-    )
-
-
-def _submpo_event_parts(entry):
-    """Return ``(mpo, where)`` if ``entry`` is a sub-MPO event, else ``None``."""
-    if (
-        isinstance(entry, tuple)
-        and len(entry) == 3
-        and isinstance(entry[0], str)
-        and _normalize_event_name(entry[0]) in _SUBMPO_EVENT_NAMES
-    ):
-        return entry[1], entry[2]
-
-    if not isinstance(entry, Mapping):
-        return None
-
-    kind = entry.get("kind", entry.get("type", entry.get("event", _MISSING)))
-    if kind is _MISSING or _normalize_event_name(kind) not in _SUBMPO_EVENT_NAMES:
-        return None
-
-    mpo = entry.get(
-        "mpo",
-        entry.get("submpo", entry.get("operator", entry.get("payload", _MISSING))),
-    )
-    where = entry.get("where", entry.get("sites", _MISSING))
-    if mpo is _MISSING or where is _MISSING:
-        raise ValueError(
-            "subMPO stream event mappings must contain 'mpo' and 'where'."
-        )
-    return mpo, where
 
 
 def _is_submpo_event(entry):

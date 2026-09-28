@@ -7,6 +7,9 @@ and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
+- [Readability and API review](readability_api_2026_09.md) — Package-wide
+  structural inventory, ranked follow-ups, and corrected vector-sampler contracts.
+
 - [PEPS reusable planner and row-cache policy](peps_sampler_planner_policy.md)
 
 - [9×9 and 10×10 D=4 sampler resource probes](peps_sampler_large_corner_cases.md)
