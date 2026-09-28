@@ -12,7 +12,98 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Added
+
+- Compiled connected-cluster MPO and Pauli PEPO products now expose
+  `trace_exp(..., normalized=False, state_budget=100000)`. It evaluates
+  complete chosen-order ordered-product traces from scalar connected
+  residuals and compatible-cluster subset recursion, without MPO/PEPO
+  assembly or SVD. Single `PauliPEPOBasis` instances expose the same method.
+  Tests cover noncommuting products, periodic parallel bonds, Torch gradients
+  and JAX JIT gradients.
+
 ### Changed
+
+- Joint located PEPO products now avoid building unused homogeneous
+  Hamiltonian component maps. Independent noncommuting square-lattice
+  set-partition checks cover joint MPO/PEPO orders two through four with
+  symmetry reuse on/off; two-site fixed joint JAX JIT gradients are checked
+  against dense ordered exponentials.
+
+- Finite NumPy MPO compression matrices that trigger SVD nonconvergence now
+  retry with SciPy `gesvd` when SciPy is installed. Other backends,
+  nonfinite inputs and requested bond ranks keep their existing policies.
+
+- Located Pauli PEPO construction now reuses lower-order support
+  contractions under the same verified Hamiltonian and geometry symmetry
+  plan used for exact targets. Residuals and sparse block insertion remain
+  per placement; no numerical values persist between evaluations.
+
+- Fixed cluster JAX evaluation is regression-tested through complete
+  three-site MPO/PEPO construction and a 2×2 square at order four under
+  `jit(value_and_grad)`, including zero parameters/time and complex-time
+  two-site cases. Torch full-graph
+  capture is verified for the local exponential/fixed-split numeric path.
+  Native Torch identity and scalar promotion avoid two Autoray tracing
+  failures, and the PEPO tree uses Python shape products during capture;
+  complete Torch builder capture remains unsupported.
+
+- Explicit post-compression of fixed-channel cluster MPOs now has a runnable
+  chi/error benchmark. Dense numerical MPO error estimates QR-canonicalize the
+  difference before its Frobenius contraction, avoiding cancellation when the
+  compression error is small. This is an opt-in diagnostic and leaves
+  SVD-free fixed construction unchanged.
+
+- Fixed cluster MPOs align evaluated targets before residual subtraction,
+  supporting host-valued time steps with positional parameters and callable
+  coefficients without extra callback evaluations. Cluster MPO parameters
+  now honor declared defaults when no parameter container is supplied.
+
+- Cluster MPO and Pauli PEPO APIs accept `factorization="fixed"` for exact,
+  SVD-free construction with parameter-independent channel shapes. Trainable
+  zero MPO residuals retain their derivatives; generic homogeneous PEPO trees
+  use fixed index splits and cached topology. Internal compression is rejected
+  in this mode; the existing numerical policy remains the default.
+- `spatial_symmetries` accepts verified finite-site permutations alongside
+  automatic term-aware cluster reuse. Invalid geometry/term/parameter claims
+  raise; independent coefficient overrides retain separate reuse plans.
+- Mixed Python/Torch Pauli PEPO coefficients retain the trainable slots'
+  precision instead of rounding constants through the default Torch dtype.
+
+
+- Graph cluster MPOs support `assembly="recursive"`: shared remaining-site
+  MPOs retain every disjoint residual collection, adding and compressing
+  branches without enumerating collections. `assembly_state_budget` guards
+  structural work and raises without an approximation fallback. Reports expose
+  subproblem counts, live cache peaks and assembly rank reductions.
+- Streaming graph MPOs on direct plans now retain products of separated
+  residuals. Intermediate assembly compression prepares an orthonormal
+  environment before truncation, avoiding gauge-dependent loss of large terms.
+
+
+- Cluster MPOs and `PauliPEPOBasis` default to conservative
+  `spatial_reuse=True`: proven translations/rotations and graph relabelings
+  share local ordered targets, with structural plans cached at compilation.
+  Parameter identity, directed/parallel bonds, factor order and gradients are
+  preserved. Cache reports expose reuse; `spatial_reuse=False` enables
+  unreduced comparisons. Residual and collection/truncation policies remain
+  unchanged.
+
+- Compiled cluster MPOs reuse their callable, expose `last_report`, and accept
+  `return_report=True` to return the resolved construction report alongside
+  the semantic MPO. Compiled PEPO calls expose cache and shape inventories;
+  ordered PEPO diagnostics include each factor's preparation state.
+
+- `PauliPEPOBasis.compile_exp()` prepares located operator maps and tree
+  topology, and homogeneous higher-order source maps, before evaluation.
+  Translated clusters share static local maps while preserving independent
+  coefficients and directed/parallel bonds. Mixed ordered products compile
+  all factors for their actual evaluation route.
+
+- Cluster PEPO plans and Pauli bases expose `cluster_inventory` with per-size
+  oriented and C4 shape counts, split into trees and loops. Bounded geometry
+  caches reuse smaller shape levels across cutoffs and finite translated
+  embeddings across builds; numerical residuals and gradients remain dynamic.
 
 - Removed duplicate backend and linalg exports from `pepsy.tensors` and
   `pepsy.tensors.core`; import them from `pepsy.backends`. Also removed unused
@@ -189,6 +280,12 @@ releases remain backwards-compatible. From 1.0 onward:
 - Tree-PEPS two-layer compression now initializes transient bond diagnostics
   consistently. Enabling `track_bond_diagnostics=True` no longer raises
   `UnboundLocalError` after applying the operator.
+- `PepsOptimizer` now builds untruncated two-site targets before deciding that
+  they fit within `chi`, forwards the selected cutoff mode to all warm-start
+  compression paths, and rejects non-finite or substantially negative
+  infidelity estimates. Explicit truncating target gate overrides now raise.
+- `PepsSampler.sample_batch` gives each returned shot its own configuration
+  list even when prefix grouping reuses its proposal and exact amplitude.
 
 - PEPS amplitude cache initialization can be retried after preparation fails.
   Sample-result log and weight accessors reject mismatched field lengths rather

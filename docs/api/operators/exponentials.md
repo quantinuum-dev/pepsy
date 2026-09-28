@@ -1,7 +1,17 @@
 # Exponential API: MPO and PEPO
 
-This page is the short usage guide for the two higher-order exponential
-builders. The rule is simple:
+This page is the short usage guide for MPO and PEPO exponential builders.
+Select the mathematical approximation separately from the tensor layout:
+
+| Construction | Spatial connectivity | Approximation control |
+| --- | --- | --- |
+| Higher-order MPO history | Terms mapped to an MPO chain | Taylor/history `order` |
+| Connected-cluster MPO | Chain intervals, or an explicit physical graph | Spatial `cluster_size` plus graph assembly and rank controls |
+| Connected-cluster PEPO | Physical lattice graph | Spatial `order` plus rank controls |
+
+For 2D cluster MPOs, use `graph="square"` or an explicit `ClusterLattice`;
+`OneDMap`/snake ordering alone does not select square-lattice clusters. The
+[MPO compile example](mpo_cluster.md#repeated-evaluations) shows both inputs.
 
 For the longer-term ownership map, canonical vocabulary, and staged
 refactoring roadmap, see the [operator and exponential API plan](../../development/plans/operator_api.md).
@@ -57,14 +67,14 @@ The semantic result records `requested_mode`, `mode`,
 | One-shot connected-cluster MPO | `exp_mpo_cluster(terms, step, ...)` | Quimb MPO or semantic cluster MPO |
 | One-shot ordered MPO cluster product | `exp_mpo_cluster_product(factors, step, ...)` | Quimb MPO or semantic joint cluster MPO |
 | Native Trotter gate-product MPO | `exp_trotter(terms, step, ...)` | Quimb `MatrixProductOperator` |
-| Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO assembled from local connected residuals |
+| Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO, or a scalar full trace via `trace_exp` |
 | Product of two existing MPOs | `compress_mpo_product(A, B, ...)` | Lazy `A @ B`, then one ordinary compressed MPO |
 | Raw MPO tensors for a compiled kernel | `basis.compile_exp(...).exp_arrays(step, ...)` | Backend-native tensor tuple |
 | Quimb MPO interoperability | `semantic_mpo.to_mpo()` | Quimb `MatrixProductOperator` |
 | One fixed-channel square-lattice PEPO | `PauliPEPOBasis.compile(...)` | Reusable `PauliPEPOBasis` |
 | One PEPO exponential | `basis.exp(step, ...)` | `ActivePEPOBlocks` by default |
 | Repeated PEPO exponentials | `basis.compile_exp().exp(step, ...)` | Cached `CompiledPEPOExp` call |
-| Ordered PEPO product | `PEPOClusterProductExpansion.from_bases(...)` | One composed PEPO |
+| Ordered PEPO product | `PEPOClusterProductExpansion.from_bases(...)` | One PEPO from joint local residuals |
 | Dense PEPO materialization | `active_blocks.to_pepo()` or `materialize=True` | Quimb `PEPO` |
 | Coefficient-dependent real-time PEPO | `build_real_time_cluster_expansion_pepo(...)` | Quimb `PEPO` or active blocks |
 | Fractional-step PEPO composition | `compose_cluster_expansion_pepo(...)` | Quimb `PEPO` |
@@ -72,6 +82,15 @@ The semantic result records `requested_mode`, `mode`,
 The MPO and PEPO APIs deliberately have the same top-level vocabulary. They
 do not have the same output layout: an MPO is a 1D semantic operator, while a
 PEPO is first kept as sparse active virtual-sector blocks.
+
+Both cluster families offer `factorization="fixed"` for exact construction
+without parameter-dependent SVDs. Use `cutoff=0.0, max_bond=None` for MPOs and
+`max_tree_rank=None` for Pauli PEPOs. Fixed construction rejects internal
+compression; compress its result separately if desired. Geometry and verified
+term-aware symmetry plans are cached, while coefficient/time gradients remain
+fresh. See [MPO autodiff](mpo_cluster.md#exact-construction-for-autodiff-without-svd)
+and [PEPO autodiff](cluster_expansion.md#svd-free-differentiable-construction)
+for backend, memory and supplied-symmetry contracts.
 
 For graph-aware MPO clusters, `graph_assembly="auto"` protects the 1D
 materialization boundary: a cutwidth-aware chain-frontier dynamic program
@@ -82,6 +101,15 @@ reported bounded one-cluster approximation when its finite
 `graph_assembly="bounded"` with `max_collection_order` when a controlled
 approximation is preferable. This control is specific to graph cluster
 products and is independent of the local `cluster_size` cutoff.
+
+For complete graph collections without explicit enumeration, use
+`assembly="recursive"`: it shares remaining-site MPO subproblems, adds their
+branches, and compresses each sum to `assembly_chi`. Its
+`assembly_state_budget` raises at compilation if too many subproblems are
+needed; `collection_budget` is unused. With no assembly/local/final rank
+truncation this retains the full chosen spatial expansion. See
+[complete recursive assembly](mpo_cluster.md#complete-recursive-assembly-add-mpo-branches-and-compress)
+for limitations and diagnostics.
 
 For wide graph MPOs, `assembly="streaming"` provides a separate working-memory
 boundary. It inserts local graph-path cores directly into the accumulator in
@@ -589,3 +617,12 @@ New code should use `exp`, `compile_exp`, `CompiledMPOExp`, and
 `compile_evolution`, `evaluate`, and `CompiledMPOEvolution` remain available
 as compatibility shims so existing programs do not break. They are not the
 recommended vocabulary for new code.
+
+### Spatial reuse for repeated cluster construction
+
+The MPO cluster family and `PauliPEPOBasis` accept `spatial_reuse=True` by
+default. They cache proven site relabelings of local ordered Hamiltonians and
+evaluate each representative once per call, keeping coefficient bindings and
+gradients fresh. Disable it for unreduced comparisons. See the
+[MPO rules and counters](mpo_cluster.md#reusing-lattice-and-hamiltonian-symmetries)
+and [Pauli PEPO rules and counters](cluster_expansion.md#hamiltonian-aware-reuse-in-pauli-pepos).

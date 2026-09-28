@@ -17,6 +17,11 @@ from itertools import product
 
 from .mpo_automaton import _as_backend, _backend_reference
 from .pepo_active import ActivePEPOBlocks
+from ._cluster_factorization import normalize_factorization
+from ._cluster_symmetry import normalize_spatial_symmetries, verify_spatial_symmetries
+from ._cluster_symmetry import (
+    ClusterReusePlan, SpatialProductData, coefficient_key, permute_operator,
+)
 
 __all__ = ["PauliPEPOTerm", "CompiledPEPOExp", "PauliPEPOBasis"]
 
@@ -259,6 +264,17 @@ class CompiledPEPOExp:
         # Compile only value-independent cluster embeddings here. Matrix
         # exponentials and coefficient contractions still happen per call.
         basis._prepare_exp_plan()
+        basis._prepare_spatial_plans((basis,), localized=basis.inhomogeneous)
+
+    @property
+    def cache_info(self):
+        """Return current compilation and evaluation diagnostics."""
+        return self.basis.cache_info
+
+    @property
+    def cluster_inventory(self):
+        """Return independent per-size square-lattice shape counts."""
+        return self.basis.cluster_inventory
 
     def exp(
         self,
@@ -282,6 +298,14 @@ class CompiledPEPOExp:
             materialize=materialize,
         )
 
+    def trace_exp(self, step, parameters=None, *, coefficients=None,
+                  normalized=False, state_budget=100000):
+        """Evaluate the complete selected-order trace without building a PEPO."""
+        return self.basis.trace_exp(
+            step, parameters, coefficients=coefficients, normalized=normalized,
+            state_budget=state_budget,
+        )
+
     evaluate = exp
     __call__ = exp
 
@@ -294,6 +318,16 @@ class PauliPEPOBasis:
     are compiled once. Each evaluation only assembles local cluster
     exponentials and fills those fixed channels with the current coefficient
     and time-step values, so backend scalar graphs are not cached or copied.
+
+    ``spatial_reuse=True`` shares exact local targets under verified site
+    relabelings, independently of the existing ``symmetry="C4"`` block
+    transport. Disable it for unreduced comparisons. Structural plans retain
+    coefficient identities, while numerical targets live for one call only.
+
+    ``factorization="fixed"`` guarantees SVD-free construction, including
+    generic trees, and requires max_tree_rank=None. ``spatial_symmetries``
+    optionally declares finite site permutations in lattice coordinates;
+    declarations are validated against geometry and term bindings.
 
     The supported Hamiltonian family is
 
@@ -320,6 +354,9 @@ class PauliPEPOBasis:
         cyclic=False,
         symmetry=None,
         max_tree_rank=None,
+        spatial_reuse=True,
+        spatial_symmetries=(),
+        factorization="auto",
     ):
         self.lx = _validate_shape(lx, "lx")
         self.ly = _validate_shape(ly, "ly")
@@ -337,11 +374,26 @@ class PauliPEPOBasis:
             if int(max_tree_rank) < 1:
                 raise ValueError("max_tree_rank must be >= 1 or None.")
             max_tree_rank = int(max_tree_rank)
+        if not isinstance(spatial_reuse, bool):
+            raise TypeError("spatial_reuse must be a bool.")
+        self.spatial_reuse = spatial_reuse
         self.symmetry = symmetry
         self.max_tree_rank = max_tree_rank
+        self.factorization = normalize_factorization(factorization)
+        if self.factorization == "fixed" and max_tree_rank is not None:
+            raise ValueError("factorization='fixed' requires max_tree_rank=None.")
         self._terms = tuple(_normalize_pauli_term(term) for term in terms)
         if not self._terms:
             raise ValueError("terms must contain at least one Pauli slot.")
+        if self.factorization == "fixed" and symmetry == "C4" and any(
+            term.support == "edge" and term.paulis != term.paulis[::-1]
+            for term in self._terms
+        ):
+            raise ValueError(
+                "fixed C4 block transport requires each edge slot to be invariant "
+                "under endpoint reversal; use symmetry=None for term-aware "
+                "automatic reuse or validated spatial_symmetries."
+            )
         self.inhomogeneous = any(term.where is not None for term in self._terms)
         if self.inhomogeneous:
             if self.symmetry is not None:
@@ -354,6 +406,9 @@ class PauliPEPOBasis:
             for j in range(self.ly)
         }
         self._sites = tuple(self.site_directions)
+        self.spatial_symmetries = normalize_spatial_symmetries(self._sites, spatial_symmetries)
+        if self.spatial_symmetries and not self.spatial_reuse:
+            raise ValueError("spatial_symmetries requires spatial_reuse=True.")
         self._site_indices = {
             site: index for index, site in enumerate(self._sites)
         }
@@ -467,6 +522,11 @@ class PauliPEPOBasis:
         self._generic_cluster_cache = {}
         self._localized_cluster_cache = None
         self._localized_embedding_cache = {}
+        self._localized_topology_cache = {}
+        self._prepared_exp_modes = set()
+        self._spatial_plans = {}
+        self._spatial_slot_cache = None
+        self._last_spatial_evaluations = 0
         self.plaquette_starts = _plaquette_starts(self.lx, self.ly, self.cyclic)
         self.pair_orbits = _pair_orbits() if symmetry == "C4" else tuple(
             (pair, (pair,)) for pair in _all_direction_pairs()
@@ -475,6 +535,30 @@ class PauliPEPOBasis:
         self.path_orbits = _path_orbits(symmetry)
         self._build_count = 0
         self._compiled_exp = None
+        self._trace_product = None
+        self._verify_declared_spatial_symmetries()
+
+    def _verify_declared_spatial_symmetries(self):
+        if not self.spatial_symmetries:
+            return
+        plan = ClusterReusePlan()
+        keys = tuple(coefficient_key(term.coefficient) for term in self._terms)
+        if any(key is None for key in keys):
+            raise ValueError("cannot verify spatial_symmetries for opaque coefficient bindings.")
+        record = _LocalizedClusterRecord(
+            sites=self._sites, site_indices=tuple(range(len(self._sites))),
+            edges=tuple((self._site_indices[a], self._site_indices[b], direction)
+                        for a, b, direction in self._positive_edges),
+            edge_indices=tuple(range(len(self._positive_edges))),
+        )
+        terms = self._spatial_factor_terms(
+            plan, self, len(self._sites), record.edges, record,
+            slot_labels=tuple(plan.label(key) for key in keys),
+        )
+        verify_spatial_symmetries(
+            self.spatial_symmetries, len(self._sites),
+            tuple((a, b) for a, b, _ in record.edges), (terms,),
+        )
 
     @classmethod
     def compile(cls, lx, ly, terms, **kwargs):
@@ -497,6 +581,15 @@ class PauliPEPOBasis:
         return len(self._terms)
 
     @property
+    def cluster_inventory(self):
+        """Return square-lattice shape counts by size, including trees and loops.
+
+        ``c4_*`` identifies rotations as well as translations. Counts describe
+        geometry, independently of symmetry reuse, finite placements or ranks.
+        """
+        return _cluster_helper("_cluster_shape_inventory")(self.order)
+
+    @property
     def cache_info(self):
         """Return topology-only compilation diagnostics."""
         return {
@@ -508,6 +601,9 @@ class PauliPEPOBasis:
             "tree_orbits": len(self.triple_orbits) + len(self.path_orbits),
             "plaquettes": len(self.plaquette_starts),
             "cluster_embedding_plans": len(self._cluster_embedding_cache),
+            "localized_embedding_plans": len(self._localized_embedding_cache),
+            "localized_tree_plans": len(self._localized_topology_cache),
+            "prepared_exp_modes": tuple(sorted(self._prepared_exp_modes)),
             "generic_cluster_levels": len(self._generic_cluster_cache),
             "generic_cluster_shapes": sum(
                 len(level) for level in self._generic_cluster_cache.values()
@@ -532,7 +628,12 @@ class PauliPEPOBasis:
             "cyclic": self.cyclic,
             "symmetry": self.symmetry,
             "max_tree_rank": self.max_tree_rank,
+            "factorization": self.factorization,
             "compiled_exp": self._compiled_exp is not None,
+            "spatial_reuse": self.spatial_reuse,
+            "declared_spatial_symmetry_count": len(self.spatial_symmetries),
+            "spatial_plans": tuple(dict(plan.info) for plan in self._spatial_plans.values()),
+            "last_local_targets_evaluated": self._last_spatial_evaluations,
         }
 
     def compile_exp(self):
@@ -546,20 +647,41 @@ class PauliPEPOBasis:
             self._compiled_exp = CompiledPEPOExp(self)
         return self._compiled_exp
 
-    def _prepare_exp_plan(self):
-        """Precompute all small cluster embedding maps for this basis."""
+    def trace_exp(self, step, parameters=None, *, coefficients=None,
+                  normalized=False, state_budget=100000):
+        """Trace this basis's complete cluster expansion without PEPO bonds."""
+        if self._trace_product is None:
+            from .pepo_product import PEPOClusterProductExpansion
+            self._trace_product = PEPOClusterProductExpansion((self,))
+        return self._trace_product.trace_exp(
+            step, parameters, coefficients=coefficients,
+            normalized=normalized, state_budget=state_budget,
+        )
+
+    def _prepare_exp_plan(self, *, localized=False):
+        """Prepare geometry and static operator maps for the evaluation route."""
+        localized = localized or self.inhomogeneous
+        mode = "localized" if localized else "homogeneous"
+        if mode in self._prepared_exp_modes:
+            return self
         # Populate the process-wide physical basis cache before building the
         # per-basis cluster maps.
         _backend_pauli_basis(1)
         _backend_pauli_basis(2)
-        if self.inhomogeneous:
-            self._localized_cluster_records()
+        if localized:
+            for records in self._localized_cluster_records().values():
+                for record in records:
+                    self._localized_embedding_plan(record)
+                    if len(record.sites) > 1:
+                        self._localized_topology_plan(record)
+            self._prepared_exp_modes.add(mode)
             return self
         # The joint ordered-product path always evaluates the one-site
         # background and positive reference edge, including at order two.
         self._cluster_embedding_plan(1, ())
         self._cluster_embedding_plan(2, ((0, 1, "r"),))
         if self.order < 3:
+            self._prepared_exp_modes.add(mode)
             return self
         representatives = []
         for representative, _orbit in self.pair_orbits:
@@ -605,6 +727,11 @@ class PauliPEPOBasis:
                     for index, (_endpoint, direction) in enumerate(branches)
                 )
                 self._cluster_embedding_plan(3, three_edges)
+        for order in range(5, self.order + 1):
+            for shape, _embeddings, _variants in self._generic_cluster_records(order):
+                self._cluster_embedding_plan(shape.nsites, shape.edges)
+                _cluster_helper("_backend_tree_topology")(shape.nsites, tuple(shape.edges))
+        self._prepared_exp_modes.add(mode)
         return self
 
     def _generic_cluster_records(self, order):
@@ -719,7 +846,11 @@ class PauliPEPOBasis:
             if ndim != 0:
                 raise TypeError(f"coefficient[{index}] must be scalar.")
         reference = _backend_reference(values)
-        return tuple(_as_backend(value, like=reference) for value in values)
+        # Keep Python constants at the precision of the trainable slots.
+        # Converting a constant through Torch's default float32 first loses
+        # information even when stack() later promotes the batch to float64.
+        from .pepo_product import _as_backend_dtype
+        return tuple(_as_backend_dtype(value, like=reference) for value in values)
 
     def coefficients(self, parameters=None):
         """Evaluate the coefficient slots as one backend-native vector."""
@@ -855,8 +986,13 @@ class PauliPEPOBasis:
         return records
 
     def _localized_embedding_plan(self, record):
-        """Return static local Pauli embeddings for one finite site subset."""
-        key = (record.site_indices, record.edge_indices)
+        """Share static Pauli embeddings by ordered local graph structure.
+
+        Global site/edge indices select coefficients later; they do not change
+        these local matrices. Keep edge ordering, orientation and repeated
+        endpoint pairs in the key so directed and parallel bonds stay distinct.
+        """
+        key = (len(record.sites), tuple((s, t) for s, t, _ in record.edges))
         try:
             return self._localized_embedding_cache[key]
         except KeyError:
@@ -976,6 +1112,104 @@ class PauliPEPOBasis:
             )
         return result
 
+    def _prepare_spatial_plans(self, bases, *, localized):
+        """Compile common binding modes before the first exponential call."""
+        if not self.spatial_reuse:
+            return
+        bases = tuple(bases)
+        if localized:
+            for defaults in ((True,) * len(bases), (False,) * len(bases)):
+                for records in self._localized_cluster_records().values():
+                    self._localized_spatial_plan(bases, defaults, records)
+        else:
+            key = ("uniform", bases)
+            plan = self._spatial_plans.setdefault(key, ClusterReusePlan())
+            data = SpatialProductData(tuple((basis, None, None, None) for basis in bases), plan)
+            for nsites, edges in self._cluster_embedding_cache:
+                self._uniform_spatial_entry(data, nsites, edges)
+
+    def _spatial_slot_descriptions(self):
+        """Sparse, value-independent slot support; shared by binding modes."""
+        if self._spatial_slot_cache is None:
+            sites = [[] for _ in self._sites]
+            edges = [[] for _ in self._positive_edges]
+            for slot, site, pauli in zip(*np.nonzero(self._site_term_map)):
+                sites[site].append((int(slot), int(pauli)))
+            for slot, edge, pauli in zip(*np.nonzero(self._lattice_edge_term_map)):
+                a, b = divmod(int(pauli), 4)
+                edges[edge].append((int(slot), a, b))
+            self._spatial_slot_cache = (tuple(map(tuple, sites)), tuple(map(tuple, edges)))
+        return self._spatial_slot_cache
+
+    @staticmethod
+    def _spatial_factor_terms(plan, basis, nsites, edges, record=None, *, slot_labels=None):
+        """Describe the same Pauli sum as the cached embedding maps."""
+        terms = []
+        if record is not None:
+            site_slots, edge_slots = basis._spatial_slot_descriptions()
+            for site, physical in enumerate(record.site_indices):
+                terms.extend((slot_labels[slot], ((site, pauli),))
+                             for slot, pauli in site_slots[physical])
+            for (source, target, _), physical in zip(record.edges, record.edge_indices):
+                terms.extend((slot_labels[slot], ((source, a), (target, b)))
+                             for slot, a, b in edge_slots[physical])
+        else:
+            for slot, term in enumerate(basis._terms):
+                # Uniform coefficient vectors may vary independently by slot.
+                label = plan.label(("slot", slot))
+                paulis = tuple(_PAULI_LABELS.index(p) for p in term.paulis)
+                if term.support == "onsite":
+                    terms.extend((label, ((site, paulis[0]),)) for site in range(nsites))
+                else:
+                    for source, target, direction in edges:
+                        a, b = paulis if direction in _POSITIVE_DIRECTIONS else paulis[::-1]
+                        terms.append((label, ((source, a), (target, b))))
+        return tuple(terms)
+
+    @classmethod
+    def _uniform_spatial_entry(cls, data, nsites, edges):
+        key = (nsites, tuple(edges))
+        if key not in data.plan.entries:
+            factors = tuple(cls._spatial_factor_terms(data.plan, basis, nsites, edges)
+                            for basis, *_ in data)
+            data.plan.add(key, nsites, tuple((a, b) for a, b, _ in edges), factors)
+        return data.plan.entries[key]
+
+    def _localized_spatial_plan(self, bases, defaults, records):
+        nsites = len(records[0].sites)
+        key = ("localized", bases, defaults, nsites)
+        if key not in self._spatial_plans:
+            plan = ClusterReusePlan()
+            labels = []
+            for basis, use_defaults in zip(bases, defaults):
+                slots = []
+                for slot, term in enumerate(basis._terms):
+                    coefficient = coefficient_key(term.coefficient) if use_defaults else None
+                    # Override vectors and opaque coefficients retain slot
+                    # identity even when their current numbers happen to agree.
+                    slots.append(plan.label(("slot", slot) if coefficient is None else coefficient))
+                labels.append(tuple(slots))
+            for index, record in enumerate(records):
+                factors = tuple(self._spatial_factor_terms(
+                    plan, basis, nsites, record.edges, record, slot_labels=slot_labels)
+                    for basis, slot_labels in zip(bases, labels))
+                plan.add(index, nsites, tuple((a, b) for a, b, _ in record.edges), factors)
+            self._spatial_plans[key] = plan
+        return self._spatial_plans[key]
+
+    def _localized_reused_products(self, localized, records, *, like, defaults):
+        if not self.spatial_reuse:
+            self._last_spatial_evaluations += len(records)
+            return self._localized_ordered_products(localized, records, like=like)
+        bases = tuple(basis for basis, *_ in localized)
+        plan = self._localized_spatial_plan(bases, defaults, records)
+        sources = tuple(i for i, (source, _) in plan.entries.items() if i == source)
+        products = dict(zip(sources, self._localized_ordered_products(
+            localized, tuple(records[i] for i in sources), like=like)))
+        self._last_spatial_evaluations += len(sources)
+        return tuple(permute_operator(products[source], axes, 2)
+                     for source, axes in plan.entries.values())
+
     def _localized_ordered_products(self, localized, records, *, like, batch_size=8):
         """Batch equal-size finite-cluster targets, preserving factor order.
 
@@ -997,6 +1231,15 @@ class PauliPEPOBasis:
                 result = local_exp if result is None else ar.do("matmul", result, local_exp)
             results.extend(result[i] for i in range(len(chunk)))
         return tuple(results)
+
+    def _localized_topology_plan(self, record):
+        """Reuse deterministic tree metadata for identical directed graphs."""
+        key = (len(record.sites), record.edges)
+        if key not in self._localized_topology_cache:
+            self._localized_topology_cache[key] = self._localized_tree_topology(
+                record.edges, len(record.sites)
+            )
+        return self._localized_topology_cache[key]
 
     @staticmethod
     def _localized_tree_topology(edges, nsites):
@@ -1082,7 +1325,7 @@ class PauliPEPOBasis:
         no coefficient-dependent SVD gauge and retains stable autodiff.
         """
         nsites = len(record.sites)
-        topology = self._localized_tree_topology(record.edges, nsites)
+        topology = self._localized_topology_plan(record)
         parent, parent_direction, children, subtree_sites, ranks = topology
         required_rank = max(ranks.values(), default=1)
         if self.max_tree_rank is not None and self.max_tree_rank < required_rank:
@@ -1092,6 +1335,7 @@ class PauliPEPOBasis:
                 nsites,
                 2,
                 self.max_tree_rank,
+                factorization=self.factorization,
             )
             if factorized is None:
                 return
@@ -1217,11 +1461,14 @@ class PauliPEPOBasis:
         # the closed trace only, never to lower-support operator subtraction.
         return {sector[0] for sector in sectors.values()}
 
-    def _build_inhomogeneous_active(self, factor_sources):
+    def _build_inhomogeneous_active(self, factor_sources, *, defaults=None):
         """Build an occurrence-aware finite-lattice connected-cluster PEPO."""
         factor_sources = tuple(factor_sources)
         if not factor_sources:
             raise ValueError("factor_sources must contain at least one factor.")
+        if defaults is None:
+            defaults = (False,) * len(factor_sources)
+        self._last_spatial_evaluations = 0
         localized = []
         for basis, beta, values in factor_sources:
             if (basis.lx, basis.ly, basis.cyclic) != (
@@ -1254,7 +1501,8 @@ class PauliPEPOBasis:
             for basis, beta, site_components, edge_components in localized
         ]
         cluster_records = self._localized_cluster_records()
-        one_exps = self._localized_ordered_products(localized, cluster_records[1], like=reference)
+        one_exps = self._localized_reused_products(
+            localized, cluster_records[1], like=reference, defaults=defaults)
         blocks = {
             site: {
                 (0,) * len(self.site_directions[site]): one_exps[site_index]
@@ -1279,13 +1527,31 @@ class PauliPEPOBasis:
                 },
             )
             records = cluster_records[cluster_order]
-            exact_products = self._localized_ordered_products(localized, records, like=reference)
-            for record, exact in zip(records, exact_products):
-                lower = _contract_active_support_backend(
-                    lower_active,
-                    record.sites,
-                    record.edges,
+            exact_products = self._localized_reused_products(
+                localized, records, like=reference, defaults=defaults)
+            lower_plan = (
+                self._localized_spatial_plan(
+                    tuple(basis for basis, *_ in localized), defaults, records
                 )
+                if self.spatial_reuse else None
+            )
+            lower_cache = {}
+            for index, (record, exact) in enumerate(zip(records, exact_products)):
+                if lower_plan is None:
+                    lower = _contract_active_support_backend(
+                        lower_active, record.sites, record.edges
+                    )
+                else:
+                    # The completed lower-order expansion is equivariant under
+                    # the same verified term and geometry permutation as the
+                    # exact local target. Keep values only for this level/call.
+                    source, axes = lower_plan.entries[index]
+                    if source not in lower_cache:
+                        source_record = records[source]
+                        lower_cache[source] = _contract_active_support_backend(
+                            lower_active, source_record.sites, source_record.edges
+                        )
+                    lower = permute_operator(lower_cache[source], axes, 2)
                 residual = ar.do("subtract", exact, lower)
                 allowed = self._add_localized_pauli_tree(
                     blocks,
@@ -1434,6 +1700,13 @@ class PauliPEPOBasis:
         Guppy-style cluster expansion rather than a product of independent
         global approximations.
         """
+        if isinstance(factor_data, SpatialProductData):
+            source, axes = PauliPEPOBasis._uniform_spatial_entry(factor_data, nsites, edges)
+            if source not in factor_data.products:
+                source_nsites, source_edges = source
+                factor_data.products[source] = PauliPEPOBasis._ordered_cluster_product(
+                    tuple(factor_data), source_nsites, source_edges)
+            return permute_operator(factor_data.products[source], axes, 2)
         reference = _backend_reference(
             tuple(
                 value
@@ -1481,6 +1754,18 @@ class PauliPEPOBasis:
             return ()
         if batch_size < 1:
             raise ValueError("batch_size must be positive.")
+        if isinstance(factor_data, SpatialProductData):
+            entries = tuple(PauliPEPOBasis._uniform_spatial_entry(factor_data, nsites, edges)
+                            for edges in edge_batches)
+            missing = tuple(dict.fromkeys(source for source, _ in entries
+                                          if source not in factor_data.products))
+            if missing:
+                values = PauliPEPOBasis._ordered_cluster_product_batch(
+                    tuple(factor_data), nsites, tuple(edges for _, edges in missing),
+                    batch_size=batch_size)
+                factor_data.products.update(zip(missing, values))
+            return tuple(permute_operator(factor_data.products[source], axes, 2)
+                         for source, axes in entries)
         reference = _backend_reference(
             tuple(
                 value
@@ -1754,6 +2039,7 @@ class PauliPEPOBasis:
                     source_shape.nsites,
                     one_exp.shape[0],
                     self.max_tree_rank,
+                    factorization=self.factorization,
                 )
                 if factorized is None:
                     continue
@@ -1839,6 +2125,11 @@ class PauliPEPOBasis:
             if not factor_data:
                 raise ValueError("factor_data must contain at least one factor.")
 
+        if self.spatial_reuse:
+            key = ("uniform", tuple(basis for basis, *_ in factor_data))
+            plan = self._spatial_plans.setdefault(key, ClusterReusePlan())
+            factor_data = SpatialProductData(factor_data, plan)
+        self._last_spatial_evaluations = None
         one_exp = self._ordered_cluster_product(factor_data, 1, ())
         edge_exact = self._ordered_cluster_product(
             factor_data,
@@ -2094,6 +2385,8 @@ class PauliPEPOBasis:
                 one_exp,
             )
 
+        if isinstance(factor_data, SpatialProductData):
+            self._last_spatial_evaluations = len(factor_data.products)
         self._build_count += 1
         return ActivePEPOBlocks(
             lx=self.lx,
@@ -2150,7 +2443,8 @@ class PauliPEPOBasis:
         if self.inhomogeneous:
             reference = _backend_reference((beta, *values))
             beta = _as_backend(beta, like=reference)
-            active = self._build_inhomogeneous_active(((self, beta, values),))
+            active = self._build_inhomogeneous_active(
+                ((self, beta, values),), defaults=(coefficients is None,))
         else:
             active = self._build_active(beta, values)
         return active.to_pepo() if materialize else active

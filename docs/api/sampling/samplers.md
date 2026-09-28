@@ -308,7 +308,9 @@ logarithmic division semantics (infinity or undefined `0/0`).
 This uses prefix groups rather than adding a shared batch index to PEPS
 tensors, because a repeated Quimb index would be contracted as an ordinary
 bond. The batch contracts each distinct final configuration's amplitude once from
-the private PEPS for importance weights.
+the private PEPS for importance weights. Repeated shots receive independent
+configuration lists, so editing one returned shot cannot change another shot.
+As usual, stored probabilities and amplitudes describe the original draws.
 
 The default factored environment cache reuses actual numerical tensors: its
 right suffixes are contracted once per row and incoming prefix group, while

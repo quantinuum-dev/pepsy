@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from numbers import Integral
+from math import prod
 import warnings
 
 import autoray as ar
@@ -34,6 +35,7 @@ from .mpo_semantic import (
     MPOLocalOperatorTerm,
     MPOParameter,
     MPOProductTerm,
+    _UNSET,
     _as_backend,
     _backend_name,
     _backend_reference,
@@ -53,6 +55,10 @@ from .mpo_semantic import (
     _scatter_add_2d,
     _term_from_input,
 )
+from ._cluster_symmetry import ClusterReusePlan, coefficient_key, permute_operator
+from ._cluster_collections import compile_collection_recursion, validate_assembly_state_budget
+from ._cluster_factorization import fixed_split, normalize_factorization
+from ._cluster_symmetry import normalize_spatial_symmetries, verify_spatial_symmetries
 from .mpo_space import MPOPhysicalSpace
 from ._mpo_sparse import SparseVirtualTensor
 from .diagnostics import OperatorReportInfo
@@ -164,6 +170,8 @@ def _set_partitions(items):
 
 
 def _identity(dim, *, like):
+    if ar.infer_backend(like) == "torch":
+        return like.new_ones((int(dim),)).diag()
     return ar.do("eye", int(dim), like=like)
 
 
@@ -618,7 +626,7 @@ def _matrix_exponential(matrix):
 
 def _resolve(value, parameters, to_backend=None):
     if isinstance(value, MPOParameter):
-        if parameters is None:
+        if parameters is None and value.default is _UNSET:
             raise ValueError(
                 "parameters are required to resolve an MPOParameter in a "
                 "cluster expansion."
@@ -764,10 +772,10 @@ def _normalize_mpo_assembly(value):
     """Normalize the global MPO materialization strategy."""
 
     if not isinstance(value, str):
-        raise TypeError("assembly must be 'direct' or 'streaming'.")
+        raise TypeError("assembly must be 'direct', 'streaming', or 'recursive'.")
     value = value.strip().lower().replace("-", "_")
-    if value not in {"direct", "streaming"}:
-        raise ValueError("assembly must be 'direct' or 'streaming'.")
+    if value not in {"direct", "streaming", "recursive"}:
+        raise ValueError("assembly must be 'direct', 'streaming', or 'recursive'.")
     return value
 
 
@@ -1133,10 +1141,10 @@ def _graph_lattice_from_spec(graph, *, shape, length, basis, cyclic=False):
     return _graph_lattice_for_basis(lattice, basis)
 
 
-def _operator_schmidt(operator, nsites, phys_dim, cutoff, max_bond=None):
+def _operator_schmidt(operator, nsites, phys_dim, cutoff, max_bond=None, *, factorization="auto"):
     """Return an exact-or-cutoff operator TT decomposition."""
 
-    if _is_zero_operator(operator):
+    if factorization != "fixed" and _is_zero_operator(operator):
         zero = ar.do("zeros", (1, 1, phys_dim, phys_dim), like=operator)
         return [zero] * nsites
     if nsites == 1:
@@ -1152,13 +1160,13 @@ def _operator_schmidt(operator, nsites, phys_dim, cutoff, max_bond=None):
     carry = ar.do("reshape", tensor, (1, *([local_size] * nsites)))
     left_rank = 1
     for site in range(nsites - 1):
-        remaining = int(np.prod(carry.shape[2:]))
+        remaining = prod(carry.shape[2:])
         matrix = ar.do(
             "reshape",
             carry,
             (left_rank * phys_dim * phys_dim, remaining),
         )
-        if (
+        if factorization == "fixed" or (
             _backend_name(operator) == "jax"
             and max_bond is None
             and cutoff in (None, 0.0)
@@ -1167,15 +1175,8 @@ def _operator_schmidt(operator, nsites, phys_dim, cutoff, max_bond=None):
             # exact identity factorization on the smaller side of the split;
             # unlike the stabilized SVD this introduces no perturbation into
             # the represented operator while preserving autodiff.
-            rows, columns = int(matrix.shape[0]), int(matrix.shape[1])
-            if rows <= columns:
-                rank = rows
-                u = _identity(rank, like=matrix)
-                carry = matrix
-            else:
-                rank = columns
-                u = matrix
-                carry = _identity(rank, like=matrix)
+            u, carry = fixed_split(matrix)
+            rank = int(u.shape[1])
             core = ar.do(
                 "reshape",
                 u,
@@ -1277,6 +1278,8 @@ class MPOClusterExpansionReport:
     assembly_batch_size: int | str | None = None
     assembly_resolved_batch_size: int | None = None
     assembly_compression_count: int = 0
+    assembly_truncated: bool = False
+    assembly_peak_cached_states: int = 0
     assembly_peak_bond_dimensions: tuple[int, ...] = ()
     assembly_cutoff: float | str | None = None
     assembly_cutoff_mode: str = "rsum2"
@@ -1285,6 +1288,7 @@ class MPOClusterExpansionReport:
     symmetry: str | None = None
     physical_charges: tuple = ()
     native_block_sparse: bool = False
+    factorization: str = "auto"
 
     @property
     def api_info(self):
@@ -1295,7 +1299,8 @@ class MPOClusterExpansionReport:
             representation="semantic_mpo",
             order=self.cluster_size,
             factor_count=self.factor_count,
-            truncated=self.local_svd_truncated,
+            truncated=(self.local_svd_truncated or self.graph_collection_truncated
+                       or self.assembly_truncated),
         )
 
 
@@ -1318,10 +1323,29 @@ class CompiledMPOClusterProduct:
 
         return self.basis.cache_info
 
-    def exp(self, step=1.0, *, parameters=None):
-        """Evaluate the compiled ordered cluster product."""
+    @property
+    def last_report(self):
+        """Return the most recent construction report, or None before evaluation."""
+        return self.basis.last_report
 
-        return self.basis.exp(step, parameters=parameters)
+    def exp(self, step=1.0, *, parameters=None, return_report=False):
+        """Evaluate the product, optionally returning ``(semantic_mpo, report)``.
+
+        The report records the resolved graph assembly policy, including any
+        collection truncation. ``cache_info`` describes configured controls.
+        """
+        result = self.basis.exp(step, parameters=parameters)
+        if return_report:
+            return result, self.last_report
+        return result
+
+    def trace_exp(self, step=1.0, *, parameters=None, normalized=False,
+                  state_budget=100000):
+        """Evaluate the complete selected-order trace without building an MPO."""
+        return self.basis.trace_exp(
+            step, parameters=parameters, normalized=normalized,
+            state_budget=state_budget,
+        )
 
     evaluate = exp
     __call__ = exp
@@ -1344,6 +1368,11 @@ class MPOClusterProductExpansion:
     cap. Use :meth:`compile_exp` for repeated ordered products; it caches only
     interval/factor schedules and never numerical autodiff values.
 
+    ``spatial_reuse=True`` shares exact local targets when the graph,
+    operator terms and coefficient references agree under site relabeling.
+    Only the structural plan survives evaluation. Disable it for an unreduced
+    comparison; ``cache_info["spatial_plan"]`` reports the detected reuse.
+
     For graph inputs, ``graph_assembly`` controls the additional collection
     expansion caused by crossing or nested graph clusters in the MPO ordering.
     The default ``"auto"`` policy counts collections with a cutwidth-aware
@@ -1353,7 +1382,11 @@ class MPOClusterProductExpansion:
     graph-path cores directly into the accumulator in bounded batches. By
     default it applies a backend-native fixed-rank TT-SVD after each batch;
     ``assembly_cutoff`` switches to a cutoff-aware semantic TT-SVD, with
-    ``assembly_form`` selecting the sweep direction.
+    ``assembly_form`` selecting the sweep direction. ``assembly="recursive"``
+    instead retains every compatible collection through shared remaining-site
+    MPOs, adding/compressing branches without collection enumeration. Its
+    hard ``assembly_state_budget`` replaces collection_budget; setting
+    ``assembly_chi=None`` skips intermediate compression.
     """
 
     def __init__(
@@ -1370,8 +1403,12 @@ class MPOClusterProductExpansion:
         graph_assembly="auto",
         max_collection_order=None,
         collection_budget=128,
+        spatial_reuse=True,
+        spatial_symmetries=(),
+        factorization="auto",
         assembly="direct",
         assembly_chi=None,
+        assembly_state_budget=4096,
         assembly_batch_size="auto",
         assembly_cutoff=None,
         assembly_cutoff_mode="auto",
@@ -1392,6 +1429,7 @@ class MPOClusterProductExpansion:
         collection_budget = _validate_graph_collection_budget(collection_budget)
         assembly = _normalize_mpo_assembly(assembly)
         assembly_chi = _validate_assembly_chi(assembly_chi)
+        assembly_state_budget = validate_assembly_state_budget(assembly_state_budget)
         assembly_batch_size = _validate_assembly_batch_size(
             assembly_batch_size
         )
@@ -1409,12 +1447,30 @@ class MPOClusterProductExpansion:
             or assembly_batch_size not in (None, "auto")
             or assembly_cutoff is not None
             or assembly_form != "left"
+            or assembly_state_budget != 4096
         ):
             raise ValueError(
                 "streaming assembly options require "
-                "assembly='streaming'."
+                "assembly='streaming' or assembly='recursive'."
             )
+        if not isinstance(spatial_reuse, bool):
+            raise TypeError("spatial_reuse must be a bool.")
+        self.spatial_reuse = spatial_reuse
+        self.factorization = normalize_factorization(factorization)
+        if self.factorization == "fixed":
+            if max_bond is not None or cutoff not in (None, 0.0):
+                raise ValueError(
+                    "factorization='fixed' requires cutoff=0 or None and max_bond=None."
+                )
+            if assembly_chi is not None or assembly_cutoff is not None:
+                raise ValueError(
+                    "factorization='fixed' requires assembly_chi=None and "
+                    "assembly_cutoff=None; compress the result separately."
+                )
         self.L = int(L)
+        self.spatial_symmetries = normalize_spatial_symmetries(range(self.L), spatial_symmetries)
+        if self.spatial_symmetries and not self.spatial_reuse:
+            raise ValueError("spatial_symmetries requires spatial_reuse=True.")
         if not isinstance(cluster_size, Integral) or isinstance(cluster_size, bool):
             raise TypeError("cluster_size must be a positive integer.")
         self.cluster_size = min(self.L, int(cluster_size))
@@ -1438,15 +1494,17 @@ class MPOClusterProductExpansion:
         self.collection_budget = collection_budget
         self.assembly = assembly
         self.assembly_chi = assembly_chi
+        self.assembly_state_budget = assembly_state_budget
+        self._graph_recursive_plan_cache = None
         self.assembly_batch_size = assembly_batch_size
         self.assembly_cutoff = assembly_cutoff
         self.assembly_cutoff_mode = assembly_cutoff_mode
         self.assembly_form = assembly_form
         self.graph = None if graph is None else _graph_lattice_from_input(graph, self.L)
         self.cluster_mode = "graph" if self.graph is not None else "interval"
-        if self.assembly == "streaming" and self.graph is None:
+        if self.assembly in {"streaming", "recursive"} and self.graph is None:
             raise ValueError(
-                "assembly='streaming' currently requires graph cluster mode."
+                f"assembly={self.assembly!r} currently requires graph cluster mode."
             )
         if self.graph is None and max_collection_order is not None:
             raise ValueError(
@@ -1457,6 +1515,16 @@ class MPOClusterProductExpansion:
                 "max_collection_order cannot be combined with "
                 "graph_assembly='exact'."
             )
+        if assembly == "recursive":
+            if graph_assembly == "bounded" or max_collection_order is not None:
+                raise ValueError(
+                    "assembly='recursive' retains complete collections; use "
+                    "graph_assembly='exact' or 'auto' without max_collection_order."
+                )
+            if assembly_chi is None and assembly_cutoff is not None:
+                raise ValueError(
+                    "assembly_cutoff requires assembly_chi for recursive assembly."
+                )
         self._graph_auto_warned = False
         self._graph_collection_plan_cache = {}
         self.factors = tuple(self._normalize_factor(factor) for factor in factors)
@@ -1481,12 +1549,17 @@ class MPOClusterProductExpansion:
             fermionic=fermionic,
             physical_space=physical_space,
         )
+        if self.factorization == "fixed" and self.physical_space.symmetry is not None:
+            raise ValueError(
+                "factorization='fixed' currently requires dense physical space; "
+                "native sector compilation may use numerical decomposition."
+            )
         if (
-            self.assembly == "streaming"
+            self.assembly in {"streaming", "recursive"}
             and self.physical_space.symmetry is not None
         ):
             raise ValueError(
-                "streaming assembly with native symmetry is not yet "
+                f"{self.assembly} assembly with native symmetry is not yet "
                 "supported because intermediate SVDs must remain sector-aware; "
                 "use assembly='direct' for a native block-sparse MPO."
             )
@@ -1644,6 +1717,11 @@ class MPOClusterProductExpansion:
             }
         self._build_count = 0
         self._last_report = None
+        self._compiled_exp = None
+        self._trace_plans = {}
+        self._spatial_plan = self._compile_spatial_plan()
+        if self.assembly == "recursive":
+            self._graph_recursive_plan()
 
     @staticmethod
     def _normalize_factor(factor):
@@ -1723,7 +1801,50 @@ class MPOClusterProductExpansion:
     def compile_exp(self):
         """Return a reusable callable over this topology-only expansion."""
 
-        return CompiledMPOClusterProduct(self)
+        if self._compiled_exp is None:
+            self._compiled_exp = CompiledMPOClusterProduct(self)
+        return self._compiled_exp
+
+    def trace_exp(self, step=1.0, *, parameters=None, normalized=False,
+                  state_budget=100000):
+        """Trace the complete cluster expansion via connected scalar residuals.
+
+        This follows all compatible cluster collections regardless of the
+        configured graph assembly or bond-compression policy. It therefore
+        represents the uncompressed chosen-order expansion, which may differ
+        from an MPO built with truncation or bounded collection assembly.
+        """
+        if self.physical_space.fermionic:
+            raise NotImplementedError("trace_exp requires a bosonic physical space.")
+        from ._cluster_trace import compile_trace_plan, evaluate_trace_plan
+
+        if state_budget not in self._trace_plans:
+            clusters = (
+                self._graph_clusters if self.graph is not None
+                else tuple(tuple(range(start, end + 1)) for start, end in self._intervals)
+            )
+            self._trace_plans[state_budget] = compile_trace_plan(
+                self.L, clusters, state_budget,
+            )
+        ordered, plan = self._trace_plans[state_budget]
+        source_traces = {}
+        local_traces = {}
+        for cluster in ordered:
+            key = cluster if self.graph is not None else (cluster[0], cluster[-1])
+            source, _axes = self._spatial_plan.entries[key]
+            if source not in source_traces:
+                target = (
+                    self._graph_local_exponential(source, step, parameters)
+                    if self.graph is not None else
+                    self._local_exponential(*source, step, parameters)
+                )
+                source_traces[source] = ar.do("trace", target) / self.phys_dim ** len(cluster)
+            local_traces[cluster] = source_traces[source]
+        local_traces = self._align_fixed_products(local_traces, force=True)
+        return evaluate_trace_plan(
+            ordered, plan, local_traces, phys_dim=self.phys_dim,
+            normalized=normalized,
+        )
 
     @property
     def cache_info(self):
@@ -1732,6 +1853,7 @@ class MPOClusterProductExpansion:
         return {
             "compiled": True,
             "builds": self._build_count,
+            "compiled_exp": self._compiled_exp is not None,
             "interval_count": len(self._intervals),
             "cluster_mode": self.cluster_mode,
             "graph_cluster_count": len(self._graph_clusters),
@@ -1745,17 +1867,29 @@ class MPOClusterProductExpansion:
             "collection_budget": self.collection_budget,
             "assembly": self.assembly,
             "assembly_chi": self.assembly_chi,
+            "assembly_state_budget": self.assembly_state_budget,
+            "assembly_subproblem_count": (
+                0 if self._graph_recursive_plan_cache is None
+                else self._graph_recursive_plan_cache["planner_state_count"]
+            ),
             "assembly_batch_size": self.assembly_batch_size,
             "assembly_cutoff": self.assembly_cutoff,
             "assembly_cutoff_mode": self.assembly_cutoff_mode,
             "assembly_form": self.assembly_form,
             "symmetry": self.physical_space.symmetry,
             "native_block_sparse": self.physical_space.symmetry is not None,
-            "graph_planner": "frontier_dp" if self.graph is not None else "none",
+            "graph_planner": (
+                "subset_dp" if self._graph_recursive_plan_cache is not None
+                else "frontier_dp" if self.graph is not None else "none"
+            ),
             "graph_frontier_width": (
                 0 if self.graph is None else self._graph_frontier_width()
             ),
             "static_matrix_count": self._static_matrix_count,
+            "spatial_reuse": self.spatial_reuse,
+            "declared_spatial_symmetry_count": len(self.spatial_symmetries),
+            "factorization": self.factorization,
+            "spatial_plan": dict(self._spatial_plan.info),
         }
 
     @classmethod
@@ -2022,13 +2156,98 @@ class MPOClusterProductExpansion:
             total = ar.do("matmul", total, local_exponential)
         return total
 
+    def _compile_spatial_plan(self):
+        """Prove local target equivalences, preserving parameter identities."""
+        plan = ClusterReusePlan()
+
+        def describe(factor_terms, positions):
+            factors = []
+            supported = self.spatial_reuse
+            for factor, terms in zip(self.factors, factor_terms):
+                # Callable factor coefficients can have observable per-cluster
+                # behavior. Do not change their evaluation count.
+                if callable(factor.coefficient):
+                    supported = False
+                labeled = []
+                for term in terms:
+                    coefficient = coefficient_key(term.coefficient)
+                    if (coefficient is None or not isinstance(term, MPOProductTerm)
+                            or term.string_operators is not None
+                            or not all(isinstance(op, np.ndarray) and op.dtype.kind in "biufc"
+                                       for op in term.operators)):
+                        supported = False
+                        continue
+                    operators = tuple((positions[site], plan.label(
+                        ("operator", op.dtype.str, op.shape, op.tobytes())))
+                        for site, op in zip(term.sites, term.operators))
+                    labeled.append((plan.label(coefficient), operators))
+                factors.append(tuple(labeled))
+            return tuple(factors) if supported else None
+
+        if self.spatial_symmetries:
+            full_edges = (tuple(self.graph.edges) if self.graph is not None
+                          else tuple((i, i + 1) for i in range(self.L - 1)))
+            verify_spatial_symmetries(
+                self.spatial_symmetries, self.L, full_edges,
+                describe(tuple(factor.terms for factor in self.factors),
+                         dict(enumerate(range(self.L)))),
+            )
+        factor_map = self._graph_factor_terms if self.graph is not None else self._interval_factor_terms
+        for key, factor_terms in factor_map.items():
+            sites = key if self.graph is not None else tuple(range(key[0], key[1] + 1))
+            if not self.spatial_reuse:
+                plan.add(key, len(sites), (), None)
+                continue
+            positions = {site: i for i, site in enumerate(sites)}
+            edges = (tuple((positions[a], positions[b]) for a, b in self.graph.edges
+                           if a in positions and b in positions)
+                     if self.graph is not None else tuple((i, i + 1) for i in range(len(sites) - 1)))
+            plan.add(key, len(sites), edges, describe(factor_terms, positions))
+        return plan
+
+    def _align_fixed_products(self, products, *, force=False):
+        """Align evaluated local targets without resolving coefficients again.
+
+        Empty supports produce host identities when the step is a Python
+        scalar. Tensor-valued defaults, positional bindings and callables may
+        reveal the evaluation backend only on larger supports. Align before
+        connected subtraction so constants and gradients share one backend.
+        """
+        if self.factorization != "fixed" and not force:
+            return products
+        reference = _backend_reference(products.values())
+        if _backend_name(reference) in {"builtins", "numpy"}:
+            return products
+        from pepsy.backends import infer_backend_converter_from_sample
+
+        native = tuple(value for value in products.values()
+                       if _backend_name(value) not in {"builtins", "numpy"})
+        if len({_backend_name(value) for value in native}) != 1:
+            raise TypeError("cluster targets must use one tensor backend.")
+        # Host identities must not force float64 on a float32 evaluation.
+        dtype = ar.get_common_dtype(*native)
+        reference = ar.do("astype", reference, dtype)
+        converter = infer_backend_converter_from_sample(reference)
+        if converter is None:
+            return products
+        aligned = {key: converter(value) for key, value in products.items()}
+        # A host-valued factor can introduce complex entries after conversion.
+        dtype = ar.get_common_dtype(*aligned.values())
+        return {key: ar.do("astype", value, dtype) for key, value in aligned.items()}
+
     def _graph_residuals(self, step, parameters):
         """Compute connected residuals using graph-connected partitions."""
 
         products = {}
         residuals = {}
         for cluster in self._graph_clusters:
-            products[cluster] = self._graph_local_exponential(cluster, step, parameters)
+            source, axes = self._spatial_plan.entries[cluster]
+            products[cluster] = (
+                self._graph_local_exponential(cluster, step, parameters)
+                if source == cluster else permute_operator(products[source], axes, self.phys_dim)
+            )
+        products = self._align_fixed_products(products)
+        for cluster in self._graph_clusters:
             residual = products[cluster]
             for partition in self._graph_partitions[cluster]:
                 contribution = _identity(
@@ -2065,6 +2284,7 @@ class MPOClusterProductExpansion:
             self.phys_dim,
             self.cutoff,
             self.max_bond,
+            factorization=self.factorization,
         )
 
         def gap_core(left_rank, right_rank, operator):
@@ -2132,7 +2352,13 @@ class MPOClusterProductExpansion:
         residuals = {}
         for interval in self._intervals:
             start, end = interval
-            products[interval] = self._local_exponential(start, end, step, parameters)
+            source, axes = self._spatial_plan.entries[interval]
+            products[interval] = (
+                self._local_exponential(start, end, step, parameters)
+                if source == interval else permute_operator(products[source], axes, self.phys_dim)
+            )
+        products = self._align_fixed_products(products)
+        for interval in self._intervals:
             residual = products[interval]
             for left_interval, right_interval in self._interval_splits[interval]:
                 residual = ar.do(
@@ -2308,6 +2534,7 @@ class MPOClusterProductExpansion:
         peak_bond_dimensions = list(accumulator.bond_dimensions)
         residual_ranks = {}
         compression_count = 0
+        assembly_truncated = False
         discarded_weights = []
         assembly_cutoff = self.assembly_cutoff
         if isinstance(assembly_cutoff, str):
@@ -2362,24 +2589,13 @@ class MPOClusterProductExpansion:
                     accumulator.bond_dimensions,
                 )
             ]
-            if assembly_cutoff is None:
-                accumulator, compression_report = accumulator.compress_fixed_rank(
-                    self.assembly_chi,
-                    form=self.assembly_form,
-                    return_report=True,
-                )
-            else:
-                accumulator, compression_report = accumulator.compress_adaptive(
-                    self.assembly_chi,
-                    cutoff=assembly_cutoff,
-                    cutoff_mode=self.assembly_cutoff_mode,
-                    form=self.assembly_form,
-                    return_report=True,
-                )
-                discarded_weights.extend(
-                    compression_report.discarded_weights
-                )
+            accumulator, compression_report = self._compress_graph_accumulator(
+                accumulator, assembly_cutoff
+            )
+            if assembly_cutoff is not None:
+                discarded_weights.extend(compression_report.discarded_weights)
             compression_count += 1
+            assembly_truncated |= compression_report.truncated
 
         return accumulator, {
             "residual_ranks": tuple(
@@ -2387,10 +2603,163 @@ class MPOClusterProductExpansion:
                 for cluster in sorted(residual_ranks)
             ),
             "compression_count": compression_count,
+            "truncated": assembly_truncated,
             "resolved_batch_size": batch_size,
             "peak_bond_dimensions": tuple(peak_bond_dimensions),
             "cutoff": assembly_cutoff,
             "resolved_cutoff": assembly_cutoff,
+            "cutoff_mode": self.assembly_cutoff_mode,
+            "form": self.assembly_form,
+            "discarded_weights": tuple(discarded_weights),
+        }
+
+    def _compress_graph_accumulator(self, accumulator, cutoff):
+        """Prepare an orthonormal environment before truncating an MPO sum.
+
+        Core direct sums/products have arbitrary gauges. An exact reverse
+        left-canonical sweep supplies the right environment for TT-SVD. Use
+        the left sweep in reversed chain order for right-directed output too:
+        the semantic right sweep absorbs singular values into site cores and
+        does not itself provide the right-canonical environment needed here.
+        """
+        def reverse(mpo):
+            return FirstDegreeMPO(
+                tuple(ar.do("transpose", core, (1, 0, 2, 3))
+                      for core in reversed(mpo.arrays)),
+                degree=self.cluster_size, physical_space=self.physical_space,
+                metadata={"history_valid": False},
+            )
+
+        source = reverse(accumulator) if self.assembly_form == "right" else accumulator
+        prepared = reverse(reverse(source).compress_fixed_rank(
+            max(source.bond_dimensions, default=1), form="left"
+        ))
+        if cutoff is None:
+            result, report = prepared.compress_fixed_rank(
+                self.assembly_chi, form="left", return_report=True
+            )
+        else:
+            result, report = prepared.compress_adaptive(
+                self.assembly_chi, cutoff=cutoff,
+                cutoff_mode=self.assembly_cutoff_mode,
+                form="left", return_report=True,
+            )
+            report = replace(report, form=self.assembly_form)
+        if self.assembly_form == "right":
+            result = reverse(result)
+        report = replace(
+            report, initial_bond_dimensions=accumulator.bond_dimensions,
+            final_bond_dimensions=result.bond_dimensions,
+            truncated=result.bond_dimensions != accumulator.bond_dimensions,
+        )
+        return result, report
+
+    def _graph_recursive_plan(self):
+        """Cache the complete collection DAG, including sharing/reference counts."""
+        if self._graph_recursive_plan_cache is None:
+            self._graph_recursive_plan_cache = compile_collection_recursion(
+                self.L, self._graph_clusters, self.assembly_state_budget)
+        return self._graph_recursive_plan_cache
+
+    def _assemble_graph_recursive(self, residuals, plan):
+        """Sum/compress shared subset MPOs, retaining all compatible products.
+
+        F(S) = E_i F(S minus {i}) + sum_{C contains i, C subset S} R_C F(S minus C).
+        The smallest remaining site i chooses a unique branch for every
+        collection. Child operators are identity on removed sites, so the
+        factors have disjoint physical support. No inverse of E_i is needed.
+        Compression changes the tensor representation, never branch selection.
+        """
+        reference = _backend_reference(tuple(residuals.values()))
+        identity = ar.do("reshape", _identity(self.phys_dim, like=reference),
+                         (1, 1, self.phys_dim, self.phys_dim))
+
+        def semantic(arrays):
+            return FirstDegreeMPO(arrays, degree=self.cluster_size,
+                                  physical_space=self.physical_space,
+                                  metadata={"operation": "cluster_expansion_recursive",
+                                            "history_valid": False})
+
+        live = {0: semantic((identity,) * self.L)}
+        uses = dict(plan["uses"])
+        pure_cores = {}
+        peak_bonds = [1] * (self.L - 1)
+        peak_cached_states = 1
+        compression_count = 0
+        truncated = False
+        discarded_weights = []
+        cutoff = self.assembly_cutoff
+        if isinstance(cutoff, str):
+            cutoff = _resolve_compression_cutoff(cutoff, reference)
+        if self.assembly == "streaming":
+            batch_size = _resolve_assembly_batch_size(
+                self.assembly_batch_size,
+                sum(len(cluster) > 1 for cluster in self._graph_clusters),
+                frontier_width=self._graph_frontier_width())
+        else:
+            batch_size = (1 if self.assembly_batch_size in (None, "auto")
+                          else self.assembly_batch_size)
+
+        def record_peak(arrays):
+            for i, array in enumerate(arrays[:-1]):
+                peak_bonds[i] = max(peak_bonds[i], int(array.shape[1]))
+
+        def compress(accumulator):
+            nonlocal compression_count, truncated
+            if self.assembly_chi is None:
+                return accumulator
+            result, report = self._compress_graph_accumulator(accumulator, cutoff)
+            if cutoff is not None:
+                discarded_weights.extend(report.discarded_weights)
+            compression_count += 1
+            truncated |= report.truncated
+            return result
+
+        for mask in plan["order"][1:]:
+            accumulator = None
+            pending = []
+            for child, cluster in plan["branches"][mask]:
+                child_mpo = live[child]
+                arrays = list(child_mpo.arrays)
+                if len(cluster) == 1:
+                    start = cluster[0]
+                    local_cores = (ar.do("reshape", residuals[cluster],
+                                        (1, 1, self.phys_dim, self.phys_dim)),)
+                else:
+                    start = min(cluster)
+                    if cluster not in pure_cores:
+                        pure_cores[cluster] = self._graph_span_cores(cluster, residuals[cluster])
+                    local_cores = pure_cores[cluster]
+                for offset, core in enumerate(local_cores):
+                    arrays[start + offset] = self._multiply_mpo_cores(core, arrays[start + offset])
+                record_peak(arrays)
+                if accumulator is None:
+                    accumulator = semantic(tuple(arrays))
+                else:
+                    pending.append(tuple(arrays))
+                    if batch_size is not None and len(pending) >= batch_size:
+                        accumulator = accumulator._add_path_cores_batch(pending)
+                        record_peak(accumulator.arrays)
+                        accumulator = compress(accumulator)
+                        pending.clear()
+                uses[child] -= 1
+                if uses[child] == 0:
+                    del live[child]
+            if pending:
+                accumulator = accumulator._add_path_cores_batch(pending)
+                record_peak(accumulator.arrays)
+                accumulator = compress(accumulator)
+            live[mask] = accumulator
+            peak_cached_states = max(peak_cached_states, len(live))
+        return live[plan["root"]], {
+            "residual_ranks": tuple((cluster, tuple(int(core.shape[1]) for core in cores))
+                                    for cluster, cores in sorted(pure_cores.items())),
+            "compression_count": compression_count,
+            "truncated": truncated,
+            "peak_cached_states": peak_cached_states,
+            "resolved_batch_size": batch_size,
+            "peak_bond_dimensions": tuple(peak_bonds),
+            "cutoff": cutoff,
             "cutoff_mode": self.assembly_cutoff_mode,
             "form": self.assembly_form,
             "discarded_weights": tuple(discarded_weights),
@@ -2625,6 +2994,8 @@ class MPOClusterProductExpansion:
     def _graph_collection_plan(self):
         """Return a cached graph collection plan for this topology."""
 
+        if self.assembly == "recursive":
+            return self._graph_recursive_plan()
         cache_key = (
             self.graph_assembly,
             self.max_collection_order,
@@ -2978,6 +3349,7 @@ class MPOClusterProductExpansion:
                     self.phys_dim,
                     self.cutoff,
                     self.max_bond,
+                    factorization=self.factorization,
                 )
 
         state_lists = [[("rail",)]]
@@ -3057,7 +3429,15 @@ class MPOClusterProductExpansion:
             arrays, state_lists, cores = self._assemble(residuals)
         else:
             graph_plan = self._graph_collection_plan()
-            if self.assembly == "streaming":
+            if self.assembly == "recursive" or (
+                self.assembly == "streaming" and graph_plan["strategy"] == "direct"
+            ):
+                graph_plan = self._graph_recursive_plan()
+                semantic, streaming_info = self._assemble_graph_recursive(residuals, graph_plan)
+                arrays = semantic.arrays
+                state_lists = None
+                cores = None
+            elif self.assembly == "streaming":
                 semantic, streaming_info = self._assemble_graph_streaming(
                     residuals,
                     graph_plan=graph_plan,
@@ -3082,6 +3462,8 @@ class MPOClusterProductExpansion:
             bond_dimensions = tuple(len(states) for states in state_lists[1:-1])
             assembled_semantic = None
             assembly_compression_count = 0
+            assembly_truncated = False
+            assembly_peak_cached_states = 0
             assembly_peak_bond_dimensions = ()
             assembly_resolved_batch_size = None
             assembly_cutoff = None
@@ -3093,6 +3475,8 @@ class MPOClusterProductExpansion:
             bond_dimensions = tuple(semantic.bond_dimensions)
             assembled_semantic = semantic
             assembly_compression_count = streaming_info["compression_count"]
+            assembly_truncated = streaming_info["truncated"]
+            assembly_peak_cached_states = streaming_info.get("peak_cached_states", 0)
             assembly_resolved_batch_size = streaming_info["resolved_batch_size"]
             assembly_peak_bond_dimensions = streaming_info[
                 "peak_bond_dimensions"
@@ -3102,6 +3486,7 @@ class MPOClusterProductExpansion:
             assembly_form = streaming_info["form"]
             assembly_discarded_weights = streaming_info["discarded_weights"]
         report = MPOClusterExpansionReport(
+            factorization=self.factorization,
             cluster_size=self.cluster_size,
             factor_count=len(self.factors),
             interval_count=len(residuals),
@@ -3132,7 +3517,7 @@ class MPOClusterProductExpansion:
             ),
             graph_collection_budget=(
                 None
-                if self.graph is None
+                if self.graph is None or graph_plan["planner"] == "subset_dp"
                 else self.collection_budget
             ),
             graph_collection_truncated=(
@@ -3161,6 +3546,8 @@ class MPOClusterProductExpansion:
             assembly_batch_size=self.assembly_batch_size,
             assembly_resolved_batch_size=assembly_resolved_batch_size,
             assembly_compression_count=assembly_compression_count,
+            assembly_truncated=assembly_truncated,
+            assembly_peak_cached_states=assembly_peak_cached_states,
             assembly_peak_bond_dimensions=assembly_peak_bond_dimensions,
             assembly_cutoff=assembly_cutoff,
             assembly_cutoff_mode=assembly_cutoff_mode,
@@ -3289,6 +3676,7 @@ def _cluster_factor_from_source(
     map_mode,
     phys_dim,
     to_backend,
+    factorization,
 ):
     """Normalize one term-centric ordered-product factor."""
 
@@ -3342,6 +3730,7 @@ def _cluster_factor_from_source(
         map_mode=map_mode,
         phys_dim=phys_dim,
         to_backend=to_backend,
+        _local_factorization=factorization,
     )
     return (
         MPOClusterFactor.from_mpo_basis(
@@ -3383,8 +3772,12 @@ def exp_mpo_cluster(
     graph_assembly="auto",
     max_collection_order=None,
     collection_budget=128,
+    spatial_reuse=True,
+    spatial_symmetries=(),
+    factorization="auto",
     assembly="direct",
     assembly_chi=None,
+    assembly_state_budget=4096,
     assembly_batch_size="auto",
     assembly_cutoff=None,
     assembly_cutoff_mode="auto",
@@ -3436,6 +3829,17 @@ def exp_mpo_cluster(
         coefficient slots, matching :func:`exp_mpo`.
     cluster_size : int, default=2
         Largest connected interval or graph cluster retained.
+    factorization : {"auto", "fixed"}, default="auto"
+        Fixed index routing performs no SVD and retains derivatives at zero.
+        Requires cutoff=0 or None, max_bond=None, no assembly/final compression,
+        and dense physical space. Auto retains the numerical policy.
+    spatial_symmetries : iterable, optional
+        Full site permutations in mapped chain indices. Each declaration is
+        checked against graph edges, operators and coefficient bindings;
+        unsupported opaque bindings raise. Local reuse still proves matches.
+    spatial_reuse : bool, default=True
+        Reuse local ordered targets under verified site relabelings. This is
+        independent of internal charge symmetry and graph collection limits.
     graph : {"auto", "chain", "square"}, optional
         ``"auto"`` selects ``"chain"`` for integer term locations and
         ``"square"`` for 2D coordinate term locations. Alternatively use
@@ -3473,22 +3877,29 @@ def exp_mpo_cluster(
         which retains every individual graph residual and omits products of
         multiple graph residuals.
     collection_budget : int or None, default=128
-        Hard limit on graph-cluster collections inspected or materialized.
-        Set ``None`` only when an explicitly unbounded exact plan is intended.
-    assembly : {"direct", "streaming"}, default="direct"
-        Global graph-path materialization strategy. ``"direct"`` constructs
-        the analytical MPO in one pass. ``"streaming"`` accumulates
-        independent graph residual paths in batches and applies a semantic
-        fixed-rank SVD after each batch, keeping the working MPO bounded.
-        Streaming currently applies to individual graph residual paths and
-        therefore requires a bounded one-cluster graph assembly plan.
+        Hard limit on explicitly inspected/materialized collections for
+        direct or streaming plans. Ignored by recursive assembly. Set None
+        only for an intentionally unbounded explicit plan.
+    assembly : {"direct", "streaming", "recursive"}, default="direct"
+        ``"direct"`` materializes the selected analytical paths. ``"streaming"``
+        adds those paths in batches and compresses. ``"recursive"`` shares
+        remaining-site subproblems to include every compatible collection
+        without enumeration. It accepts graph_assembly="auto" or "exact"
+        and does not use collection_budget. Graph mode is required for the
+        latter two modes; native charge/fermionic assembly is unsupported.
     assembly_chi : int, optional
-        Working bond cap used by ``assembly="streaming"``. This is separate
-        from ``chi``, which is an optional final Quimb numerical compression.
+        Intermediate bond cap after each sum; temporary products/sums can
+        exceed it. Required for streaming. Recursive assembly with None
+        skips compression. Separate from optional final ``chi``.
+    assembly_state_budget : int or None, default=4096
+        Hard limit on shared remaining-site subproblems, including the empty
+        base. Exceeding it raises without dropping collections. Used by
+        recursive assembly and streaming's complete direct-plan fallback;
+        None explicitly removes the guard. This is not a tensor-byte limit.
     assembly_batch_size : int, "auto", or None, optional
-        Number of graph residual paths accumulated before each streaming SVD.
-        The default ``"auto"`` selects up to 32 paths, reducing the batch for
-        very wide graph frontiers. ``None`` retains path-at-a-time assembly.
+        Additions per compression batch. Recursive "auto" means one;
+        streaming "auto" resolves a frontier-aware batch size. None means
+        one addition in both modes.
     assembly_cutoff : float, "auto", or None, optional
         Optional numerical cutoff for intermediate streaming SVDs. ``None``
         retains backend-differentiable fixed-rank streaming. A numeric value
@@ -3546,6 +3957,9 @@ def exp_mpo_cluster(
     practice, but finite intermediate SVD truncation can change the result.
     """
 
+    factorization = normalize_factorization(factorization)
+    if factorization == "fixed" and chi is not None:
+        raise ValueError("factorization='fixed' requires chi=None; compress the result separately.")
     if not isinstance(progress, bool):
         raise TypeError("progress must be a boolean.")
     if not isinstance(differentiable, bool):
@@ -3578,6 +3992,7 @@ def exp_mpo_cluster(
             map_mode=map_mode,
             phys_dim=phys_dim,
             to_backend=to_backend,
+            _local_factorization=factorization,
         )
         reference_basis = basis
         if coefficients is None:
@@ -3614,6 +4029,7 @@ def exp_mpo_cluster(
                 map_mode=map_mode,
                 phys_dim=phys_dim,
                 to_backend=to_backend,
+                factorization=factorization,
             )
             cluster_factors.append(factor)
             if basis is not None:
@@ -3686,8 +4102,12 @@ def exp_mpo_cluster(
             graph_assembly=graph_assembly,
             max_collection_order=max_collection_order,
             collection_budget=collection_budget,
+            spatial_reuse=spatial_reuse,
+            spatial_symmetries=spatial_symmetries,
+            factorization=factorization,
             assembly=assembly,
             assembly_chi=assembly_chi,
+            assembly_state_budget=assembly_state_budget,
             assembly_batch_size=assembly_batch_size,
             assembly_cutoff=assembly_cutoff,
             assembly_cutoff_mode=assembly_cutoff_mode,
@@ -3717,8 +4137,12 @@ def exp_mpo_cluster(
             graph_assembly=graph_assembly,
             max_collection_order=max_collection_order,
             collection_budget=collection_budget,
+            spatial_reuse=spatial_reuse,
+            spatial_symmetries=spatial_symmetries,
+            factorization=factorization,
             assembly=assembly,
             assembly_chi=assembly_chi,
+            assembly_state_budget=assembly_state_budget,
             assembly_batch_size=assembly_batch_size,
             assembly_cutoff=assembly_cutoff,
             assembly_cutoff_mode=assembly_cutoff_mode,
@@ -3843,6 +4267,7 @@ def exp_mpo_cluster(
             "graph_requested": graph_requested,
             "graph_inferred": graph_inferred,
             "cluster_size": expansion.cluster_size,
+            "factorization": expansion.factorization,
             "factor_count": len(expansion.factors),
             "cutoff": expansion.cutoff,
             "max_bond": expansion.max_bond,
@@ -3858,6 +4283,9 @@ def exp_mpo_cluster(
             "graph_planner_state_budget": cluster_report.graph_planner_state_budget,
             "assembly": cluster_report.assembly,
             "assembly_chi": cluster_report.assembly_chi,
+            "assembly_state_budget": expansion.assembly_state_budget,
+            "assembly_truncated": cluster_report.assembly_truncated,
+            "assembly_peak_cached_states": cluster_report.assembly_peak_cached_states,
             "assembly_batch_size": cluster_report.assembly_batch_size,
             "assembly_resolved_batch_size": (
                 cluster_report.assembly_resolved_batch_size
@@ -3917,8 +4345,12 @@ def exp_mpo_cluster_product(
     graph_assembly="auto",
     max_collection_order=None,
     collection_budget=128,
+    spatial_reuse=True,
+    spatial_symmetries=(),
+    factorization="auto",
     assembly="direct",
     assembly_chi=None,
+    assembly_state_budget=4096,
     assembly_batch_size="auto",
     assembly_cutoff=None,
     assembly_cutoff_mode="auto",
@@ -3972,8 +4404,12 @@ def exp_mpo_cluster_product(
         graph_assembly=graph_assembly,
         max_collection_order=max_collection_order,
         collection_budget=collection_budget,
+        spatial_reuse=spatial_reuse,
+        spatial_symmetries=spatial_symmetries,
+        factorization=factorization,
         assembly=assembly,
         assembly_chi=assembly_chi,
+        assembly_state_budget=assembly_state_budget,
         assembly_batch_size=assembly_batch_size,
         assembly_cutoff=assembly_cutoff,
         assembly_cutoff_mode=assembly_cutoff_mode,

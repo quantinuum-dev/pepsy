@@ -1,6 +1,6 @@
 # Cluster PEPO backend and downstream optimization status
 
-Updated 2026-09-26. Pepsy `develop` at **`b4c4631`** is published, including
+Updated 2026-09-28. Pepsy `develop` at **`b4c4631`** is published, including
 the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
@@ -61,6 +61,131 @@ above. The [commit handoff](../../history/2026-09-28-readability-commit.md)
 records the combined validation and remaining limits; the
 [four-domain handoff](../../history/2026-09-28-bp-vmc-mpo-pepo-readability.md)
 retains the earlier focused evidence.
+## Working-tree trace-only cluster evaluation, 2026-09-28
+
+A further uncommitted Pepsy update on baseline `4e398e4` adds
+`trace_exp` to compiled MPO and Pauli PEPO cluster products and single
+Pauli PEPO bases. It computes exact local ordered-product traces, scalar
+connected residuals and the complete selected-order collection sum.
+No MPO/PEPO assembly or rank compression is involved. This trace is
+different from the trace of a rank-truncated or collection-bounded
+representation. A state budget raises before omitting collections.
+The [trace-only evidence](notes/2026-09-28-cluster-trace-only.md) records
+the new checks and 5×6 order-four CPU measurements; no published commit
+or full-suite result is claimed for this update.
+
+## Working-tree geometry update, 2026-09-28
+
+On `develop` baseline `4e398e4`, an uncommitted update adds per-size oriented
+and C4 tree/loop inventories and bounded reuse of immutable shape levels and
+finite translated embeddings. This does not change the numerical residual
+construction. New cluster/API/layout validation: **120 passed**, full Ruff and
+whitespace checks passed; no new full-suite result. Geometry-only benchmarks
+and scope are recorded in the
+[dated evidence](notes/2026-09-28-cluster-geometry-cache.md). These edits are
+not part of the published commits listed above.
+
+A subsequent uncommitted compile-path review prepares located static maps and
+tree topology before evaluation, shares local maps across placements, prepares
+higher-order homogeneous source maps, and fixes mixed-product route selection.
+New validation: **122 cluster/API/layout tests passed**, including repeated
+value/gradient references; full Ruff and whitespace checks passed. The
+[compile review](notes/2026-09-28-cluster-compile-review.md) records static
+preparation time and memory reductions and their limits. No new full-suite or
+end-to-end performance claim is made.
+
+The subsequent compiled-API review adds direct report access and optional
+paired returns to cluster MPO calls, stable compiled-callable reuse, and direct
+PEPO shape/cache inspection. New validation: **160 MPO/PEPO cluster/API/layout
+tests passed**, Ruff and whitespace checks passed, and the documented 2D
+compiled example ran successfully. These remain uncommitted working-tree
+changes; see the [API review evidence](notes/2026-09-28-cluster-api-review.md).
+
+## Working-tree spatial reuse, 2026-09-28
+
+A further uncommitted update on baseline `4e398e4` enables Hamiltonian-aware
+local target reuse in cluster MPOs and `PauliPEPOBasis`, controlled by
+`spatial_reuse=True`. It retains coefficient identities, directed/parallel
+bond occurrences, factor order, residual subtraction and all placements.
+The 5x6 open uniform X + ZZ example at p=4 has 492 placed targets and six
+local representatives. This does not change graph collection approximations.
+New focused validation: **175 passed**, two existing deprecation warnings.
+The new full CPU-only gate passed: **5199 passed, 105 skipped**, with 777
+warnings (26:29). Full Ruff and whitespace checks passed. The interrupted
+GPU gate/resource limitation and exact validation scope are recorded in the
+[dated evidence](notes/2026-09-28-cluster-spatial-reuse.md), together with scoped
+timings and backend limits. This work is not part of the published ledger above.
+
+## Working-tree complete graph MPO assembly, 2026-09-28
+
+A further uncommitted change on baseline `4e398e4` adds
+`assembly="recursive"`: shared remaining-site MPO subproblems include all
+compatible disjoint residual collections, with optional per-batch compression.
+`assembly_state_budget` guards structural work and raises without dropping
+collections; collection_budget is unused in this mode. Streaming direct plans
+now preserve separated residual products, and assembly truncation prepares an
+orthonormal environment. Reports expose subproblem/cache counts and rank
+reductions. No native sector/fermionic recursive support is claimed.
+
+New CPU-only validation: **270 passed**, two existing deprecation warnings,
+full Ruff and whitespace checks passed. This is a focused MPO/API/layout gate;
+the earlier full-suite result above predates these edits. Measurements include
+a 5x6 p=2 chi=4 assembly in 8.31 s (65,805,402 collections, 703 subproblems)
+and a compile-only 5x6 p=4 plan (249,479,463,512 collections, 33,514 subproblems).
+See [construction, checks and limits](notes/2026-09-28-mpo-recursive-assembly.md).
+Nothing from this update has been committed or published.
+
+## Working-tree fixed construction for autodiff, 2026-09-28
+
+A further uncommitted update on baseline `4e398e4` adds
+`factorization="fixed"` to cluster MPOs and Pauli PEPOs. Exact shape-based
+splits avoid SVD and preserve zero-residual gradients; the default `"auto"`
+retains numerical factorization/compression policies. Generic PEPO tree
+structure is cached. Supplied finite-lattice `spatial_symmetries` are validated
+against graph multiplicity, operators and coefficient identities; automatic
+local translation/rotation/reflection reuse remains term-aware. Fixed mode
+rejects internal truncation and unsupported native MPO conversion.
+
+The [implementation and measurements](notes/2026-09-28-fixed-cluster-autodiff.md)
+link the owning API guides and record compiler/backend limits. The
+[current handoff](../../history/2026-09-28-fixed-cluster-autodiff.md) records
+validation: **5241 passed, 105 skipped** in the full CPU gate, followed by
+**277 focused MPO/API/layout checks** covering the final narrow host-step and
+dense-term parsing fixes. Ruff, whitespace and documentation link checks pass.
+The full gate started before those last fixes and the separate compiler test
+file; it is not an all-files-at-final-HEAD claim. Local Torch
+full-graph and JAX JIT checks do not establish whole-builder machine-code
+compilation. Exact global bonds and contraction can still be expensive.
+Nothing from this update has been committed or published.
+
+## Working-tree correctness review, 2026-09-28
+
+The subsequent [correctness review](notes/2026-09-28-cluster-correctness-review.md)
+found and fixed a cluster MPO backend mismatch for positional tensor parameters
+and callable coefficients with host-valued steps, and enabled declared
+`MPOParameter` defaults. Evaluated fixed-mode targets are aligned before
+subtraction, without additional callback evaluations. PEPO numerical code is
+unchanged. An independent square-lattice set-partition reference checks orders
+2, 3 and 4 for both MPO/PEPO with and without symmetry reuse. New validation: **374 focused domain/API/layout checks passed**, and the
+expanded new review file passed **15 tests**. Ruff, whitespace and relative
+documentation link checks passed. Exact scope is
+recorded in the [review handoff](../../history/2026-09-28-cluster-correctness-review.md);
+the earlier full-suite counts above predate this narrow fix. No commits or
+publication.
+
+## Working-tree fixed MPO bond compression benchmark, 2026-09-28
+
+An [explicit post-compression benchmark](notes/2026-09-28-cluster-bond-compression.md)
+measures time, final bonds and Frobenius error against an uncompressed fixed
+p-cluster MPO. A dense MPO error-estimation issue at small truncation errors
+was fixed by canonicalizing the difference before its norm contraction.
+The [handoff](../../history/2026-09-28-cluster-bond-compression.md) records
+**274 affected checks passed**, followed by **22 compression/sector checks**
+after the final dense-data guard. Full Ruff, whitespace and affected link
+checks passed. The earlier full-suite result predates this change.
+Post-compression still requires the full exact MPO to be constructed first;
+internal numerical assembly compression remains a separate policy. No
+commit or publication was made.
 
 ## Tracking future work
 
@@ -79,3 +204,77 @@ links and measured scope when the implementation changes, without rewriting
 old evidence into a claim of current validation. Whole-cost PEPO compilation,
 general rank-changing derivatives and native cluster-symmetry optimization
 remain deferred; they are not features of this published correction.
+
+## Working-tree fixed cluster JIT gradients, 2026-09-28
+
+Complete three-site order-three and 2×2 square order-four fixed MPO/PEPO
+scalar losses pass JAX `jit(value_and_grad)` against independent dense
+exponentials, including zero coefficient and zero time. Two-site complex-time
+cases pass analytic checks.
+Torch `compile(backend="aot_eager", fullgraph=True)` captures local
+exponential/identity/fixed-split and PEPO tree-factorization forward and
+backward with correct gradients. Narrow native Torch tensor factories and
+Python shape products avoid tracing failures.
+The complete Torch MPO/PEPO builder remains eager: full-graph probes fail in
+Python/Autoray/Quimb assembly, and partial-graph compile also failed in this
+installed stack. No end-to-end Torch graph or performance claim is made.
+
+The [JIT evidence](notes/2026-09-28-cluster-jit-gradients.md) and
+[handoff](../../history/2026-09-28-cluster-jit-gradients.md) record scope and
+limits. The final affected cluster gate passed 183 tests on CPU, including all ten
+new JIT cases.
+The preceding full suite predates this update. No commit or publication.
+
+## Working-tree 5×6 cluster construction measurements, 2026-09-28
+
+The [PEPO stage profile](notes/2026-09-28-pepo-stage-profile.md) measures
+the previously unmeasured lower-residual contraction, Pauli expansion and
+sparse block insertion on the uniform 5×6 order-four model. Reusing verified
+symmetry-equivalent lower contractions reduced their calls from 462 to five
+and their median time from 0.693 s to 0.014 s. The complete PEPO evaluation
+fell from 1.313 s to 0.550 s, with fresh-process peak RSS about 0.223 GiB.
+All 28,470 active sparse blocks agreed with the no-reuse reference to
+3.19e-16 maximum entry difference. These are CPU-only scoped observations.
+
+The [graph MPO numerical record](notes/2026-09-28-graph-mpo-5x6-numerical.md)
+extends the 33,514-state order-four plan to actual numerical assembly and
+compares selected matrix elements with an independent, complete order-four
+collection sum. It separates collection completeness from compression error.
+With batch four, chi-1/chi-2 assembly took 486.314/1237.625 s and peaked
+at 0.810/1.017 GiB RSS. The two measured relative errors were
+44.3%/80.7% at chi one and 13.6%/42.9% at chi two: neither cap is accurate
+enough for these elements, and global error remains unverified. The focused
+CPU domain/API/layout gate passed **386 tests**, with full Ruff and whitespace
+checks. The final result and validation are recorded in the
+[handoff](../../history/2026-09-28-cluster-cost-closure.md). This work remains
+uncommitted and unpublished; earlier full-suite checks predate it.
+
+## Working-tree joint MPO/PEPO cluster audit, 2026-09-28
+
+The [joint implementation audit](notes/2026-09-28-joint-cluster-audit.md)
+checks two noncommuting ordered factors on a 2×2 square against an
+independent set-partition reference at orders two through four, for both
+MPO and PEPO with spatial reuse on/off. Complete fixed joint two-site
+MPO/PEPO JAX JIT values and coefficient/step gradients match dense
+ordered exponentials. Order-four joint PEPO Torch values and gradients
+also match the full dense product with reuse on/off. Joint located PEPO
+evaluation now skips unused
+homogeneous component maps; verified joint lower contractions still
+fall from nine to three at order four. The affected CPU
+domain/API/layout gate passed **391 tests**, with two existing warnings;
+the final correctness-review file then passed **19 tests** after the
+last Torch regression. Full Ruff, whitespace and affected link checks
+passed. The
+[handoff](../../history/2026-09-28-joint-cluster-audit.md) records
+scope and limits. The earlier full-suite result predates this audit;
+nothing was committed or published. The large 5×6 graph MPO rank-cap
+accuracy limitation above remains.
+
+A [follow-up joint review](notes/2026-09-28-joint-cluster-followup.md)
+found no further numerical mismatch in periodic directed/parallel-bond
+PEPO, mixed trainable MPO/PEPO products, or small joint streaming and
+recursive MPO cases. One independent periodic joint regression was added;
+the correctness-review file then passed **20 tests**. The
+[follow-up handoff](../../history/2026-09-28-joint-cluster-followup.md)
+records the exact CPU scope. No production implementation or large-graph
+accuracy claim changed.

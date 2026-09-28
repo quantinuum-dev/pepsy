@@ -719,12 +719,20 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _target_gate_options(self, *, cutoff, cutoff_mode, gate_kwargs=None):
         opts = self._base_gate_options(
-            cutoff=cutoff,
+            cutoff=0.0,
             cutoff_mode=cutoff_mode,
             gate_kwargs=gate_kwargs,
         )
-        opts.pop("max_bond", None)
         opts.update(self.target_gate_kwargs)
+        for key, exact_value in (
+            ("cutoff", 0.0), ("max_bond", None), ("path_compress", False)
+        ):
+            if key in self.target_gate_kwargs and self.target_gate_kwargs[key] != exact_value:
+                raise ValueError(
+                    f"target_gate_kwargs[{key!r}] must be {exact_value!r} "
+                    "to preserve the exact post-gate target."
+                )
+            opts[key] = exact_value
         return opts
 
     def _warmstart_gate_options(self, *, cutoff, cutoff_mode, gate_kwargs=None):
@@ -808,7 +816,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             opts=opts,
             inplace=True,
         )
-        return self._compress_to_chi(out, cutoff=cutoff)
+        return self._compress_to_chi(out, cutoff=cutoff, cutoff_mode=cutoff_mode)
 
     def _build_routed_batch_warmstart(
         self,
@@ -834,7 +842,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 opts=opts,
                 inplace=True,
             )
-        return self._compress_to_chi(state_work, cutoff=cutoff)
+        return self._compress_to_chi(state_work, cutoff=cutoff, cutoff_mode=cutoff_mode)
 
     def _build_warmstart(
         self,
@@ -849,7 +857,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         gate_kwargs,
     ):
         if hasattr(target, "copy"):
-            warmstart = self._compress_to_chi(target.copy(), cutoff=cutoff)
+            warmstart = self._compress_to_chi(
+                target.copy(), cutoff=cutoff, cutoff_mode=cutoff_mode
+            )
             max_bond = self._max_bond(warmstart)
             if max_bond is None or max_bond <= self.chi:
                 return warmstart
@@ -875,7 +885,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         gate_kwargs,
     ):
         if hasattr(target, "copy"):
-            warmstart = self._compress_to_chi(target.copy(), cutoff=cutoff)
+            warmstart = self._compress_to_chi(
+                target.copy(), cutoff=cutoff, cutoff_mode=cutoff_mode
+            )
             max_bond = self._max_bond(warmstart)
             if max_bond is None or max_bond <= self.chi:
                 return warmstart
@@ -918,18 +930,21 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             tuple(which for _, _, which in batch_entries),
         )
 
-    def _compress_to_chi(self, state, *, cutoff):
+    def _compress_to_chi(self, state, *, cutoff, cutoff_mode):
         max_bond = self._max_bond(state)
         if max_bond is None or max_bond <= self.chi:
             return state
 
         compress_all = getattr(state, "compress_all", None)
         if callable(compress_all):
-            return compress_all(max_bond=self.chi, cutoff=cutoff, inplace=False)
+            return compress_all(
+                max_bond=self.chi, cutoff=cutoff,
+                cutoff_mode=cutoff_mode, inplace=False,
+            )
 
         compress_all_ = getattr(state, "compress_all_", None)
         if callable(compress_all_):
-            compress_all_(max_bond=self.chi, cutoff=cutoff)
+            compress_all_(max_bond=self.chi, cutoff=cutoff, cutoff_mode=cutoff_mode)
         return state
 
     @staticmethod
@@ -949,9 +964,13 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         if value is None:
             return None
         value = _backend_to_float(value)
+        if not math.isfinite(value):
+            raise ValueError("PEPS infidelity must be finite.")
         if value < 0.0 and abs(value) < 1.0e-12:
             value = 0.0
-        return max(0.0, value)
+        if value < 0.0:
+            raise ValueError("PEPS infidelity is substantially negative.")
+        return value
 
     @staticmethod
     def _clip_fidelity(value):

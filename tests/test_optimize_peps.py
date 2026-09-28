@@ -621,6 +621,74 @@ def test_sweep_optimizer_infidelity_uses_requested_chi_and_none_override(
     assert fixed_sweeps["fit_rtol"] is None
 
 
+def test_peps_optimizer_target_is_exact_before_chi_decision():
+    """A run cutoff must not discard a target component and report zero loss."""
+    state = qtn.PEPS.product_state(
+        [[np.array([1.0, 0.0], dtype="complex128")] * 2] * 2
+    )
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    angle = 0.1
+    gate = np.cos(angle) * np.eye(4) - 1j * np.sin(angle) * np.kron(x, x)
+    optimizer = PepsOptimizer(
+        state, [(gate, ((0, 0), (0, 1)))], chi=2,
+        boundary_engine="quimb-mps", contraction_opt="greedy",
+    )
+
+    output = optimizer.run(cutoff=0.1, cutoff_mode="rsum2", optimize=False)
+
+    amplitudes = np.sort(np.abs(output.to_dense().reshape(-1)))[-2:]
+    np.testing.assert_allclose(amplitudes, [np.sin(angle), np.cos(angle)], atol=1e-12)
+    assert optimizer.step_records[0]["reason"] == "within_chi"
+    assert optimizer.step_records[0]["final_infidelity"] == 0.0
+    assert output.max_bond() == 2
+
+
+@pytest.mark.parametrize("target_kwargs", [
+    {"cutoff": 0.1}, {"max_bond": 1}, {"path_compress": True},
+])
+def test_peps_optimizer_rejects_truncated_target_options(target_kwargs):
+    """Explicit target overrides must not silently defeat the exact target."""
+    optimizer = PepsOptimizer(
+        DummyState(bond=1), [({"bond": 2}, ((0, 0), (0, 1)))],
+        chi=2, normalize_initial=False, target_gate_kwargs=target_kwargs,
+    )
+    with pytest.raises(ValueError, match="exact post-gate target"):
+        optimizer.run(normalize_target=False)
+
+
+def test_peps_optimizer_warmstart_uses_requested_cutoff_mode():
+    """The full warm-start compression must honor the specified Quimb mode."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=4, dtype="complex128", seed=2)
+    optimizer = PepsOptimizer(state, chi=3, normalize_initial=False)
+
+    actual = optimizer._compress_to_chi(
+        state.copy(), cutoff=0.1, cutoff_mode="abs"
+    )
+    expected = state.compress_all(
+        max_bond=3, cutoff=0.1, cutoff_mode="abs", inplace=False
+    )
+    implicit_mode = state.compress_all(
+        max_bond=3, cutoff=0.1, inplace=False
+    )
+
+    np.testing.assert_allclose(actual.to_dense(), expected.to_dense())
+    assert sorted(actual.ind_size(i) for i in actual.inner_inds()) == [3] * 4
+    assert sorted(implicit_mode.ind_size(i) for i in implicit_mode.inner_inds()) == [2] * 4
+
+
+@pytest.mark.parametrize("infidelity", [float("nan"), float("inf"), -0.1])
+def test_peps_optimizer_rejects_invalid_infidelity(monkeypatch, infidelity):
+    """A failed boundary estimate must never count as a perfect candidate."""
+    monkeypatch.setattr(
+        peps_mod, "boundary_infidelity",
+        lambda *args, **kwargs: {"infidelity": infidelity},
+    )
+    state = DummyState(bond=1)
+    optimizer = PepsOptimizer(state, chi=2, normalize_initial=False)
+    with pytest.raises(ValueError, match="infidelity"):
+        optimizer.estimate_infidelity(state, state)
+
+
 def test_peps_optimizer_within_chi_skips_infidelity_and_optimizer(monkeypatch):
     """Two-site gates whose target fits in chi should advance exactly."""
     gate_calls = _install_fake_gate(monkeypatch)

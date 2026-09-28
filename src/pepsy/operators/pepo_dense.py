@@ -23,6 +23,7 @@ from collections.abc import Hashable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import product
+from math import prod
 from numbers import Integral
 
 import autoray as ar
@@ -34,6 +35,7 @@ from quimb.tensor.fitting import tensor_network_distance
 from .mpo_automaton import _as_backend
 from .diagnostics import OperatorReportInfo
 from .mpo_semantic import _fixed_rank_svd
+from ._cluster_factorization import fixed_split, normalize_factorization
 from .pepo_active import (
     ActivePEPOBlocks,
     GraphActivePEPOBlocks,
@@ -494,32 +496,51 @@ def _make_cluster_shape(sites):
     )
 
 
+@lru_cache(maxsize=18)
+def _connected_cluster_shape_level(size, quotient_rotations):
+    """Cache immutable levels separately so increasing a cutoff reuses work."""
+    if size == 1:
+        return (_make_cluster_shape(((0, 0),)),)
+    candidates = set()
+    for shape in _connected_cluster_shape_level(size - 1, quotient_rotations):
+        occupied = set(shape.sites)
+        for x, y in shape.sites:
+            for dx, dy in _DIRECTION_VECTORS.values():
+                neighbour = (x + dx, y + dy)
+                if neighbour in occupied:
+                    continue
+                candidates.add(
+                    _canonical_cluster_sites(
+                        (*shape.sites, neighbour),
+                        quotient_rotations=quotient_rotations,
+                    )
+                )
+    return tuple(_make_cluster_shape(sites) for sites in sorted(candidates))
+
+
 @lru_cache(maxsize=8)
 def _connected_cluster_shapes_cached(max_sites, quotient_rotations):
-    """Build the immutable connected-shape inventory for one C4 policy."""
-    levels = {1: {((0, 0),)}}
-    for size in range(2, max_sites + 1):
-        candidates = set()
-        for sites in levels[size - 1]:
-            occupied = set(sites)
-            for x, y in sites:
-                for dx, dy in _DIRECTION_VECTORS.values():
-                    neighbour = (x + dx, y + dy)
-                    if neighbour in occupied:
-                        continue
-                    candidates.add(
-                        _canonical_cluster_sites(
-                            (*sites, neighbour),
-                            quotient_rotations=quotient_rotations,
-                        )
-                    )
-        levels[size] = candidates
-
+    """Collect shared immutable levels for one cutoff and C4 policy."""
     return tuple(
-        _make_cluster_shape(sites)
+        shape
         for size in range(1, max_sites + 1)
-        for sites in sorted(levels[size])
+        for shape in _connected_cluster_shape_level(size, quotient_rotations)
     )
+
+
+def _cluster_shape_inventory(order):
+    """Return fresh shape counts, independent of finite-lattice placements."""
+    inventory = {}
+    for size in range(1, order + 1):
+        row = {}
+        for prefix, quotient in (("", False), ("c4_", True)):
+            shapes = _connected_cluster_shape_level(size, quotient)
+            trees = sum(shape.is_tree for shape in shapes)
+            row[f"{prefix}shapes"] = len(shapes)
+            row[f"{prefix}trees"] = trees
+            row[f"{prefix}loops"] = len(shapes) - trees
+        inventory[size] = row
+    return inventory
 
 
 def generate_connected_cluster_shapes(
@@ -3079,6 +3100,7 @@ def _dense_loop_tensors(coefficients, local_dim):
     return first_corner, second_corner, third_corner, fourth_corner
 
 
+@lru_cache(maxsize=256)
 def _cluster_shape_embeddings(shape, lx, ly, cyclic):
     """Return all valid finite-lattice translations of a cluster shape."""
     embeddings = []
@@ -3224,24 +3246,9 @@ def _tree_factorize_operator(operator, edges, nsites, local_dim, max_rank):
     )
 
 
-def _tree_factorize_operator_backend(
-    operator,
-    edges,
-    nsites,
-    local_dim,
-    max_rank=None,
-):
-    """Autodiff-safe exact spanning-tree factorization of a local operator.
-
-    The topology and retained ranks are determined from static matrix shapes;
-    no backend value is converted to NumPy and no singular-value threshold is
-    used.  This keeps the factorization differentiable for Torch and JAX.
-    Loop edges are intentionally accepted and ignored only by the
-    factorization tree; they remain present in the operator supplied by the
-    connected-cluster residual solver.
-    """
-    operator_tensor = _backend_operator_tensor(operator, nsites, local_dim)
-    operator_rank = local_dim**2
+@lru_cache(maxsize=256)
+def _backend_tree_topology(nsites, edges):
+    """Cache immutable spanning-tree structure without numerical values."""
     adjacency = [[] for _ in range(nsites)]
     for source, target, direction in edges:
         adjacency[source].append((target, direction))
@@ -3264,6 +3271,43 @@ def _tree_factorize_operator_backend(
     for site in traversal[1:]:
         children[parent[site]].append(site)
 
+    return (
+        tuple(parent.items()), tuple(parent_direction.items()),
+        tuple((site, tuple(nodes)) for site, nodes in children.items()),
+        tuple(traversal),
+    )
+
+
+def _tree_factorize_operator_backend(
+    operator,
+    edges,
+    nsites,
+    local_dim,
+    max_rank=None,
+    *,
+    factorization="auto",
+):
+    """Autodiff-safe exact spanning-tree factorization of a local operator.
+
+    The topology and retained ranks are determined from static matrix shapes;
+    no backend value is converted to NumPy and no singular-value threshold is
+    used.  This keeps the factorization differentiable for Torch and JAX.
+    Loop edges are intentionally accepted and ignored only by the
+    factorization tree; they remain present in the operator supplied by the
+    connected-cluster residual solver.
+    """
+    factorization = normalize_factorization(factorization)
+    if factorization == "fixed" and max_rank is not None:
+        raise ValueError("fixed tree factorization requires max_rank=None.")
+    operator_tensor = _backend_operator_tensor(operator, nsites, local_dim)
+    operator_rank = local_dim**2
+    parent_items, direction_items, child_items, traversal = _backend_tree_topology(
+        nsites, tuple(edges)
+    )
+    parent = dict(parent_items)
+    parent_direction = dict(direction_items)
+    children = {site: list(nodes) for site, nodes in child_items}
+
     current = operator_tensor
     axes = [("physical", site) for site in range(nsites)]
     local_tensors = {}
@@ -3284,17 +3328,24 @@ def _tree_factorize_operator_backend(
         matrix = ar.do(
             "reshape",
             transposed,
-            (int(np.prod(row_shape)), int(np.prod(column_shape))),
+            (prod(row_shape), prod(column_shape)),
         )
-        left, singular_values, right = _fixed_rank_svd(matrix)
+        if factorization == "fixed":
+            left, weighted_right = fixed_split(matrix)
+        else:
+            left, singular_values, right = _fixed_rank_svd(matrix)
         rank = min(int(matrix.shape[-2]), int(matrix.shape[-1]))
         if max_rank is not None:
             rank = min(rank, max_rank)
         if rank < 1:
             return None
         left = left[:, :rank]
-        singular_values = singular_values[:rank]
-        right = right[:rank, :]
+        if factorization != "fixed":
+            singular_values = singular_values[:rank]
+            right = right[:rank, :]
+            weighted_right = ar.do(
+                "multiply", ar.do("reshape", singular_values, (rank, 1)), right
+            )
         local_tensors[site] = (
             child_nodes,
             ar.do(
@@ -3308,11 +3359,6 @@ def _tree_factorize_operator_backend(
             ),
         )
         ranks[site] = rank
-        weighted_right = ar.do(
-            "multiply",
-            ar.do("reshape", singular_values, (rank, 1)),
-            right,
-        )
         current = ar.do(
             "reshape",
             weighted_right,
@@ -4647,6 +4693,17 @@ class ClusterExpansionPlan:
             self.order,
             quotient_rotations=self.symmetry == "C4",
         )
+
+    @property
+    def cluster_inventory(self):
+        """Shape counts by size, separating trees, loops and C4 representatives.
+
+        Unprefixed counts identify translations only. ``c4_*`` counts also
+        identify rotations, but not reflections. These are infinite-square-
+        lattice shape counts, not finite placements or numerical solve counts.
+        Each call returns an independent dictionary.
+        """
+        return _cluster_shape_inventory(self.order)
 
     def build(self, beta, *, materialize=True, return_report=False):
         """Build the cluster approximation to ``exp(-beta * H)``.

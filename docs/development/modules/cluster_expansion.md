@@ -57,6 +57,14 @@ the same inventory through `connected_cluster_shapes`. The dense builder now
 uses the five- through nine-site slices of this inventory for its recursive
 generic higher-order path.
 
+`cluster_inventory` on both dense plans and Pauli bases reports oriented and
+C4 shape counts by size, split into trees and loops, independently of finite
+placements. The shared geometry implementation caches immutable individual
+shape levels (18 entries), aggregate inventories (8 entries), and translated
+shape embeddings (256 entries, keyed by shape, dimensions and boundary flags).
+It never caches numerical residuals or backend tensors. Increasing an order
+reuses the lower levels instead of generating their shapes again.
+
 The local tensor starts with the one-site exponential in the all-trivial
 virtual sector. For order two, the residual of the exact two-site exponential
 after subtracting the two one-site factors is decomposed with an operator
@@ -155,9 +163,23 @@ to the backend SVD truncation path. Global history ids are compacted per
 physical bond only when materializing the Quimb PEPO, keeping the active
 representation and autodiff topology stable.
 
+`compile_exp()` now completes the static preparation used by evaluation:
+located cluster records, local operator maps and deterministic tree metadata,
+or homogeneous source maps including orders five through nine. Located maps
+are keyed by site count and the ordered directed local endpoint pairs, rather
+than global site/edge ids, so translated clusters share the same NumPy maps.
+Tree metadata additionally retains lattice directions. These caches are owned
+by the basis and contain no coefficient values or backend autodiff graphs.
+Mixed uniform/located ordered products prepare every factor for the located
+route. Preparation is idempotent for each route, and cache diagnostics identify
+the prepared modes and the numbers of local operator/tree plans.
+
 Located evaluations batch up to eight equal-size cluster products per backend
 matrix-exponential call. Factor order and complete generators are unchanged;
 each cluster order still subtracts the frozen lower-order active network.
+For located terms, the verified spatial plan also shares equivalent lower
+support contractions within that order and evaluation; all placements retain
+their own residual and sparse block insertion.
 Besides reducing dispatch overhead, batching improves measured small-matrix
 Torch exponential accuracy. The analytic onsite and independent downstream
 polymer-gradient regressions cover this behavior without relaxing tolerances.
@@ -171,7 +193,13 @@ PEPO. It never constructs an independent full-lattice PEPO for each factor.
 This is the same local-residual definition used by the MPO cluster engine;
 only the final tensor topology differs. All factors must share the lattice,
 symmetry policy, and cluster order. `cache_info["joint_cluster_residual"]`
-records this construction invariant.
+records this construction invariant. When any ordered factor has located
+terms, every factor uses the located route; evaluation skips homogeneous
+component maps that this route never reads. Its verified symmetry plan also
+shares equivalent lower-support contractions from the frozen lower-order
+PEPO. A separate 2×2 noncommuting set-partition reference checks joint MPO
+and PEPO outputs through order four, with reuse enabled and disabled; a
+two-site JAX JIT check covers complete fixed-mode joint values and gradients.
 
 ## Cluster order and dimension accounting
 
@@ -229,3 +257,36 @@ operator contributions from local exponentials. BP can later provide
 environment-aware PEPO/PEPS contraction diagnostics or truncation objectives,
 but it cannot replace the local residual solver needed for orders five and
 above.
+
+## Spatial target reuse
+
+`operators/_cluster_symmetry.py` owns bounded labeled-graph canonicalization,
+immutable coefficient identity and backend-preserving physical-axis transport.
+`mpo_product.py` compiles interval/graph target representatives;
+`pepo_basis.py` supplies uniform or occurrence-aware Pauli descriptors and
+caches sparse slot support. `pepo_product.py` prepares the common product
+binding modes. Only structural plans survive evaluation. Residual subtraction,
+PEPO gauges and MPO collection planning remain with their existing owners.
+See the [API rules](../../api/operators/cluster_expansion.md#hamiltonian-aware-reuse-in-pauli-pepos)
+and [dated validation](../notes/2026-09-28-cluster-spatial-reuse.md).
+
+## Complete graph MPO collection assembly
+
+`operators/_cluster_collections.py` owns the value-independent remaining-site
+DAG used by `assembly="recursive"`. `operators/mpo_product.py` evaluates it
+with fresh semantic MPOs, cached local residual span cores, reference-counted
+subproblem release, and canonicalized add/compress steps. `mpo_basis.py`
+forwards the state budget and includes it in compiled-plan keys. Direct and
+explicit streaming collection plans retain their existing planners; streaming
+on a direct plan uses the recurrence to preserve disjoint residual products.
+See the [public controls](../../api/operators/mpo_cluster.md#complete-recursive-assembly-add-mpo-branches-and-compress).
+
+## Fixed-index autodiff construction
+
+`operators/_cluster_factorization.py` owns the shared exact matrix split and
+policy validation. MPO residual TT assembly and generic backend PEPO trees
+consume it with `factorization="fixed"`. `_backend_tree_topology` in
+`pepo_dense.py` caches immutable tree structure, warmed by Pauli compilation;
+no backend tensor is retained. `_cluster_symmetry.py` additionally normalizes
+and verifies supplied finite-lattice site permutations. Existing local labeled
+Hamiltonian matching remains authoritative for numerical reuse.

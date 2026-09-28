@@ -855,6 +855,20 @@ def _fixed_rank_svd(matrix):
             singular_values[..., :rank],
             right[..., :rank, :],
         )
+    if _backend_name(matrix) == "numpy":
+        try:
+            return ar.do("linalg.svd", matrix, full_matrices=False)
+        except np.linalg.LinAlgError as original_error:
+            if matrix.ndim != 2 or not np.isfinite(matrix).all():
+                raise
+            # LAPACK's divide-and-conquer SVD can fail on a finite,
+            # ill-conditioned graph-assembly core. The optional general
+            # rectangular driver is a numerical fallback, not a rank policy.
+            try:
+                from scipy.linalg import svd  # pylint: disable=import-outside-toplevel
+            except ImportError:
+                raise original_error from None
+            return svd(matrix, full_matrices=False, lapack_driver="gesvd")
     if _backend_name(matrix) != "torch":
         return ar.do("linalg.svd", matrix, full_matrices=False)
 
@@ -1433,11 +1447,14 @@ def _as_square_operator(value):
     return array
 
 
-def _local_operator_mpo_cores(term):
+def _local_operator_mpo_cores(term, *, factorization="auto"):
     """Decompose one general local operator into exact fixed-rank MPO cores."""
 
     if not isinstance(term, MPOLocalOperatorTerm):
         raise TypeError("term must be an MPOLocalOperatorTerm.")
+    from ._cluster_factorization import fixed_split, normalize_factorization
+
+    factorization = normalize_factorization(factorization)
     nsites = len(term.sites)
     phys_dim = term.phys_dim
     if nsites == 1:
@@ -1463,22 +1480,19 @@ def _local_operator_mpo_cores(term):
             remainder,
             (left_rank * local_size, -1),
         )
-        u, singular_values, vh = _fixed_rank_svd(matrix)
         rank = min(int(matrix.shape[0]), int(matrix.shape[1]))
-        u = u[:, :rank]
-        singular_values = singular_values[:rank]
-        vh = vh[:rank]
+        if factorization == "fixed":
+            u, remainder = fixed_split(matrix)
+        else:
+            u, singular_values, vh = _fixed_rank_svd(matrix)
+            u = u[:, :rank]
+            remainder = ar.do("multiply", singular_values[:rank, None], vh[:rank])
         core = ar.do(
             "reshape",
             u,
             (left_rank, phys_dim, phys_dim, rank),
         )
         cores.append(ar.do("transpose", core, (0, 3, 1, 2)))
-        remainder = ar.do(
-            "multiply",
-            singular_values[:, None],
-            vh,
-        )
         left_rank = rank
         remaining_sites = nsites - site - 1
         remainder = ar.do(
@@ -2505,7 +2519,7 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
     return chain_length, tuple(compiled), metadata
 
 
-def _mixed_term_automaton(L, terms, *, phys_dim, unit_coefficients):
+def _mixed_term_automaton(L, terms, *, phys_dim, unit_coefficients, factorization="auto"):
     """Compile product and general local terms into one exact automaton."""
 
     automaton = MPOAutomaton(L, phys_dim=int(phys_dim))
@@ -2526,7 +2540,7 @@ def _mixed_term_automaton(L, terms, *, phys_dim, unit_coefficients):
             term_slots.append(((first_site, transition_index, term.operators[0]),))
             continue
 
-        cores = _local_operator_mpo_cores(term)
+        cores = _local_operator_mpo_cores(term, factorization=factorization)
         slots = automaton.add_local_mpo_term(
             term.sites,
             cores,
@@ -3216,7 +3230,9 @@ class FirstDegreeMPO:
         contract the Frobenius norm of ``MPO_before - MPO_after`` without
         densifying either operator. ``sector_aware='auto'`` uses the native
         Symmray sector-wise SVD when the compiled MPO has Abelian blocks;
-        ``sector_aware=True`` rejects a dense fallback.
+        ``sector_aware=True`` rejects a dense fallback. For dense MPOs,
+        the difference is QR-canonicalized before its norm is contracted
+        to avoid cancellation at small errors.
         """
         if max_bond is not None:
             if not isinstance(max_bond, Integral) or int(max_bond) < 1:
@@ -3259,6 +3275,11 @@ class FirstDegreeMPO:
             # computes the operator Frobenius norm here. Keeping this behind
             # an explicit flag leaves the normal compression path unchanged.
             difference = reference - mpo
+            if initial_sector_summary is None:
+                # QR-canonicalize the direct-sum difference before contracting
+                # its norm. Its raw doubled network can cancel large terms and
+                # lose small compression errors to floating-point roundoff.
+                difference.left_canonize()
             operator_frobenius_error = difference.norm()
             reference_norm = reference.norm()
             try:

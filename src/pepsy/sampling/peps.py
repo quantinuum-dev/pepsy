@@ -1918,7 +1918,7 @@ class PepsSampler:
             amplitude = self._projected_amplitude_scaled(group["config"])
             for index in group["indices"]:
                 index = int(index)
-                configs[index] = group["config"]
+                configs[index] = list(group["config"])
                 omegas[index] = omega
                 amplitudes[index] = amplitude
 

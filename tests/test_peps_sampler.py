@@ -444,11 +444,14 @@ def test_peps_sampler_reference_batch_and_duplicate_amplitudes(array_backend, mo
     monkeypatch.setattr(sampler, "_projected_amplitude_scaled", amplitude)
     result = sampler.sample_batch(40, seed=2)
     assert result.configs == [[0, 0, 0, 0]] * 40
+    assert len({id(config) for config in result.configs}) == 40
     assert len(calls) == 1
     assert sampler.row_cache_stats["mode"] == "reference-prefix"
     np.testing.assert_allclose(result.omegas[0], 1)
     np.testing.assert_allclose(result.ps[0], 1)
     assert sampler.probability([1, 0, 0, 0]) == 0.0
+    result.configs[0][0] = 1
+    assert result.configs[1] == [0, 0, 0, 0]
 
 
 @pytest.mark.parametrize("cache_budget", [0, 64 * 2**20])

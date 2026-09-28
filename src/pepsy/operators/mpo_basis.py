@@ -700,6 +700,7 @@ class MPOBasis:
         upper_ind_id="k{}",
         lower_ind_id="b{}",
         site_tag_id="I{}",
+        _local_factorization="auto",
     ):
         if not isinstance(L, Integral):
             raise TypeError("L must be an integer.")
@@ -752,6 +753,7 @@ class MPOBasis:
                 unit_terms,
                 phys_dim=phys_dim,
                 unit_coefficients=True,
+                factorization=_local_factorization,
             )
         else:
             automaton, slots = MPOAutomaton.from_product_terms(
@@ -1058,6 +1060,9 @@ class MPOBasis:
         parameters=None,
         *,
         cluster_size=2,
+        spatial_reuse=True,
+        spatial_symmetries=(),
+        factorization="auto",
         cutoff=1.0e-12,
         max_bond=None,
         symmetry=None,
@@ -1078,8 +1083,17 @@ class MPOBasis:
             MPOClusterProductExpansion,
         )
 
+        from ._cluster_symmetry import normalize_spatial_symmetries
+        spatial_symmetries = normalize_spatial_symmetries(range(self.L), spatial_symmetries)
+        from ._cluster_factorization import normalize_factorization
+        factorization = normalize_factorization(factorization)
+        if not isinstance(spatial_reuse, bool):
+            raise TypeError("spatial_reuse must be a bool.")
         cache_key = (
             int(cluster_size),
+            spatial_reuse,
+            spatial_symmetries,
+            factorization,
             None if cutoff is None else float(cutoff),
             None if max_bond is None else int(max_bond),
             symmetry,
@@ -1092,6 +1106,9 @@ class MPOBasis:
             expansion = MPOClusterProductExpansion.from_mpo_basis(
                 self,
                 cluster_size=cluster_size,
+                spatial_reuse=spatial_reuse,
+                spatial_symmetries=spatial_symmetries,
+                factorization=factorization,
                 cutoff=cutoff,
                 max_bond=max_bond,
                 symmetry=symmetry,
@@ -1106,6 +1123,9 @@ class MPOBasis:
         self,
         *,
         cluster_size=2,
+        spatial_reuse=True,
+        spatial_symmetries=(),
+        factorization="auto",
         cutoff=1.0e-12,
         max_bond=None,
         symmetry=None,
@@ -1119,8 +1139,17 @@ class MPOBasis:
             MPOClusterProductExpansion,
         )
 
+        from ._cluster_symmetry import normalize_spatial_symmetries
+        spatial_symmetries = normalize_spatial_symmetries(range(self.L), spatial_symmetries)
+        from ._cluster_factorization import normalize_factorization
+        factorization = normalize_factorization(factorization)
+        if not isinstance(spatial_reuse, bool):
+            raise TypeError("spatial_reuse must be a bool.")
         cache_key = (
             int(cluster_size),
+            spatial_reuse,
+            spatial_symmetries,
+            factorization,
             None if cutoff is None else float(cutoff),
             None if max_bond is None else int(max_bond),
             symmetry,
@@ -1133,6 +1162,9 @@ class MPOBasis:
             expansion = MPOClusterProductExpansion.from_mpo_basis(
                 self,
                 cluster_size=cluster_size,
+                spatial_reuse=spatial_reuse,
+                spatial_symmetries=spatial_symmetries,
+                factorization=factorization,
                 cutoff=cutoff,
                 max_bond=max_bond,
                 symmetry=symmetry,
@@ -1150,6 +1182,9 @@ class MPOBasis:
         *,
         graph=None,
         cluster_size=2,
+        spatial_reuse=True,
+        spatial_symmetries=(),
+        factorization="auto",
         cutoff=1.0e-12,
         max_bond=None,
         graph_assembly="auto",
@@ -1157,6 +1192,7 @@ class MPOBasis:
         collection_budget=128,
         assembly="direct",
         assembly_chi=None,
+        assembly_state_budget=4096,
         assembly_batch_size="auto",
         assembly_cutoff=None,
         assembly_cutoff_mode="auto",
@@ -1185,11 +1221,17 @@ class MPOBasis:
         cores, inserts bounded batches directly into the accumulator, and
         applies a semantic fixed-rank SVD after each batch;
         ``assembly_chi`` and ``assembly_batch_size`` control that working
-        boundary.
+        boundary. ``assembly="recursive"`` instead shares MPO subproblems
+        and keeps all disjoint collections without enumerating them, guarded
+        by ``assembly_state_budget``. Its ``assembly_chi=None`` skips assembly
+        compression; collection_budget does not apply to recursive mode.
         """
         compiled = self.compile_graph_cluster_expansion(
             graph=graph,
             cluster_size=cluster_size,
+            spatial_reuse=spatial_reuse,
+            spatial_symmetries=spatial_symmetries,
+            factorization=factorization,
             cutoff=cutoff,
             max_bond=max_bond,
             graph_assembly=graph_assembly,
@@ -1197,6 +1239,7 @@ class MPOBasis:
             collection_budget=collection_budget,
             assembly=assembly,
             assembly_chi=assembly_chi,
+            assembly_state_budget=assembly_state_budget,
             assembly_batch_size=assembly_batch_size,
             assembly_cutoff=assembly_cutoff,
             assembly_cutoff_mode=assembly_cutoff_mode,
@@ -1213,6 +1256,9 @@ class MPOBasis:
         *,
         graph=None,
         cluster_size=2,
+        spatial_reuse=True,
+        spatial_symmetries=(),
+        factorization="auto",
         cutoff=1.0e-12,
         max_bond=None,
         graph_assembly="auto",
@@ -1220,6 +1266,7 @@ class MPOBasis:
         collection_budget=128,
         assembly="direct",
         assembly_chi=None,
+        assembly_state_budget=4096,
         assembly_batch_size="auto",
         assembly_cutoff=None,
         assembly_cutoff_mode="auto",
@@ -1237,7 +1284,10 @@ class MPOBasis:
         explicit approximation on wide MPO orderings. ``assembly="streaming"``
         is a separate working-memory control that inserts graph-path cores
         directly into the accumulator in batches, without temporary path or
-        batch MPOs.
+        batch MPOs. ``assembly="recursive"`` keeps all collections using
+        shared subset MPOs and optional per-batch compression; it replaces
+        collection_budget with a hard ``assembly_state_budget`` on structural
+        subproblems. Numerical tensors are fresh for each evaluation.
         """
         from .mpo_product import (  # pylint: disable=import-outside-toplevel
             MPOGraphClusterProductExpansion,
@@ -1253,6 +1303,9 @@ class MPOBasis:
             _validate_graph_collection_order,
         )
 
+        from ._cluster_collections import validate_assembly_state_budget
+
+        assembly_state_budget = validate_assembly_state_budget(assembly_state_budget)
         graph_assembly = _normalize_graph_assembly(graph_assembly)
         assembly = _normalize_mpo_assembly(assembly)
         assembly_chi = _validate_assembly_chi(assembly_chi)
@@ -1269,10 +1322,19 @@ class MPOBasis:
         )
         collection_budget = _validate_graph_collection_budget(collection_budget)
         normalized_graph = _graph_lattice_for_basis(graph, self)
+        from ._cluster_symmetry import normalize_spatial_symmetries
+        spatial_symmetries = normalize_spatial_symmetries(range(self.L), spatial_symmetries)
+        from ._cluster_factorization import normalize_factorization
+        factorization = normalize_factorization(factorization)
+        if not isinstance(spatial_reuse, bool):
+            raise TypeError("spatial_reuse must be a bool.")
         cache_key = (
             tuple(normalized_graph.sites),
             tuple(normalized_graph.edges),
             int(cluster_size),
+            spatial_reuse,
+            spatial_symmetries,
+            factorization,
             None if cutoff is None else float(cutoff),
             None if max_bond is None else int(max_bond),
             graph_assembly,
@@ -1280,6 +1342,7 @@ class MPOBasis:
             None if collection_budget is None else int(collection_budget),
             assembly,
             None if assembly_chi is None else int(assembly_chi),
+            assembly_state_budget,
             assembly_batch_size,
             assembly_cutoff,
             assembly_cutoff_mode,
@@ -1295,6 +1358,9 @@ class MPOBasis:
                 self,
                 graph=normalized_graph,
                 cluster_size=cluster_size,
+                spatial_reuse=spatial_reuse,
+                spatial_symmetries=spatial_symmetries,
+                factorization=factorization,
                 cutoff=cutoff,
                 max_bond=max_bond,
                 graph_assembly=graph_assembly,
@@ -1302,6 +1368,7 @@ class MPOBasis:
                 collection_budget=collection_budget,
                 assembly=assembly,
                 assembly_chi=assembly_chi,
+                assembly_state_budget=assembly_state_budget,
                 assembly_batch_size=assembly_batch_size,
                 assembly_cutoff=assembly_cutoff,
                 assembly_cutoff_mode=assembly_cutoff_mode,

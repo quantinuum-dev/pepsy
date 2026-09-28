@@ -21,7 +21,13 @@ forwarded to Quimb's boundary SVD via `compress_opts`.
 
 Use `PepsOptimizer.run(k_2q_batch=N)` to absorb up to `N` sequential two-site
 gates, plus intervening one-site gates, into one PEPS target before truncating
-to `chi` and optionally running the sweep/global cleanup.
+to `chi` and optionally running the sweep/global cleanup. Two-site targets use
+`cutoff=0`, no bond cap, and no path compression, even when `run(cutoff=...)`
+requests truncation for the warm start. An explicit truncating value in
+`target_gate_kwargs` raises `ValueError`. Warm-start `compress_all` receives both
+the requested `cutoff` and `cutoff_mode`; one-site gates continue to use the
+run's gate options directly. Infidelity estimates must be finite; a
+substantially negative value raises rather than counting as a perfect update.
 
 The FIT controls can be supplied directly to `PepsOptimizer`, matching the
 `SweepOptimizer` names, for example `fit_mode`, `fit_layer_mode`,
