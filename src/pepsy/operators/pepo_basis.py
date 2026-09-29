@@ -17,6 +17,7 @@ from itertools import product
 
 from .mpo_automaton import _as_backend, _backend_reference
 from .pepo_active import ActivePEPOBlocks
+from ._cluster_api import resolve_cluster_size
 from ._cluster_factorization import normalize_factorization
 from ._cluster_symmetry import normalize_spatial_symmetries, verify_spatial_symmetries
 from ._cluster_symmetry import (
@@ -261,6 +262,7 @@ class CompiledPEPOExp:
         if not isinstance(basis, PauliPEPOBasis):
             raise TypeError("basis must be a PauliPEPOBasis.")
         self.basis = basis
+        self.cluster_size = basis.cluster_size
         # Compile only value-independent cluster embeddings here. Matrix
         # exponentials and coefficient contractions still happen per call.
         basis._prepare_exp_plan()
@@ -319,6 +321,9 @@ class PauliPEPOBasis:
     exponentials and fills those fixed channels with the current coefficient
     and time-step values, so backend scalar graphs are not cached or copied.
 
+    ``cluster_size`` is the maximum connected site count (default 4).
+    ``order`` remains an equivalent spelling; supplying both requires agreement.
+
     ``spatial_reuse=True`` shares exact local targets under verified site
     relabelings, independently of the existing ``symmetry="C4"`` block
     transport. Disable it for unreduced comparisons. Structural plans retain
@@ -350,7 +355,8 @@ class PauliPEPOBasis:
         ly,
         terms,
         *,
-        order=4,
+        order=None,
+        cluster_size=None,
         cyclic=False,
         symmetry=None,
         max_tree_rank=None,
@@ -361,9 +367,8 @@ class PauliPEPOBasis:
         self.lx = _validate_shape(lx, "lx")
         self.ly = _validate_shape(ly, "ly")
         self.cyclic = _validate_cyclic(cyclic, self.lx, self.ly)
-        if not isinstance(order, Integral):
-            raise TypeError("order must be an integer.")
-        self.order = int(order)
+        self.order = resolve_cluster_size(order, cluster_size, default=4)
+        self.cluster_size = self.order
         if self.order < 1 or self.order > 9:
             raise ValueError("PauliPEPOBasis currently supports orders 1 through 9.")
         if symmetry not in (None, "C4"):
@@ -561,6 +566,19 @@ class PauliPEPOBasis:
         )
 
     @classmethod
+    def from_plan(cls, plan, terms, **kwargs):
+        """Compile located graph terms, returning a graph-PEPO expansion.
+
+        Terms use MPO's ``(sites, paulis, coefficient)`` schema with integer
+        indices in ``plan.sites`` order, rather than square direction slots.
+        Graph materialization uses NumPy; trace/residuals preserve autodiff.
+        """
+        from .graph_pepo_product import GraphPEPOClusterProductExpansion
+        from .mpo_product import MPOClusterFactor
+
+        return GraphPEPOClusterProductExpansion.from_plan(plan, (MPOClusterFactor(terms),), **kwargs)
+
+    @classmethod
     def compile(cls, lx, ly, terms, **kwargs):
         """Compile fixed lattice and Pauli topology for repeated evaluations.
 
@@ -597,6 +615,7 @@ class PauliPEPOBasis:
             "builds": self._build_count,
             "terms": self.num_terms,
             "order": self.order,
+            "cluster_size": self.cluster_size,
             "pair_orbits": len(self.pair_orbits),
             "tree_orbits": len(self.triple_orbits) + len(self.path_orbits),
             "plaquettes": len(self.plaquette_starts),

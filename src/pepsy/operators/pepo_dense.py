@@ -33,6 +33,7 @@ import quimb.tensor as qtn
 from quimb.tensor.fitting import tensor_network_distance
 
 from .mpo_automaton import _as_backend
+from ._cluster_api import cluster_size_constructor_alias, resolve_cluster_size
 from .diagnostics import OperatorReportInfo
 from .mpo_semantic import _fixed_rank_svd
 from ._cluster_factorization import fixed_split, normalize_factorization
@@ -234,54 +235,10 @@ class ClusterLattice:
         if min_sites > max_sites:
             raise ValueError("min_sites must be <= max_sites.")
 
-        site_index = {site: index for index, site in enumerate(self.sites)}
-        adjacency = {
-            site_index[site]: tuple(site_index[neighbor] for neighbor, _ in links)
-            for site, links in self.adjacency.items()
-        }
-        shapes = []
-        upper = min(max_sites, len(self.sites))
-        levels = {
-            1: {frozenset((site,)) for site in range(len(self.sites))}
-        }
-        for size in range(2, upper + 1):
-            candidates = set()
-            for selected in levels[size - 1]:
-                frontier = {
-                    neighbor
-                    for site in selected
-                    for neighbor in adjacency[site]
-                    if neighbor not in selected
-                }
-                candidates.update(
-                    selected | frozenset((neighbor,))
-                    for neighbor in frontier
-                )
-            levels[size] = candidates
+        from .cluster_plan import ClusterPlan
 
-        for size in range(min_sites, upper + 1):
-            for selected in sorted(levels[size], key=lambda sites: tuple(sorted(sites))):
-                selected = tuple(sorted(selected))
-                local_sites = tuple(self.sites[index] for index in selected)
-                selected_set = set(local_sites)
-                local_index = {site: index for index, site in enumerate(local_sites)}
-                local_edges = tuple(
-                    (
-                        local_index[source],
-                        local_index[target],
-                        edge_index,
-                    )
-                    for edge_index, (source, target) in enumerate(self.edges)
-                    if source in selected_set and target in selected_set
-                )
-                shapes.append(
-                    GraphConnectedClusterShape(
-                        sites=local_sites,
-                        edges=local_edges,
-                        loops=len(local_edges) - size + 1,
-                    )
-                )
-        return tuple(shapes)
+        return tuple(shape for shape in ClusterPlan(self, cluster_size=max_sites).graph_shapes
+                     if shape.nsites >= min_sites)
 
 
 @dataclass(frozen=True)
@@ -1958,7 +1915,8 @@ def build_real_time_cluster_expansion_pepo(
     twosite_terms,
     onesite_terms,
     *,
-    order=5,
+    order=None,
+    cluster_size=None,
     cyclic=False,
     edge_cutoff=0.0,
     max_edge_rank=None,
@@ -2003,7 +1961,7 @@ def build_real_time_cluster_expansion_pepo(
         1j * time,
         twosite_op,
         onesite_op,
-        order=order,
+        order=resolve_cluster_size(order, cluster_size, default=5),
         cyclic=cyclic,
         edge_cutoff=edge_cutoff,
         max_edge_rank=max_edge_rank,
@@ -2234,8 +2192,31 @@ def _add_graph_tree_factor_blocks(
             blocks[lattice_site][key] = blocks[lattice_site].get(key, 0) + block
 
 
-class GraphClusterExpansionPlan:
+class _DenseClusterExponential:
+    """Common exponential entry point for fixed dense generators."""
+
+    def compile_exp(self):
+        """Return this reusable plan; compilation does not enable backend JIT."""
+        return self
+
+    def exp(self, step, *, materialize=False, return_report=False):
+        """Approximate ``exp(step * H)`` using the plan's fixed dense operators.
+
+        The historical ``build(beta)`` computes ``exp(-beta * H)``. Runtime
+        coefficient vectors and differentiable inputs belong to PauliPEPOBasis.
+        """
+        return self.build(-step, materialize=materialize, return_report=return_report)
+
+    evaluate = exp
+    __call__ = exp
+
+
+class GraphClusterExpansionPlan(_DenseClusterExponential):
     """Reusable arbitrary-graph cluster-expansion construction plan.
+
+    ``cluster_size`` counts connected sites (default 3); ``order`` remains
+    an equivalent spelling. ``exp(step)`` uses the common positive-step
+    convention, while ``build(beta)`` retains ``exp(-beta * H)``.
 
     The graph builder uses exact connected-subgraph residual subtraction and a
     spanning-tree factorization for every residual, including clusters whose
@@ -2251,7 +2232,9 @@ class GraphClusterExpansionPlan:
         twosite_op,
         onesite_op,
         *,
-        order=3,
+        order=None,
+        cluster_size=None,
+        cluster_plan=None,
         edge_cutoff=0.0,
         max_edge_rank=None,
         max_tree_rank=None,
@@ -2260,8 +2243,23 @@ class GraphClusterExpansionPlan:
     ):
         if not isinstance(lattice, ClusterLattice):
             lattice = ClusterLattice.from_edges(lattice[0], lattice[1])
+        from .cluster_plan import ClusterPlan
+
+        if cluster_plan is not None:
+            if not isinstance(cluster_plan, ClusterPlan):
+                raise TypeError("cluster_plan must be a ClusterPlan.")
+            if lattice != cluster_plan.lattice:
+                raise ValueError("lattice must match cluster_plan.lattice.")
+            if order is None and cluster_size is None:
+                cluster_size = cluster_plan.cluster_size
         self.lattice = lattice
-        self.order = _validate_shape(order, "order")
+        self.order = _validate_shape(
+            resolve_cluster_size(order, cluster_size, default=3), "cluster_size"
+        )
+        self.cluster_size = self.order
+        if cluster_plan is not None and min(self.order, len(lattice.sites)) != cluster_plan.cluster_size:
+            raise ValueError("cluster_size must match cluster_plan.cluster_size.")
+        self.cluster_plan = cluster_plan or ClusterPlan(lattice, cluster_size=self.order)
         if self.order > 9:
             raise NotImplementedError(
                 "graph cluster-expansion builders currently support orders 1 through 9."
@@ -2288,12 +2286,21 @@ class GraphClusterExpansionPlan:
             for site in lattice.sites
         }
         self._shapes_by_order = {}
-        for shape in lattice.connected_cluster_shapes(self.order):
+        for shape in self.cluster_plan.graph_shapes:
             self._shapes_by_order.setdefault(shape.nsites, []).append(shape)
         self._shapes_by_order = {
             size: tuple(shapes)
             for size, shapes in self._shapes_by_order.items()
         }
+
+    @classmethod
+    def from_plan(cls, plan, twosite_op, onesite_op, **kwargs):
+        """Use shared finite geometry with uniform one- and two-site operators.
+
+        The interaction on each unique graph edge is ``twosite_op`` in that
+        edge's source/target order; support multiplicities do not scale it.
+        """
+        return cls(plan.lattice, twosite_op, onesite_op, cluster_plan=plan, **kwargs)
 
     @property
     def connected_cluster_shapes(self):
@@ -2488,7 +2495,8 @@ def build_graph_cluster_expansion_pepo(
     twosite_op,
     onesite_op,
     *,
-    order=3,
+    order=None,
+    cluster_size=None,
     edge_cutoff=0.0,
     max_edge_rank=None,
     max_tree_rank=None,
@@ -2508,7 +2516,7 @@ def build_graph_cluster_expansion_pepo(
         lattice,
         twosite_op,
         onesite_op,
-        order=order,
+        order=resolve_cluster_size(order, cluster_size, default=3),
         edge_cutoff=edge_cutoff,
         max_edge_rank=max_edge_rank,
         max_tree_rank=max_tree_rank,
@@ -4533,9 +4541,14 @@ def _add_generic_cluster_levels(
     )
 
 
+@cluster_size_constructor_alias
 @dataclass
-class ClusterExpansionPlan:
+class ClusterExpansionPlan(_DenseClusterExponential):
     """Reusable geometry and symmetry plan for dense cluster-expansion PEPOs.
+
+    ``cluster_size`` counts connected sites (default 3); ``order`` remains
+    an equivalent spelling. ``exp(step)`` uses the common positive-step
+    convention, while ``build(beta)`` retains ``exp(-beta * H)``.
 
     The lattice topology and cluster-orbit bookkeeping are cached in the plan;
     beta-dependent local exponentials and residual solves are performed by
@@ -4576,13 +4589,16 @@ class ClusterExpansionPlan:
     fit_warm_start: bool = True
     last_report: ClusterExpansionReport | None = field(default=None, init=False, repr=False)
 
+    @property
+    def cluster_size(self):
+        """Spatial cutoff alias; ``order`` is the canonical dataclass field."""
+        return self.order
+
     def __post_init__(self):
         self.lx = _validate_shape(self.lx, "lx")
         self.ly = _validate_shape(self.ly, "ly")
         self.cyclic = _validate_cyclic(self.cyclic, self.lx, self.ly)
-        if not isinstance(self.order, Integral):
-            raise TypeError("order must be an integer.")
-        self.order = int(self.order)
+        self.order = resolve_cluster_size(self.order, None, default=3)
         if self.order < 1:
             raise ValueError("order must be >= 1.")
         if self.order > 9:
@@ -5505,7 +5521,8 @@ def build_cluster_expansion_pepo(
     twosite_op,
     onesite_op,
     *,
-    order=3,
+    order=None,
+    cluster_size=None,
     cyclic=False,
     edge_cutoff=0.0,
     max_edge_rank=None,
@@ -5623,7 +5640,7 @@ def build_cluster_expansion_pepo(
         ly,
         twosite_op,
         onesite_op,
-        order=order,
+        order=resolve_cluster_size(order, cluster_size, default=3),
         cyclic=cyclic,
         edge_cutoff=edge_cutoff,
         max_edge_rank=max_edge_rank,
@@ -5655,7 +5672,8 @@ def build_model_cluster_expansion_pepo(
     beta,
     model,
     *,
-    order=3,
+    order=None,
+    cluster_size=None,
     cyclic=False,
     edge_cutoff=0.0,
     max_edge_rank=None,
@@ -5701,7 +5719,7 @@ def build_model_cluster_expansion_pepo(
         beta,
         adapter.twosite_op,
         adapter.onesite_op,
-        order=order,
+        order=resolve_cluster_size(order, cluster_size, default=3),
         cyclic=cyclic,
         edge_cutoff=edge_cutoff,
         max_edge_rank=max_edge_rank,
@@ -5783,7 +5801,8 @@ def build_itf_cluster_expansion_pepo(
     *,
     J=1.0,
     field=1.0,
-    order=3,
+    order=None,
+    cluster_size=None,
     cyclic=False,
     edge_cutoff=0.0,
     max_edge_rank=None,
@@ -5817,7 +5836,7 @@ def build_itf_cluster_expansion_pepo(
         beta,
         J * np.kron(z, z),
         field * x,
-        order=order,
+        order=resolve_cluster_size(order, cluster_size, default=3),
         cyclic=cyclic,
         edge_cutoff=edge_cutoff,
         max_edge_rank=max_edge_rank,

@@ -7,7 +7,7 @@ compatible cluster collections. No operator factorization is needed.
 
 from numbers import Integral
 
-from ._cluster_collections import compile_collection_recursion
+from .cluster_plan import _collections
 
 
 def compile_trace_plan(length, clusters, state_budget):
@@ -22,7 +22,7 @@ def compile_trace_plan(length, clusters, state_budget):
     if any(not sites or tuple(sorted(sites)) != sites for sites in ordered):
         raise ValueError("connected trace clusters must be sorted, nonempty site tuples.")
     try:
-        plan = compile_collection_recursion(length, ordered, state_budget)
+        plan = _collections(length, ordered, state_budget)
     except ValueError as exc:
         if "exceeds assembly_state_budget" not in str(exc):
             raise

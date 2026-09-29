@@ -14,6 +14,21 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Add `pepsy.operators.ClusterPlan` for inferred interaction graphs, lazy cached
+  cluster inventories, exact partition/collection counts and verified local
+  symmetry reuse. MPO and graph PEPO share `from_plan` factories; general graph
+  products support nonuniform and higher-body terms. Graph materialization
+  preserves asymmetric complex operators and mixed-block dtypes; graph traces
+  and residuals preserve backend gradients. See the interaction-cluster guide.
+
+- Common cluster API conventions across MPO, PEPO and Gaugy: PEPO plans and
+  builders accept `cluster_size` as an alias for spatial `order`; dense PEPO
+  plans expose `compile_exp().exp(step)` with `build(-step)` semantics.
+  MPO products expose `from_bases`, positional runtime `parameters`, and
+  per-factor term `coefficients` in compiled and one-shot evaluations, plus
+  `materialize=True` on reusable evaluators for direct Quimb MPO output. Their
+  cached vector-binding plans preserve independent coefficient gradients.
+
 - Compiled connected-cluster MPO and Pauli PEPO products now expose
   `trace_exp(..., normalized=False, state_budget=100000)`. It evaluates
   complete chosen-order ordered-product traces from scalar connected
@@ -23,6 +38,17 @@ releases remain backwards-compatible. From 1.0 onward:
   and JAX JIT gradients.
 
 ### Changed
+
+- Graph MPO runtime coefficient vectors retain the original graph-support
+  contract, including interactions connected through intermediate sites.
+  Graph active-block materialization preserves Torch storage metadata and
+  gradients, including isolated sites. Shared-plan factories reject invalid
+  term indices with an explicit validation error.
+
+- Shared cluster bindings now accept `None` factor vectors on MPO products,
+  matching PEPO/Gaugy defaults, and reject conflicting parameter/coefficient
+  containers before evaluating PEPO callbacks. The dense PEPO cutoff alias
+  preserves `dataclasses.replace(plan, order=...)` by storing only `order`.
 
 - Joint located PEPO products now avoid building unused homogeneous
   Hamiltonian component maps. Independent noncommuting square-lattice

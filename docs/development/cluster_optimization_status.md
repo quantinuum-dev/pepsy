@@ -1,10 +1,51 @@
 # Cluster PEPO backend and downstream optimization status
 
-Updated 2026-09-28. An earlier Pepsy `develop` publication at
+Updated 2026-09-29. An earlier Pepsy `develop` publication at
 **`b4c4631`** includes
 the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
+
+## Shared interaction-graph planner, 2026-09-29
+
+The publication after `a233a40` includes lazy `pepsy.operators.ClusterPlan`, exact
+finite inventories and counts, verified symmetry candidates, bounded structural
+caches, common `from_plan` adapters, and general ordered graph-PEPO products.
+Gaugy's matching implementation adds automatic local Pauli equivalence and
+shared graph factories. It is published as `b6cfe55` on Gaugy develop,
+with 255 focused tests passing. Graph-PEPO matrix orientation/dtype and mixed backend
+residuals were corrected during cross-representation validation.
+
+See the [API and limits](../api/operators/interaction_clusters.md) and
+[implementation/validation record](../../history/2026-09-29-interaction-cluster-plan.md).
+The planner and API alignment are included in the publication containing the
+[final review record](../../history/2026-09-29-cluster-final-review-publication.md).
+That review also corrected legacy graph-MPO runtime rebinding, Torch graph
+block metadata/isolated-site materialization, and invalid term-index errors.
+Unrelated MPS working-tree changes are outside this publication.
+
+## Shared API review corrections, 2026-09-29
+
+A second review reproduced and fixed dense-plan dataclass replacement with
+`order`, MPO partial-default coefficient vectors, and early PEPO runtime
+binding conflict validation. These fixes are included in the shared-planner
+publication above. See the
+[review and validation record](../../history/2026-09-29-cluster-api-review.md).
+
+## Shared cluster API alignment, 2026-09-29
+
+The shared-planner publication on `develop` after `a233a40` aligns the main dense/Pauli
+PEPO, MPO and Gaugy Pauli entry points. PEPO exposes the spatial
+`cluster_size` alias; dense plans add `compile_exp().exp(step)` with preserved
+`build(beta)` behavior. MPO adds `from_bases`, runtime term vectors,
+positional parameter bindings and explicit materialization. Numerical
+cluster algorithms and existing defaults remain unchanged.
+
+See the [common API table](../api/operators/exponentials.md#shared-connected-cluster-calls)
+and [validation handoff](../../history/2026-09-29-cluster-api-alignment.md).
+These Pepsy changes are included in the publication above; the September 28
+records below describe earlier commits. Gaugy's cutoff alias continues to
+work with the established public Pepsy constructor keyword.
 
 ## Responsibility and supported behavior
 

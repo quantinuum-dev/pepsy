@@ -39,6 +39,7 @@ from .mpo_semantic import (
     _as_backend,
     _backend_name,
     _backend_reference,
+    _check_scalar,
     _fixed_rank_svd,
     _multiply_scalar,
     _resolve_compression_cutoff,
@@ -998,6 +999,10 @@ def _graph_lattice_for_basis(graph, basis):
 
     from .pepo_dense import ClusterLattice  # pylint: disable=import-outside-toplevel
 
+    if isinstance(graph, str) and graph == "interactions":
+        from .cluster_plan import ClusterPlan
+
+        return ClusterPlan.from_terms(basis.terms, sites=basis.L, cluster_size=1).lattice
     if isinstance(graph, str):
         graph_name = _resolve_graph_name(graph, basis)
         return _graph_lattice_from_spec(
@@ -1316,6 +1321,7 @@ class CompiledMPOClusterProduct:
         if not isinstance(basis, MPOClusterProductExpansion):
             raise TypeError("basis must be an MPOClusterProductExpansion.")
         self.basis = basis
+        self.cluster_size = basis.cluster_size
 
     @property
     def cache_info(self):
@@ -1328,22 +1334,26 @@ class CompiledMPOClusterProduct:
         """Return the most recent construction report, or None before evaluation."""
         return self.basis.last_report
 
-    def exp(self, step=1.0, *, parameters=None, return_report=False):
+    def exp(self, step=1.0, parameters=None, *, coefficients=None, materialize=False,
+            return_report=False):
         """Evaluate the product, optionally returning ``(semantic_mpo, report)``.
 
+        ``materialize=True`` returns a Quimb MPO instead of the semantic MPO.
         The report records the resolved graph assembly policy, including any
         collection truncation. ``cache_info`` describes configured controls.
         """
-        result = self.basis.exp(step, parameters=parameters)
+        result = self.basis.exp(
+            step, parameters, coefficients=coefficients, materialize=materialize,
+        )
         if return_report:
             return result, self.last_report
         return result
 
-    def trace_exp(self, step=1.0, *, parameters=None, normalized=False,
+    def trace_exp(self, step=1.0, parameters=None, *, coefficients=None, normalized=False,
                   state_budget=100000):
         """Evaluate the complete selected-order trace without building an MPO."""
         return self.basis.trace_exp(
-            step, parameters=parameters, normalized=normalized,
+            step, parameters, coefficients=coefficients, normalized=normalized,
             state_budget=state_budget,
         )
 
@@ -1399,6 +1409,7 @@ class MPOClusterProductExpansion:
         cutoff=1.0e-12,
         max_bond=None,
         graph=None,
+        cluster_plan=None,
         to_backend=None,
         graph_assembly="auto",
         max_collection_order=None,
@@ -1500,7 +1511,45 @@ class MPOClusterProductExpansion:
         self.assembly_cutoff = assembly_cutoff
         self.assembly_cutoff_mode = assembly_cutoff_mode
         self.assembly_form = assembly_form
+        from .cluster_plan import ClusterPlan
+        from .pepo_dense import ClusterLattice
+
+        # Materialize generators once: inference must inspect every factor.
+        factors = tuple(self._normalize_factor(factor) for factor in factors)
+        if isinstance(graph, str) and graph == "interactions":
+            if cluster_plan is not None:
+                raise ValueError("supply cluster_plan or graph='interactions', not both.")
+            cluster_plan = ClusterPlan.from_terms(
+                (term for factor in factors for term in factor.terms),
+                sites=self.L, cluster_size=self.cluster_size,
+            )
+        if cluster_plan is not None:
+            if not isinstance(cluster_plan, ClusterPlan):
+                raise TypeError("cluster_plan must be a ClusterPlan.")
+            if len(cluster_plan.sites) != self.L or cluster_plan.cluster_size != min(self.cluster_size, self.L):
+                raise ValueError("L and cluster_size must match cluster_plan.")
+            indexed_graph = ClusterLattice(range(self.L), tuple(
+                (cluster_plan.sites.index(a), cluster_plan.sites.index(b))
+                for a, b in cluster_plan.lattice.edges
+            ))
+            if graph is not None and graph != "interactions":
+                supplied = _graph_lattice_from_input(graph, self.L)
+                if set(map(frozenset, supplied.edges)) != set(map(frozenset, indexed_graph.edges)):
+                    raise ValueError("graph must match cluster_plan.")
+            graph = indexed_graph
+            for factor in factors:
+                for term in factor.terms:
+                    if any(site < 0 or site >= self.L for site in term.sites):
+                        raise ValueError("a cluster term site is outside the chain.")
+                    support = tuple(cluster_plan.sites[i] for i in term.sites)
+                    cluster_plan.subclusters(support, proper=False)
+        # Legacy explicit graphs may connect a term through additional sites.
+        # Runtime rebinding must retain their original validation contract.
+        self._supplied_cluster_plan = cluster_plan
         self.graph = None if graph is None else _graph_lattice_from_input(graph, self.L)
+        self.cluster_plan = cluster_plan
+        if self.graph is not None and self.cluster_plan is None:
+            self.cluster_plan = ClusterPlan(self.graph, cluster_size=self.cluster_size)
         self.cluster_mode = "graph" if self.graph is not None else "interval"
         if self.assembly in {"streaming", "recursive"} and self.graph is None:
             raise ValueError(
@@ -1667,11 +1716,8 @@ class MPOClusterProductExpansion:
                 site: set(neighbor for neighbor, _ in links)
                 for site, links in self.graph.adjacency.items()
             }
-            shapes = self.graph.connected_cluster_shapes(self.cluster_size)
-            self._graph_clusters = tuple(
-                tuple(sorted(shape.sites))
-                for shape in shapes
-            )
+            shapes = self.cluster_plan.graph_shapes
+            self._graph_clusters = self.cluster_plan.index_clusters
             self._graph_loop_counts = tuple(int(shape.loops) for shape in shapes)
             self._graph_factor_terms = {
                 cluster: tuple(
@@ -1718,10 +1764,20 @@ class MPOClusterProductExpansion:
         self._build_count = 0
         self._last_report = None
         self._compiled_exp = None
+        self._coefficient_expansion = None
         self._trace_plans = {}
         self._spatial_plan = self._compile_spatial_plan()
         if self.assembly == "recursive":
             self._graph_recursive_plan()
+
+    @classmethod
+    def from_plan(cls, plan, factors, **kwargs):
+        """Compile factors on a shared plan, using sites indexed in plan order."""
+        if "cluster_size" in kwargs and kwargs["cluster_size"] != plan.cluster_size:
+            raise ValueError("cluster_size must match cluster_plan.cluster_size.")
+        kwargs["cluster_size"] = plan.cluster_size
+        kwargs.setdefault("graph", None)
+        return cls(len(plan.sites), factors, cluster_plan=plan, **kwargs)
 
     @staticmethod
     def _normalize_factor(factor):
@@ -1794,9 +1850,86 @@ class MPOClusterProductExpansion:
             MPOClusterFactor.from_mpo_basis(basis, coefficient=coefficient)
             for basis, coefficient in zip(bases, coefficients)
         )
-        if kwargs.get("graph") is not None:
+        if kwargs.get("graph") is not None and kwargs["graph"] != "interactions":
             kwargs["graph"] = _graph_lattice_for_basis(kwargs["graph"], bases[0])
         return cls.from_factors(bases[0].L, factors, **kwargs)
+
+    @classmethod
+    def from_bases(cls, bases, *, coefficients=None, **kwargs):
+        """Build algebraically ordered factors, matching the PEPO factory.
+
+        Here ``coefficients`` are factor scales. On ``exp`` and ``trace_exp``
+        they instead supply runtime term vectors, one vector per factor.
+        """
+        return cls.from_mpo_bases(bases, coefficients=coefficients, **kwargs)
+
+    def _bind_coefficients(self, parameters, coefficients):
+        """Return a cached independent-slot topology and fresh scalar bindings."""
+        if parameters is not None:
+            raise ValueError("pass either parameters or coefficients, not both.")
+        if len(self.factors) == 1:
+            batches = (coefficients,)
+        else:
+            try:
+                batches = tuple(coefficients)
+            except TypeError as exc:
+                raise TypeError("coefficients must contain one vector per factor.") from exc
+            if len(batches) != len(self.factors):
+                raise ValueError("coefficients must contain one vector per factor.")
+        bindings = {}
+        for i, (factor, batch) in enumerate(zip(self.factors, batches)):
+            shape = getattr(batch, "shape", None)
+            if batch is None:
+                if any(callable(term.coefficient) for term in factor.terms):
+                    raise KeyError("callable term coefficients require parameters.")
+                values = tuple(_resolve(term.coefficient, None) for term in factor.terms)
+            elif shape is not None and len(shape) == 0:
+                values = (batch,)
+            else:
+                if shape is not None and len(shape) != 1:
+                    raise ValueError("coefficients must be one-dimensional.")
+                try:
+                    values = tuple(batch)
+                except TypeError as exc:
+                    raise TypeError("coefficients must be one-dimensional.") from exc
+            if len(values) != len(factor.terms):
+                raise ValueError(f"coefficients for factor {i} must have length {len(factor.terms)}.")
+            for j, value in enumerate(values):
+                _check_scalar(value, name=f"coefficients[{i}][{j}]")
+                bindings[("term", i, j)] = value
+            if callable(factor.coefficient):
+                raise KeyError("callable factor coefficients require parameters.")
+            bindings[("factor", i)] = _resolve(factor.coefficient, None)
+        if self._coefficient_expansion is None:
+            # Every slot gets its own identity, even when today's values match.
+            # Only structure is retained; backend values belong to this call.
+            factors = tuple(
+                MPOClusterFactor(
+                    tuple(replace(term, coefficient=MPOParameter(("term", i, j)))
+                          for j, term in enumerate(factor.terms)),
+                    MPOParameter(("factor", i)),
+                )
+                for i, factor in enumerate(self.factors)
+            )
+            self._coefficient_expansion = MPOClusterProductExpansion(
+                self.L, factors, phys_dim=self.phys_dim,
+                cluster_size=self.cluster_size, cutoff=self.cutoff,
+                max_bond=self.max_bond, graph=self.graph, to_backend=self.to_backend,
+                cluster_plan=self._supplied_cluster_plan,
+                graph_assembly=self.graph_assembly,
+                max_collection_order=self.max_collection_order,
+                collection_budget=self.collection_budget,
+                spatial_reuse=self.spatial_reuse,
+                spatial_symmetries=self.spatial_symmetries,
+                factorization=self.factorization, assembly=self.assembly,
+                assembly_chi=self.assembly_chi,
+                assembly_state_budget=self.assembly_state_budget,
+                assembly_batch_size=self.assembly_batch_size,
+                assembly_cutoff=self.assembly_cutoff,
+                assembly_cutoff_mode=self.assembly_cutoff_mode,
+                assembly_form=self.assembly_form, physical_space=self.physical_space,
+            )
+        return self._coefficient_expansion, bindings
 
     def compile_exp(self):
         """Return a reusable callable over this topology-only expansion."""
@@ -1805,7 +1938,7 @@ class MPOClusterProductExpansion:
             self._compiled_exp = CompiledMPOClusterProduct(self)
         return self._compiled_exp
 
-    def trace_exp(self, step=1.0, *, parameters=None, normalized=False,
+    def trace_exp(self, step=1.0, parameters=None, *, coefficients=None, normalized=False,
                   state_budget=100000):
         """Trace the complete cluster expansion via connected scalar residuals.
 
@@ -1814,6 +1947,11 @@ class MPOClusterProductExpansion:
         represents the uncompressed chosen-order expansion, which may differ
         from an MPO built with truncation or bounded collection assembly.
         """
+        if coefficients is not None:
+            expansion, bindings = self._bind_coefficients(parameters, coefficients)
+            return expansion.trace_exp(
+                step, bindings, normalized=normalized, state_budget=state_budget,
+            )
         if self.physical_space.fermionic:
             raise NotImplementedError("trace_exp requires a bosonic physical space.")
         from ._cluster_trace import compile_trace_plan, evaluate_trace_plan
@@ -1854,6 +1992,7 @@ class MPOClusterProductExpansion:
             "compiled": True,
             "builds": self._build_count,
             "compiled_exp": self._compiled_exp is not None,
+            "coefficient_topology_compiled": self._coefficient_expansion is not None,
             "interval_count": len(self._intervals),
             "cluster_mode": self.cluster_mode,
             "graph_cluster_count": len(self._graph_clusters),
@@ -2005,13 +2144,10 @@ class MPOClusterProductExpansion:
     def _connected_partitions(self, cluster):
         """Return proper partitions whose blocks are graph-connected."""
 
-        connected = []
-        for partition in _set_partitions(cluster):
-            if len(partition) == 1:
-                continue
-            if all(self._is_graph_connected(block) for block in partition):
-                connected.append(tuple(tuple(block) for block in partition))
-        return tuple(connected)
+        sites = self.cluster_plan.sites
+        positions = {site: i for i, site in enumerate(sites)}
+        return tuple(tuple(tuple(positions[site] for site in block) for block in partition)
+                     for partition in self.cluster_plan.partitions(tuple(sites[i] for i in cluster)))
 
     def _is_graph_connected(self, sites):
         sites = set(sites)
@@ -2246,7 +2382,7 @@ class MPOClusterProductExpansion:
                 self._graph_local_exponential(cluster, step, parameters)
                 if source == cluster else permute_operator(products[source], axes, self.phys_dim)
             )
-        products = self._align_fixed_products(products)
+        products = self._align_fixed_products(products, force=True)
         for cluster in self._graph_clusters:
             residual = products[cluster]
             for partition in self._graph_partitions[cluster]:
@@ -2357,7 +2493,7 @@ class MPOClusterProductExpansion:
                 self._local_exponential(start, end, step, parameters)
                 if source == interval else permute_operator(products[source], axes, self.phys_dim)
             )
-        products = self._align_fixed_products(products)
+        products = self._align_fixed_products(products, force=True)
         for interval in self._intervals:
             residual = products[interval]
             for left_interval, right_interval in self._interval_splits[interval]:
@@ -3411,8 +3547,23 @@ class MPOClusterProductExpansion:
             arrays.append(array)
         return tuple(arrays), state_lists, cores
 
-    def exp(self, step=1.0, *, parameters=None):
-        """Build the cluster expansion for the supplied exponential step."""
+    def exp(self, step=1.0, parameters=None, *, coefficients=None, materialize=False):
+        """Build ``exp(step * H_0) @ exp(step * H_1) ...`` jointly.
+
+        Supply either ``parameters`` for symbolic bindings or ``coefficients``
+        for term overrides: a vector for one factor, one vector per factor for
+        a product. A ``None`` vector retains that factor's default terms.
+        Factor scales remain those configured on the expansion.
+        Return a semantic MPO by default, or a Quimb MPO with ``materialize=True``.
+        """
+        if materialize:
+            return self.exp(step, parameters, coefficients=coefficients).to_mpo()
+        if coefficients is not None:
+            expansion, bindings = self._bind_coefficients(parameters, coefficients)
+            result = expansion.exp(step, bindings)
+            self._build_count += 1
+            self._last_report = expansion.last_report
+            return result
 
         self._build_count += 1
         step = _cluster_to_backend(step, self.to_backend)
@@ -3638,9 +3789,12 @@ class MPOClusterProductExpansion:
             },
         )
 
-    def residuals(self, step=1.0, *, parameters=None):
+    def residuals(self, step=1.0, *, parameters=None, coefficients=None):
         """Return connected residual matrices keyed by intervals or graph sites."""
 
+        if coefficients is not None:
+            expansion, bindings = self._bind_coefficients(parameters, coefficients)
+            return expansion._residuals(step, bindings)
         return self._residuals(step, parameters)
 
 
@@ -3826,7 +3980,9 @@ def exp_mpo_cluster(
         written as a tuple such as ``(x, y)``. Do not mix chain indices and
         lattice coordinates in one call. ``coefficients`` is mutually
         exclusive with ``parameters`` and overrides the parsed term
-        coefficient slots, matching :func:`exp_mpo`.
+        coefficient slots, matching :func:`exp_mpo`. For a product, provide
+        one vector per factor (a flat vector when there is only one factor).
+        Factor scales remain configured on the factors.
     cluster_size : int, default=2
         Largest connected interval or graph cluster retained.
     factorization : {"auto", "fixed"}, default="auto"
@@ -3975,11 +4131,8 @@ def exp_mpo_cluster(
 
     if factors is not None and terms is not None:
         raise ValueError("pass either terms or factors, not both.")
-    if factors is not None and coefficients is not None:
-        raise ValueError(
-            "coefficients are only supported for the single-factor terms "
-            "interface; put coefficients in each factor's terms instead."
-        )
+    if parameters is not None and coefficients is not None:
+        raise ValueError("pass either parameters or coefficients, not both.")
 
     reference_basis = None
     if factors is None:
@@ -4195,7 +4348,10 @@ def exp_mpo_cluster(
         )
     try:
         stage_start = time.perf_counter()
-        semantic = expansion.exp(step, parameters=parameters)
+        semantic = expansion.exp(
+            step, parameters,
+            coefficients=coefficients if factors is not None else None,
+        )
         timings["cluster"] = time.perf_counter() - stage_start
         cluster_report = expansion.last_report
         if progress_bar is not None:
@@ -4335,6 +4491,7 @@ def exp_mpo_cluster_product(
     mapper=None,
     map_mode="snake",
     parameters=None,
+    coefficients=None,
     dt=None,
     phys_dim=None,
     cluster_size=2,
@@ -4383,9 +4540,9 @@ def exp_mpo_cluster_product(
 
     All graph, cyclic, streaming, backend, report, and final numerical
     compression options intentionally match :func:`exp_mpo_cluster`. Term
-    ``coefficients`` are configured within each factor; use
-    :class:`MPOParameter` and ``parameters`` for repeated parameterized
-    evaluations.
+    ``coefficients`` overrides term values (one vector per factor, or a
+    single vector for one factor). It is mutually exclusive with ``parameters``.
+    Repeated evaluations should reuse a compiled product expansion.
     """
     return exp_mpo_cluster(
         step=step,
@@ -4393,6 +4550,7 @@ def exp_mpo_cluster_product(
         mapper=mapper,
         map_mode=map_mode,
         parameters=parameters,
+        coefficients=coefficients,
         dt=dt,
         phys_dim=phys_dim,
         cluster_size=cluster_size,

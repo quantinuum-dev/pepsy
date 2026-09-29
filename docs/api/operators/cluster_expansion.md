@@ -1,9 +1,30 @@
 # PEPO cluster expansion and joint ordered products
 
+For arbitrary interaction graphs and a common MPO/PEPO/Pauli plan, see the
+[shared interaction-cluster guide](interaction_clusters.md).
+
 For the canonical MPO/PEPO entry-point map, step convention, and return-type
 summary, see the [unified exponential API](exponentials.md). This page gives
 the detailed `pepsy.operators.pepo_cluster` cluster and fixed-channel PEPO
 reference. The higher-order MPO and MPO cluster families are separate APIs.
+
+`cluster_size` is the common spatial cutoff keyword across PEPO, MPO and
+Gaugy Pauli clusters. PEPO's existing `order` keyword is an equivalent alias;
+conflicting values are rejected. Both reusable dense plans and the Pauli
+basis expose `.cluster_size`. Defaults remain three for dense plans and four
+for the Pauli basis. Ordered products inherit the cutoff of their bases.
+See the [shared call table](exponentials.md#shared-connected-cluster-calls).
+For the dense square dataclass, retain `order` when copying configuration with
+`dataclasses.replace(plan, order=p)`; `cluster_size` aliases this field rather
+than storing a second cutoff.
+
+For a fixed dense generator, `plan.compile_exp().exp(step)` now gives the
+same sign convention as Pauli PEPO and MPO exponentials. It returns active
+blocks by default; use `materialize=True` for a Quimb operator. This is
+`plan.build(-step, materialize=False)` with reusable geometry, not backend
+JIT. Existing `build(beta)` defaults and numerical behavior are unchanged.
+Use `PauliPEPOBasis` for runtime coefficient vectors, autodiff and trace-only
+calls.
 
 `build_itf_cluster_expansion_pepo` constructs a dense square-lattice PEPO
 approximation to `exp(-beta * H)` for Pepsy's transverse-field Ising

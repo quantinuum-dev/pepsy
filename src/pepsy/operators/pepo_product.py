@@ -85,6 +85,7 @@ class CompiledPEPOClusterProduct:
                 "expansion must be a PEPOClusterProductExpansion."
             )
         self.expansion = expansion
+        self.cluster_size = expansion.cluster_size
         localized = any(factor.basis.inhomogeneous for factor in expansion.factors)
         for factor in expansion.factors:
             factor.basis._prepare_exp_plan(localized=localized)
@@ -189,9 +190,21 @@ class PEPOClusterProductExpansion:
                 )
         self.factors = factors
         self.lx, self.ly, self.cyclic = geometry
+        self.cluster_size = reference.cluster_size
         self._build_count = 0
         self._compiled_exp = None
         self._trace_plans = {}
+
+    @classmethod
+    def from_plan(cls, plan, factors, **kwargs):
+        """Compile located graph factors in algebraic order.
+
+        Returns GraphPEPOClusterProductExpansion, using MPOClusterFactor's
+        term schema and graph tensor-network materialization.
+        """
+        from .graph_pepo_product import GraphPEPOClusterProductExpansion
+
+        return GraphPEPOClusterProductExpansion.from_plan(plan, factors, **kwargs)
 
     @staticmethod
     def _normalize_factor(factor):
@@ -245,6 +258,7 @@ class PEPOClusterProductExpansion:
             "factor_count": len(self.factors),
             "lattice_shape": (self.lx, self.ly),
             "cyclic": self.cyclic,
+            "cluster_size": self.cluster_size,
             "factor_orders": tuple(factor.basis.order for factor in self.factors),
             "factor_cache_info": tuple(factor.basis.cache_info for factor in self.factors),
             "max_tree_rank": self.factors[0].basis.max_tree_rank,
@@ -259,7 +273,9 @@ class PEPOClusterProductExpansion:
             self._compiled_exp = CompiledPEPOClusterProduct(self)
         return self._compiled_exp
 
-    def _factor_coefficients(self, coefficients):
+    def _factor_coefficients(self, coefficients, parameters=None):
+        if coefficients is not None and parameters is not None:
+            raise ValueError("parameters and coefficients are mutually exclusive.")
         if coefficients is None:
             return (None,) * len(self.factors)
         if len(self.factors) == 1:
@@ -284,6 +300,7 @@ class PEPOClusterProductExpansion:
         placement. This is independent of PEPO tree-rank and compression
         settings: a rank-capped materialized PEPO may have a different trace.
         """
+        factor_coefficients = self._factor_coefficients(coefficients, parameters)
         from ._cluster_trace import compile_trace_plan, evaluate_trace_plan
 
         reference_basis = self.factors[0].basis
@@ -298,16 +315,10 @@ class PEPOClusterProductExpansion:
                 self.lx * self.ly, clusters, state_budget,
             )
         ordered, plan = self._trace_plans[state_budget]
-        factor_coefficients = self._factor_coefficients(coefficients)
         localized = []
         for factor, term_coefficients in zip(self.factors, factor_coefficients):
             coefficient = _resolve_pepo_factor_value(factor.coefficient, parameters)
             beta = ar.do("multiply", -step, coefficient)
-            if term_coefficients is not None and parameters is not None:
-                raise ValueError(
-                    "parameters and coefficients are mutually exclusive for "
-                    "an ordered PEPO product."
-                )
             values = factor.basis._coefficient_values(
                 parameters if term_coefficients is None else None,
                 term_coefficients,
@@ -382,9 +393,9 @@ class PEPOClusterProductExpansion:
         ``materialize=False`` to return those active blocks directly;
         compression requires a materialized Quimb PEPO.
         """
+        factor_coefficients = self._factor_coefficients(coefficients, parameters)
         if compress and self.factors[0].basis.factorization == "fixed":
             raise ValueError("factorization='fixed' requires compress=False; compress the result separately.")
-        factor_coefficients = self._factor_coefficients(coefficients)
         localized = any(factor.basis.inhomogeneous for factor in self.factors)
         factor_data = []
         factor_sources = []
@@ -394,11 +405,6 @@ class PEPOClusterProductExpansion:
                 parameters,
             )
             factor_beta = ar.do("multiply", -step, coefficient)
-            if term_coefficients is not None and parameters is not None:
-                raise ValueError(
-                    "parameters and coefficients are mutually exclusive for "
-                    "an ordered PEPO product."
-                )
             values = factor.basis._coefficient_values(
                 parameters if term_coefficients is None else None,
                 term_coefficients,

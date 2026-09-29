@@ -52,6 +52,16 @@ def _backend_nonzero(value):
         return True
 
 
+def _graph_block_reference(blocks):
+    """Promote dtype metadata through empty views, preserving backend/device."""
+    values = (block for site_blocks in blocks.values() for block in site_blocks.values())
+    reference = next(values)
+    for block in values:
+        if block.dtype != reference.dtype:
+            reference = reference[:0, :0] + block[:0, :0]
+    return reference
+
+
 def _materialize_site_blocks(
     directions,
     blocks,
@@ -87,7 +97,8 @@ def _materialize_site_blocks(
                 block,
                 (1,) * len(directions) + (physical_dim, physical_dim),
             )
-            data = ar.do("add", data, ar.do("multiply", mask[..., None, None], block))
+            contribution = block if mask is None else ar.do("multiply", mask[..., None, None], block)
+            data = ar.do("add", data, contribution)
         return data
 
     data = np.zeros(shape, dtype=dtype)
@@ -671,8 +682,7 @@ class GraphActivePEPOBlocks:
     @property
     def dense_nbytes(self):
         """Estimate bytes required by dense graph tensor-network tensors."""
-        reference = next(iter(next(iter(self.blocks.values())).values()))
-        itemsize = _backend_dtype_itemsize(reference)
+        itemsize = _backend_dtype_itemsize(_graph_block_reference(self.blocks))
         return sum(
             self.bond_dim ** len(self.site_directions[site])
             * self.physical_dim**2
@@ -758,7 +768,7 @@ class GraphActivePEPOBlocks:
     def to_tensor_network(self, *, remove_orphans=True):
         """Materialize the graph PEPO as a generic Quimb tensor network."""
         active = self.compact() if remove_orphans else self
-        dtype = next(iter(next(iter(active.blocks.values())).values())).dtype
+        dtype = _graph_block_reference(active.blocks).dtype
         edge_inds = {
             edge_index: ("graph-bond", edge_index)
             for edge_index in range(len(active.edges))
@@ -768,7 +778,9 @@ class GraphActivePEPOBlocks:
             directions = active.site_directions[site]
             data = _materialize_site_blocks(
                 directions,
-                active.blocks[site],
+                # The shared square-PEPO helper stores ket/bra matrices.
+                # This graph container explicitly exposes bra/ket indices.
+                {key: block.T for key, block in active.blocks[site].items()},
                 active.bond_dim,
                 dtype,
             )

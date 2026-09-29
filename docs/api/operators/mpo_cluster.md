@@ -1,10 +1,39 @@
 # MPO cluster expansion and ordered products
 
+For arbitrary interaction graphs and a common MPO/PEPO/Pauli plan, see the
+[shared interaction-cluster guide](interaction_clusters.md).
+
 This page documents `pepsy.operators.mpo_product`, the connected spatial MPO
 family. It is separate from the SciPost higher-order/history construction in
 [`higher_order_mpo.md`](higher_order_mpo.md): `cluster_size` counts local
 connected support, while higher-order `order` controls virtual history/Taylor
 construction.
+
+## Common evaluation contract
+
+`MPOClusterProductExpansion.from_bases(bases, coefficients=scales, ...)`
+uses the same product factory name as PEPO and Gaugy Pauli clusters;
+`from_mpo_bases` remains supported. Factory `coefficients` are factor scales.
+For each call, `exp(step, parameters=None, *, coefficients=None)` and
+`trace_exp(step, parameters=None, *, coefficients=None, normalized=False)`
+accept either parameter bindings or runtime **term** vectors. A single factor
+uses one flat vector; a product uses one vector per factor, in public term
+order. A `None` vector retains that factor's default term coefficients, matching
+PEPO/Gaugy; required symbolic/callable coefficients still require parameters. `exp_mpo_cluster_product` accepts the same runtime vectors. Reusable
+`exp` calls return semantic MPOs by default; `materialize=True` returns a
+Quimb MPO, matching the explicit materialization option on PEPO/Gaugy calls.
+
+MPO vector overrides compile an additional structural plan on first use.
+Each term retains an independent slot even when current values coincide;
+subsequent calls reuse that plan with fresh backend tensors. All graph,
+rank, native physical-space and assembly settings are preserved. Supplied
+spatial symmetries must also preserve these independent bindings: use shared
+`MPOParameter` bindings when the requested symmetry requires shared values.
+No runtime scalar or autodiff graph is stored on the expansion. The
+`cache_info["coefficient_topology_compiled"]` flag identifies this cached plan.
+
+See the [shared cluster API table](exponentials.md#shared-connected-cluster-calls)
+for cutoff aliases, return types and the distinct Gaugy trace closures.
 
 ## Term-centric facade
 
