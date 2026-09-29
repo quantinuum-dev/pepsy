@@ -428,8 +428,8 @@ canonicalization/compression, or independent/coalesced trajectory replay.
 ## Performance and layout
 
 The public performance defaults are ``mode="auto"`` (TreeMPO routing),
-``threads=1`` and ``subtree_workers=1`` (small-TTN operations avoid
-oversubscription), ``profile=False``, and ``track_truncation=False`` (no
+``threads=None`` (preserve ambient CPU settings), ``subtree_workers=1``,
+``profile=False``, and ``track_truncation=False`` (no
 diagnostic spectrum SVDs). The low-level
 ``TreeTensorNetwork.compress_edge_`` default is the same ``cutoff_mode="rsum2"``
 used by ``TreeOptimizer``. A ``track_truncation=True`` warning is intentional:
@@ -439,7 +439,7 @@ selectors are the other actionable warning class.
 
 Dense and native trees share the direct one-edge contraction, immutable path
 cache, routed-isometry reuse, and proof-forwarding optimizations. Keep the
-thread cap, self-healing tensor-id cache, copy semantics, and
+explicit opt-in thread cap, self-healing tensor-id cache, copy semantics, and
 TreeLayoutFinder objective plumbing intact. The native QR safeguard, detailed
 performance rules, and non-binary layout contract are in
 [`references/performance-layout.md`](references/performance-layout.md); read

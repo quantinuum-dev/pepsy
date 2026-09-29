@@ -40,7 +40,7 @@ Start with the defaults and add options for the part of replay you need:
 | State and bond cap | Constructor `p`, `gates`, `chi`; `set_p`, `set_gates` | Optimizer state and queued stream |
 | Compression algorithm | `mode`, `submpo_method`, `compression_opts`, `compression_seed` | `run(mode=...)` changes the retained mode; other listed run controls apply to that call |
 | Accuracy | `cutoff`, `cutoff_mode` | That replay; independent of the bond cap |
-| Variational FIT | `n_iter`, `fit_rtol`, `fit_patience`, `fit_init_strategy` | That replay; select a DMRG mode first |
+| Variational FIT | `n_iter`, `fit_single_pair_n_iter`, `fit_rtol`, `fit_patience`, `fit_init_strategy` | That replay; select a DMRG mode first |
 | Layout | `apply_layout(...)`, `logical_order`, `to_dense()` | Persistent physical ordering and logical readout |
 | Diagnostics | `finite_check`, `timing`, `fit_overlap_diagnostics` | Opt-in work for that replay |
 | Shot ensemble | `shots`, `seed`, `strategy`, `run_kwargs`, `retain` | Child trajectories; see the [noise guide](noise.md) |
@@ -706,8 +706,9 @@ requested FIT sweeps and convergence controls. With
 `fit_single_pair_fast_path=True`, `dmrg1`, `dmrg2`, and `dmrg3` immediately
 advance to the next gate after one exact update instead of repeating their
 warm-up or entering one-site refinement.
-The named `dmrg2` schedule is an exception for an adjacent two-site gate: it
-uses one exact update by default, regardless of the general fast-path default.
+Named `dmrg2` also honors the two-site sweep budget and convergence controls.
+Explicit `fit_single_pair_fast_path=True` requests one exact update in every
+DMRG mode.
 `fit_three_site_sweeps` remains a deprecated alias for
 `fit_adaptive_sweeps`.
 `fit_max_span="auto"` also limits the spatial width of a batched
@@ -723,6 +724,30 @@ For ordinary DMRG and mixed DMRG, `n_iter` is a maximum rather than an
 unconditional sweep count. `fit_min_iter`, `fit_rtol`, and `fit_patience`
 control adaptive stopping from FIT's final retained-center norm change. The
 public `MpsOptimizer.run` defaults are `n_iter=8` and `fit_rtol="auto"`.
+DMRG defaults to `fit_single_pair_n_iter=None`, which inherits `n_iter` for
+each replay. Unless explicitly overridden, adjacent two-site windows have
+the same sweep budget as longer windows, including in named `dmrg2`.
+Setting a positive pair cap makes a window spanning exactly two adjacent
+MPS sites use at most `min(n_iter, fit_single_pair_n_iter)` sweeps, while
+larger windows retain the full `n_iter` budget. This depends
+on the complete window span, not `fit_block_size` or the number of gate
+endpoints. A non-adjacent two-qubit gate uses the larger budget; batched
+gates use their combined spatial span. Both layered and materialized targets,
+measurement windows, and shot replay preserve this control.
+
+```python
+opt.run(
+    n_iter=8,                       # longer windows
+    fit_single_pair_n_iter=5,        # explicitly lower the adjacent-pair cap
+    fit_single_pair_fast_path=False,
+    fit_rtol="auto",                 # either budget may stop early
+)
+```
+
+Change the pair cap to another positive integer, or omit it/pass `None` to
+inherit `n_iter`. This cap is ignored outside DMRG modes. Opt-in FIT timing records
+include `requested_sweeps` for each window's effective budget.
+
 The automatic tolerance selects `1e-3`, `1e-5`, or `1e-9` for 16-,
 32-/complex64-, or higher-precision data. Pass an explicit numeric tolerance
 to choose another threshold, or `fit_rtol=None` for fixed iterations.
@@ -747,7 +772,7 @@ At least two adaptive block sweeps are required whenever the active window
 needs rank growth, regardless of `fit_rtol`; an adjacent two-site interval is
 a structural special case whose only pair is
 the complete variational problem. The default
-`fit_single_pair_fast_path=False` honors `n_iter` and `fit_rtol`; set it to
+`fit_single_pair_fast_path=False` honors the window's budget and `fit_rtol`; set it to
 `True` to stop after one effective-tensor SVD, even when `fit_rtol=None`.
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
 non-finite sweep. Non-unitary MPS DMRG keeps the dtype-aware automatic

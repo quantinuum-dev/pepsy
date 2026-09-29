@@ -652,6 +652,7 @@ def _apply_measure_event(  # pylint: disable=too-many-arguments,too-many-positio
                 fit_single_pair_fast_path=mode_kwargs[
                     "fit_single_pair_fast_path"
                 ],
+                fit_single_pair_n_iter=mode_kwargs.get("fit_single_pair_n_iter"),
                 finite_check=mode_kwargs.get("finite_check", False),
                 fit_overlap_diagnostics=mode_kwargs[
                     "fit_overlap_diagnostics"

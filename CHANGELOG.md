@@ -14,12 +14,28 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- TreeOptimizer adds opt-in `stabilize_unitary` at construction and replay,
+  restoring incoming unitary norms while retaining compression loss and
+  preserving explicitly non-unitary scale changes. TreeOptimizer and
+  TreeSampler now default to `threads=None`. Disabling tree replay history
+  also disables accumulated norm/FIT records; compact norm queries are
+  available through `norm_diagnostics(include_history=False)`. Automatic
+  cutoff and cutoff-mode defaults remain unchanged.
+
 - Add `pepsy.operators.ClusterPlan` for inferred interaction graphs, lazy cached
   cluster inventories, exact partition/collection counts and verified local
   symmetry reuse. MPO and graph PEPO share `from_plan` factories; general graph
   products support nonuniform and higher-body terms. Graph materialization
   preserves asymmetric complex operators and mixed-block dtypes; graph traces
   and residuals preserve backend gradients. See the interaction-cluster guide.
+
+- `MpsOptimizer.run(fit_single_pair_n_iter=None)` inherits `n_iter` by
+  default; a positive integer caps adjacent two-site DMRG windows separately.
+  Larger and batched
+  windows use their full span to select the budget; convergence stopping,
+  measurement/shot replay, and timing records preserve it. Named DMRG2
+  honors the same budget policy; explicit `fit_single_pair_fast_path=True`
+  still selects one update.
 
 - Common cluster API conventions across MPO, PEPO and Gaugy: PEPO plans and
   builders accept `cluster_size` as an alias for spatial `order`; dense PEPO

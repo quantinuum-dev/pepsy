@@ -3174,6 +3174,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        fit_single_pair_n_iter=None,
         finite_check=False,
         fit_overlap_diagnostics=False,
         stabilize_unitary=False,
@@ -3455,6 +3456,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Stop an adjacent two-site FIT after its single exact variational
             update. This structural convergence is independent of ``rtol``;
             enable it when deliberately choosing the one-update fast path.
+        fit_single_pair_n_iter : int | None, default=None
+            Separate DMRG sweep cap for windows spanning exactly two MPS
+            sites. Longer windows retain ``n_iter``, including non-adjacent
+            two-qubit gates and batches whose combined span exceeds two.
+            The effective pair budget is ``min(n_iter, fit_single_pair_n_iter)``.
+            ``None`` inherits ``n_iter`` for that replay, including in
+            ``dmrg2``. ``fit_single_pair_fast_path=True`` explicitly selects
+            the one-update shortcut instead.
+            ``fit_rtol`` still controls early stopping. Ignored outside DMRG.
         fit_overlap_diagnostics : bool, default=False
             Contract the final fitted MPS against the disposable exact FIT
             target and report target-overlap fidelity. This adds an extra
@@ -3740,6 +3750,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_init_rand_strength=fit_init_rand_strength,
             fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
+            fit_single_pair_n_iter=fit_single_pair_n_iter,
             finite_check=finite_check,
             fit_overlap_diagnostics=fit_overlap_diagnostics,
             stabilize_unitary=stabilize_unitary,
@@ -3803,6 +3814,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength,
         fit_init_seed,
         fit_single_pair_fast_path,
+        fit_single_pair_n_iter,
         finite_check,
         fit_overlap_diagnostics,
         stabilize_unitary,
@@ -3815,6 +3827,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         This preserves the public-to-backend boundary: all modes receive
         resolved normalization, compression, FIT, and diagnostic options.
         """
+        if fit_single_pair_n_iter is not None:
+            if (
+                not isinstance(fit_single_pair_n_iter, Integral)
+                or isinstance(fit_single_pair_n_iter, bool)
+                or int(fit_single_pair_n_iter) < 1
+            ):
+                raise ValueError("fit_single_pair_n_iter must be a positive integer or None.")
+            fit_single_pair_n_iter = int(fit_single_pair_n_iter)
+        else:
+            # Resolve per replay, after shot-level run_kwargs overrides.
+            # A resolved budget also suppresses DMRG2's legacy pair shortcut.
+            fit_single_pair_n_iter = n_iter
         non_unitary = bool(non_unitary)
         if non_unitary or has_control:
             # Non-unitary and control-event runs can change the represented
@@ -4057,6 +4081,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_init_rand_strength=fit_init_rand_strength,
             fit_init_seed=fit_init_seed,
             fit_single_pair_fast_path=bool(fit_single_pair_fast_path),
+            fit_single_pair_n_iter=fit_single_pair_n_iter,
             finite_check=finite_check,
             fit_overlap_diagnostics=fit_overlap_diagnostics,
             stabilize_unitary=bool(stabilize_unitary),
@@ -4078,7 +4103,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_min_iter fit_rtol fit_patience fit_block_size fit_adaptive_sweeps
             fit_sweep_sequence fit_layer_size fit_max_span fit_three_site_sweeps
             target_cutoff fit_target_strategy fit_mpo_guess fit_init_strategy
-            fit_init_rand_strength fit_init_seed fit_single_pair_fast_path finite_check
+            fit_init_rand_strength fit_init_seed fit_single_pair_fast_path
+            fit_single_pair_n_iter finite_check
             fit_overlap_diagnostics stabilize_unitary fit_stabilize_unitary timing
             timing_sync_device quality_check_every quality_check_repair""".split()
         # Identity sentinels must not cross serialization/deep-copy boundaries.
@@ -6741,6 +6767,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # nested per-site dictionary multiple times.
             for record in fit._take_timing_records():
                 record["fit_index"] = fit_index
+                record["requested_sweeps"] = int(kwargs["n_iter"])
                 record["record_index"] = len(self._timing_state["fit_steps"])
                 self._timing_state["fit_steps"].append(record)
 
@@ -6768,6 +6795,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         measurement_index,
         finite_check=False,
         fit_overlap_diagnostics=False,
+        fit_single_pair_n_iter=None,
     ):
         """Apply a multi-site projective measurement through DMRG FIT.
 
@@ -6782,6 +6810,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # while the DMRG/FIT window is represented by its endpoint span.
         where_sites = tuple(int(site) for site in where)
         span = (min(where_sites), max(where_sites))
+        if fit_single_pair_n_iter is not None and span[1] == span[0] + 1:
+            n_iter = min(n_iter, fit_single_pair_n_iter)
         requested_block_size = min(
             int(fit_block_size),
             span[1] - span[0] + 1,
@@ -7046,6 +7076,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         adaptive_rank_schedule,
         adaptive_sweeps,
         use_single_pair_fast_path,
+        fit_single_pair_n_iter=None,
     ):
         """Fit one gate or sub-MPO with its own target, guess, and rollback.
 
@@ -7056,6 +7087,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         counters, normalization cadence, and progress reporting.
         """
         xmin, xmax = sorted(where)
+        if fit_single_pair_n_iter is not None and xmax == xmin + 1:
+            n_iter = min(n_iter, fit_single_pair_n_iter)
         active_fit_block_size = min(
             fit_block_size,
             xmax - xmin + 1,
@@ -7440,6 +7473,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         adaptive_rank_schedule,
         adaptive_sweeps,
         use_single_pair_fast_path,
+        fit_single_pair_n_iter=None,
     ):
         """Fit a collected gate batch with one shared target and recovery point.
 
@@ -7451,6 +7485,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         batch_span_sites = [site for where_i in batch_where for site in where_i]
         xmin, xmax = min(batch_span_sites), max(batch_span_sites)
+        if fit_single_pair_n_iter is not None and xmax == xmin + 1:
+            n_iter = min(n_iter, fit_single_pair_n_iter)
         active_fit_block_size = min(
             fit_block_size,
             xmax - xmin + 1,
@@ -7774,6 +7810,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_init_rand_strength=0.0,
         fit_init_seed=0,
         fit_single_pair_fast_path=False,
+        fit_single_pair_n_iter=None,
         finite_check=False,
         fit_overlap_diagnostics=False,
         stabilize_unitary=False,
@@ -7852,6 +7889,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             """Apply the named DMRG2 adjacent-pair schedule exception."""
             return bool(fit_single_pair_fast_path) or (
                 self._dmrg_mode_alias == "dmrg2"
+                and fit_single_pair_n_iter is None
                 and int(xmax) == int(xmin) + 1
                 and int(active_block_size) == 2
             )
@@ -7938,6 +7976,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         adaptive_rank_schedule=adaptive_rank_schedule,
                         adaptive_sweeps=adaptive_sweeps,
                         use_single_pair_fast_path=use_single_pair_fast_path,
+                        fit_single_pair_n_iter=fit_single_pair_n_iter,
                     )
                     idx += 1
                     advanced = 1
@@ -7983,6 +8022,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         adaptive_rank_schedule=adaptive_rank_schedule,
                         adaptive_sweeps=adaptive_sweeps,
                         use_single_pair_fast_path=use_single_pair_fast_path,
+                        fit_single_pair_n_iter=fit_single_pair_n_iter,
                     )
                     advanced = next_idx - idx
                     idx = next_idx

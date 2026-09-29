@@ -4,6 +4,9 @@
 exact Born samples from a `TreeTensorNetwork` (or the live state of a
 `TreeOptimizer`) with the same public surface and batched efficiency.
 
+CPU threads are not capped by default (`threads=None`), matching TreeOptimizer.
+Pass a positive `threads` value to explicitly limit BLAS/OpenMP around sampling.
+
 ```python
 from pepsy.optimizers import TreeOptimizer
 from pepsy.sampling import TreeSampler

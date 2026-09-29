@@ -1634,8 +1634,8 @@ def test_mps_optimizer_default_runs_requested_adjacent_pair_sweeps():
     assert diagnostics["convergence_reason"] != "single_pair_exact"
 
 
-def test_mps_optimizer_dmrg2_adjacent_pair_defaults_to_one_update():
-    """Named DMRG2 keeps its one-update schedule for neighboring gates."""
+def test_mps_optimizer_dmrg2_can_explicitly_select_adjacent_pair_shortcut():
+    """The named DMRG2 one-update shortcut requires an explicit fast path."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("00", dtype="complex128"),
         gates=[(qu.CNOT(), (0, 1))],
@@ -1643,7 +1643,10 @@ def test_mps_optimizer_dmrg2_adjacent_pair_defaults_to_one_update():
         mode="dmrg2",
     )
 
-    optimizer.run(progbar=False, n_iter=8, fit_rtol=None, timing=True)
+    optimizer.run(
+        progbar=False, n_iter=8, fit_rtol=None, timing=True,
+        fit_single_pair_fast_path=True,
+    )
 
     diagnostics = optimizer._last_dmrg_fit_diagnostics
     assert diagnostics["iterations"] == 1

@@ -217,7 +217,8 @@ configured `fit_adaptive_sweeps`.
 `get_fit_diagnostics()` returns an independent record for the latest completed
 FIT update, including its effective `max_bond` and `cutoff`. It returns `None`
 outside FIT or after a completed non-FIT update. `fit_diagnostics` retains
-historical FIT records; replacing the state through `set_tn` / `set_p` clears
+historical FIT records only when `record_history=True`; the latest record is
+still available with history disabled. Replacing the state through `set_tn` / `set_p` clears
 both the history and latest record along with the other update diagnostics.
 The record's `split_method` identifies the actual local factorization:
 `"direct"` or `"dm"`. Explicit direct/DM compression settings are retained;

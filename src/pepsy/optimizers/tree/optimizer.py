@@ -394,8 +394,8 @@ class TreeOptimizer:
 
     The constructor defaults are performance-oriented: ordinary gate entries
     are converted to a TreeMPO and routed through ``apply_sub_mpotree`` on
-    their active canonical Steiner region, small tree contractions are capped
-    to one BLAS/OpenMP thread (``threads=1``), and full singular-spectrum
+    their active canonical Steiner region, CPU thread settings remain
+    unchanged (``threads=None``), and full singular-spectrum
     diagnostics are disabled
     (``track_truncation=False``). Enable those diagnostics explicitly when
     collecting truncation reports; the one-time warning in that case is
@@ -530,14 +530,10 @@ class TreeOptimizer:
         ``TreePlan.root_qubit``.
     dtype : numpy dtype
         Data type of the initial product state (default ``complex128``).
-    threads : int or None
-        BLAS/OpenMP thread cap applied around gate application and the heavy
-        contraction read-outs.  Tree tensors are small (rank ``<= 3``, bounded
-        by ``chi``), so multi-threaded linear algebra is dominated by thread
-        launch/synchronisation overhead: capping to ``1`` (the default) makes
-        replay both markedly faster and stable in wall-clock time.  Pass
-        ``None`` to leave the ambient thread count untouched (worthwhile only in
-        a large-``chi`` regime where a single contraction is itself large).
+    threads : int or None, default=None
+        Leave ambient CPU thread settings unchanged by default. A positive
+        integer explicitly caps BLAS/OpenMP during gate application and heavy
+        readouts. This controls CPU libraries, not CUDA kernel parallelism.
     seed : int or None
         Seed for the internal random generator used by :meth:`measure` and
         :meth:`reset`.
@@ -550,6 +546,11 @@ class TreeOptimizer:
         its norm-based progress readout. This is enabled by default for
         compatibility with direct TreeOptimizer use, but can be disabled for
         non-unitary transfer-operator streams where norm changes are physical.
+    stabilize_unitary : bool, default=False
+        Restore the incoming represented norm after unitary compression by
+        scaling only the canonical centre. Compression loss is recorded before
+        restoration when tracking is enabled; it is not added to the physical
+        exponent. Non-unitary replay and track_norm=False updates are excluded.
     compression_seed : int, optional
         Seed forwarded to randomized tree-edge compression when
         ``compression_mode`` is ``'src'``, ``'sdcr'``, or an oversampled
@@ -807,9 +808,10 @@ class TreeOptimizer:
                  layout_time_window=None, layout=None, tree=None,
                  map_mode=None,
                  root_qubit=None,
-                 dtype=complex, threads=1, subtree_workers=1, seed=None,
+                 dtype=complex, threads=None, subtree_workers=1, seed=None,
                  run=True, tn=None,
                  state=None, track_truncation=False, track_infidelity=True,
+                 stabilize_unitary=False,
                  max_intermediate_bond=None,
                  max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
                  max_subtree_nodes=_DEFAULT_MAX_SUBTREE_NODES,
@@ -1046,6 +1048,9 @@ class TreeOptimizer:
         self.fit_single_node_fast_path = bool(fit_single_node_fast_path)
         self.fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
         self.fit_finite_check = bool(fit_finite_check)
+        self.stabilize_unitary = bool(stabilize_unitary)
+        self._defer_stabilization_checks = False
+        self._pending_stabilization_error = None
         self._finite_check_enabled = False
         self._finite_check_warning_handled = False
         self.fit_diagnostics = []
@@ -1127,6 +1132,8 @@ class TreeOptimizer:
         self._update_counter = 0
         self._truncation_log_survival = 0.0
         self._norm_log_survival = 0.0
+        self._norm_event_count = 0
+        self._last_norm_event = None
         self._norm_tracking_enabled = True
 
         if tree is None:
@@ -1936,6 +1943,9 @@ class TreeOptimizer:
         self._last_fit_diagnostics = None
         self._truncation_log_survival = 0.0
         self._norm_log_survival = 0.0
+        self._norm_event_count = 0
+        self._last_norm_event = None
+        self._pending_stabilization_error = None
         self._update_counter = 0
         self._attach_profile_sink()
         return self
@@ -2728,7 +2738,7 @@ class TreeOptimizer:
         # MPS compression event. It deliberately does not inspect singular
         # spectra; that extra per-edge work remains behind track_truncation.
         if (
-            self.track_infidelity
+            (self.track_infidelity or self.stabilize_unitary)
             and bool(track_norm)
             and self._norm_tracking_enabled
             and str(kind) in {"gate", "subtree", "submpo", "subtreempo"}
@@ -2762,13 +2772,70 @@ class TreeOptimizer:
         self._active_update = None
 
     def _finish_norm_update(self, active):
-        """Record path-level norm survival independently of edge spectra."""
+        """Record compression loss before optionally restoring unitary scale."""
         if not active.get("track_norm", True) or active.get("norm_before") is None:
             return
-        self._norm_log_survival, event = norm_event(
-            active, self._ledger_norm(), self._norm_log_survival,
-        )
-        self.norm_events.append(event)
+        observed = self._ledger_norm()
+        if self.track_infidelity:
+            self._norm_log_survival, event = norm_event(
+                active, observed, self._norm_log_survival,
+            )
+            self._last_norm_event = event
+            self._norm_event_count += 1
+            if self.record_history:
+                self.norm_events.append(event)
+        if self.stabilize_unitary:
+            self._restore_unitary_norm(active["norm_before"], observed)
+
+    def _restore_unitary_norm(self, expected, observed):
+        """Restore the incoming norm at the canonical centre, without exponent loss.
+
+        Unitary truncation loss belongs in the compression ledger, not in the
+        represented state's physical exponent. Keep device scalar arithmetic
+        on its backend and combine zero checks until the replay boundary.
+        """
+        backend = ar.infer_backend(observed)
+        if backend in {"torch", "jax", "cupy"}:
+            observed = ar.do("stop_gradient", ar.do("abs", observed))
+            if ar.infer_backend(expected) != backend:
+                expected = ar.do("full_like", observed, expected)
+            expected = ar.do("stop_gradient", ar.do("abs", expected))
+            invalid = ar.do("logical_or", observed == 0, expected == 0)
+            if self._finite_check_enabled or self.fit_finite_check:
+                invalid = ar.do("logical_or", invalid, ar.do(
+                    "logical_not", ar.do("logical_and",
+                                          ar.do("isfinite", observed),
+                                          ar.do("isfinite", expected)),
+                ))
+            self._pending_stabilization_error = (
+                invalid if self._pending_stabilization_error is None else
+                ar.do("logical_or", self._pending_stabilization_error, invalid)
+            )
+            ratio = expected / ar.do("where", invalid, 1., observed)
+        else:
+            expected, observed = float(expected), float(observed)
+            if (expected <= 0. or observed <= 0.
+                    or not np.isfinite(expected) or not np.isfinite(observed)):
+                raise FloatingPointError(
+                    "Cannot stabilize a unitary tree state with a zero or non-finite norm."
+                )
+            ratio = expected / observed
+        if not self._defer_stabilization_checks:
+            self._check_unitary_stabilization()
+        if self.center is None:
+            region = self.tn.canonical_region
+            self._move_center(min(region) if region else self.plan.root)
+        tensor = self.tn.tensor_map[self._tid(self.center)]
+        tensor.modify(data=tensor.data * ratio)
+        self._invalidate_state_norm_cache()
+
+    def _check_unitary_stabilization(self):
+        pending = self._pending_stabilization_error
+        self._pending_stabilization_error = None
+        if pending is not None and bool(to_float(pending, real=True)):
+            raise FloatingPointError(
+                "Cannot stabilize a unitary tree state with a zero or non-finite norm."
+            )
 
     def _finish_update(self):
         """Commit one gate-level truncation aggregation."""
@@ -3132,9 +3199,10 @@ class TreeOptimizer:
             "guess_backend": "single_node",
         }
         self._last_fit_diagnostics = diagnostics
-        self.fit_diagnostics.append(deepcopy(diagnostics))
+        if self.record_history:
+            self.fit_diagnostics.append(deepcopy(diagnostics))
         if active is not None:
-            active["fit_diagnostics"] = deepcopy(diagnostics)
+            active["fit_diagnostics"] = diagnostics
 
     def _run_tree_fit(self, target, region, support, *, operator=None, target_norm=None,
                       path_order=None, max_bond=None, cutoff=None):
@@ -3272,9 +3340,11 @@ class TreeOptimizer:
         self._invalidate_state_norm_cache()
         self.plan = self.tn.plan
         self._last_fit_diagnostics = diagnostics
-        self.fit_diagnostics.append(deepcopy(diagnostics))
+        if self.record_history:
+            self.fit_diagnostics.append(deepcopy(diagnostics))
         if self._active_update is not None:
-            self._active_update["fit_diagnostics"] = deepcopy(diagnostics)
+            self._active_update["fit_diagnostics"] = diagnostics
+        if self._active_update is not None and self.track_bond_diagnostics:
             target_edges = tuple(
                 (node0, node1)
                 for node0 in sorted(region)
@@ -3565,6 +3635,7 @@ class TreeOptimizer:
         normalize_every=False,
         normalize_final=False,
         normalize_eps=1e-15,
+        stabilize_unitary=None,
         finite_check=False,
         seed=None,
         track_infidelity=None,
@@ -3657,6 +3728,9 @@ class TreeOptimizer:
             ``non_unitary=True``.
         normalize_eps : float, default=1e-15
             Zero-state threshold used by automatic normalization.
+        stabilize_unitary : bool or None, default=None
+            Override unitary norm restoration for this replay only. None uses
+            the constructor setting. Shot run_kwargs can override this value.
         seed : int | None, default=None
             Reseed measurement/reset sampling before replay.
         track_infidelity : bool | None, default=None
@@ -3781,6 +3855,8 @@ class TreeOptimizer:
             child_kwargs.setdefault("track_infidelity", track_infidelity)
             child_kwargs.setdefault("progbar", progbar)
             child_kwargs.setdefault("finite_check", finite_check)
+            if stabilize_unitary is not None:
+                child_kwargs.setdefault("stabilize_unitary", stabilize_unitary)
             stream = self._trajectory_gate_stream() if gates is None else gates
             return self._run_shots(
                 stream,
@@ -3864,6 +3940,8 @@ class TreeOptimizer:
         control_count = 0
         submpo_count = 0
         previous_norm_tracking = self._norm_tracking_enabled
+        previous_stabilization = self.stabilize_unitary
+        previous_defer_checks = self._defer_stabilization_checks
         previous_finite_check = self._finite_check_enabled
         previous_finite_warning = self._finite_check_warning_handled
         # A non-unitary stream changes the physical norm for reasons other
@@ -3873,6 +3951,9 @@ class TreeOptimizer:
         self._norm_tracking_enabled = not non_unitary
 
         try:
+            if stabilize_unitary is not None:
+                self.stabilize_unitary = bool(stabilize_unitary)
+            self._defer_stabilization_checks = True
             self._finite_check_enabled = bool(finite_check)
             self._finite_check_warning_handled = bool(finite_check or self.fit_finite_check)
             if self._finite_check_warning_handled:
@@ -3959,8 +4040,12 @@ class TreeOptimizer:
                 )
             if finite_check:
                 TreeFIT._check_state_finite(self.tn, self.plan.nodes())
+            self._check_unitary_stabilization()
         finally:
             self._norm_tracking_enabled = previous_norm_tracking
+            self.stabilize_unitary = previous_stabilization
+            self._defer_stabilization_checks = previous_defer_checks
+            self._pending_stabilization_error = None
             self._finite_check_enabled = previous_finite_check
             self._finite_check_warning_handled = previous_finite_warning
             if pbar is not None:
@@ -7773,6 +7858,8 @@ class TreeOptimizer:
         other._update_counter = self._update_counter
         other._truncation_log_survival = self._truncation_log_survival
         other._norm_log_survival = self._norm_log_survival
+        other._norm_event_count = self._norm_event_count
+        other._last_norm_event = deepcopy(self._last_norm_event)
         return other
 
     def copy(self):
@@ -7932,7 +8019,7 @@ class TreeOptimizer:
         """
         return diagnostic_to_host(self.norm_events)
 
-    def norm_diagnostics(self):
+    def norm_diagnostics(self, *, include_history=True):
         """Return canonical norm-based compression diagnostics.
 
         ``cumulative_fidelity`` is the log-accumulated product of the
@@ -7946,12 +8033,14 @@ class TreeOptimizer:
         ``state_norm`` and ``norm`` are the live represented Tree norm.
         ``cumulative_norm`` is instead the square root of
         ``cumulative_fidelity`` and is only a retained-compression proxy.
+        ``include_history=False`` returns constant-size scalar summaries.
+        ``record_history=False`` disables accumulated norm/FIT/update records
+        while preserving the latest FIT record and cumulative scalar ledger.
         """
-        valid = [event for event in self.get_norm_events() if event.get("valid")]
-        current = valid[-1] if valid else None
+        current = diagnostic_to_host(self._last_norm_event)
         cumulative_fidelity = (
             None
-            if not valid
+            if current is None
             else fidelity_from_log(to_float(self._norm_log_survival, real=True))
         )
         cumulative_infidelity = (
@@ -7960,12 +8049,12 @@ class TreeOptimizer:
             else infidelity_from_log(to_float(self._norm_log_survival, real=True))
         )
         state_norm = float(self.norm())
-        return {
+        result = {
             "tracking": bool(self.track_infidelity),
             "norm_tracking": bool(self.track_infidelity),
             "truncation_tracking": bool(self.track_truncation),
-            "events": len(self.norm_events),
-            "completed_events": len(valid),
+            "events": self._norm_event_count,
+            "completed_events": self._norm_event_count,
             "current_valid": current is not None,
             "current_fidelity": (
                 None if current is None else current["local_fidelity"]
@@ -8013,8 +8102,10 @@ class TreeOptimizer:
             # as a compatibility alias; ``cumulative_norm`` is the retained
             # norm proxy shared with the MPS diagnostics.
             "norm": state_norm,
-            "norm_events": self.get_norm_events(),
         }
+        if include_history:
+            result["norm_events"] = self.get_norm_events()
+        return result
 
     def get_projection_diagnostics(self):
         """Return projection norm/support/span/bond diagnostics in order."""

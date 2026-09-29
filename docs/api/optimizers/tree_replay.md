@@ -412,14 +412,28 @@ implemented by these modes.
 
 The default replay configuration is intended for production evolution:
 `mode="auto"` uses the true TreeMPO route on every ordinary gate support,
-while `threads=1` avoids
-oversubscribing the small tree contractions, `subtree_workers=1` keeps the
+while `threads=None` leaves ambient CPU thread settings unchanged,
+`subtree_workers=1` keeps the
 serial path free of thread-pool overhead, `profile=False` avoids timing overhead, and
 `track_truncation=False` avoids full-spectrum diagnostic SVDs, while
 `track_bond_diagnostics=False` avoids live-bond scans. `record_history` and
 `track_infidelity` retain the established API defaults; the latter enables the
 cheap canonical-centre norm ledger and its progress-bar readout. It does not
 enable spectrum probes.
+
+`stabilize_unitary=True` restores the incoming norm after each unitary
+compression, by rescaling the canonical centre. The compression ledger records
+loss before restoration; discarded weight is not stored in `tn.exponent`.
+The package default is False, matching MpsOptimizer. A per-replay
+`run(stabilize_unitary=...)` override is scoped to that replay and propagates
+to shots unless their `run_kwargs` override it. Non-unitary replay and
+`track_norm=False` updates retain physical scale changes.
+
+For long runs, `record_history=False` omits accumulated norm, FIT, edge and
+update histories. The latest FIT record and cumulative compression scalar
+remain available. `norm_diagnostics(include_history=False)` reads a bounded
+summary without rebuilding earlier events; it does not add contractions for
+an exact target overlap. Unit-norm restoration works with tracking disabled.
 
 `fit_finite_check=False` keeps optional FIT finite scans off. MPI shot replay
 also defaults to `collect_diagnostics=False`; pass
@@ -484,15 +498,11 @@ snapshots before and after the update. The records are also available through
   QR bond-threading and double-bond fusion of the general geodesic route and is
   the common case in a locality-aware layout.
 
-- **Thread cap.** Tree tensors are moderate-rank (set by local arity and the
-  optional root physical leg, with dimensions bounded by `chi`), so
-  multi-threaded BLAS/OpenMP linear algebra is dominated by thread launch and
-  synchronisation overhead. `TreeOptimizer` caps threads to `1` around gate
-  application and the heavy read-outs by default (`threads=1`), which makes
-  replay both markedly faster and stable in wall-clock time; pass
-  `threads=None` to leave the ambient thread count untouched (worthwhile only
-  in a large-`chi` regime where a single contraction is itself large). Thread
-  limiting uses `threadpoolctl` when available and is a no-op otherwise.
+- **Optional thread cap.** `TreeOptimizer` and `TreeSampler` default to
+  `threads=None`, preserving ambient CPU settings. Explicit `threads=1` can
+  reduce overhead for small CPU contractions; measure the relevant workload
+  before choosing a cap. Explicit limits use `threadpoolctl` when available
+  and do not set CUDA kernel parallelism.
 - **Lazy canonical centre.** A freshly built product state has every virtual
   bond at dimension 1, so it is already canonical with the root as
   orthogonality centre; `from_plan` records that centre on the network rather

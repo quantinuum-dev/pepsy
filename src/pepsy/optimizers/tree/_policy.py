@@ -23,7 +23,7 @@ COPY_SETTINGS = (
     "structure", "max_arity", "top_arity", "community_frac", "star_frac",
     "dtype", "threads", "subtree_workers", "layout_objective",
     "layout_weight_mode", "layout_time_decay", "layout_time_window",
-    "track_truncation", "track_infidelity", "max_intermediate_bond",
+    "track_truncation", "track_infidelity", "stabilize_unitary", "max_intermediate_bond",
     "max_operator_qubits", "max_subtree_nodes", "record_history", "profile",
     "profile_sync", "track_bond_diagnostics",
 )

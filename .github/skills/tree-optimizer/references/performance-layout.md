@@ -49,12 +49,20 @@ The native `TreeTensorNetwork` QR policy is centralized in
   local projection. See `fit-environments.md` for the execution contract and
   `docs/development/notes/tree_fit_execution.md` for measured tradeoffs.
 
-- **BLAS thread cap is the biggest performance lever.** Tree tensors are
-  moderate-rank (set by local arity and an optional root physical leg, with
-  dimensions bounded by `chi`), so multi-threaded BLAS/OpenMP is dominated by
-  thread launch/sync overhead. `threads=1` is the default; gate
-  application and heavy readouts run inside `self._thread_ctx()` using
-  `threadpoolctl` when available. Only raise `threads` in a large-`chi` regime.
+- **CPU thread limits are opt-in.** TreeOptimizer and TreeSampler default to
+  `threads=None`; do not impose a cap when the caller omitted one. An explicit
+  positive limit uses `threadpoolctl` around gate application and readouts.
+  Small CPU contractions can benefit from a low cap, but measure the workload;
+  this control does not set GPU kernel parallelism.
+- **Unitary working scale.** `stabilize_unitary=True` restores the pre-update
+  represented norm at the canonical centre after recording compression loss.
+  Do not add discarded weight to the physical exponent, normalize a private
+  FIT target/guess, or restore physical non-unitary norm changes. Constructor
+  default is False; replay overrides are scoped and inherited by shots.
+  Keep scalar arithmetic on the array backend and finite scans opt-in.
+- **Bounded reports.** `record_history=False` omits accumulated FIT and norm
+  histories as well as edge/update records. Keep the latest FIT record and
+  scalar norm ledger; compact norm polling must not traverse past events.
 - The self-healing tid cache (`_nid_to_tid`, `_tid`) validates cached tensor
   ids against `self.tn.tensor_map`; a stale entry is recomputed safely.
 - **Native central-edge compression.** A native compression call receives a

@@ -258,11 +258,9 @@ class TreeSampler:
     seed : None, int, or np.random.Generator, optional
         Seed (or generator) for the sampler's persistent random generator,
         used when :meth:`sample` is called without a per-call ``seed``.
-    threads : int or None, default=1
-        BLAS/OpenMP thread cap applied around the batched contractions.  Tree
-        node arrays are small (bounded by the bond dimension), so a single
-        thread is typically fastest; pass ``None`` to leave the ambient thread
-        count untouched.
+    threads : int or None, default=None
+        Leave ambient CPU thread settings unchanged. A positive integer
+        explicitly caps BLAS/OpenMP around batched contractions.
     backend : {"auto", "native", "numpy", "torch", "cupy", "symmray"}, default="auto"
         Backend used for cached node arrays and batched contractions. ``auto``
         preserves the existing dense compatibility path for Symmray trees;
@@ -288,7 +286,7 @@ class TreeSampler:
         state,
         *,
         seed=None,
-        threads: int | None = 1,
+        threads: int | None = None,
         backend="auto",
         fermion=None,
     ):
