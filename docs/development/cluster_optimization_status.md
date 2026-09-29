@@ -1,6 +1,7 @@
 # Cluster PEPO backend and downstream optimization status
 
-Updated 2026-09-28. Pepsy `develop` at **`b4c4631`** is published, including
+Updated 2026-09-28. An earlier Pepsy `develop` publication at
+**`b4c4631`** includes
 the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
@@ -49,6 +50,23 @@ Detailed records:
 - [Backend correction](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-26-projector-boundary-gradients.md)
 - [Dependency merge and successful publication](https://github.com/quantinuum-dev/pepsy/blob/develop/history/2026-09-26-cluster-api-dependency-sync.md)
 - [Current downstream ledger](https://github.com/rezaquant/gaugy/blob/develop/DEVELOPMENT_STATUS.md)
+
+
+## Integrated cluster and PEPS update, 2026-09-28
+
+Pepsy `develop` commit **`8673ef7`** publishes the cluster MPO/PEPO work
+and PEPS optimizer/sampler corrections described in the dated sections below.
+Those sections retain their original "working-tree" and "uncommitted"
+wording as historical evidence from baseline `4e398e4`. The commit was
+rebased over remote `89e6d29`; the two overlapping documentation entries
+were combined, and numerical source merged automatically.
+
+On the integrated tree, the affected cluster/PEPS/API/layout selection
+passed **547 tests, 2 skipped**. The full CPU suite passed **5,313 tests,
+105 skipped** with 684 warnings; full Ruff and whitespace checks passed.
+The [publication handoff](../../history/2026-09-28-cluster-publication.md)
+records the synchronization and validation. These are new integrated-tree
+results; earlier full-suite counts below refer to their own baselines.
 
 ## 2026-09-28 local readability follow-up
 
