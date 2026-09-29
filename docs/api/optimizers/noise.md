@@ -258,6 +258,12 @@ siblings and parents awaiting processing.
 Canonical MPS Kraus probabilities use local Gram-operator expectations with
 the optimizer's tracked center. Control norms use that center and the stored
 exponent; exact and simple-update states retain their general norm paths.
+Ordinary tree Kraus probabilities likewise use exact local expectations of
+`K.conj().T @ K` on a private TTN wrapper. Probability evaluation does not
+compress trial branches or apply unitary stabilization, and the common stored
+exponent cancels from the ratios. Only the selected branch is replayed with
+the requested direct/DMRG settings, then physically normalized, including
+very small positive branches selected by importance sampling.
 
 Every trajectory result exposes a lightweight `diagnostics` summary:
 
@@ -268,9 +274,10 @@ print(result.diagnostics.used_kraus_copy_fallback)
 
 `max_kraus_probability_residual` is the largest deviation of the raw Kraus
 branch probabilities from one before the sampler normalizes them. A small
-residual is expected from finite-bond truncation; a large residual indicates
-that the channel, local contraction, or compression settings should be
-checked.
+residual can arise from floating-point contraction error; a large residual
+indicates that the channel or probability calculation should be checked.
+The exact local MPS/tree probability paths do not include trial-branch
+truncation in these weights.
 
 This is normally more useful than `torch.vmap` for rare faults: after a fault
 or collapse, states have different tensor data and often different bond
@@ -642,6 +649,12 @@ complete local qubit channel (`sum(K.conj().T @ K) == I`) on the corresponding
 one- or multi-qubit `TrajectoryEvent` support. For ordinary MPS or TTN replay,
 replace the factory above with a fresh `MpsOptimizer(initial_mps, ...)` or
 `TreeOptimizer(...)` and pass its usual options through `run_kwargs`.
+
+Tree FIT controls such as `fit_n_iter` are constructor settings, rather than
+`run_kwargs` entries. The default is at most four iterations per fitted gate
+window, each with two directional passes; see [tree FIT controls](tree_fit.md)
+for early stopping and the single-node shortcut. Read the actual count with
+`optimizer.get_fit_diagnostics()["iterations"]` after a fitted update.
 
 For ordinary `MpsOptimizer`, Kraus normalization is tracked automatically in
 the optimizer's norm-survival ledger. The selected branch event retains its

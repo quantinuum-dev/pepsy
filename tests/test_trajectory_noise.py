@@ -1,5 +1,7 @@
 """Regression tests for user-defined MPS quantum-trajectory channels."""
 
+from contextlib import nullcontext
+
 import numpy as np
 import pytest
 import quimb.tensor as qtn
@@ -349,6 +351,67 @@ def test_mps_kraus_bell_branches_match_dense_trajectory_states():
         )
         assert leaf.optimizer.p.norm() == pytest.approx(1.0)
     assert result.diagnostics.used_kraus_copy_fallback is False
+
+
+@pytest.mark.parametrize("mode", ("direct", "dmrg2"))
+@pytest.mark.parametrize("strategy", ("independent", "coalesced"))
+@pytest.mark.parametrize("entrypoint", ("optimizer", "runner"))
+@pytest.mark.parametrize("option", ("stabilize_unitary", "fit_stabilize_unitary"))
+def test_mps_kraus_only_disables_unitary_stabilization(mode, strategy, entrypoint, option):
+    """Kraus normalization preserves Born weights and surrounding scale control."""
+    theta = 0.4
+    gate = np.cos(theta) * np.eye(4) - 1j * np.sin(theta) * np.kron(_X, _X)
+    stream = [
+        (gate, (0, 1)),
+        pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(0.3), 0),
+        (gate, (0, 1)),
+    ]
+    initial = qtn.MPS_computational_state("10", dtype="complex128")
+    run_kwargs = {"progbar": False, "cutoff": 0.0, "n_iter": 3, option: True}
+    original_kwargs = dict(run_kwargs)
+    warning = (
+        pytest.warns(DeprecationWarning, match="fit_stabilize_unitary")
+        if option == "fit_stabilize_unitary" else nullcontext()
+    )
+    with warning:
+        if entrypoint == "optimizer":
+            simulator = pepsy.MpsOptimizer(initial, stream, chi=1, mode=mode)
+            result = simulator.run(
+                shots=16, workers=1, strategy=strategy, seed=9, progress=False,
+                **run_kwargs,
+            )
+        else:
+            result = pepsy.run_trajectory_shots(
+                lambda: pepsy.MpsOptimizer(initial.copy(), chi=1, mode=mode),
+                stream, shots=16, strategy=strategy, seed=9, run_kwargs=run_kwargs,
+            )
+    assert run_kwargs == original_kwargs
+    assert result.shots == 16
+    records = (
+        result.records if entrypoint == "optimizer" or strategy == "independent"
+        else tuple(leaf.records for leaf in result.leaves)
+    )
+    assert {record[0].label for record in records} == {"jump", "no_jump"}
+    for optimizer, record in zip(result.optimizers, records):
+        jump = record[0].label == "jump"
+        probability = 0.3 if jump else 0.7
+        assert record[0].probability == pytest.approx(probability)
+        expected = np.array([1, 0, 0, 0] if jump else [0, 0, 1, 0], dtype=complex)
+        np.testing.assert_allclose(_statevector(optimizer), expected, atol=1e-10)
+        assert optimizer.p.exponent == pytest.approx(0.0)
+        events = optimizer.get_norm_events()
+        assert [event["kind"] for event in events] == [
+            "unitary_compression", "trajectory_kraus", "unitary_compression",
+        ]
+        # Both lossy gates retain cos(theta) of the amplitude, yet their working
+        # states stay normalized. The physical Kraus loss is not compression.
+        for event in (events[0], events[2]):
+            assert event["expected_norm"] == pytest.approx(1.0)
+            assert event["local_fidelity"] == pytest.approx(np.cos(theta) ** 2)
+        assert events[1]["expected_norm"] == pytest.approx(np.sqrt(probability))
+        assert events[1]["observed_norm"] == pytest.approx(np.sqrt(probability))
+        assert events[1]["local_fidelity"] == pytest.approx(1.0)
+        assert events[-1]["cumulative_fidelity"] == pytest.approx(np.cos(theta) ** 4)
 
 
 @pytest.mark.parametrize("mode", ("mix",))
@@ -941,6 +1004,88 @@ def test_tree_state_dependent_kraus_branches_are_sampled_from_the_current_state(
         expected = [1.0, 0.0, 0.0, 0.0] if records[0].label == "jump" else [0.0, 0.0, 1.0, 0.0]
         np.testing.assert_allclose(_statevector(optimizer), expected, atol=1e-8)
         assert optimizer.norm() == pytest.approx(1.0, abs=1e-8)
+
+
+@pytest.mark.parametrize("mode", ("direct", "dmrg2"))
+@pytest.mark.parametrize("strategy", ("independent", "coalesced"))
+@pytest.mark.parametrize("excited", (False, True))
+def test_tree_kraus_weights_ignore_unitary_stabilization(mode, strategy, excited):
+    initial = qtn.MPS_computational_state("10" if excited else "00", dtype="complex128")
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.TreeOptimizer(None, state=initial, mode=mode, chi=2,
+                                    stabilize_unitary=True, run=False),
+        [pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(.3), 0)],
+        shots=24, strategy=strategy, seed=6,
+    )
+    records = result.records if strategy == "independent" else tuple(leaf.records for leaf in result.leaves)
+    labels = {record[0].label for record in records}
+    assert labels == ({"jump", "no_jump"} if excited else {"no_jump"})
+    for opt, record in zip(result.optimizers, records):
+        jump = record[0].label == "jump"
+        expected_probability = (.3 if jump else .7) if excited else 1.
+        assert record[0].probability == pytest.approx(expected_probability)
+        expected = [0, 0, 1, 0] if excited and not jump else [1, 0, 0, 0]
+        np.testing.assert_allclose(_statevector(opt), expected, atol=1e-11)
+        assert opt.norm() == pytest.approx(1.)
+        assert opt.stabilize_unitary
+        assert not opt.get_norm_events()  # Born loss is not compression loss.
+
+
+@pytest.mark.parametrize("kind", ("mps", "tree"))
+@pytest.mark.parametrize("mode", ("direct", "dmrg2"))
+@pytest.mark.parametrize("strategy", ("independent", "coalesced"))
+def test_kraus_weights_are_evaluated_before_branch_truncation(kind, mode, strategy):
+    # One outcome creates entanglement beyond chi=1. Its sampling probability
+    # must be the Born weight, independently of later branch compression.
+    initial = qtn.MPS_computational_state("00", dtype="complex128")
+    channel = pepsy.TrajectoryChannel.kraus([
+        ("idle", np.sqrt(.25) * np.eye(4, dtype=complex)),
+        ("entangle", np.sqrt(.75) * np.asarray(pepsy.cx(), dtype=complex)),
+    ])
+
+    def factory():
+        if kind == "mps":
+            return pepsy.MpsOptimizer(initial.copy(), chi=1, mode=mode)
+        return pepsy.TreeOptimizer(None, state=initial, chi=1, mode=mode,
+                                   cutoff=0., run=False)
+
+    result = pepsy.run_trajectory_shots(
+        factory, [(np.asarray(pepsy.h(), dtype=complex), 0),
+                  pepsy.TrajectoryEvent(channel, (0, 1))],
+        shots=24, strategy=strategy, seed=6, run_kwargs={"progbar": False},
+    )
+    records = result.records if strategy == "independent" else tuple(leaf.records for leaf in result.leaves)
+    assert {record[0].label for record in records} == {"idle", "entangle"}
+    for opt, record in zip(result.optimizers, records):
+        expected = .25 if record[0].label == "idle" else .75
+        assert record[0].probability == pytest.approx(expected)
+        assert np.linalg.norm(_statevector(opt)) == pytest.approx(1.)
+
+
+@pytest.mark.parametrize("kind", ("mps", "tree"))
+@pytest.mark.parametrize("mode", ("direct", "dmrg2"))
+@pytest.mark.parametrize("strategy", ("independent", "coalesced"))
+def test_importance_sampled_rare_kraus_branch_is_normalized(kind, mode, strategy):
+    initial = qtn.MPS_computational_state("10", dtype="complex128")
+
+    def factory():
+        if kind == "mps":
+            return pepsy.MpsOptimizer(initial.copy(), chi=4, mode=mode)
+        return pepsy.TreeOptimizer(None, state=initial, chi=4, mode=mode, run=False)
+
+    result = pepsy.run_trajectory_shots(
+        factory, [pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(1e-40), 0)],
+        shots=16, strategy=strategy, seed=6, run_kwargs={"progbar": False},
+        importance_sampling=pepsy.ImportanceSamplingPolicy({0: {"jump": .5, "no_jump": .5}}),
+    )
+    records = result.records if strategy == "independent" else tuple(leaf.records for leaf in result.leaves)
+    assert {record[0].label for record in records} == {"jump", "no_jump"}
+    for opt, record in zip(result.optimizers, records):
+        jump = record[0].label == "jump"
+        assert record[0].probability == pytest.approx(1e-40 if jump else 1., rel=1e-12, abs=0.)
+        expected = [1, 0, 0, 0] if jump else [0, 0, 1, 0]
+        np.testing.assert_allclose(_statevector(opt), expected, atol=1e-11)
+        assert opt.p.exponent == 0.
 
 
 def test_tree_stab_state_dependent_kraus_branches_use_tree_normalization():

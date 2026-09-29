@@ -104,9 +104,11 @@ and a single array-kind pass supplies the native/dense routing decisions.
 Keep full target-index separation and the original target tensor order.
 
 An active interval containing one adjacent pair reaches its complete local
-optimum after that split. Named `dmrg2` enables the single-pair fast path even
-when tolerance stopping is disabled. Other modes require
-`fit_single_pair_fast_path=True` for this shortcut.
+optimum after that split. Every DMRG mode, including named `dmrg2`, honors
+the requested sweep budget and convergence controls by default. An omitted or
+None `fit_single_pair_n_iter` inherits `n_iter`; a positive cap selects
+`min(n_iter, fit_single_pair_n_iter)`. Only explicit
+`fit_single_pair_fast_path=True` selects the one-update shortcut.
 After any final sweep, FIT's retained norm and center tensor are authoritative
 for infidelity and unitary stabilization; recanonicalizing the interval is
 redundant. Non-unitary scale control likewise normalizes that singleton center

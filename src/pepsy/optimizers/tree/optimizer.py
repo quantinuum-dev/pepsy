@@ -88,7 +88,9 @@ from .layout import (
 from ._application import (
     _same_tree_plan, operator_local_tensors, peel_order, plan_operator_application,
 )
-from ._diagnostics import diagnostic_to_host, norm_event, summarize_update, truncation_event
+from ._diagnostics import (
+    diagnostic_to_host, norm_event, represented_norm, summarize_update, truncation_event,
+)
 from ._readout import product_pauli_probabilities, single_pauli_probabilities
 from ._policy import (
     COPY_SETTINGS,
@@ -2746,7 +2748,9 @@ class TreeOptimizer:
             and self._norm_tracking_enabled
             and str(kind) in {"gate", "subtree", "submpo", "subtreempo"}
         ):
-            self._active_update["norm_before"] = self._ledger_norm()
+            norm, exponent = self._ledger_norm()
+            self._active_update["norm_before"] = norm
+            self._active_update["norm_before_exponent"] = exponent
         return True
 
     def _record_transient_bond(self, dimension, *, phase, edge=None):
@@ -2778,25 +2782,35 @@ class TreeOptimizer:
         """Record compression loss before optionally restoring unitary scale."""
         if not active.get("track_norm", True) or active.get("norm_before") is None:
             return
-        observed = self._ledger_norm()
+        observed, observed_exponent = self._ledger_norm()
         if self.track_infidelity:
             self._norm_log_survival, event = norm_event(
                 active, observed, self._norm_log_survival,
+                observed_exponent=observed_exponent,
             )
             self._last_norm_event = event
             self._norm_event_count += 1
             if self.record_history:
                 self.norm_events.append(event)
         if self.stabilize_unitary:
-            self._restore_unitary_norm(active["norm_before"], observed)
+            self._restore_unitary_norm(
+                active["norm_before"], observed,
+                expected_exponent=active["norm_before_exponent"],
+                observed_exponent=observed_exponent,
+            )
 
-    def _restore_unitary_norm(self, expected, observed):
+    def _restore_unitary_norm(self, expected, observed, *, expected_exponent=0.,
+                              observed_exponent=0.):
         """Restore the incoming norm at the canonical centre, without exponent loss.
 
         Unitary truncation loss belongs in the compression ledger, not in the
         represented state's physical exponent. Keep device scalar arithmetic
         on its backend and combine zero checks until the replay boundary.
         """
+        if not np.isfinite(expected_exponent) or not np.isfinite(observed_exponent):
+            raise FloatingPointError(
+                "Cannot stabilize a unitary tree state with a zero or non-finite norm."
+            )
         backend = ar.infer_backend(observed)
         if backend in {"torch", "jax", "cupy"}:
             observed = ar.do("stop_gradient", ar.do("abs", observed))
@@ -2814,7 +2828,7 @@ class TreeOptimizer:
                 invalid if self._pending_stabilization_error is None else
                 ar.do("logical_or", self._pending_stabilization_error, invalid)
             )
-            ratio = expected / ar.do("where", invalid, 1., observed)
+            observed = ar.do("where", invalid, 1., observed)
         else:
             expected, observed = float(expected), float(observed)
             if (expected <= 0. or observed <= 0.
@@ -2822,7 +2836,13 @@ class TreeOptimizer:
                 raise FloatingPointError(
                     "Cannot stabilize a unitary tree state with a zero or non-finite norm."
                 )
+        exponent_delta = expected_exponent - observed_exponent
+        if exponent_delta == 0.:
             ratio = expected / observed
+        else:
+            # Cancel the common stored scale before constructing any factor.
+            ratio = ar.do("exp", ar.do("log", expected) - ar.do("log", observed)
+                          + exponent_delta * np.log(10.))
         if not self._defer_stabilization_checks:
             self._check_unitary_stabilization()
         if self.center is None:
@@ -3126,14 +3146,15 @@ class TreeOptimizer:
         node = next(iter(application.region))
         strategy = self._fit_guess_strategy()
         active = self._active_update
-        represented_norm = (
+        incoming_norm = (
             None if active is None else active.get("norm_before")
         )
         target_norm_available = bool(track_norm and self._norm_tracking_enabled)
         norm_pair = (
-            None if represented_norm is None
-            else (represented_norm, 0.0)
+            None if incoming_norm is None
+            else (incoming_norm, active["norm_before_exponent"])
         )
+        norm_value = None if norm_pair is None else represented_norm(*norm_pair)
         fit_rtol = (
             None
             if self._fit_rtol_requested == "auto" and not target_norm_available
@@ -3144,22 +3165,22 @@ class TreeOptimizer:
             "converged": True,
             "convergence_reason": "single_node_exact",
             "relative_change": None,
-            "final_norm": represented_norm,
+            "final_norm": norm_value,
             "final_norm_mantissa": (
                 None if norm_pair is None else norm_pair[0]
             ),
             "final_norm_exponent": (
                 None if norm_pair is None else norm_pair[1]
             ),
-            "local_norm": represented_norm,
+            "local_norm": norm_value,
             "local_norm_trace": (
-                () if represented_norm is None else (represented_norm,)
+                () if norm_value is None else (norm_value,)
             ),
             "local_norm_stripped_trace": (
                 () if norm_pair is None else (norm_pair,)
             ),
             "sweep_norm_trace": (
-                () if represented_norm is None else (represented_norm,)
+                () if norm_value is None else (norm_value,)
             ),
             "local_fidelity": 1.0 if target_norm_available else None,
             "local_infidelity": 0.0 if target_norm_available else None,
@@ -5347,6 +5368,7 @@ class TreeOptimizer:
         Direct/DM prepare a path endpoint and compress once to the other end.
         On branches, start at ``hub`` and descend. Compressing ``node -> child``
         advances the center; a lossless QR returns it before the next branch.
+        After the last cut, leave the center at the final visited tensor.
         Each direct/DM cut sees the completed update with canonical boundaries.
         """
         snodes = frozenset(snodes)
@@ -5397,13 +5419,13 @@ class TreeOptimizer:
                 max_bond=max_bond, cutoff=cutoff,
             )
 
-        def descend(node, parent):
+        def descend(node, parent, *, return_to_node):
             children = sorted(
                 neighbor
                 for neighbor in self._neighbors(node)
                 if neighbor in snodes and neighbor != parent
             )
-            for child in children:
+            for index, child in enumerate(children):
                 child_cutoff = edge_cutoff(node, child)
                 reduced, reduction_proven = self._edge_reduction(
                     node, child, max_bond=max_bond, cutoff=child_cutoff,
@@ -5416,7 +5438,14 @@ class TreeOptimizer:
                     reduced=reduced,
                     reduction_proven=reduction_proven,
                 )
-                descend(child, node)
+                # Return only if this node or an ancestor has another branch
+                # to process. The final descent needs no QR walk back to hub.
+                needs_return = return_to_node or index < len(children) - 1
+                final_center = descend(
+                    child, node, return_to_node=needs_return,
+                )
+                if not needs_return:
+                    return final_center
                 canonize_bond = int(
                     self.tn.ind_size(self.tn.bond(child, node))
                 )
@@ -5434,8 +5463,9 @@ class TreeOptimizer:
                         ),
                     )
 
-        descend(hub, None)
-        self.center = hub
+            return node
+
+        self.center = descend(hub, None, return_to_node=False)
 
     def _qr_route_message(self, tensor, left_inds, *, bond_ind):
         """Split one subtree message losslessly while carrying operator legs."""
@@ -5986,13 +6016,12 @@ class TreeOptimizer:
                     if self.center is None:
                         self._move_center(min(region))
                     active = self._active_update
-                    exponent = float(getattr(self.tn, "exponent", 0.0))
-                    if exponent == 0.0 and active is not None and active.get("norm_before") is not None:
-                        target_norm = (active["norm_before"], 0.0)
+                    if active is not None and active.get("norm_before") is not None:
+                        target_norm = (active["norm_before"], active["norm_before_exponent"])
                     else:
                         squared, exponent, _ = TreeFIT._center_norm_squared_backend(self.tn)
                         target_norm = (
-                            ar.do("sqrt", ar.do("maximum", ar.do("real", squared), 0.0)),
+                            ar.do("sqrt", ar.do("clip", ar.do("real", squared), 0.0, None)),
                             exponent,
                         )
                 self._run_tree_fit(
@@ -7483,13 +7512,10 @@ class TreeOptimizer:
         return float(np.sqrt(abs(to_float(squared, real=True)))) * scale
 
     def _ledger_norm(self):
-        # Preserve Python-double exponent range on JAX without x64 and Metal.
-        # Explicit extracted-scale bookkeeping remains a host boundary, as it
-        # is for non-unitary normalization. Ordinary unitary replay has scale 1.
-        if float(getattr(self.tn, "exponent", 0.0)) != 0.0:
-            return self.norm()
-        value = self._norm_backend()
-        return value if ar.infer_backend(value) == "builtins" else ar.do("stop_gradient", value)
+        """Return a detached backend norm and its unmaterialized exponent."""
+        squared, exponent = self._norm_components_backend(strip_exponent=True)
+        value = ar.do("sqrt", ar.do("abs", ar.do("real", squared)))
+        return ar.do("stop_gradient", value), exponent
 
     def _norm_backend(self):
         """Compute the represented norm without materializing a host scalar."""
@@ -7498,23 +7524,32 @@ class TreeOptimizer:
             return float(np.sqrt(abs(to_float(squared, real=True)))) * scale
         return ar.do("sqrt", ar.do("abs", ar.do("real", squared))) * scale
 
-    def _norm_components_backend(self):
-        """Return a backend norm square and its separate host scale factor."""
+    def _norm_components_backend(self, *, strip_exponent=False):
+        """Return a backend norm square and a host scale factor or exponent."""
         center = self.center
+        network = self.tn
+        exponent = float(getattr(network, "exponent", 0.0))
+        if strip_exponent and center is None and exponent != 0.:
+            # A full contraction includes the network exponent. Strip it on
+            # an independent wrapper, preserving live data and canonicality.
+            network = network.copy()
+            network.exponent = 0.
         if self.tn.fermionic:
             with self._thread_ctx():
-                val = self.tn._fermionic_center_norm_squared()
+                val = network._fermionic_center_norm_squared()
             val = val.data if isinstance(val, qtn.Tensor) else val
+            if strip_exponent:
+                return val, exponent
             return val, self._represented_scale() if center is not None else 1.0
         if center is not None:
             t = self.tn.tensor_map[self._tid(center)]
             val = qtn.tensor_contract(t.H, t, output_inds=[])
             val = val.data if isinstance(val, qtn.Tensor) else val
-            return val, self._represented_scale()
+            return val, exponent if strip_exponent else self._represented_scale()
         with self._thread_ctx():
-            val = (self.tn.H & self.tn).contract(output_inds=[])
+            val = (network.H & network).contract(output_inds=[])
         val = val.data if isinstance(val, qtn.Tensor) else val
-        return val, 1.0
+        return val, exponent if strip_exponent else 1.0
 
     def _represented_scale(self):
         """Return Quimb's extracted global base-10 state scale."""

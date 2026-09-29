@@ -78,11 +78,13 @@ than hiding policy in a mode-specific helper.
   starts directly with one-site FIT. An under-capacity non-adjacent `dmrg1`
   window requires `n_iter >= 3`: two block sweeps plus at least one refinement
   sweep. Its default `fit_patience=2` is a two-sample same-phase norm window,
-  i.e. one stable comparison. A two-site window is a structural special case for
-  `dmrg2` by default, or other schedules with `fit_single_pair_fast_path=True`:
-  perform exactly one two-site update, no
-  one-site refinement, then advance to the next gate without consuming the
-  remaining `n_iter` budget. Compose with
+  i.e. one stable comparison. Adjacent two-site windows inherit `n_iter` when
+  `fit_single_pair_n_iter` is omitted or None; a positive cap selects
+  `min(n_iter, fit_single_pair_n_iter)`. Every DMRG mode, including `dmrg2`,
+  honors that budget and its convergence controls by default.
+  `fit_single_pair_fast_path=True` explicitly requests one exact two-site
+  update, without warm-up repetition or one-site refinement, before advancing
+  to the next gate. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
 - `direct` (default), or another bare/`quimb-<method>` name: native Quimb

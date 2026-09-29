@@ -14,12 +14,27 @@ from ...backends.convert import _array_namespace
 from .._fidelity import fidelity_from_log, infidelity_from_log, log_fidelity_from_norms
 
 
+def represented_norm(mantissa, exponent):
+    """Materialize a stripped norm only for a represented-scale readout."""
+    if exponent == 0.:
+        return mantissa
+    mantissa = abs(to_float(mantissa, real=True))
+    if mantissa == 0. or not np.isfinite(mantissa):
+        return mantissa
+    with np.errstate(over="ignore", under="ignore"):
+        return float(np.exp(np.log(mantissa) + exponent * np.log(10.)))
+
+
 def diagnostic_to_host(value):
     """Materialize detached scalar diagnostics at an explicit readout boundary."""
     if isinstance(value, dict):
         result = {key: diagnostic_to_host(item) for key, item in value.items()}
         if not result.pop("_raw_valid", True):
             result["fidelity_raw"] = None
+        exponent = result.pop("_norm_exponent", 0.)
+        if exponent != 0.:
+            for key in ("expected_norm", "observed_norm"):
+                result[key] = represented_norm(result[key], exponent)
         return result
     if isinstance(value, (list, tuple)):
         return type(value)(diagnostic_to_host(item) for item in value)
@@ -28,7 +43,7 @@ def diagnostic_to_host(value):
     return deepcopy(value)
 
 
-def _backend_norm_event(active, observed, log_survival):
+def _backend_norm_event(active, observed, log_survival, norm_exponent):
     """Use the tree's existing zero/NaN policy without per-update host reads."""
     xp = _array_namespace(observed)
     observed = xp.stop_gradient(observed)
@@ -54,7 +69,7 @@ def _backend_norm_event(active, observed, log_survival):
     log_survival = xp.where(complete_loss, -np.inf, log_survival + log_local)
     cumulative = xp.exp(log_survival)
     loss = -xp.expm1(log_survival)
-    return log_survival, {
+    event = {
         "step": int(active["update"]), "kind": active["kind"],
         "where": tuple(active["support"]), "valid": True,
         "expected_norm": xp.abs(expected), "observed_norm": xp.abs(observed),
@@ -66,33 +81,40 @@ def _backend_norm_event(active, observed, log_survival):
         "cumulative_compression_fidelity": cumulative,
         "cumulative_compression_infidelity": loss,
     }
+    if norm_exponent != 0.:
+        # Keep the ratio on-device even when its represented norms overflow.
+        # Only public readout constructs those display values on the host.
+        event["_norm_exponent"] = norm_exponent
+    return log_survival, event
 
 
-def norm_event(active, observed, log_survival):
+def norm_event(active, observed, log_survival, *, observed_exponent=0.):
     """Build a retained-norm event and return its updated log survival."""
     expected = active.get("norm_before")
     if expected is None:
         return log_survival, None
+    expected_exponent = active.get("norm_before_exponent", 0.)
+    exponent_delta = observed_exponent - expected_exponent
     backend = ar.infer_backend(observed)
-    if backend in {"torch", "jax", "cupy"} and ar.infer_backend(expected) == backend:
-        return _backend_norm_event(active, observed, log_survival)
-    # An operator can introduce or cancel an extracted exponent mid-update.
-    # In that case one norm is a host double and the other a device scalar.
-    # Keep this explicit scale boundary on the host: casting the former to a
-    # float32 device scalar can overflow or underflow its represented norm.
+    if (exponent_delta == 0. and backend in {"torch", "jax", "cupy"}
+            and ar.infer_backend(expected) == backend):
+        return _backend_norm_event(active, observed, log_survival, observed_exponent)
+    # An operator changing the exponent keeps the existing host-double scalar
+    # boundary: JAX without x64 and Metal cannot represent e.g. fidelity 1e-200.
+    # Unchanged scales cancel above, including extreme stored exponents.
     expected = to_float(expected, real=True)
     observed = to_float(observed, real=True)
     log_survival = to_float(log_survival, real=True)
     log_local = log_fidelity_from_norms(observed, expected)
-    raw_local = (
-        None
-        if (
-            expected <= 0.0
-            or not np.isfinite(expected)
-            or not np.isfinite(observed)
-        )
-        else float((observed / expected) ** 2)
-    )
+    if expected <= 0. or not np.isfinite(expected) or not np.isfinite(observed):
+        raw_local = None
+    elif exponent_delta != 0. and observed > 0.:
+        log_ratio = np.log(observed) - np.log(expected) + exponent_delta * np.log(10.)
+        log_local = min(0., 2. * log_ratio)
+        with np.errstate(over="ignore", under="ignore"):
+            raw_local = float(np.exp(2. * log_ratio))
+    else:
+        raw_local = float((observed / expected) ** 2)
     local_fidelity = fidelity_from_log(log_local)
     local_infidelity = infidelity_from_log(log_local)
     if log_survival == -np.inf or log_local == -np.inf:
@@ -106,8 +128,8 @@ def norm_event(active, observed, log_survival):
         "kind": active["kind"],
         "where": tuple(active["support"]),
         "valid": True,
-        "expected_norm": float(abs(expected)),
-        "observed_norm": float(abs(observed)),
+        "expected_norm": represented_norm(abs(expected), expected_exponent),
+        "observed_norm": represented_norm(abs(observed), observed_exponent),
         "fidelity_raw": raw_local,
         "local_fidelity": local_fidelity,
         "local_infidelity": local_infidelity,

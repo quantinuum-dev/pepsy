@@ -62,6 +62,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Changed
 
+- Branched tree direct/DM compression keeps the canonical center at the final
+  visited tensor, skipping the final QR return to the hub. Cut order and
+  required returns between branches are preserved. Later finite-bond sweeps
+  can take a different direction because their incoming center has changed.
+
 - Tree DMRG reuses unchanged non-differentiable Torch exterior branches as
   identity environments and combines the target norm with its first required
   convergence readout. Single-site Torch unitary checks use a bounded cache
@@ -309,6 +314,23 @@ releases remain backwards-compatible. From 1.0 onward:
   ordered rotations and pair wires.
 
 ### Fixed
+
+- Tree Kraus sampling computes exact local Born weights before branch
+  compression or stabilization, preserving unequal and zero probabilities
+  and cancelling common stored scales. Importance-sampled positive branches
+  are normalized even when their amplitude is below the default norm threshold.
+
+- MPS trajectories disable unitary stabilization only during selected Kraus
+  updates, avoiding conflicting non-unitary options while preserving branch
+  probabilities, normalization, and stabilization of surrounding unitary gates.
+  Independent and coalesced replay also handle the deprecated stabilization alias.
+
+- Tree DMRG and mixed replay use Autoray-compatible scalar clipping when
+  preparing target norms with tracking disabled or extracted state scales.
+  Unitary stabilization and compression loss now keep norms and exponents
+  separate, preserving finite working states at extreme stored scales.
+  TreeFIT scalar readout also preserves CuPy arrays for Autoray conversion
+  instead of unwrapping their device memory pointers.
 
 - Ordinary `hrs_to_mps`, `hrs_to_peps`, and `hrs_to_ttn` now reject real
   storage, which previously discarded Haar phases and could reduce the norm.

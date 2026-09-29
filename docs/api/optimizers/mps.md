@@ -517,6 +517,13 @@ when passed directly to `run`. `run_kwargs={...}` remains supported and its
 explicit values override the corresponding top-level per-trajectory options.
 Mode selection and the shot RNG remain parent-level controls.
 
+With `stabilize_unitary=True`, trajectory replay stabilizes unitary gate
+segments and disables that restoration only while applying a selected Kraus
+operator. The Kraus branch retains its physical norm for compression
+accounting, then is normalized before the next segment. Its Born probability
+does not count as compression loss. This also applies to the deprecated
+`fit_stabilize_unitary` alias.
+
 Use `retain="all"` (the default) for final states plus replay metadata,
 `retain="final"` for final states without concrete streams and records, or
 `retain="none"` when only the shot count/side effects matter. The latter keeps

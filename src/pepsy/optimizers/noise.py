@@ -4,7 +4,7 @@ Pepsy's native design is stream-local: users can place stochastic instructions
 such as ``("depolarize1", p, q)`` or ``("amplitude_damping", gamma, q)`` exactly
 where the hardware schedule says the channel acts. The trajectory runners
 sample a *concrete* branch for each shot and replay the resulting ordinary gate
-stream with either :class:`MpsOptimizer` or :class:`StabilizerMpsSimulator`. The older
+stream with MPS, tree, or stabilizer tensor-network optimizers. The older
 ``PauliErrorModel`` helpers remain convenience macros for inserting uniform
 post-gate Pauli faults into a clean deterministic stream.
 """
@@ -402,8 +402,8 @@ class TrajectoryDiagnostics:
 
     ``max_kraus_probability_residual`` is measured before the branch
     probabilities are normalized for sampling. A small nonzero value is
-    expected from finite-MPS truncation; a large value indicates that the
-    channel, local contraction, or compression path needs attention.
+    expected from floating-point contraction error; a large value indicates
+    that the channel or probability calculation needs attention.
     ``used_kraus_copy_fallback`` reports whether any local Kraus probability
     could not use the environment contraction fast path.
     """
@@ -2974,11 +2974,14 @@ def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 
 def _trajectory_norm_squared(optimizer) -> float:
-    """Read the represented state norm through the optimizer's public API."""
+    """Read a working norm; common stored exponents cancel from Born ratios."""
     norm = getattr(optimizer, "norm", None)
     if isinstance(optimizer, MpsOptimizer):
         # A common represented exponent cancels from every Born ratio.
         value = optimizer._control_state_norm(include_exponent=False)
+    elif isinstance(optimizer, TreeOptimizer):
+        value, _ = optimizer._ledger_norm()
+        value = _trajectory_real_scalar(value, label="trajectory state norm")
     elif callable(norm):
         value = _trajectory_real_scalar(norm(), label="trajectory state norm")
     else:
@@ -3104,7 +3107,26 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
 
 
 def _tree_outcome_norm_squared(optimizer, matrix, where) -> float:
-    """Evaluate one Kraus branch on a copied ordinary TTN without mutation."""
+    """Evaluate a Kraus weight independently of tree replay/compression policy."""
+    if isinstance(optimizer, TreeOptimizer):
+        matrix = _to_trajectory_backend(matrix, optimizer)
+        support = optimizer._validate_support(_trajectory_where(where))
+        gram = ar.do("conj", ar.do("transpose", matrix)) @ matrix
+        # Copy only the TTN wrapper, preserving live gauge, histories and RNG.
+        # This exact local contraction neither compresses a trial branch nor
+        # restores its nonunitary norm through inherited stabilization.
+        state = optimizer.tn.copy()
+        state.exponent = 0.
+        value = state.local_expectation(
+            gram, support, normalized=True, _preserve_gauge=False,
+        )
+        # K†K is Hermitian; discard imaginary contraction roundoff before
+        # the scalar readout, including complex64 device arithmetic.
+        value = _trajectory_real_scalar(ar.do("real", value), label="local Kraus probability")
+        if not np.isfinite(value) or value < -1e-10:
+            raise ValueError("local Kraus contraction produced an invalid probability.")
+        return max(0., value) * _trajectory_norm_squared(optimizer)
+    # Retain the copy/apply protocol for external optimizer lookalikes.
     copy = getattr(optimizer, "copy", None)
     if not callable(copy):
         raise TypeError(
@@ -3217,8 +3239,8 @@ def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.nda
     if total <= 0.0:
         raise ValueError("Kraus channel has no nonzero trajectory outcome for this state.")
     _record_kraus_probability_diagnostic(optimizer, residual=total - 1.0)
-    # A complete channel sums to one. Normalize the tiny residual caused by
-    # finite-MPS truncation so the shot sampler remains a proper distribution.
+    # A complete channel sums to one. Normalize contraction roundoff so the
+    # shot sampler remains a proper distribution.
     return probabilities / total
 
 
@@ -3312,6 +3334,11 @@ def _run_trajectory_entries(
         kwargs["normalize_final"] = False
         if isinstance(optimizer, MpsOptimizer):
             kwargs["_trajectory_non_unitary"] = True
+            # Kraus branches retain their physical norm until branch
+            # normalization. Override only this segment's copied options;
+            # surrounding unitary segments keep the caller's stabilization.
+            kwargs["stabilize_unitary"] = False
+            kwargs.pop("fit_stabilize_unitary", None)
     optimizer.run(**kwargs)
 
 
@@ -3424,7 +3451,12 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
             physical_boundary=True,
             renormalized=True,
         )
-    normalize()
+    if isinstance(optimizer, TreeOptimizer):
+        # A sampled branch has positive Born weight, even when importance
+        # sampling selected an amplitude below the general normalization eps.
+        normalize(eps=0.)
+    else:
+        normalize()
     # MpsOptimizer stores removed scale in ``p.exponent`` so norm diagnostics
     # see the represented non-unitary norm. A quantum-trajectory branch is
     # physically renormalized, therefore clear that bookkeeping scale.

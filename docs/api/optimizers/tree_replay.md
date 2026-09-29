@@ -260,8 +260,13 @@ incoming tracked center, with structural node id breaking ties; this routing
 order never changes the gate's logical argument order. Off-path branches
 remain canonical boundaries with their existing virtual dimensions. Explicit
 subtree-operator and sub-MPO paths use the same directional compression.
-Branched regions retain their tree sweep. Finite-cap results can change from
-the previous interior-hub order.
+Branched direct/DM regions retain their depth-first cut order. The center
+returns toward the hub only when another branch remains to be processed;
+after the final cut it stays at the last visited tensor. The state-owned
+canonical center and local `left_inds` proofs track this endpoint, so local
+norm readout and the next update can use it directly. Omitting the final
+lossless return preserves the completed update up to roundoff. The different
+incoming center can change a later sweep's direction and finite-bond result.
 
 SRC/SDC/SDCR and their oversampled variants likewise use an endpoint hub on paths, building only the complementary
 environments needed for the opposite projection sweep. Zipup uses a directional
@@ -430,6 +435,10 @@ enable spectrum probes.
 `stabilize_unitary=True` restores the incoming norm after each unitary
 compression, by rescaling the canonical centre. The compression ledger records
 loss before restoration; discarded weight is not stored in `tn.exponent`.
+Restoration and retained-fidelity ratios use stripped norms and exponent
+differences, so finite working tensors remain usable with stored exponents
+such as `400` or `-400`. Represented norm readouts can still overflow or
+underflow the host floating-point range without invalidating those ratios.
 The package default is False, matching MpsOptimizer. A per-replay
 `run(stabilize_unitary=...)` override is scoped to that replay and propagates
 to shots unless their `run_kwargs` override it. Non-unitary replay and
@@ -448,8 +457,10 @@ also defaults to `collect_diagnostics=False`; pass
 For Torch, JAX, and CuPy, ordinary replay retains detached norm and
 log-fidelity scalars on the array backend. `norm()`, `get_norm_events()`,
 `norm_diagnostics()`, diagnostic reports, and progress display are explicit
-host readout boundaries. A nonzero extracted `tn.exponent` retains Python
-double scale bookkeeping to avoid losing its range on float32-only devices.
+host readout boundaries. An unchanged extracted `tn.exponent` cancels before
+the backend ratio calculation. If an operator changes that exponent, the
+ledger uses host double scalar bookkeeping to preserve very small fidelities
+on float32-only devices; stabilization still uses Autoray backend scalars.
 Norm tracking remains enabled by default. FIT convergence/local reports,
 measurement decisions, native QR safety checks, and upstream truncation rank
 selection can still synchronize; disabling optional diagnostics does not

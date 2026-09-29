@@ -339,7 +339,7 @@ def _exponent_value(network):
 def _scalar_value(value):
     """Convert a scalar backend value into a Python complex number."""
 
-    if hasattr(value, "data"):
+    if isinstance(value, qtn.Tensor):
         value = value.data
     try:
         value = ar.to_numpy(value)

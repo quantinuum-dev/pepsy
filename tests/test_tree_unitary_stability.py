@@ -6,7 +6,7 @@ import autoray as ar
 import numpy as np
 import pytest
 
-from pepsy.optimizers import TreeOptimizer, TreePlan, TreeTensorNetwork
+from pepsy.optimizers import SubTreeMPO, TreeOptimizer, TreePlan, TreeTensorNetwork
 from pepsy.sampling import TreeSampler
 
 
@@ -63,6 +63,63 @@ def test_stabilization_works_without_diagnostic_tracking(backend):
     assert opt.norm_events == [] and opt.fit_diagnostics == []
     assert opt.update_history == [] and opt.profile_events == []
     assert opt.norm_diagnostics()["cumulative_fidelity"] is None
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("mode", ["direct", "dmrg"])
+@pytest.mark.parametrize("exponent", [-400., 400.])
+@pytest.mark.parametrize("tracking", [False, True])
+def test_stabilization_preserves_extreme_extracted_scales(backend, mode, exponent, tracking):
+    opt, gate = _optimizer(backend, mode=mode, stabilize_unitary=True,
+                          track_infidelity=tracking, fit_init_strategy="guess-direct")
+    opt.tn.exponent = exponent
+    signature = opt.backend_info()
+    opt.run([(gate, (0, 3))] * 3)
+    assert opt.tn.exponent == exponent
+    working = opt.tn.copy()
+    working.exponent = 0.
+    expected = np.zeros(16)
+    expected[0] = 1.
+    np.testing.assert_allclose(working.to_dense().reshape(-1), expected, atol=1e-10)
+    assert opt.backend_info() == signature
+    opt.tn.validate(check_canonical=True)
+    if tracking:
+        report = opt.norm_diagnostics(include_history=False)
+        assert report["cumulative_fidelity"] == pytest.approx(np.cos(0.4)**6)
+        assert report["local_fidelity"] == pytest.approx(np.cos(0.4)**2)
+    else:
+        assert opt.norm_events == []
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("operator_exponent", [-1., 1.])
+def test_stabilization_accounts_for_operator_exponent(backend, operator_exponent):
+    opt, gate = _optimizer(backend, mode="direct", stabilize_unitary=True)
+    opt.tn.exponent = 400.
+    operator = SubTreeMPO.from_gate(opt.plan, gate * 10.**-operator_exponent, (0, 3))
+    operator.exponent = operator_exponent
+    opt.apply_sub_mpotree(operator)
+    assert opt.tn.exponent == 400. + operator_exponent
+    working = opt.tn.copy()
+    working.exponent = 0.
+    expected = np.zeros(16)
+    expected[0] = 10.**-operator_exponent
+    np.testing.assert_allclose(working.to_dense().reshape(-1), expected, atol=1e-10)
+    assert opt.norm_diagnostics()["local_fidelity"] == pytest.approx(np.cos(0.4)**2)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_stabilization_preserves_extreme_scale_without_known_center(backend):
+    opt, gate = _optimizer(backend, mode="direct", stabilize_unitary=True)
+    opt.tn.exponent = 400.
+    opt.tn.invalidate_canonical_form()
+    assert opt.center is None
+    opt.run([(gate, (0, 3))])
+    assert opt.tn.exponent == 400.
+    working = opt.tn.copy()
+    working.exponent = 0.
+    assert np.linalg.norm(working.to_dense()) == pytest.approx(1.)
+    assert opt.norm_diagnostics()["local_fidelity"] == pytest.approx(np.cos(0.4)**2)
 
 
 def test_no_history_keeps_compact_fidelity_and_latest_fit(monkeypatch):
@@ -127,6 +184,17 @@ def test_zero_state_stabilization_raises_and_clears_replay_policy(backend):
     assert not opt._defer_stabilization_checks
 
 
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("exponent", [-np.inf, np.inf, np.nan])
+def test_stabilization_rejects_nonfinite_exponent(backend, exponent):
+    opt, gate = _optimizer(backend, mode="direct", track_infidelity=False)
+    opt.tn.exponent = exponent
+    with pytest.raises(FloatingPointError, match="zero or non-finite"):
+        opt.run([(gate, (0, 3))], stabilize_unitary=True)
+    assert opt.stabilize_unitary is False
+    assert not opt._defer_stabilization_checks
+
+
 def test_shots_forward_stabilization_and_allow_child_override(monkeypatch):
     opt, gate = _optimizer()
     calls = []
@@ -157,7 +225,8 @@ def test_default_threads_do_not_enter_a_thread_limiter(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["direct", "dmrg"])
-def test_native_fermionic_stabilization_preserves_state_direction(mode):
+@pytest.mark.parametrize("exponent", [0., -400., 400.])
+def test_native_fermionic_stabilization_preserves_state_direction(mode, exponent):
     pytest.importorskip("symmray")
     import pepsy
 
@@ -166,6 +235,7 @@ def test_native_fermionic_stabilization_preserves_state_direction(mode):
     state = pepsy.ps_to_ttn(4, tree=plan, fermion=fermion,
                             occupations=((1, 1), (0, 0), (1, 1), (0, 0)),
                             dtype="complex128")
+    state.exponent = exponent
     gate = fermion.hopping_gate(0.3, t=1., imaginary=False)
     kwargs = dict(tree=plan, state=state, chi=1, mode=mode,
                   fit_init_strategy="guess-direct", run=False)
@@ -174,15 +244,20 @@ def test_native_fermionic_stabilization_preserves_state_direction(mode):
     raw.apply_gate(gate, (0, 3))
     stable.apply_gate(gate, (0, 3))
     assert stable.tn.fermionic
+    assert raw.tn.exponent == stable.tn.exponent == exponent
+    # Compare working states without materializing the common physical scale.
+    raw.tn.exponent = stable.tn.exponent = 0.
     assert stable.norm() == pytest.approx(1., abs=1e-10)
     np.testing.assert_allclose(stable.to_dense(), raw.to_dense() / raw.norm(), atol=1e-10)
     assert stable.norm_diagnostics()["fidelity"] == pytest.approx(raw.norm()**2)
     stable.tn.validate(check_canonical=True)
 
 
-def test_stabilization_preserves_torch_gradients():
+@pytest.mark.parametrize("exponent", [0., 400.])
+def test_stabilization_preserves_torch_gradients(exponent):
     torch = pytest.importorskip("torch")
     opt, _ = _optimizer("torch", mode="direct", stabilize_unitary=True)
+    opt.tn.exponent = exponent
     theta = torch.tensor(0.3, dtype=torch.float64, requires_grad=True)
     c, s = torch.cos(theta), torch.sin(theta)
     gate = torch.stack((torch.stack((c, -s)), torch.stack((s, c)))).to(torch.complex128)
