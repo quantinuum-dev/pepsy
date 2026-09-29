@@ -29,7 +29,7 @@ shared Torch/CTMRG safeguards previously embedded in the root guide.
 - [MPS optimizer](mps-optimizer/SKILL.md)
 - [Tensor fitting](tensor-fitting/SKILL.md)
 - [Tree optimizer](tree-optimizer/SKILL.md): tree replay, unitary stabilization,
-  opt-in CPU thread limits, and bounded diagnostic histories.
+  device-aware FIT environments, opt-in CPU thread limits, and bounded histories.
 - [qMERA energy optimizer](qmera-energy-optimizer/SKILL.md)
 
 ## Domain workflows

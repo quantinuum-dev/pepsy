@@ -96,7 +96,13 @@ the complete operator in an isometric environment.
 A compact one-site unitary is absorbed directly in every mode, preserving
 the incoming canonical center or region and local isometry metadata. The
 current small physical matrix is checked at arithmetic precision, including
-even native operators; nonunitary and odd native operators retain the general
+even native operators. Torch certification is reused in a bounded cache while
+the array's storage/view and mutation version remain unchanged; tracked
+in-place edits invalidate it. NumPy, native arrays, and Torch inference tensors
+without version counters are checked directly. For writes through external
+storage or `.data`, mark the Torch tensor with
+`torch.autograd.graph.increment_version` or reinstall the stream with
+`set_gates` before replay. Nonunitary and odd native operators retain the general
 route. This exact absorption skips FIT and clears its latest diagnostic record.
 Native `compression_mode="dm"` raises before update accounting or state
 changes; use `"direct"` for native graded compression.

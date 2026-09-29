@@ -46,8 +46,11 @@ directed tree edge, with tensor sizes determined by the live bond dimensions.
 For dense compact circuit targets, an unchanged canonical exterior component
 can instead be relabelled to its boundary identity without contracting the
 dangling branch; `environment_cache_info()["identity_shortcuts"]` reports
-these uses. Native Symmray and fermionic fits retain the graded message
-contraction.
+these uses. NumPy can prove this by exact array equality. Torch uses shared
+array identity and matching leg order, without a device equality test; distinct
+arrays, changed gauges, and tensors requiring gradients retain full overlap
+contractions. Identity tensors, when needed, keep the source dtype and device.
+Native Symmray and fermionic fits retain the graded message contraction.
 
 Standalone callers who directly edit `fit.p` tensor data must invalidate its
 canonical metadata and call `fit.clear_environment_cache()` before resuming.
@@ -293,7 +296,12 @@ local and cumulative retained-norm proxy, which is computed from
 canonical-centre norm ratios and stored in logarithmic form to avoid
 underflow. For lazy targets, pass the known exact `target_norm` (a norm or
 mantissa/exponent pair) to obtain this normalized ratio without additional
-target work. TreeOptimizer supplies the pre-update canonical norm when
+target work. A scalar backend mantissa is retained until the first sweep's
+norm readout, when both scalars are transferred together and the target norm
+is validated. TreeOptimizer reuses its pre-update device norm when available,
+avoiding a separate pre-fit synchronization. Convergence still reads one
+terminal-centre norm per iteration and preserves the same stopping rule.
+TreeOptimizer supplies the pre-update canonical norm when
 `track_norm=True`, the unitary-update contract. For non-unitary updates use
 `track_norm=False`; an unknown lazy target norm yields `local_fidelity=None`
 while the retained norm and convergence trace remain available.

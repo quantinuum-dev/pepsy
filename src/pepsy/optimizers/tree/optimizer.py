@@ -1122,6 +1122,7 @@ class TreeOptimizer:
         # large backend arrays. Entries retain the payload object so Python id
         # reuse cannot return a stale factorization.
         self._gate_factor_cache = {}
+        self._unitary_matrix_cache = {}
         self._gate_factor_cache_limit = 64
         # Gate supports recur frequently in circuit streams. Cache only the
         # immutable geometry path; centre-dependent source orientation is
@@ -1872,6 +1873,7 @@ class TreeOptimizer:
         # Gate factors include TreeMPOs mounted on the previous TreePlan.
         # Even a same-size replacement can change geometry or site order.
         self._gate_factor_cache.clear()
+        self._unitary_matrix_cache.clear()
         self.tn.validate()
         self.n = self.tn.nqubits
         self._logical_qubits = list(range(self.n))
@@ -2475,6 +2477,7 @@ class TreeOptimizer:
             self.plan = result["plan"]
             self._two_site_path_cache.clear()
             self._gate_factor_cache.clear()
+            self._unitary_matrix_cache.clear()
             self.tn = self._remount_product_state(self.tn)
             self.center = self.plan.root
             self.layout_finder = finder
@@ -3912,6 +3915,7 @@ class TreeOptimizer:
         if normalized is not None:
             self.G, self.where, self.event_types = normalized
             self._gate_factor_cache.clear()
+            self._unitary_matrix_cache.clear()
         self._warn_track_truncation_slow()
         # The complete stream was validated at installation. Replay therefore
         # uses the caller's payload objects without a second scan or cast.
@@ -4058,6 +4062,7 @@ class TreeOptimizer:
         self._validate_gate_stream_backend(normalized[0], normalized[2])
         self.G, self.where, self.event_types = normalized
         self._gate_factor_cache.clear()
+        self._unitary_matrix_cache.clear()
         return self
 
     def add_gates(self, gates):
@@ -4068,6 +4073,7 @@ class TreeOptimizer:
         self.where.extend(where_new)
         self.event_types.extend(event_types_new)
         self._gate_factor_cache.clear()
+        self._unitary_matrix_cache.clear()
         return self
 
     @staticmethod
@@ -5809,12 +5815,39 @@ class TreeOptimizer:
         # backend scalar. Both retain the full matrix on its device.
         return bool(to_float(ar.do("allclose", gram, identity, rtol=rtol, atol=atol), real=True))
 
+    def _cached_is_unitary_matrix(self, matrix, *, rtol=0., atol=1e-12):
+        """Reuse Torch certification only while its tracked storage is unchanged.
+
+        Views share their base tensor's mutation counter. NumPy, native arrays,
+        and inference tensors without version counters retain direct checking.
+        Hold the source strongly in this bounded cache to prevent id reuse.
+        """
+        if ar.infer_backend(matrix) != "torch":
+            return self._is_unitary_matrix(matrix, rtol=rtol, atol=atol)
+        source = matrix._base
+        if source is None:
+            source = matrix
+        try:
+            version = matrix._version
+        except (AttributeError, RuntimeError):
+            return self._is_unitary_matrix(matrix, rtol=rtol, atol=atol)
+        key = (id(source), matrix.data_ptr(), tuple(matrix.shape),
+               tuple(matrix.stride()), matrix.dtype, matrix.device, rtol, atol)
+        cached = self._unitary_matrix_cache.get(key)
+        if cached is not None and cached[0] is source and cached[1] == version:
+            return cached[2]
+        unitary = self._is_unitary_matrix(matrix, rtol=rtol, atol=atol)
+        if key not in self._unitary_matrix_cache and len(self._unitary_matrix_cache) >= 64:
+            self._unitary_matrix_cache.pop(next(iter(self._unitary_matrix_cache)))
+        self._unitary_matrix_cache[key] = (source, version, unitary)
+        return unitary
+
     def _apply_compact_one_site_unitary(self, operator, application, *, cutoff=None,
                                         max_bond=None, track_norm=True):
         """Absorb a certified local unitary without changing the state gauge.
 
-        Certification reads the current small physical matrix, so edits to a
-        supplied operator cannot leave a stale unitary flag. No state or
+        Certification is reused for version-tracked unchanged Torch matrices;
+        edits through Torch invalidate it. Other arrays are checked directly. No state or
         multi-site operator is densified. Native odd operators retain their
         general graded application path.
         """
@@ -5839,7 +5872,7 @@ class TreeOptimizer:
         # user's truncation cutoff (which can be arbitrarily loose).
         real_dtype = np.result_type(ar.get_dtype_name(ar.do("real", matrix)), np.float32)
         tolerance = 8 * np.finfo(real_dtype).eps
-        if not self._is_unitary_matrix(matrix, atol=tolerance):
+        if not self._cached_is_unitary_matrix(matrix, atol=tolerance):
             return False
         region = self.tn.canonical_region
         left_inds = self.tn.node_tensor(node).left_inds
@@ -5952,7 +5985,16 @@ class TreeOptimizer:
                 if track_norm and self._norm_tracking_enabled:
                     if self.center is None:
                         self._move_center(min(region))
-                    target_norm = TreeFIT._center_norm_stripped(self.tn)[:2]
+                    active = self._active_update
+                    exponent = float(getattr(self.tn, "exponent", 0.0))
+                    if exponent == 0.0 and active is not None and active.get("norm_before") is not None:
+                        target_norm = (active["norm_before"], 0.0)
+                    else:
+                        squared, exponent, _ = TreeFIT._center_norm_squared_backend(self.tn)
+                        target_norm = (
+                            ar.do("sqrt", ar.do("maximum", ar.do("real", squared), 0.0)),
+                            exponent,
+                        )
                 self._run_tree_fit(
                     target,
                     region,
@@ -7800,6 +7842,7 @@ class TreeOptimizer:
             self.top_arity = self.plan.top_arity if self.plan.top_arity >= 2 else None
             self._two_site_path_cache.clear()
             self._gate_factor_cache.clear()
+            self._unitary_matrix_cache.clear()
             self.n = self.tn.nqubits
             remaining = [label for label in self._logical_qubits if label != logical_q]
             if compact_labels:

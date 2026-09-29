@@ -62,6 +62,12 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Changed
 
+- Tree DMRG reuses unchanged non-differentiable Torch exterior branches as
+  identity environments and combines the target norm with its first required
+  convergence readout. Single-site Torch unitary checks use a bounded cache
+  guarded by storage/view and mutation versions, with direct-check fallbacks
+  for unversioned arrays. Sweep budgets, stopping rules, and cutoffs are unchanged.
+
 - Graph MPO runtime coefficient vectors retain the original graph-support
   contract, including interactions connected through intermediate sites.
   Graph active-block materialization preserves Torch storage metadata and

@@ -14,6 +14,10 @@ Read this reference before changing `pepsy.fitting.TreeFIT` or its
   Stop that path at the first active-block node. A center already inside the
   block proves its exterior is isometric; no interior QR is needed before
   replacing the block. Factorization sets the final requested center.
+- Dense exterior identity proofs may use NumPy equality or shared Torch array
+  identity plus matching leg order. Do not introduce Torch equality readouts;
+  distinct arrays, changed gauges, and differentiable arrays retain full
+  messages. Materialized identity messages must preserve dtype and device.
 - Target bonds are fixed private indices; fitted bonds must be resolved
   from the live state. Temporary messages need no tensor tags.
   Native fermionic effective tensors need parity flips on their dual open
@@ -98,6 +102,9 @@ Read this reference before changing `pepsy.fitting.TreeFIT` or its
 - Convergence reads only the terminal canonical-center norm. Patience counts
   stable same-phase comparisons and resets when the block size changes.
   Do not interpret norm stagnation as a global fidelity bound.
+  Reuse the pre-update device norm for a known unitary target and combine its
+  first host read with the first convergence sample. Preserve stripped
+  exponents, public norm traces, and per-iteration stopping behavior.
   Cache traversal orders only within each run's fixed region. Three-node
   factorization must also support an explicit endpoint center by peeling the
   newly exposed middle node and retaining the already factored child bond.

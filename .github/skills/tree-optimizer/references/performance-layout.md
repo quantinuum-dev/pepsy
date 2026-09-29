@@ -133,8 +133,9 @@ The native `TreeTensorNetwork` QR policy is centralized in
 - **Public performance defaults.** Ordinary ``mode="auto"`` gates use the
   TreeMPO active-subtree route and deterministic compression. The dedicated
   two-site kernel remains available through the lower-level explicit APIs.
-  ``threads=1`` and ``subtree_workers=1`` avoid oversubscription
-  on small tree tensors, ``profile=False`` avoids timing overhead, and
+  ``threads=None`` leaves ambient CPU libraries unchanged and
+  ``subtree_workers=1`` avoids worker oversubscription;
+  ``profile=False`` avoids timing overhead, and
   ``track_truncation=False`` avoids diagnostic spectrum probes. The low-level
   ``TreeTensorNetwork.compress_edge_`` API uses the same ``rsum2`` cutoff-mode
   default as ``TreeOptimizer``. Dense and native trees share these routing,
@@ -172,6 +173,12 @@ The native `TreeTensorNetwork` QR policy is centralized in
 - Reuse immutable FIT block traversal orders within a run. Preserve the order
   and scope the cache to its fixed region; geometry-based reordering changes
   the variational schedule and needs an explicit numerical comparison.
+- Reuse single-site Torch unitary certification only while its storage/view,
+  precision tolerance, and mutation version match. Bound retained sources,
+  clear certification when replacing the gate stream, and check unversioned
+  inference/NumPy/native arrays directly. Raw external writes must mark the
+  Torch version or reinstall the stream; ordinary in-place Torch edits do so
+  automatically. Never reuse a result solely by a recycled Python id.
 - Compression-hook signature capabilities are cached for the current hook
   function, with one entry per optimizer. Replacing a legacy/custom hook must
   trigger fresh inspection; never retain bound-method owners in a global cache.

@@ -348,6 +348,20 @@ def _scalar_value(value):
     return np.asarray(value).reshape(()).item()
 
 
+def _same_dense_data(target, fitted):
+    """Prove equal dense arrays without a device comparison or host read."""
+    backend = ar.infer_backend(target)
+    if backend != ar.infer_backend(fitted) or target.shape != fitted.shape:
+        return False
+    if backend == "torch":
+        # Copies of an untouched branch share the same array object. Do not
+        # replace a differentiable overlap by a constant identity.
+        return target is fitted and not target.requires_grad
+    if backend == "numpy":
+        return target is fitted or np.array_equal(target, fitted)
+    return False
+
+
 def _scale_stripped(mantissa, exponent):
     """Reconstruct a scalar from Quimb's mantissa/base-ten exponent pair."""
 
@@ -661,13 +675,7 @@ class TreeFIT:
         self.p = p if inplace else p.copy()
         self.finite_check = bool(finite_check)
         self._finite_check_warning_handled = False
-        if target_norm is not None:
-            target_norm = ((float(target_norm), 0.0) if np.isscalar(target_norm)
-                           else tuple(float(x) for x in target_norm))
-            if (len(target_norm) != 2 or target_norm[0] < 0
-                    or not all(np.isfinite(x) for x in target_norm)):
-                raise ValueError("target_norm must be a non-negative norm or (mantissa, exponent)")
-        self._known_target_norm = target_norm
+        self._set_known_target_norm(target_norm)
         self.tn = tn.copy() if copy_target else tn
         self.max_bond = max_bond
         self.cutoffs = cutoffs
@@ -999,6 +1007,34 @@ class TreeFIT:
         self._effective_cache.clear()
         return self
 
+    def _set_known_target_norm(self, value):
+        """Retain a device norm until the first required scalar readout."""
+        self._known_target_norm = None
+        self._pending_target_norm = None
+        if value is None:
+            return
+        if isinstance(value, (tuple, list)) or getattr(value, "ndim", 0) == 1:
+            if len(value) != 2:
+                raise ValueError("target_norm must be a norm or (mantissa, exponent)")
+            mantissa, exponent = value
+        else:
+            mantissa, exponent = value, 0.0
+        exponent = float(exponent)
+        if not np.isfinite(exponent):
+            raise ValueError("target_norm exponent must be finite")
+        if ar.infer_backend(mantissa) in {"torch", "jax", "cupy"}:
+            if ar.ndim(mantissa) != 0:
+                raise ValueError("target_norm mantissa must be a scalar")
+            self._pending_target_norm = (ar.do("stop_gradient", mantissa), exponent)
+        else:
+            self._store_target_norm(float(mantissa), exponent)
+
+    def _store_target_norm(self, mantissa, exponent):
+        if mantissa < 0 or not np.isfinite(mantissa):
+            raise ValueError("target_norm must be non-negative and finite")
+        self._known_target_norm = (mantissa, exponent)
+        self._pending_target_norm = None
+
     def _identity_environment(self, outside, inside):
         """Return an exact inactive-branch overlap proof when provable.
 
@@ -1046,17 +1082,15 @@ class TreeFIT:
         fitted_tensor = _tensor_of(self.p, outside)
         target_data = target_tensor.data
         fitted_data = fitted_tensor.data
-        if (
-            ar.infer_backend(target_data) != "numpy"
-            or ar.infer_backend(fitted_data) != "numpy"
-            or target_data.shape != fitted_data.shape
-            or not np.array_equal(target_data, fitted_data)
-        ):
+        if not _same_dense_data(target_data, fitted_data):
             # Reject the common non-identity case before walking the whole
             # component. Gauge-equivalent but differently based branches also
             # take the general contraction path.
             return None
-        dtype = np.result_type(target_data.dtype, fitted_data.dtype)
+        prototype = (
+            np.empty((), dtype=np.result_type(target_data.dtype, fitted_data.dtype))
+            if ar.infer_backend(target_data) == "numpy" else target_data
+        )
 
         component = _component_of(self.p, outside, inside)
         for node in component:
@@ -1069,12 +1103,7 @@ class TreeFIT:
             fitted_tensor = _tensor_of(self.p, node)
             target_data = target_tensor.data
             fitted_data = fitted_tensor.data
-            if node != outside and (
-                ar.infer_backend(target_data) != "numpy"
-                or ar.infer_backend(fitted_data) != "numpy"
-                or target_data.shape != fitted_data.shape
-                or not np.array_equal(target_data, fitted_data)
-            ):
+            if node != outside and not _same_dense_data(target_data, fitted_data):
                 # Keep backend/device data native and avoid treating a mere
                 # gauge-equivalent branch as an identity in mismatched bases.
                 return None
@@ -1098,7 +1127,7 @@ class TreeFIT:
                         return None
                 except ValueError:
                     return None
-        return target_bond, state_bond, target_dim, dtype
+        return target_bond, state_bond, target_dim, prototype
 
     @staticmethod
     def _normalize_traversal(value):
@@ -1161,9 +1190,9 @@ class TreeFIT:
                     self._identity_message_edges[edge] = identity
                     new_identity = True
             if identity is not None:
-                target_bond, state_bond, target_dim, dtype = identity
+                target_bond, state_bond, target_dim, prototype = identity
                 self._messages[edge] = qtn.Tensor(
-                    np.eye(target_dim, dtype=dtype),
+                    ar.do("eye", target_dim, like=prototype),
                     inds=(target_bond, state_bond),
                 )
                 if new_identity:
@@ -1492,8 +1521,8 @@ class TreeFIT:
         )
 
     @staticmethod
-    def _center_norm_stripped(network, center=None):
-        """Read one canonical centre norm as ``(mantissa, exponent)``.
+    def _center_norm_squared_backend(network, center=None):
+        """Contract the canonical centre without reading its device scalar.
 
         This is the tree equivalent of FIT's terminal MPS tensor readout.  A
         canonical exterior cancels, so only the centre tensor is contracted;
@@ -1520,14 +1549,20 @@ class TreeFIT:
         if bool(getattr(network, "fermionic", False)) and callable(
             fermionic_center_norm
         ):
-            squared = _scalar_value(fermionic_center_norm(center))
-            value = float(np.sqrt(max(0.0, float(np.real(squared)))))
+            squared = fermionic_center_norm(center)
         else:
             tensor = _tensor_of(network, center)
             squared = qtn.tensor_contract(tensor.H, tensor, output_inds=[])
-            squared = _scalar_value(squared)
-            value = float(np.sqrt(max(0.0, float(np.real(squared)))))
-        return value, _exponent_value(network), center
+        if isinstance(squared, qtn.Tensor):
+            squared = squared.data
+        return squared, _exponent_value(network), center
+
+    @staticmethod
+    def _center_norm_stripped(network, center=None):
+        """Read the canonical centre norm as (mantissa, exponent, centre)."""
+        squared, exponent, center = TreeFIT._center_norm_squared_backend(network, center)
+        value = float(np.sqrt(max(0.0, float(np.real(_scalar_value(squared))))))
+        return value, exponent, center
 
     @staticmethod
     def _log_norm_pair(norm_pair):
@@ -1560,6 +1595,9 @@ class TreeFIT:
 
         if self._target_norm_stripped is not None:
             return self._target_norm_stripped
+        if self._pending_target_norm is not None:
+            mantissa, exponent = self._pending_target_norm
+            self._store_target_norm(float(np.real(_scalar_value(mantissa))), exponent)
         if self._known_target_norm is not None:
             return self._known_target_norm
 
@@ -1679,9 +1717,26 @@ class TreeFIT:
     def _record_local_norm(self):
         """Record one terminal canonical-centre norm for the latest sweep."""
 
-        mantissa, exponent, center = self._center_norm_stripped(
-            self.p, self.final_center_site
-        )
+        if self._pending_target_norm is None:
+            mantissa, exponent, center = self._center_norm_stripped(
+                self.p, self.final_center_site
+            )
+        else:
+            squared, exponent, center = self._center_norm_squared_backend(
+                self.p, self.final_center_site
+            )
+            target, target_exponent = self._pending_target_norm
+            if ar.infer_backend(squared) == ar.infer_backend(target):
+                # One transfer supplies both the first convergence sample and
+                # the target norm. No separate pre-fit GPU synchronization.
+                pair = ar.do("stack", (ar.do("real", squared), ar.do("real", target)))
+                squared_host, target_host = ar.to_numpy(ar.do("stop_gradient", pair))
+                self._store_target_norm(float(target_host), target_exponent)
+                mantissa = float(np.sqrt(max(0.0, float(squared_host))))
+            else:
+                # Mixed-backend explicit inputs retain their readout boundary.
+                self._store_target_norm(float(np.real(_scalar_value(target))), target_exponent)
+                mantissa = float(np.sqrt(max(0.0, float(np.real(_scalar_value(squared))))))
         pair = (mantissa, exponent)
         represented = _scale_stripped(mantissa, exponent)
         self.final_center_site = center

@@ -247,6 +247,8 @@ projection is unsupported; use native `direct` or `zipup` for those states.
   or canonical precompression. Its intermediate cuts have noncanonical
   unvisited environments, so discarded weights are not global error bounds.
 - TreeFIT uses incremental neighboring messages and `inward-outward` passes.
+  Unchanged non-differentiable Torch exteriors can use shared-array identity
+  proofs; combine the device target norm with the first convergence read.
   TreeOptimizer's `fit_rtol="auto"` follows the state dtype; `None` disables
   tolerance stopping. Keep finite scans and exact overlap diagnostics opt-in.
   Read [`references/fit-environments.md`](references/fit-environments.md)
