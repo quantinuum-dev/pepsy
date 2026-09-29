@@ -642,6 +642,10 @@ class ActivePEPOBlocks:
             arrays.append(row)
         return qtn.PEPO(arrays, shape="urdlbk", cyclic=self.cyclic)
 
+    def to_dense(self):
+        """Explicitly materialize and contract the square PEPO as a matrix."""
+        return self.to_pepo().to_dense()
+
     materialize = to_pepo
 
 @dataclass

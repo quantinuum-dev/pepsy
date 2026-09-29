@@ -196,15 +196,17 @@ class PEPOClusterProductExpansion:
         self._trace_plans = {}
 
     @classmethod
-    def from_plan(cls, plan, factors, **kwargs):
-        """Compile located graph factors in algebraic order.
+    def from_plan(cls, plan, factors, *, layout="auto", **kwargs):
+        """Compile located factors in algebraic order on a shared plan.
 
-        Returns GraphPEPOClusterProductExpansion, using MPOClusterFactor's
-        term schema and graph tensor-network materialization.
+        ``layout="auto"`` selects square PEPO construction for a complete
+        square NN graph with fixed Pauli product terms, otherwise graph
+        construction. ``"square"`` requires compatibility; ``"graph"`` keeps
+        generic graph output. Both default to active blocks from ``exp``.
         """
-        from .graph_pepo_product import GraphPEPOClusterProductExpansion
+        from .square_pepo_product import from_interaction_plan
 
-        return GraphPEPOClusterProductExpansion.from_plan(plan, factors, **kwargs)
+        return from_interaction_plan(plan, factors, layout=layout, **kwargs)
 
     @staticmethod
     def _normalize_factor(factor):

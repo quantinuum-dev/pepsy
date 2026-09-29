@@ -131,21 +131,85 @@ combinatorial at large cutoff or graph width.
 | Entry point | Located input | Result of `exp(step)` |
 | --- | --- | --- |
 | `MPOClusterProductExpansion.from_plan` | `MPOClusterFactor`/term sequences | MPO operator wrapper |
-| `PEPOClusterProductExpansion.from_plan` | Same factors as MPO | Active graph PEPO blocks |
-| `PauliPEPOBasis.from_plan` | One sequence of located terms | Active graph PEPO blocks |
+| `PEPOClusterProductExpansion.from_plan` | Same factors as MPO | Active square or graph PEPO blocks |
+| `PauliPEPOBasis.from_plan` | One sequence of located terms | Active square or graph PEPO blocks |
 | `GraphClusterExpansionPlan.from_plan` | Uniform dense edge/onsite matrices | Active graph PEPO blocks |
 | Gaugy `PauliClusterBasis.from_plan` | One sequence of located Pauli terms | Pauli cluster operator |
 | Gaugy `PauliClusterProductExpansion.from_plan` | Algebraically ordered Pauli factors | Pauli cluster operator |
 
-Graph PEPO factories return `GraphPEPOClusterProductExpansion`. They support
-nonuniform couplings and higher-body terms using exact local products and
-spanning-tree residual factorizations. `materialize=True` produces a generic
-Quimb `TensorNetwork`, because Quimb's square `PEPO` container has fixed
-lattice legs. Graph PEPO materialization currently requires NumPy values;
-it rejects differentiable backend values instead of detaching them.
-`trace_exp` and `residuals` retain Torch/JAX gradients. `max_tree_rank` affects
-materialization, not scalar trace closure; factorization errors in a report
-are local diagnostics, not a global error certificate.
+`PEPOClusterProductExpansion.from_plan` and `PauliPEPOBasis.from_plan` accept
+`layout="auto"` (default), `"square"`, or `"graph"`. Automatic selection returns
+`SquarePEPOClusterProductExpansion` for a complete square nearest-neighbor
+graph with a two-dimensional shape and fixed one-/two-site Pauli product
+terms. Other supported plans retain `GraphPEPOClusterProductExpansion`.
+`layout="square"` validates those requirements and raises on incompatibility;
+`layout="graph"` explicitly preserves the previous generic representation.
+Direct `GraphPEPOClusterProductExpansion.from_plan` always selects the graph
+builder.
+
+The graph builder supports nonuniform couplings and higher-body terms using
+exact local products and spanning-tree residual factorizations.
+`materialize=True` produces a generic Quimb `TensorNetwork`. Graph PEPO
+materialization currently requires NumPy values; scalar `trace_exp` and
+`residuals` retain Torch/JAX gradients. `max_tree_rank` affects materialization,
+not scalar trace closure; factorization errors in a report are local
+diagnostics, not a global error certificate.
+
+## Shared square plans and 2D PEPO construction
+
+```python
+from pepsy.operators import ClusterPlan, MPOParameter, PauliPEPOBasis
+
+edges = [(0, 1), (0, 2), (1, 3), (2, 3)]
+terms = [((i,), "X", MPOParameter("h")) for i in range(4)]
+terms += [(edge, "ZZ", MPOParameter("J")) for edge in edges]
+plan = ClusterPlan.from_supports(
+    4, [term[0] for term in terms], shape=(2, 2), cluster_size=3,
+)
+builder = PauliPEPOBasis.from_plan(plan, terms)
+assert builder.cache_info["representation"] == "square-pepo"
+active = builder.exp(-0.05j, {"h": 0.3, "J": 0.7})
+pepo = active.to_pepo()  # Quimb PEPO with Lx=Ly=2 and square virtual legs.
+# Equivalent: builder.exp(..., materialize=True)
+```
+
+The square adapter retains one coefficient slot per input term and the
+original parameter references and factor scales. Repeated terms remain
+separate slots. Existing square local-target and lower-support symmetry reuse
+therefore recognizes shared bindings; runtime override vectors remain
+independent. Local cluster records use the supplied plan's cached inventory.
+The square tensor network can use the existing 2D PEPO contraction workflows.
+`ActivePEPOBlocks.to_dense()` explicitly materializes and contracts it.
+
+Provide rectangular coordinates in row-major order, or supply `shape=(Lx, Ly)`
+for row-major integer/arbitrary labels. A one-dimensional inferred shape
+keeps graph output unless you explicitly provide a two-dimensional shape.
+The plan must contain exactly the full nearest-neighbor graph for its shape
+and `cyclic` metadata. Missing bonds, extra diagonal/NNN edges, permuted
+coordinate labels, higher-body terms, and non-Pauli operator matrices retain
+the graph path. Square conversion accepts fixed NumPy I/X/Y/Z matrices;
+scalar amplitudes belong in term coefficients. It does not convert charge,
+fermion, or string metadata. The square backend's cutoff limit remains nine.
+
+OBC, cylinders and fully periodic squares are supported. Wraparound terms
+must still be supplied explicitly. For a length-two periodic axis, each
+supplied term is assigned one deterministic virtual route, even though two
+routes share its endpoints. Terms are never implicitly doubled or dropped.
+Long-range routing onto square virtual bonds is not implemented in this step.
+
+The default square result is `ActivePEPOBlocks`; `materialize=True` returns a
+Quimb `PEPO`. `compile_exp()` caches square structure. Square-specific options
+include `spatial_reuse` and `factorization`; `factorization="fixed"` supports
+Torch/JAX differentiable materialization without numerical rank selection
+and requires `max_tree_rank=None`. Its larger fixed channels are distinct
+from rank-capped numerical construction. `return_report=True` reports the
+layout, cutoff, cluster counts, factorization policy and rank cap. Scalar
+traces precede materialization. `residuals()` lazily uses the shared local
+MPO engine and keeps integer indices in plan order.
+
+Gaugy's shared-plan Pauli factories use the same layout selection;
+`bound.to_pepo()` returns a 2D PEPO for compatible square inputs. The
+connected-log and residual-partition scalar endpoints remain distinct.
 
 The uniform `GraphClusterExpansionPlan` applies one `twosite_op` to each
 unique oriented graph edge. It does not infer distinct couplings or multiply

@@ -363,12 +363,22 @@ class PauliPEPOBasis:
         spatial_reuse=True,
         spatial_symmetries=(),
         factorization="auto",
+        cluster_plan=None,
     ):
         self.lx = _validate_shape(lx, "lx")
         self.ly = _validate_shape(ly, "ly")
         self.cyclic = _validate_cyclic(cyclic, self.lx, self.ly)
         self.order = resolve_cluster_size(order, cluster_size, default=4)
         self.cluster_size = self.order
+        self.cluster_plan = cluster_plan
+        if cluster_plan is not None:
+            from .square_pepo_product import _square_plan_geometry
+
+            _square_plan_geometry(cluster_plan)
+            if (cluster_plan.shape != (self.lx, self.ly)
+                    or cluster_plan.cyclic != self.cyclic
+                    or cluster_plan.cluster_size != min(self.order, self.lx * self.ly)):
+                raise ValueError("shape, cyclic and cluster_size must match cluster_plan.")
         if self.order < 1 or self.order > 9:
             raise ValueError("PauliPEPOBasis currently supports orders 1 through 9.")
         if symmetry not in (None, "C4"):
@@ -567,16 +577,16 @@ class PauliPEPOBasis:
 
     @classmethod
     def from_plan(cls, plan, terms, **kwargs):
-        """Compile located graph terms, returning a graph-PEPO expansion.
+        """Compile located terms with automatic square/graph PEPO selection.
 
         Terms use MPO's ``(sites, paulis, coefficient)`` schema with integer
-        indices in ``plan.sites`` order, rather than square direction slots.
-        Graph materialization uses NumPy; trace/residuals preserve autodiff.
+        indices in ``plan.sites`` order. ``layout="auto"`` selects the square
+        builder when compatible; ``layout="graph"`` keeps generic output.
         """
-        from .graph_pepo_product import GraphPEPOClusterProductExpansion
+        from .pepo_product import PEPOClusterProductExpansion
         from .mpo_product import MPOClusterFactor
 
-        return GraphPEPOClusterProductExpansion.from_plan(plan, (MPOClusterFactor(terms),), **kwargs)
+        return PEPOClusterProductExpansion.from_plan(plan, (MPOClusterFactor(terms),), **kwargs)
 
     @classmethod
     def compile(cls, lx, ly, terms, **kwargs):
@@ -940,33 +950,38 @@ class PauliPEPOBasis:
         if self._localized_cluster_cache is not None:
             return self._localized_cluster_cache
 
-        adjacency = {index: set() for index in range(len(self._sites))}
-        for source, target, _direction in self._positive_edges:
-            source_index = self._site_indices[source]
-            target_index = self._site_indices[target]
-            adjacency[source_index].add(target_index)
-            adjacency[target_index].add(source_index)
+        if self.cluster_plan is not None:
+            levels = {}
+            for cluster in self.cluster_plan.index_clusters:
+                levels.setdefault(len(cluster), set()).add(frozenset(cluster))
+        else:
+            adjacency = {index: set() for index in range(len(self._sites))}
+            for source, target, _direction in self._positive_edges:
+                source_index = self._site_indices[source]
+                target_index = self._site_indices[target]
+                adjacency[source_index].add(target_index)
+                adjacency[target_index].add(source_index)
 
-        levels = {
-            1: {
-                frozenset((site_index,))
-                for site_index in range(len(self._sites))
-            }
-        }
-        for size in range(2, min(self.order, len(self._sites)) + 1):
-            candidates = set()
-            for selected in levels[size - 1]:
-                frontier = {
-                    neighbor
-                    for site_index in selected
-                    for neighbor in adjacency[site_index]
-                    if neighbor not in selected
+            levels = {
+                1: {
+                    frozenset((site_index,))
+                    for site_index in range(len(self._sites))
                 }
-                candidates.update(
-                    selected | frozenset((neighbor,))
-                    for neighbor in frontier
-                )
-            levels[size] = candidates
+            }
+            for size in range(2, min(self.order, len(self._sites)) + 1):
+                candidates = set()
+                for selected in levels[size - 1]:
+                    frontier = {
+                        neighbor
+                        for site_index in selected
+                        for neighbor in adjacency[site_index]
+                        if neighbor not in selected
+                    }
+                    candidates.update(
+                        selected | frozenset((neighbor,))
+                        for neighbor in frontier
+                    )
+                levels[size] = candidates
 
         records = {}
         for size, selected_sets in levels.items():

@@ -14,6 +14,13 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Shared PEPO `from_plan` factories now select the existing square 2D builder
+  for compatible nearest-neighbor Pauli plans, with explicit `layout="square"`
+  and `"graph"` controls. The square adapter preserves term slots, ordered
+  factors, parameter identities, OBC/PBC metadata and repeated periodic terms,
+  reuses the shared inventory, and supports fixed-channel Torch/JAX
+  materialization. Active square blocks expose explicit `to_dense()`.
+
 - TreeOptimizer adds opt-in `stabilize_unitary` at construction and replay,
   restoring incoming unitary norms while retaining compression loss and
   preserving explicitly non-unitary scale changes. TreeOptimizer and

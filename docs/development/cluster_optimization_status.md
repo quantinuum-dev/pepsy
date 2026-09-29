@@ -6,6 +6,17 @@ the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
 
+## Shared square-plan PEPO integration, 2026-09-29
+
+Shared-plan PEPO factories now select the existing 2D square builder for
+complete NN square graphs with fixed Pauli product terms. Selection is
+explicitly controllable through `layout`; other supported graphs retain the
+generic builder. Parameter identities, factor order, periodic multiplicities
+and the shared cluster inventory are preserved. Gaugy's matching conversion
+uses the same selection. Diagonal/NNN routing remains a separate next step.
+See the [API](../api/operators/interaction_clusters.md#shared-square-plans-and-2d-pepo-construction)
+and [validation/publication record](../../history/2026-09-29-square-cluster-plan.md).
+
 ## Shared interaction-graph planner, 2026-09-29
 
 The publication after `a233a40` includes lazy `pepsy.operators.ClusterPlan`, exact

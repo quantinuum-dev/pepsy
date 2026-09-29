@@ -14,6 +14,10 @@ conflicting values are rejected. Both reusable dense plans and the Pauli
 basis expose `.cluster_size`. Defaults remain three for dense plans and four
 for the Pauli basis. Ordered products inherit the cutoff of their bases.
 See the [shared call table](exponentials.md#shared-connected-cluster-calls).
+Shared-plan factories now select the square 2D builder automatically for
+compatible nearest-neighbor Pauli plans. Use `layout="graph"` for generic
+graph output, or `layout="square"` to require a square layout. See
+[selection, boundaries and limits](interaction_clusters.md#shared-square-plans-and-2d-pepo-construction).
 For the dense square dataclass, retain `order` when copying configuration with
 `dataclasses.replace(plan, order=p)`; `cluster_size` aliases this field rather
 than storing a second cutoff.
