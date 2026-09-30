@@ -434,6 +434,17 @@ class TreeSampler:
         out = np.asarray(_backend_array_to_numpy(array))
         return out.astype(dtype, copy=False) if dtype is not None else out
 
+    def _array_device_context(self):
+        """Keep CuPy allocations on the captured tree device."""
+        if self.resolved_backend == "cupy":
+            return self._arrays[self._root].device
+        if (
+            self.resolved_backend == "symmray"
+            and self._symmray_state["array_backend"] == "cupy"
+        ):
+            return self._symmray_state["template"].device
+        return contextlib.nullcontext()
+
     def _zeros(self, shape, *, dtype):
         if self.resolved_backend == "torch":
             import torch
@@ -1294,7 +1305,12 @@ class TreeSampler:
             return K.reshape(B, par)
 
         rho_root = self._ones((B, 1, 1), dtype=arrays[self._root].dtype)
-        visit(self._root, rho_root)
+        try:
+            visit(self._root, rho_root)
+        finally:
+            # Break the recursive closure's self-reference so completed chunk
+            # buffers are released without waiting for cyclic GC.
+            visit = None
         return configs, prob
 
     def sample_arrays(self, n_samples: int = 1, seed=None, *, to_numpy=False):
@@ -1311,7 +1327,7 @@ class TreeSampler:
         if int(n_samples) < 1:
             raise ValueError("n_samples must be a positive integer.")
         rng = self._rng if seed is None else np.random.default_rng(seed)
-        with self._thread_ctx():
+        with self._thread_ctx(), self._array_device_context():
             if self.resolved_backend == "symmray":
                 configs, probs = self._symmray_sample_arrays(int(n_samples), rng)
                 if not to_numpy:
@@ -1336,19 +1352,24 @@ class TreeSampler:
                             probs,
                             dtype=self._symmray_state["template"].real.dtype,
                         )
-            elif self.chunk_size is not None:
-                # Keep RNG order independent of chunk boundaries. The only
-                # full-shot device arrays are small uniforms and final results.
-                draws = self._as_backend(rng.random((len(self._qubit_of_node), int(n_samples))))
-                chunks = [
-                    self._sample_arrays(
-                        min(self.chunk_size, int(n_samples) - start), rng,
-                        physical_draws=draws[:, start:start + self.chunk_size],
+            elif self.chunk_size is not None and self.chunk_size < int(n_samples):
+                # Preserve RNG ordering, but retain only the final outputs and
+                # one chunk instead of collecting and concatenating all chunks.
+                count = int(n_samples)
+                draws = self._as_backend(rng.random((len(self._qubit_of_node), count)))
+                for start in range(0, count, self.chunk_size):
+                    stop = min(start + self.chunk_size, count)
+                    chunk_configs, chunk_probs = self._sample_arrays(
+                        stop - start, rng, physical_draws=draws[:, start:stop],
                     )
-                    for start in range(0, int(n_samples), self.chunk_size)
-                ]
-                configs = ar.do("concatenate", [chunk[0] for chunk in chunks], axis=0)
-                probs = ar.do("concatenate", [chunk[1] for chunk in chunks], axis=0)
+                    if start == 0:
+                        configs = self._zeros(
+                            (count, self._nqubits), dtype=chunk_configs.dtype,
+                        )
+                        probs = self._zeros((count,), dtype=chunk_probs.dtype)
+                    configs[start:stop] = chunk_configs
+                    probs[start:stop] = chunk_probs
+                    del chunk_configs, chunk_probs
             else:
                 configs, probs = self._sample_arrays(int(n_samples), rng)
         if to_numpy:
@@ -1465,8 +1486,8 @@ class TreeSampler:
         returned amplitude may differ from the graded amplitude ordering by a
         per-configuration sign; the derived :meth:`probabilities` are exact.
         """
-        configs = self._check_configs(configs)
-        with self._thread_ctx():
+        with self._thread_ctx(), self._array_device_context():
+            configs = self._check_configs(configs)
             out = (
                 self._symmray_amplitudes(configs)
                 if self.resolved_backend == "symmray"
@@ -1480,8 +1501,8 @@ class TreeSampler:
         For the normalized state captured by the sampler this is the exact
         probability of each supplied configuration.
         """
-        configs = self._check_configs(configs)
-        with self._thread_ctx():
+        with self._thread_ctx(), self._array_device_context():
+            configs = self._check_configs(configs)
             if self.resolved_backend == "symmray":
                 out = self._symmray_probabilities(configs)
             else:

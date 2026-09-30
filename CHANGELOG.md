@@ -17,7 +17,10 @@ releases remain backwards-compatible. From 1.0 onward:
 - Optional `TreeSampler(chunk_size=...)` bounds dense shot batches and tiles
   first-child density environments to avoid quartic bond allocations.
   The default remains unchunked, with native outputs and seeded draw ordering
-  preserved. Total requested sample counts are unchanged.
+  preserved. Total requested sample counts are unchanged. Chunk collection
+  fills one native output allocation and promptly releases completed chunk
+  buffers; single-chunk requests reuse their outputs. CuPy sampling and scoring
+  honor the captured tree device independently of the current CUDA device.
 
 - `PepsSampler(amplitude_mode="boundary", amplitude_chi=...)` evaluates
   projected amplitudes with a capped boundary-MPS sweep, preserving scaled
