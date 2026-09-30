@@ -59,12 +59,13 @@ Construct a new TreeFIT when changing target geometry or connectivity.
 
 `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
 engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names.
-`TreeOptimizer(mode="dmrg")` defaults to `fit_block_size=1`: one-node refinement
+`TreeOptimizer(mode="dmrg")` requires `fit_block_size=1`: one-node refinement
 from the initialized guess, with no two-/three-node FIT warm-up. The `fit`
-alias follows this default. Guess construction can still split tensors and
-open bond support; one-node refinement retains that support. Explicit
-`fit_block_size=2` or `3` opts into an adaptive block schedule. The separate
-`TreePepsOptimizer` retains its own block-size default of two.
+and deprecated `dmrg1` aliases enforce the same restriction, including when
+switching modes with `run()`. Larger explicit block sizes raise `ValueError`;
+use `dmrg2` or `dmrg3` for block updates. Guess construction can still split
+tensors and open bond support; one-node refinement retains that support.
+The separate `TreePepsOptimizer` retains its own block-size default of two.
 Selecting `TreeOptimizer`'s legacy `dmrg1` in the constructor or explicitly
 in `run(mode=...)` emits a visible `FutureWarning` recommending `dmrg` for
 one-site refinement. It now uses exactly the same FIT settings and schedule

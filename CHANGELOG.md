@@ -22,6 +22,10 @@ releases remain backwards-compatible. From 1.0 onward:
   `amplitude_mode="none"` skips amplitude contractions, returns `ps=None`, and
   uses equal weights for ordinary proposal averages with explicit diagnostics.
 
+- TreeOptimizer's `dmrg`, `fit`, and deprecated `dmrg1` now require
+  `fit_block_size=1`, matching MPS one-site DMRG. Larger blocks are rejected
+  at construction and replay; use `dmrg2` or `dmrg3` for block updates.
+
 - TreeOptimizer's `dmrg1` is now a deprecated alias of `dmrg`: both default
   to one-site refinement from the initialized guess, without a two-node
   warm-up. Explicit FIT settings are honored identically. Selecting `dmrg1`

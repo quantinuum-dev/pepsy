@@ -346,15 +346,15 @@ def test_tree_dmrg_default_preserves_native_guess(symmetry, dtype):
     )
 
 
-def test_tree_optimizer_explicit_dmrg_warmup_then_refinement():
-    """An explicit larger Tree DMRG block retains its adaptive handoff."""
+def test_tree_optimizer_dmrg2_warmup_then_refinement():
+    """The named two-node mode retains its warm-up and one-node handoff."""
 
     plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
     optimizer = TreeOptimizer(
         None,
         n=5,
         tree=plan,
-        mode="dmrg",
+        mode="dmrg2",
         chi=2,
         cutoff=0.0,
         fit_n_iter=4,

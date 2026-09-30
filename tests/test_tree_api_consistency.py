@@ -51,9 +51,8 @@ def test_dmrg1_warns_to_use_dmrg_and_refines_one_site(entry):
 
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
 @pytest.mark.parametrize("iterations", [1, 4])
-@pytest.mark.parametrize("block_size", [1, 2])
 @pytest.mark.parametrize("entry", ["constructor", "run", "copy"])
-def test_dmrg1_is_numerically_identical_to_dmrg(backend, iterations, block_size, entry):
+def test_dmrg1_is_numerically_identical_to_dmrg(backend, iterations, entry):
     from pepsy.optimizers.tree import TreeTensorNetwork
 
     plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
@@ -64,7 +63,7 @@ def test_dmrg1_is_numerically_identical_to_dmrg(backend, iterations, block_size,
         state.apply_to_arrays(lambda data: torch.as_tensor(data.copy()))
         gates = [(torch.as_tensor(gate.copy()), where) for gate, where in gates]
     options = dict(state=state, tree=plan, chi=2, cutoff=0., fit_rtol=None,
-                   fit_n_iter=iterations, fit_block_size=block_size,
+                   fit_n_iter=iterations, fit_block_size=1,
                    fit_adaptive_sweeps=3, fit_init_seed=17, run=False)
     reference = TreeOptimizer(gates, mode="dmrg", **options)
     reference.run()
@@ -81,10 +80,34 @@ def test_dmrg1_is_numerically_identical_to_dmrg(backend, iterations, block_size,
     assert actual["block_size_trace"] == expected["block_size_trace"]
     assert actual["iterations"] == expected["iterations"]
     assert actual["convergence_reason"] == expected["convergence_reason"]
-    if block_size == 1:
-        assert actual["block_size_trace"] == (1,) * iterations
+    assert actual["block_size_trace"] == (1,) * iterations
     assert alias.center == reference.center
     assert alias.tn.validate(check_canonical=True) is alias.tn
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "fit", "dmrg1"])
+@pytest.mark.parametrize("block_size", [2, 3])
+@pytest.mark.parametrize("entry", ["constructor", "two_site_mode", "run", "shots"])
+def test_one_site_dmrg_rejects_larger_blocks_before_replay(mode, block_size, entry):
+    stream = [(_gate(), (0, 3))]
+    options = dict(n=4, fit_block_size=block_size, run=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        if entry in {"constructor", "two_site_mode"}:
+            selector = "mode" if entry == "constructor" else "two_site_mode"
+            with pytest.raises(ValueError, match="fixes fit_block_size=1.*dmrg2.*dmrg3"):
+                TreeOptimizer(stream, **{selector: mode}, **options)
+        else:
+            opt = TreeOptimizer(stream, mode="dmrg2", **options)
+            before = opt.to_dense().copy()
+            configuration = _configuration(opt)
+            queue = (tuple(opt.G), tuple(opt.where), tuple(opt.event_types))
+            with pytest.raises(ValueError, match="fixes fit_block_size=1.*dmrg2.*dmrg3"):
+                opt.run([], mode=mode, **({"shots": 2} if entry == "shots" else {}))
+            assert _configuration(opt) == configuration
+            assert (tuple(opt.G), tuple(opt.where), tuple(opt.event_types)) == queue
+            np.testing.assert_array_equal(opt.to_dense(), before)
 
 
 @pytest.mark.parametrize("mode", ("dmrg", "fit", "dmrg2", "dmrg3"))
