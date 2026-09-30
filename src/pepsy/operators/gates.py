@@ -16,6 +16,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from .._internal.cutoff import dtype_auto_cutoff
 from .._internal.quimb import (
     quimb_mpo_auto_swap_function,
     require_quimb_gate_option,
@@ -1728,6 +1729,26 @@ def _normalize_gate_entries(
     )
 
 
+def _resolve_gate_cutoff(tn, cutoff):
+    """Resolve policy at the public boundary without converting tensor data."""
+    if isinstance(cutoff, str) and cutoff.strip().lower() == "auto":
+        sample = resolve_backend_sample_data_from_tn(tn)
+        return dtype_auto_cutoff(getattr(sample, "dtype", "complex128"))
+    try:
+        cutoff = float(cutoff)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cutoff must be 'auto' or a non-negative number.") from exc
+    if not np.isfinite(cutoff) or cutoff < 0:
+        raise ValueError("cutoff must be 'auto' or a non-negative number.")
+    return cutoff
+
+
+def _resolve_gate_cutoff_mode(mode):
+    if mode is None or (isinstance(mode, str) and mode.strip().lower() == "auto"):
+        return "rsum2"
+    return mode
+
+
 def gate(tn, gates, where=None, which=None, dagger=False, transpose=False, **kwargs):
     """Apply one or many gates with automatic 1D/2D/3D dispatch.
 
@@ -1759,6 +1780,12 @@ def gate(tn, gates, where=None, which=None, dagger=False, transpose=False, **kwa
         route-local controls ``path_canonize`` / ``path_compress``. Use
         ``max_bond`` for the per-SWAP/per-gate local split truncation;
         ``chi`` is a final whole-network compression pass after the stream.
+        ``cutoff="auto"`` (default) uses the input network dtype: 1e-12 for
+        float64/complex128, 1e-6 for float32/complex64, and 1e-3 for 16-bit
+        data. ``cutoff_mode="auto"`` (default) resolves to ``"rsum2"``.
+        Explicit numeric cutoffs override the dtype policy. ``chi_cutoff``
+        also defaults to ``"auto"``; ``path_compress_cutoff=None`` inherits
+        the resolved gate cutoff, while ``"auto"`` uses the dtype policy.
 
     Returns
     -------
@@ -1811,10 +1838,13 @@ def gate(tn, gates, where=None, which=None, dagger=False, transpose=False, **kwa
         opts["dagger"] = True
     if transpose:
         opts["transpose"] = True
-    opts.setdefault("cutoff_mode", "rsum2")
+    opts["cutoff"] = _resolve_gate_cutoff(tn, opts.get("cutoff", "auto"))
+    opts["cutoff_mode"] = _resolve_gate_cutoff_mode(opts.get("cutoff_mode", "auto"))
+    if opts.get("path_compress_cutoff") is not None:
+        opts["path_compress_cutoff"] = _resolve_gate_cutoff(tn, opts["path_compress_cutoff"])
     inplace = opts.pop("inplace", True)
     chi = opts.pop("chi", None)
-    chi_cutoff = float(opts.pop("chi_cutoff", 1.0e-12))
+    chi_cutoff = _resolve_gate_cutoff(tn, opts.pop("chi_cutoff", "auto"))
     which_default = _normalize_gate_which(which)
     if "gauges" in opts or "renorm" in opts or "smudge" in opts:
         raise TypeError(
@@ -1938,10 +1968,11 @@ def gate_simple(
     which=None,
     ind_id=None,
     renorm=True,
+    strip_exponent=False,
     smudge=1e-12,
     max_bond=None,
-    cutoff=1e-12,
-    cutoff_mode="rsum2",
+    cutoff="auto",
+    cutoff_mode="auto",
     strict_max_bond: bool = False,
     dagger=False,
     transpose=False,
@@ -1974,6 +2005,7 @@ def gate_simple(
     * Dimension-aware, backend-aligned internal SWAP tensors for long-range
       routing through mixed physical dimensions.
     * Optional out-of-place semantics via ``inplace=False``.
+    * Scale-preserving gauge normalization with ``strip_exponent=True``.
 
     The ``gauges`` dictionary is mutated in place by ``gate_simple_`` and is
     the single source of truth for the simple-update bond environment.
@@ -2002,16 +2034,26 @@ def gate_simple(
     renorm : bool, optional
         Whether to renormalize the singular values after the gate. Default True.
         Ignored for one-site gates.
+    strip_exponent : bool, optional
+        Normalize bond gauges to unit RMS while accumulating the removed
+        scale in ``tn.exponent`` (base 10). Requires ``renorm=False`` so no
+        physical scale is discarded. Applies after every two-site update,
+        including routed SWAPs. Existing internal gauges are scaled before
+        the stream. Defaults to False. Nonzero cutoffs must be relative
+        (``rel``, ``rsum1``, or ``rsum2``), since scalar gauge changes alter
+        absolute singular-value thresholds.
     smudge : float, optional
         Small numerical-safety value. Default 1e-12.
     max_bond : int or None, optional
         Maximum bond dimension for each local SWAP/gate simple-update split.
         Default None.
-    cutoff : float, optional
-        Truncation cutoff. Default 1e-12.
-    cutoff_mode : str, optional
+    cutoff : float or {"auto"}, optional
+        Truncation cutoff. Default ``"auto"`` follows the input network dtype:
+        1e-12 for float64/complex128, 1e-6 for float32/complex64, and 1e-3
+        for 16-bit data. Explicit nonnegative numbers override this policy.
+    cutoff_mode : str or {"auto"}, optional
         Cutoff mode passed to ``gate_simple_`` (e.g. ``'rsum2'``, ``'rel'``).
-        Default ``'rsum2'``.
+        Default ``"auto"`` resolves to ``"rsum2"``.
     strict_max_bond : bool, optional
         Enforce ``max_bond`` as a hard *total* block-sparse bond limit even
         when a nonzero cutoff has degenerate singular values at its boundary.
@@ -2048,6 +2090,17 @@ def gate_simple(
         where = None
     if gauges is None:
         raise TypeError("gate_simple() requires a gauges dictionary.")
+    cutoff = _resolve_gate_cutoff(tn, cutoff)
+    cutoff_mode = _resolve_gate_cutoff_mode(cutoff_mode)
+    if path_compress_cutoff is not None:
+        path_compress_cutoff = _resolve_gate_cutoff(tn, path_compress_cutoff)
+    if strip_exponent:
+        if renorm:
+            raise ValueError("strip_exponent=True requires renorm=False to preserve physical scale")
+        if not hasattr(tn, "exponent"):
+            raise TypeError("strip_exponent=True requires tensor-network exponent support")
+        if cutoff and cutoff_mode not in ("rel", "rsum1", "rsum2", 2, 4, 6):
+            raise ValueError("strip_exponent=True requires a relative cutoff or cutoff=0")
     if dagger:
         require_quimb_gate_option("dagger", simple=True)
     if transpose:
@@ -2057,6 +2110,10 @@ def gate_simple(
     entries = _normalize_gate_entries(
         G, where=where, allow_empty=True, allow_which=True
     )
+    if strip_exponent and entries:
+        for index in tuple(gauges):
+            if len(tn_work.ind_map.get(index, ())) == 2:
+                _renorm_gauge_index(tn_work, gauges, index, smudge=0.0)
     which_default = _normalize_gate_which(which)
 
     gate_opts_base = {
@@ -2142,6 +2199,7 @@ def gate_simple(
                     where_norm,
                     gauges,
                     renorm=renorm,
+                    strip_exponent=strip_exponent,
                     smudge=smudge,
                     gate_opts=gate_opts,
                     ind_id=ind_id_one,
@@ -2418,6 +2476,7 @@ def _gate_simple_one(
     gauges,
     *,
     renorm,
+    strip_exponent,
     smudge,
     gate_opts,
     ind_id=None,
@@ -2463,6 +2522,7 @@ def _gate_simple_one(
             where,
             gauges,
             renorm=renorm,
+            strip_exponent=strip_exponent,
             smudge=smudge,
             gate_opts=gate_opts,
             sequence=sequence,
@@ -2489,6 +2549,7 @@ def _gate_simple_one_with_current_site_ind_id(
     gauges,
     *,
     renorm,
+    strip_exponent,
     smudge,
     gate_opts,
     sequence=None,
@@ -2557,6 +2618,8 @@ def _gate_simple_one_with_current_site_ind_id(
             **transform_opts,
             **gate_opts,
         )
+        if strip_exponent:
+            renorm_gauge(tn_work, gauges, where, smudge=0.0)
         _maybe_compress_path(
             tn_work,
             path_pairs,
@@ -2635,6 +2698,8 @@ def _gate_simple_one_with_current_site_ind_id(
             renorm=renorm, smudge=smudge, inplace=True,
             **gate_opts,
         )
+        if strip_exponent:
+            renorm_gauge(tn_work, gauges, pair, smudge=0.0)
 
     # Apply the actual gate on the final (now adjacent) pair.
     tn_work.gate_simple_(
@@ -2643,6 +2708,8 @@ def _gate_simple_one_with_current_site_ind_id(
         **transform_opts,
         **gate_opts,
     )
+    if strip_exponent:
+        renorm_gauge(tn_work, gauges, final, smudge=0.0)
 
     # Reverse SWAPs.
     for pair in reversed(swaps):
@@ -2659,6 +2726,8 @@ def _gate_simple_one_with_current_site_ind_id(
             renorm=renorm, smudge=smudge, inplace=True,
             **gate_opts,
         )
+        if strip_exponent:
+            renorm_gauge(tn_work, gauges, pair, smudge=0.0)
 
     _maybe_compress_path(
         tn_work,
@@ -2710,6 +2779,11 @@ def renorm_gauge(tn, gauges, where, smudge=1e-12):
             "(no shared bond)."
         )
     ix = next(iter(bond_ix_set))
+    _renorm_gauge_index(tn, gauges, ix, smudge)
+
+
+def _renorm_gauge_index(tn, gauges, ix, smudge):
+    """Extract one gauge's scalar without densifying blocks or detaching data."""
     s = gauges[ix]
     # SU singular values can be Symmray BlockVectors. Reduce their backend
     # blocks directly: Symmray has no mean, and detaching its wrapper does not

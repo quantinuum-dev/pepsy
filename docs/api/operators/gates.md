@@ -24,11 +24,75 @@ whether the target network is mutated.
 
 ## Truncation policy
 
+`gate` and `gate_simple` default to `cutoff="auto"` and
+`cutoff_mode="auto"`. Pepsy resolves these before dispatching to Quimb, using
+the input tensor network's dtype and the same policy as `MpsOptimizer`:
+
+| Network dtype | Automatic cutoff |
+| --- | --- |
+| `float64` / `complex128` | `1e-12` |
+| `float32` / `complex64` | `1e-6` |
+| 16-bit floating point | `1e-3` |
+
+Automatic cutoff mode is `rsum2` (relative discarded squared singular-value
+weight). Explicit nonnegative numeric cutoffs, including zero to disable
+cutoff truncation, and explicit cutoff modes override the defaults.
+Resolution reads dtype metadata without moving arrays or densifying native
+Symmray tensors. It occurs once per public call, before any gate mutation;
+subsequent internal SWAPs use the resolved policy. Supply compatible network
+and gate backends explicitly; this does not convert user gates.
+
+For `gate`, the optional final compression `chi_cutoff` also accepts and
+defaults to `auto`. Both APIs accept `path_compress_cutoff="auto"`;
+the existing `None` default inherits the resolved local gate cutoff.
+
 `build_pepo_from_gates(..., cutoff_mode="rsum2")` applies the requested
 truncation policy to both gate splits and fallback compression. The fallback
 also uses the supplied `cutoff`, rather than a separate hard-coded threshold.
 
 ## Gauge scale extraction
+
+For scale-preserving simple update, use:
+
+```python
+from pepsy.operators import gate_simple
+
+gate_simple(psi, gates, gauges=gauges, max_bond=D, cutoff="auto",
+            cutoff_mode="auto", renorm=False, strip_exponent=True)
+```
+
+`strip_exponent=True` normalizes each updated bond gauge to unit RMS and
+stores its removed positive scale in `psi.exponent`, including every routed
+SWAP. It also normalizes existing internal gauges before the gate stream.
+This is scalar bookkeeping, with no additional SVD or BP solve. The physical
+state includes `10**psi.exponent`; the gauges and core tensors alone are its
+mantissa. Keep this metadata when copying or saving the state.
+
+This option defaults to `False` for compatibility and requires `renorm=False`.
+`renorm=True` intentionally discards the gate's singular-value scale and
+cannot be combined with scale-preserving exponent tracking. Nonzero cutoffs
+must be relative (`rel`, `rsum1`, `rsum2`); absolute cutoffs depend on the
+representation's scalar gauge and are rejected. `cutoff=0` is also supported.
+The existing `inplace=False` contract remains: the tensor network is copied,
+but the supplied gauge dictionary is updated, so copy that dictionary too if
+you need to retain the original core-plus-gauge state.
+
+To measure the actual squared norm, absorb gauges once into a copy:
+
+```python
+physical = psi.copy()
+physical.gauge_simple_insert(gauges)
+norm2 = physical.make_norm().contract(all, optimize="auto-hq")
+# Avoid materializing very large/small values:
+mantissa, exponent = physical.make_norm().contract(
+    all, optimize="auto-hq", strip_exponent=True
+)
+```
+
+Pepsy D2BP/loop-cluster contractions likewise include the network exponent;
+use their `strip_exponent=True` option for a mantissa/exponent result. The
+norm-network exponent is twice the ket's exponent. This scale handling does
+not make finite-cluster BP exact or remove SU truncation error.
 
 `renorm_gauge(network, gauges, where, smudge=1e-12)` divides a bond's weights
 by a detached positive scale and adds the logarithm of **that same scale**

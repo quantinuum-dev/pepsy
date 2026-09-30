@@ -21,12 +21,12 @@ have sampler-specific meanings; use the contract for the selected engine.
 ## Direct PEPS sampler
 
 `PepsSampler` has an exact reference mode and a compressed boundary-MPS mode.
-The exact mode is:
+The explicit exact reference mode is:
 
 ```python
 from pepsy.sampling import PepsSampler
 
-sampler = PepsSampler(peps)
+sampler = PepsSampler(peps, boundary_engine="exact", amplitude_mode="exact")
 result = sampler.sample(samples=16, seed=0)
 ```
 
@@ -42,6 +42,7 @@ sampler = PepsSampler(
     ket_compression="quimb",    # or "fit", or None
     cutoff="auto",              # Resolve from the working tensor dtype
     cutoff_mode="auto",         # Relative discarded squared weight (rsum2)
+    amplitude_mode="boundary",  # Default: boundary-MPS amplitude correction
 )
 ```
 
@@ -125,7 +126,8 @@ row-environment caching:
 4. After the whole row is fixed, absorb its **single ket layer** into the
    conditioned boundary and compress with `chi_prime` (**χ′**).
 5. Continue to the next row. Accumulate the conditional log probabilities and
-   contract the original private ket for the final sampled amplitude.
+   optionally contract the original private ket for the final sampled amplitude
+   with the selected amplitude method (boundary MPS by default).
 
 | Quantity | Dimension / role |
 | --- | --- |
@@ -406,7 +408,66 @@ planner memory, all simultaneous inputs, or wall time. Better paths or exact
 slicing can reduce intermediates; prefix chunking alone cannot. A rejected
 public batch raises rather than returning partial samples.
 
-### Bounded batches, exact amplitudes, and weight diagnostics
+### Bounded batches, amplitude evaluation, and weight diagnostics
+
+The proposal probability is the product of the sampled conditional
+probabilities: `q(s) = exp(sum(log(p_site)))`. This is sufficient to draw
+configurations and compute ordinary proposal averages. It does not in general
+equal the normalized Born probability of the original PEPS when the boundary
+environments are truncated, and it contains no complex amplitude phase.
+
+Amplitude evaluation is a separate choice for importance correction:
+
+```python
+sampler = PepsSampler(
+    peps, chi=64, chi_prime=32,
+    amplitude_mode="boundary",  # default; full exact amplitudes are opt-in
+    amplitude_chi=32,           # defaults to chi_prime
+)
+```
+
+`amplitude_mode="boundary"` projects the original private ket onto each
+configuration, contracts its rows through a boundary MPS with this cap and
+the sampler's cutoff, and contracts the remaining one-dimensional boundary.
+It rescales and caches physical slices before boundary contraction, preserving
+phase and physical scale, including large PEPS exponents, without overflowing
+intermediate input products. The cutoff acts on these internally rescaled
+boundary tensors; relative cutoff modes are the scale-independent choice. It never
+builds a full-network exact amplitude plan. Only open PEPS are supported.
+Weights are then `abs(Psi_estimate)**2 / q`, so the correction itself is
+approximate. `PEPSSampleResult.amplitude_mode` and
+`weight_diagnostics["weights_are_approximate"]` make that explicit.
+`amplitude_max_cost` and `amplitude_max_intermediate_bytes` apply only to exact
+amplitude mode. Neither cap controls total memory.
+
+To skip amplitude evaluation entirely and average the proposal draws directly:
+
+```python
+sampler = PepsSampler(peps, chi=64, chi_prime=32, amplitude_mode="none")
+batch = sampler.sample_batch(4096, seed=17, chunk_size=32)
+q_logs = batch.log_probabilities  # sum of the selected site log conditionals
+assert batch.ps is None
+weights = batch.normalized_weights  # equal weights: 1 / number of samples
+```
+
+This mode never evaluates amplitudes, including in serial and streamed calls.
+`log_weights` is zero, `weight_kind` is `"proposal"`, and `log_mean_weight` is
+None because no PEPS norm estimate was made. Accessing `log_abs_amplitudes`
+raises instead of inventing amplitudes or phases from q. ESS equals the number
+of draws by construction; it does not diagnose proposal accuracy. Ordinary
+averages use equal weights, **not q again**, because the configurations were
+already drawn from q.
+
+Increasing χ and χ′ can recover exact Born probabilities as boundary
+compression and solver errors vanish. A fixed nonzero cutoff or unconverged
+variational boundary fit can leave residual error. q approaches the normalized
+`abs(Psi)**2`, not the complex amplitude itself. Boundary amplitudes converge
+separately as `amplitude_chi` (default χ′) increases and truncation vanishes;
+an explicitly fixed `amplitude_chi` does not grow when χ′ changes. If both
+amplitude_chi and χ′ are None, the amplitude sweep has no rank cap but still
+uses the selected cutoff. No full exact amplitude mode is selected implicitly.
+Proposal-engine selection is independent: omitting both χ and χ′ still selects
+exact conditional contractions. Supply those caps for boundary sampling.
 
 Use `chunk_size` to bound the number of live sample-prefix states while still
 returning a complete result, or consume `iter_samples` to bound output storage:
@@ -436,16 +497,17 @@ diagnostics for the most recently yielded chunk. `row_cache_stats` describes
 the latest chunk. `batch_stats["final_prefix_groups"]` for a collected chunked
 batch sums distinct configurations within each chunk, not globally deduplicated
 configurations. `sampler.diagnostics` copies a compact summary to the host;
-`amplitude_stats` reports exact contraction calls and plan builds since refresh.
+`amplitude_stats` reports amplitude contractions and exact plan builds since refresh.
 A subsequent likelihood query replaces the rho diagnostics but leaves the last
 batch counts intact. Serial `sample` rho diagnostics describe its last draw.
 Each scaled result field must contain one mantissa and exponent per configuration;
 log and weight accessors reject mismatched lengths instead of broadcasting them.
 
-`normalized_weights` computes `exp(log_w - max(log_w))` and normalizes the sum.
+`normalized_weights` computes `exp(log_w - max(log_w))` and normalizes the sum
+(uniform weights in `amplitude_mode="none"`).
 `effective_sample_size` is `1 / sum(normalized_weights**2)`.
 `weight_diagnostics` adds ESS/N, maximum normalized weight, zero-weight count,
-and the log mean unnormalized weight. With full proposal support, the latter
+and the log mean unnormalized weight. With exact amplitudes and full proposal support, the latter
 estimates the log of a Monte Carlo estimate of the squared PEPS norm; it is
 not an unbiased estimator of the logarithm itself. Empty, all-zero, NaN, or
 positive-infinite weight sets raise `ValueError` instead of yielding a uniform
@@ -465,7 +527,7 @@ phase and original PEPS scale, including amplitudes beyond the raw dtype range.
 It retains at most one additional ket's array data plus small scale arrays and
 contraction metadata. Result exponents may be fractional. No sampled amplitude
 values or configurations are retained between batches. Full exact amplitude
-contractions remain mandatory and are not capped by χ or χ′; the stable path
+contractions in `amplitude_mode="exact"` are not capped by χ or χ′; the stable path
 adds arithmetic and can cost more than raw contraction on small networks.
 
 The default factored suffix cache avoids forming dense column transfer tensors

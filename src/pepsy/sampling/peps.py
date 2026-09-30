@@ -85,6 +85,15 @@ class PepsSampler:
     amplitude_max_cost : float, optional
         Optional maximum Cotengra estimated exact contraction cost. Exceeding
         it raises before execution; no approximate amplitude is substituted.
+    amplitude_mode : {"boundary", "none", "exact"}, default="boundary"
+        Evaluate amplitudes with a full exact contraction or a truncated
+        single-layer boundary-MPS sweep. Boundary amplitudes and the resulting
+        importance weights are approximate; proposal probabilities remain those
+        of the actual sampling procedure. "none" skips amplitude evaluation
+        and returns proposal probabilities with equal averaging weights.
+    amplitude_chi : int, optional
+        Boundary amplitude bond cap. Defaults to chi_prime in boundary mode.
+        If both are None, the boundary sweep has no bond cap; cutoff still applies.
     row_cache_max_bytes : int, default=67108864
         Budget for estimated row-environment storage and workspace across live
         prefix groups, including the initial row retained until ``refresh()``.
@@ -128,6 +137,8 @@ class PepsSampler:
         row_contraction_opt="auto-hq",
         amplitude_max_intermediate_bytes=None,
         amplitude_max_cost=None,
+        amplitude_mode="boundary",
+        amplitude_chi=None,
         row_cache_max_bytes=64 * 2**20,
         row_cache_mode="factored",
         sample_chi=None,
@@ -152,6 +163,13 @@ class PepsSampler:
             has_cap = self.sample_chi is not None or self.marginal_chi not in (None, 0)
             self.boundary_engine = "dmrg" if has_cap else "exact"
         self.ket_compression = self._normalize_ket_compression(ket_compression)
+        if amplitude_mode not in {"exact", "boundary", "none"}:
+            raise ValueError("amplitude_mode must be 'boundary', 'none', or 'exact'.")
+        self.amplitude_mode = amplitude_mode
+        self.amplitude_chi = self._validate_optional_chi(amplitude_chi, "amplitude_chi")
+        if amplitude_mode == "boundary":
+            if self.amplitude_chi is None:
+                self.amplitude_chi = self.sample_chi
         from ..optimizers.sweep.environments import (  # noqa: PLC0415
             _canonical_cutoff_mode,
         )
@@ -340,7 +358,7 @@ class PepsSampler:
             raise TypeError("PepsSampler requires a finite 2D PEPS.") from exc
         if self.Lx < 1 or self.Ly < 1:
             raise ValueError("PepsSampler requires a non-empty PEPS.")
-        if self.boundary_engine != "exact" and (
+        if (self.boundary_engine != "exact" or self.amplitude_mode == "boundary") and (
             any(self.peps.is_cyclic_x(y) for y in range(self.Ly))
             or any(self.peps.is_cyclic_y(x) for x in range(self.Lx))
         ):
@@ -599,6 +617,8 @@ class PepsSampler:
         return {
             "boundary_engine": self.boundary_engine,
             "rho_positivity": self.rho_positivity,
+            "amplitude_mode": self.amplitude_mode,
+            "amplitude_chi": self.amplitude_chi,
             "conditional_evaluations": sum(d["evaluation_count"] for d in values),
             "max_hermiticity_defect": max(
                 (d["max_hermiticity_defect"] for d in values), default=0.0
@@ -1552,15 +1572,77 @@ class PepsSampler:
         )
         return projected.contract(all, optimize=self.contraction_opt)
 
+    def _prepare_amplitude_leaves(self, specs):
+        """Cache normalized physical slices and their scale for either method."""
+        leaves = []
+        for tensor, spec in zip(self._ket.tensors, specs):
+            axes = tuple(i for i, pos in enumerate(spec) if pos is None)
+            magnitude = self._xp.abs(tensor.data)
+            largest = self._real_xp.max(magnitude, axis=axes, keepdims=True) if axes else magnitude
+            scale = self._real_xp.where(largest > 0, largest, self._real_xp.ones_like(largest))
+            if ar.get_dtype_name(tensor.data).startswith("complex"):
+                data = self._xp.real(tensor.data) / scale + 1j * (self._xp.imag(tensor.data) / scale)
+            else:
+                data = tensor.data / scale
+            power = self._real_xp.where(largest > 0, self._real_xp.log10(scale), -math.inf)
+            leaves.append((data, power))
+        # Publish only complete caches so failed preparation can be retried.
+        self._amplitude_specs = specs
+        self._amplitude_leaves = tuple(leaves)
+
     def _projected_amplitude_scaled(self, config):
-        """Contract the original ket with one reusable exact, scaled plan.
+        """Evaluate a scaled amplitude using the selected contraction method.
 
         Projected leaves and intermediate contractions are rescaled before
         magnitudes leave the dtype range. Removed positive factors are added
         to the returned base-10 exponent; phase and the physical scale remain.
         Normalized physical slices are cached until refresh(); evaluated
         amplitudes and sampled configurations are not retained between calls.
+        Boundary mode instead compresses projected rows before contracting
+        the final one-dimensional boundary, retaining its physical scale.
         """
+        if self.amplitude_mode == "boundary":
+            if self._amplitude_leaves is None:
+                positions = {self._site_inds[site]: i for i, site in enumerate(self.site_order)}
+                self._prepare_amplitude_leaves(tuple(
+                    tuple(positions.get(ind) for ind in tensor.inds) for tensor in self._ket.tensors
+                ))
+            projected = self._ket.isel({
+                self._site_inds[site]: int(value)
+                for site, value in zip(self.site_order, config)
+            })
+            powers = []
+            for tensor, (data, scale), spec in zip(
+                projected.tensors, self._amplitude_leaves, self._amplitude_specs
+            ):
+                selectors = tuple(slice(None) if pos is None else int(config[pos]) for pos in spec)
+                tensor.modify(data=data[selectors])
+                powers.append(self._real_xp.reshape(scale[selectors], ()))
+            physical_power = float(self._scalar(self._real_xp.sum(self._real_xp.stack(powers))))
+            self._amplitude_stats["contractions"] += 1
+            if physical_power == -math.inf:
+                return 0.0j, 0
+            # Keep large Python exponent metadata out of backend float32 math.
+            projected.exponent = 0.0
+            # Collapse every row into a bounded single-layer MPS before the
+            # remaining one-dimensional scalar contraction. Proposal-only
+            # rescaled boundaries cannot supply physical amplitude scales.
+            boundary = projected.contract_boundary(
+                max_bond=self.amplitude_chi, cutoff=self.cutoff,
+                compress_opts={"cutoff_mode": self.cutoff_mode},
+                sequence=("ymin",), max_separation=0,
+                equalize_norms=True, final_contract=False,
+            )
+            # This tree is only the remaining one-dimensional boundary, not
+            # a full-network amplitude plan. Preserve zeros and extreme scales.
+            tree = boundary.contraction_tree(optimize=self.row_contraction_opt, output_inds=())
+            mantissa, exponent = tree.contract(boundary.arrays, strip_exponent=True,
+                                               check_zero=True, backend=self.backend, autojit=False)
+            if self._scalar(mantissa) == 0:
+                return 0.0j, 0
+            return self._scalar(mantissa), float(
+                self._scalar(exponent) + boundary.exponent + physical_power + self._ket.exponent
+            )
         if self._amplitude_tree is None:
             site_positions = {self._site_inds[site]: i for i, site in enumerate(self.site_order)}
             specs = tuple(
@@ -1578,21 +1660,7 @@ class PepsSampler:
             # Every site's physical slices are immutable until refresh. Scale
             # them together once, retaining at most one extra ket's array data,
             # instead of launching max/divide/log kernels for every shot.
-            leaves = []
-            for tensor, spec in zip(self._ket.tensors, specs):
-                axes = tuple(i for i, pos in enumerate(spec) if pos is None)
-                magnitude = self._xp.abs(tensor.data)
-                largest = self._real_xp.max(magnitude, axis=axes, keepdims=True) if axes else magnitude
-                scale = self._real_xp.where(largest > 0, largest, self._real_xp.ones_like(largest))
-                if ar.get_dtype_name(tensor.data).startswith("complex"):
-                    data = self._xp.real(tensor.data) / scale + 1j * (self._xp.imag(tensor.data) / scale)
-                else:
-                    data = tensor.data / scale
-                leaves.append((data, self._real_xp.log10(scale)))
-            # Publish only a complete cache: failed preparation must be safe
-            # to retry without refresh or partially initialized state.
-            self._amplitude_specs = specs
-            self._amplitude_leaves = tuple(leaves)
+            self._prepare_amplitude_leaves(specs)
             self._amplitude_tree = tree
             self._amplitude_stats["plan_builds"] += 1
         # Recheck cached plans too, including limits adjusted between batches.
@@ -1654,6 +1722,12 @@ class PepsSampler:
             working.isel_({ket_ind: value})
         return float(self._scalar(log10_probability))
 
+    def _sampled_amplitude(self, config):
+        """Keep proposal-only draws independent of every amplitude evaluator."""
+        if self.amplitude_mode == "none":
+            return None
+        return self._projected_amplitude_scaled(config)
+
     def _sample_one_exact(self, rng):
         """Draw one configuration from the exact serial proposal."""
         self._reset_rho_diagnostics()
@@ -1671,7 +1745,7 @@ class PepsSampler:
             )
             working.isel_({ket_ind: value})
 
-        amplitude = self._projected_amplitude_scaled(config)
+        amplitude = self._sampled_amplitude(config)
         return config, self._log10_to_scaled(log10_proposal), amplitude
 
     def _sample_one(self, rng):
@@ -1680,7 +1754,7 @@ class PepsSampler:
             return self._sample_one_exact(rng)
 
         config, omega = self._boundary_sample_or_probability(rng=rng)
-        return config, omega, self._projected_amplitude_scaled(config)
+        return config, omega, self._sampled_amplitude(config)
 
     def _log10_to_scaled(self, log10_probability):
         """Convert a base-10 log probability to mantissa/exponent form."""
@@ -1915,7 +1989,7 @@ class PepsSampler:
         amplitudes = [None] * samples
         for group in groups:
             omega = self._log10_to_scaled(group["log10"])
-            amplitude = self._projected_amplitude_scaled(group["config"])
+            amplitude = self._sampled_amplitude(group["config"])
             for index in group["indices"]:
                 index = int(index)
                 configs[index] = list(group["config"])
@@ -1942,11 +2016,12 @@ class PepsSampler:
             )
         return PEPSSampleResult(
             configs=configs,
+            amplitude_mode=self.amplitude_mode,
             omegas=(
                 [value[0] for value in omegas],
                 [value[1] for value in omegas],
             ),
-            ps=(
+            ps=None if self.amplitude_mode == "none" else (
                 [value[0] for value in amplitudes],
                 [value[1] for value in amplitudes],
             ),
@@ -1987,7 +2062,9 @@ class PepsSampler:
         if chunk_size is None:
             return self._sample_batch(self._make_rng(seed), samples)
         chunk_size = self._positive_sample_count(chunk_size, "chunk_size")
-        result = PEPSSampleResult([], ([], []), ([], []))
+        result = PEPSSampleResult([], ([], []),
+                                  None if self.amplitude_mode == "none" else ([], []),
+                                  amplitude_mode=self.amplitude_mode)
         stats = {"samples": samples, "chunks": 0, "chunk_size": chunk_size,
                  "max_prefix_groups": 0, "conditional_batches": 0,
                  "final_prefix_groups": 0, "boundary_engine": self.boundary_engine}
@@ -1995,6 +2072,8 @@ class PepsSampler:
         for batch in self.iter_samples(samples, chunk_size=chunk_size, seed=seed):
             result.configs.extend(batch.configs)
             for target, source in ((result.omegas, batch.omegas), (result.ps, batch.ps)):
+                if target is None:
+                    continue
                 target[0].extend(source[0])
                 target[1].extend(source[1])
             stats["chunks"] += 1
@@ -2069,14 +2148,16 @@ class PepsSampler:
             config, omega, amplitude = self._sample_one(rng)
             configs.append(config)
             omega_mantissa, omega_exponent = omega
-            amplitude_mantissa, amplitude_exponent = amplitude
             omegas_mantissa.append(omega_mantissa)
             omegas_exponent.append(omega_exponent)
-            ps_mantissa.append(amplitude_mantissa)
-            ps_exponent.append(amplitude_exponent)
+            if amplitude is not None:
+                amplitude_mantissa, amplitude_exponent = amplitude
+                ps_mantissa.append(amplitude_mantissa)
+                ps_exponent.append(amplitude_exponent)
 
         return PEPSSampleResult(
             configs=configs,
+            amplitude_mode=self.amplitude_mode,
             omegas=(omegas_mantissa, omegas_exponent),
-            ps=(ps_mantissa, ps_exponent),
+            ps=None if self.amplitude_mode == "none" else (ps_mantissa, ps_exponent),
         )

@@ -718,7 +718,7 @@ def test_peps_sampler_absorbs_only_after_complete_row_and_respects_ket_chi(monke
     sampler = pepsy.PepsSampler(
         qtn.PEPS.rand(3, 3, bond_dim=2, dtype="complex128", seed=128),
         sample_chi=1, marginal_chi=8, boundary_engine="quimb-mps",
-        contraction_opt="greedy",
+        contraction_opt="greedy", amplitude_mode="exact",
     )
     compressed = []
     update = sampler._update_conditioned_boundary
@@ -787,7 +787,7 @@ def test_peps_sampler_boundary_rejects_periodic_edges():
     with pytest.raises(ValueError, match="open boundaries"):
         pepsy.PepsSampler(state, sample_chi=2, boundary_engine="quimb-mps")
     # Exact contraction does not use the open-boundary sweep assumptions.
-    assert len(pepsy.PepsSampler(state).sample(seed=2).configs[0]) == 9
+    assert len(pepsy.PepsSampler(state, amplitude_mode="exact").sample(seed=2).configs[0]) == 9
 
 
 def test_peps_sampler_variable_physical_dimensions_and_integer_conversion():

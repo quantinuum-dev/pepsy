@@ -68,18 +68,26 @@ class PEPSSampleResult:
     omegas
         Pair ``(mantissas, exponents)`` for proposal probabilities.
     ps
-        Pair ``(mantissas, exponents)`` for sampled PEPS amplitudes.
+        Pair ``(mantissas, exponents)`` for sampled PEPS amplitude estimates,
+        or None when amplitude evaluation was disabled.
+    amplitude_mode
+        ``"boundary"``, ``"none"``, or ``"exact"``. Boundary-mode amplitudes and
+        importance weights include finite-bond contraction error. "none" gives
+        equal weights for proposal averages, not an importance correction.
+        The record's legacy default "exact" supports existing BP/manual records;
+        PepsSampler explicitly supplies its selected mode (default "boundary").
     log_probabilities, log_abs_amplitudes, log_weights
         Natural-log NumPy arrays computed from the scaled pairs without
         materializing their powers of ten. Access copies any backend scalars
-        to the host. ``log_weights`` represents ``log(|Psi|**2 / q)``.
+        to the host. ``log_weights`` represents ``log(|Psi_estimate|**2 / q)``.
         Both parts of each scaled pair must match the number of configurations;
         these accessors raise ``ValueError`` when lengths differ.
     """
 
     configs: list[list[int]]
     omegas: tuple[list[float], list[int]]
-    ps: tuple[list[Any], list[Any]]
+    ps: tuple[list[Any], list[Any]] | None
+    amplitude_mode: str = "exact"
 
     def __len__(self):
         """Return the number of sampled configurations."""
@@ -110,11 +118,15 @@ class PEPSSampleResult:
     @property
     def log_abs_amplitudes(self):
         """Natural logs of the absolute PEPS amplitudes, as a NumPy array."""
+        if self.ps is None:
+            raise ValueError("Amplitudes were not evaluated (amplitude_mode='none').")
         return self._scaled_logs(self.ps, absolute=True)
 
     @property
     def log_weights(self):
-        """Natural logs of unnormalized importance weights ``|Psi|**2 / q``."""
+        """Log importance weights, or zeros for uncorrected proposal averages."""
+        if self.amplitude_mode == "none":
+            return np.zeros(len(self), dtype=float)
         return 2.0 * self.log_abs_amplitudes - self.log_probabilities
 
     @property
@@ -156,11 +168,15 @@ class PEPSSampleResult:
         ess = float(1.0 / np.sum(weights**2))
         return {
             "samples": len(weights),
+            "amplitude_mode": self.amplitude_mode,
+            "weight_kind": "proposal" if self.amplitude_mode == "none" else "importance",
+            "weights_are_approximate": self.amplitude_mode != "exact",
             "effective_sample_size": ess,
             "ess_fraction": ess / len(weights),
             "max_normalized_weight": float(np.max(weights)),
             "zero_weights": int(np.count_nonzero(np.isneginf(logs))),
-            "log_mean_weight": float(largest + np.log(np.exp(logs - largest).mean())),
+            "log_mean_weight": (None if self.amplitude_mode == "none" else
+                                float(largest + np.log(np.exp(logs - largest).mean()))),
         }
 
 

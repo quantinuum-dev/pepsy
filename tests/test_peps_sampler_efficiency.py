@@ -63,10 +63,12 @@ def test_factored_cache_budget_refresh_and_rare_branch():
 
 
 @pytest.mark.parametrize("engine", ["exact", "quimb-mps", "dmrg"])
-def test_chunked_replay_stream_and_bound(engine, monkeypatch):
+@pytest.mark.parametrize("amplitude_mode", ["boundary", "exact"])
+def test_chunked_replay_stream_and_bound(engine, amplitude_mode, monkeypatch):
     state = qtn.PEPS.rand(2, 2, bond_dim=2, seed=17, dtype="complex128")
     kwargs = {} if engine == "exact" else dict(chi=8, chi_prime=4)
-    sampler = PepsSampler(state, boundary_engine=engine, contraction_opt="greedy", **kwargs)
+    sampler = PepsSampler(state, boundary_engine=engine, contraction_opt="greedy",
+                          amplitude_mode=amplitude_mode, **kwargs)
     calls = []
     original = sampler._sample_batch
 
@@ -90,7 +92,7 @@ def test_chunked_replay_stream_and_bound(engine, monkeypatch):
     np.testing.assert_array_equal(batch.log_abs_amplitudes,
                                   np.concatenate([c.log_abs_amplitudes for c in chunks]))
     assert len(set(tuple(c) for c in batch.configs)) > 1
-    assert sampler.amplitude_stats["plan_builds"] == 1
+    assert sampler.amplitude_stats["plan_builds"] == int(amplitude_mode == "exact")
     sampler.refresh()
     assert sampler.amplitude_stats == {"plan_builds": 0, "contractions": 0}
 
@@ -107,13 +109,14 @@ def test_invalid_chunk_sizes(option):
 @pytest.mark.parametrize("dtype,scale", [("complex64", 1e20), ("complex64", 1e-20),
                                         ("complex128", 1e150), ("complex128", 1e-150)])
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
-def test_scaled_amplitudes_keep_extreme_physical_scale(dtype, scale, backend):
+@pytest.mark.parametrize("amplitude_mode", ["boundary", "exact"])
+def test_scaled_amplitudes_keep_extreme_physical_scale(dtype, scale, backend, amplitude_mode):
     phase = np.exp(.3j)
     vector = np.array([scale * phase, 0], dtype=dtype)
     state = qtn.PEPS.product_state([[vector] * 4] * 2)
     if backend == "torch":
         state.apply_to_arrays(pytest.importorskip("torch").as_tensor)
-    sampler = PepsSampler(state, contraction_opt="greedy")
+    sampler = PepsSampler(state, contraction_opt="greedy", amplitude_mode=amplitude_mode)
     before = [t.data for t in state]
     mantissa, exponent = sampler._projected_amplitude_scaled([0] * 8)
     assert np.log(abs(mantissa)) + exponent * np.log(10) == pytest.approx(
@@ -122,7 +125,7 @@ def test_scaled_amplitudes_keep_extreme_physical_scale(dtype, scale, backend):
     np.testing.assert_allclose(mantissa / abs(mantissa), phase**8, atol=2e-6)
     zero = sampler._projected_amplitude_scaled([1] + [0] * 7)
     assert zero[0] == 0
-    assert sampler.amplitude_stats == {"plan_builds": 1, "contractions": 2}
+    assert sampler.amplitude_stats == {"plan_builds": int(amplitude_mode == "exact"), "contractions": 2}
     assert all(t.data is original for t, original in zip(state, before))
 
 
@@ -165,7 +168,7 @@ def test_factored_complex128_born_and_memory_estimate():
 
 def test_amplitude_plan_refresh_and_network_exponent():
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=31)
-    sampler = PepsSampler(state, contraction_opt="greedy")
+    sampler = PepsSampler(state, contraction_opt="greedy", amplitude_mode="exact")
     configs = list(product(range(2), repeat=4))
     for c in configs:
         m, e = sampler._projected_amplitude_scaled(c)
@@ -211,11 +214,12 @@ def test_factored_truncated_repaired_proposal_matches_reference():
     assert cached.batch_stats["suffix_cache_builds"] > 0
 
 
-def test_float32_amplitude_keeps_large_network_exponent_metadata():
+@pytest.mark.parametrize("amplitude_mode", ["boundary", "exact"])
+def test_float32_amplitude_keeps_large_network_exponent_metadata(amplitude_mode):
     vector = np.array([.3, .7], dtype="complex64")
     state = qtn.PEPS.product_state([[vector] * 2] * 2)
     state.exponent = 30000.0
-    sampler = PepsSampler(state, contraction_opt="greedy")
+    sampler = PepsSampler(state, contraction_opt="greedy", amplitude_mode=amplitude_mode)
     m, e = sampler._projected_amplitude_scaled([0] * 4)
     assert np.log(abs(m)) + (e - 30000) * np.log(10) == pytest.approx(
         4 * np.log(float(vector[0].real)), abs=3e-6
@@ -224,7 +228,7 @@ def test_float32_amplitude_keeps_large_network_exponent_metadata():
 
 def test_amplitude_cache_preparation_failure_can_retry(monkeypatch):
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=719)
-    sampler = PepsSampler(state, contraction_opt="greedy")
+    sampler = PepsSampler(state, contraction_opt="greedy", amplitude_mode="exact")
     config = [0, 1, 1, 0]
     expected = sampler._projected_amplitude(config)
 
@@ -309,7 +313,7 @@ def test_default_reusable_builder_and_cached_row_optimizer(monkeypatch):
 ])
 def test_amplitude_limits_reject_before_execution_and_allow_retry(limit, error):
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=845)
-    sampler = PepsSampler(state, contraction_opt="greedy", **{limit: 1})
+    sampler = PepsSampler(state, contraction_opt="greedy", amplitude_mode="exact", **{limit: 1})
     config = [0, 1, 1, 0]
     expected = sampler._projected_amplitude(config)
     with pytest.raises(error, match=limit):

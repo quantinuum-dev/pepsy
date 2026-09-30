@@ -1,6 +1,6 @@
 # Examples
 
-Start with a tutorial, then use the repository scripts for larger examples.
+Start with a tutorial, or use the repository's MPS magnetization notebook.
 
 ## Walkthroughs
 
@@ -12,12 +12,10 @@ Start with a tutorial, then use the repository scripts for larger examples.
 | Set bond dimensions and sweep counts | [Choose parameters](howto/choose_parameters.md) |
 | Configure an optimization solver | [Tune sweep solvers](howto/solver_tuning.md) |
 
-## Repository scripts
+## Repository example
 
 The [examples directory](https://github.com/quantinuum-dev/pepsy/tree/develop/examples)
-contains the maintained runnable scripts and notebooks.
-
-Other examples in this checkout:
+contains the MPS magnetization example:
 
 - [MPS magnetization notebook](https://github.com/quantinuum-dev/pepsy/blob/develop/examples/MpsMagnetization/mps_simulator.ipynb).
 

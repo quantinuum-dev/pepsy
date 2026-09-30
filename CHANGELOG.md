@@ -14,6 +14,14 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- `PepsSampler(amplitude_mode="boundary", amplitude_chi=...)` evaluates
+  projected amplitudes with a capped boundary-MPS sweep, preserving scaled
+  values and phase without a full-network exact amplitude plan. Results and
+  weight diagnostics identify approximate weights. Boundary amplitudes are now
+  the library default; full exact amplitudes require `amplitude_mode="exact"`.
+  `amplitude_mode="none"` skips amplitude contractions, returns `ps=None`, and
+  uses equal weights for ordinary proposal averages with explicit diagnostics.
+
 - Selecting TreeOptimizer's legacy `dmrg1` mode now warns to use `dmrg` for
   one-site refinement, while preserving the legacy growth schedule.
 
@@ -21,6 +29,17 @@ releases remain backwards-compatible. From 1.0 onward:
   only one tree node at a time from its initialized guess without multi-node
   FIT warm-up. The four-iteration budget still allows eight directional passes;
   explicit larger block sizes and named DMRG schedules remain available.
+
+- Public `gate` and `gate_simple` now default to dtype-aware `cutoff="auto"`
+  (1e-12 for complex128/float64, 1e-6 for complex64/float32, 1e-3 for 16-bit)
+  and `cutoff_mode="auto"` (rsum2), sharing the MPS policy. Numeric overrides
+  remain supported. Roughening forwards the policy to these package APIs.
+
+- `gate_simple(..., renorm=False, strip_exponent=True)` keeps simple-update
+  gauges at unit RMS and retains their scale in the tensor-network exponent,
+  including routed SWAPs. Exact and BP contractions can recover the physical
+  norm or return it as mantissa/exponent. Active absolute cutoffs are rejected;
+  the default gate behavior is unchanged.
 
 - Cluster-MPO facades now accept `preparation="frontier"` or `"automaton"`
   with fixed uncapped construction, plus `delinearize=True` for integrated

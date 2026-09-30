@@ -247,11 +247,6 @@ after the full fixed-channel MPO exists, so it cannot cap peak assembly memory.
 For large graphs that require a working bond cap during assembly, use the
 separate numerical `assembly_chi` policy and check convergence in that cap.
 
-Run `python examples/cluster_mpo_bond_compression.py` from the repository root
-for a reproducible 2x3 square-lattice chi/error sweep. It reports construction
-time, initial/final MPO bonds, compression time, and the relative error against
-the selected p-cluster reference. Its timings exclude global dense operators.
-
 For qubits, a generic exact four-site residual has local MPO ranks at most
 `(4, 16, 4)`. This does not bound the assembled lattice MPO: sums of many
 clusters can still have large bonds. SVD-free construction removes the
