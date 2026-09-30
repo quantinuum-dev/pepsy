@@ -957,8 +957,9 @@ def test_pauli_pepo_basis_batches_translated_pbc_shapes():
         materialize=False,
     )
     assert active.active_block_count > 0
-    assert basis.cache_info["generic_cluster_levels"] == 1
-    assert basis.cache_info["generic_translated_clusters"] > 1
+    info = basis.cache_info
+    assert info["localized_cluster_counts"][5] == 6
+    assert info["last_local_targets_evaluated"] < sum(info["localized_cluster_counts"].values())
 
 
 def test_pauli_pepo_basis_order_five_keeps_torch_autodiff():

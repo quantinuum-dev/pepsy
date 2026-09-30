@@ -266,7 +266,7 @@ class CompiledPEPOExp:
         # Compile only value-independent cluster embeddings here. Matrix
         # exponentials and coefficient contractions still happen per call.
         basis._prepare_exp_plan()
-        basis._prepare_spatial_plans((basis,), localized=basis.inhomogeneous)
+        basis._prepare_spatial_plans((basis,), localized=basis._requires_localized_build)
 
     @property
     def cache_info(self):
@@ -301,12 +301,15 @@ class CompiledPEPOExp:
         )
 
     def trace_exp(self, step, parameters=None, *, coefficients=None,
-                  normalized=False, state_budget=100000):
-        """Evaluate the complete selected-order trace without building a PEPO."""
+                  normalized=False, state_budget=100000, **build_opts):
+        """Construct this basis's PEPO and measure its trace."""
         return self.basis.trace_exp(
             step, parameters, coefficients=coefficients, normalized=normalized,
-            state_budget=state_budget,
+            state_budget=state_budget, **build_opts,
         )
+
+    def partition_trace_exp(self, *args, **kwargs):
+        return self.basis.partition_trace_exp(*args, **kwargs)
 
     evaluate = exp
     __call__ = exp
@@ -677,19 +680,38 @@ class PauliPEPOBasis:
         return self._compiled_exp
 
     def trace_exp(self, step, parameters=None, *, coefficients=None,
-                  normalized=False, state_budget=100000):
-        """Trace this basis's complete cluster expansion without PEPO bonds."""
+                  normalized=False, state_budget=100000, **build_opts):
+        """Trace the constructed PEPO, including selected numerical compression."""
         if self._trace_product is None:
             from .pepo_product import PEPOClusterProductExpansion
             self._trace_product = PEPOClusterProductExpansion((self,))
         return self._trace_product.trace_exp(
             step, parameters, coefficients=coefficients,
-            normalized=normalized, state_budget=state_budget,
+            normalized=normalized, state_budget=state_budget, **build_opts,
+        )
+
+    def partition_trace_exp(self, step, parameters=None, *, coefficients=None,
+                            normalized=False, state_budget=100000):
+        """Explicit uncompressed scalar partition closure, without PEPO construction."""
+        if self._trace_product is None:
+            from .pepo_product import PEPOClusterProductExpansion
+            self._trace_product = PEPOClusterProductExpansion((self,))
+        return self._trace_product.partition_trace_exp(
+            step, parameters, coefficients=coefficients,
+            normalized=normalized, state_budget=state_budget)
+
+    @property
+    def _requires_localized_build(self):
+        # A cluster can wrap around a short periodic axis. Infinite-lattice
+        # shape channels then alias sites or miss parallel bond occurrences.
+        return self.inhomogeneous or any(
+            periodic and length <= self.order
+            for length, periodic in zip((self.lx, self.ly), self.cyclic)
         )
 
     def _prepare_exp_plan(self, *, localized=False):
         """Prepare geometry and static operator maps for the evaluation route."""
-        localized = localized or self.inhomogeneous
+        localized = localized or self._requires_localized_build
         mode = "localized" if localized else "homogeneous"
         if mode in self._prepared_exp_modes:
             return self
@@ -1211,7 +1233,7 @@ class PauliPEPOBasis:
 
     def _localized_spatial_plan(self, bases, defaults, records):
         nsites = len(records[0].sites)
-        key = ("localized", bases, defaults, nsites)
+        key = ("localized", bases, defaults, tuple(record.sites for record in records))
         if key not in self._spatial_plans:
             plan = ClusterReusePlan()
             labels = []
@@ -1231,20 +1253,24 @@ class PauliPEPOBasis:
             self._spatial_plans[key] = plan
         return self._spatial_plans[key]
 
-    def _localized_reused_products(self, localized, records, *, like, defaults):
+    def _localized_reused_products(self, localized, records, *, like, defaults, stats=None):
+        if stats is not None:
+            stats.products_requested += len(records)
+            stats.exponentials_requested += len(records) * len(localized)
         if not self.spatial_reuse:
             self._last_spatial_evaluations += len(records)
-            return self._localized_ordered_products(localized, records, like=like)
+            return self._localized_ordered_products(localized, records, like=like, stats=stats)
         bases = tuple(basis for basis, *_ in localized)
         plan = self._localized_spatial_plan(bases, defaults, records)
         sources = tuple(i for i, (source, _) in plan.entries.items() if i == source)
         products = dict(zip(sources, self._localized_ordered_products(
-            localized, tuple(records[i] for i in sources), like=like)))
+            localized, tuple(records[i] for i in sources), like=like, defaults=defaults, stats=stats)))
         self._last_spatial_evaluations += len(sources)
         return tuple(permute_operator(products[source], axes, 2)
                      for source, axes in plan.entries.values())
 
-    def _localized_ordered_products(self, localized, records, *, like, batch_size=8):
+    def _localized_ordered_products(self, localized, records, *, like, batch_size=8,
+                                    defaults=None, stats=None):
         """Batch equal-size finite-cluster targets, preserving factor order.
 
         Actual finite embeddings share matrix size, but not coefficients.
@@ -1252,19 +1278,48 @@ class PauliPEPOBasis:
         exponential path, which is more accurate than its low-degree scalar
         shortcut for small onsite matrices in tested Torch versions.
         """
-        results = []
-        for start in range(0, len(records), batch_size):
-            chunk = records[start:start + batch_size]
-            result = None
-            for basis, beta, site_components, edge_components in localized:
-                hamiltonians = ar.do("stack", tuple(
-                    basis._localized_cluster_hamiltonian(
-                        record, site_components, edge_components, like=like)
-                    for record in chunk), axis=0)
-                local_exp = _backend_expm(ar.do("multiply", -beta, hamiltonians))
-                result = local_exp if result is None else ar.do("matmul", result, local_exp)
-            results.extend(result[i] for i in range(len(chunk)))
-        return tuple(results)
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive.")
+        if stats is not None:
+            stats.products_evaluated += len(records)
+        entries_by_factor = []
+        pending = []
+        for index, (basis, _beta, _site_components, _edge_components) in enumerate(localized):
+            if defaults is not None and self.spatial_reuse:
+                plan = self._localized_spatial_plan((basis,), (defaults[index],), records)
+                entries = tuple(plan.entries.values())
+            else:
+                entries = tuple((i, tuple(range(len(record.sites))))
+                                for i, record in enumerate(records))
+            sources = tuple(dict.fromkeys(source for source, _ in entries))
+            entries_by_factor.append(entries)
+            pending.extend((index, source) for source in sources)
+        exponentials = {}
+        start = 0
+        while start < len(pending):
+            size = min(batch_size, len(pending) - start)
+            # Pool across factors as well as clusters. Avoid a singleton tail:
+            # Torch's small-matrix singleton path loses precision in 2.6.
+            if batch_size > 2 and len(pending) - start == size + 1:
+                size -= 1
+            chunk = pending[start:start + size]
+            exponents = []
+            for index, source in chunk:
+                basis, beta, site_components, edge_components = localized[index]
+                hamiltonian = basis._localized_cluster_hamiltonian(
+                    records[source], site_components, edge_components, like=like)
+                exponents.append(ar.do("multiply", -beta, hamiltonian))
+            values = _backend_expm(ar.do("stack", tuple(exponents), axis=0))
+            if stats is not None:
+                stats.batches.append(len(chunk))
+            exponentials.update((key, values[i]) for i, key in enumerate(chunk))
+            start += size
+        products = [None] * len(records)
+        for index, entries in enumerate(entries_by_factor):
+            for i, (source, axes) in enumerate(entries):
+                value = permute_operator(exponentials[index, source], axes, 2)
+                products[i] = value if products[i] is None else ar.do("matmul", products[i], value)
+        return tuple(products)
 
     def _localized_topology_plan(self, record):
         """Reuse deterministic tree metadata for identical directed graphs."""
@@ -1495,7 +1550,7 @@ class PauliPEPOBasis:
         # the closed trace only, never to lower-support operator subtraction.
         return {sector[0] for sector in sectors.values()}
 
-    def _build_inhomogeneous_active(self, factor_sources, *, defaults=None):
+    def _build_inhomogeneous_active(self, factor_sources, *, defaults=None, stats=None):
         """Build an occurrence-aware finite-lattice connected-cluster PEPO."""
         factor_sources = tuple(factor_sources)
         if not factor_sources:
@@ -1536,7 +1591,7 @@ class PauliPEPOBasis:
         ]
         cluster_records = self._localized_cluster_records()
         one_exps = self._localized_reused_products(
-            localized, cluster_records[1], like=reference, defaults=defaults)
+            localized, cluster_records[1], like=reference, defaults=defaults, stats=stats)
         blocks = {
             site: {
                 (0,) * len(self.site_directions[site]): one_exps[site_index]
@@ -1561,8 +1616,10 @@ class PauliPEPOBasis:
                 },
             )
             records = cluster_records[cluster_order]
+            if stats is not None:
+                stats.lower_requested += len(records)
             exact_products = self._localized_reused_products(
-                localized, records, like=reference, defaults=defaults)
+                localized, records, like=reference, defaults=defaults, stats=stats)
             lower_plan = (
                 self._localized_spatial_plan(
                     tuple(basis for basis, *_ in localized), defaults, records
@@ -1572,6 +1629,8 @@ class PauliPEPOBasis:
             lower_cache = {}
             for index, (record, exact) in enumerate(zip(records, exact_products)):
                 if lower_plan is None:
+                    if stats is not None:
+                        stats.lower_contractions += 1
                     lower = _contract_active_support_backend(
                         lower_active, record.sites, record.edges
                     )
@@ -1581,6 +1640,8 @@ class PauliPEPOBasis:
                     # exact local target. Keep values only for this level/call.
                     source, axes = lower_plan.entries[index]
                     if source not in lower_cache:
+                        if stats is not None:
+                            stats.lower_contractions += 1
                         source_record = records[source]
                         lower_cache[source] = _contract_active_support_backend(
                             lower_active, source_record.sites, source_record.edges
@@ -1734,13 +1795,33 @@ class PauliPEPOBasis:
         Guppy-style cluster expansion rather than a product of independent
         global approximations.
         """
+        from ._cluster_stats import EvaluationProductData
+
+        stats = getattr(factor_data, "stats", None)
+        is_factor = getattr(factor_data, "is_factor", False)
+        if stats is not None and not is_factor:
+            stats.products_requested += 1
+            stats.exponentials_requested += len(factor_data)
         if isinstance(factor_data, SpatialProductData):
             source, axes = PauliPEPOBasis._uniform_spatial_entry(factor_data, nsites, edges)
             if source not in factor_data.products:
+                if stats is not None and not is_factor:
+                    stats.products_evaluated += 1
                 source_nsites, source_edges = source
-                factor_data.products[source] = PauliPEPOBasis._ordered_cluster_product(
-                    tuple(factor_data), source_nsites, source_edges)
+                if factor_data.factor_data:
+                    values = [PauliPEPOBasis._ordered_cluster_product(
+                        data, source_nsites, source_edges) for data in factor_data.factor_data]
+                    result = values[0]
+                    for value in values[1:]:
+                        result = ar.do("matmul", result, value)
+                    factor_data.products[source] = result
+                else:
+                    factor_data.products[source] = PauliPEPOBasis._ordered_cluster_product(
+                        (tuple(factor_data) if stats is None else
+                         EvaluationProductData(factor_data, stats, is_factor=True)), source_nsites, source_edges)
             return permute_operator(factor_data.products[source], axes, 2)
+        if stats is not None and not is_factor:
+            stats.products_evaluated += 1
         reference = _backend_reference(
             tuple(
                 value
@@ -1760,6 +1841,8 @@ class PauliPEPOBasis:
             local_exp = _backend_expm(
                 ar.do("multiply", -beta, hamiltonian)
             )
+            if stats is not None:
+                stats.batches.append(1)
             result = (
                 local_exp
                 if result is None
@@ -1788,18 +1871,39 @@ class PauliPEPOBasis:
             return ()
         if batch_size < 1:
             raise ValueError("batch_size must be positive.")
+        from ._cluster_stats import EvaluationProductData
+
+        stats = getattr(factor_data, "stats", None)
+        is_factor = getattr(factor_data, "is_factor", False)
+        if stats is not None and not is_factor:
+            stats.products_requested += len(edge_batches)
+            stats.exponentials_requested += len(edge_batches) * len(factor_data)
         if isinstance(factor_data, SpatialProductData):
             entries = tuple(PauliPEPOBasis._uniform_spatial_entry(factor_data, nsites, edges)
                             for edges in edge_batches)
             missing = tuple(dict.fromkeys(source for source, _ in entries
                                           if source not in factor_data.products))
             if missing:
-                values = PauliPEPOBasis._ordered_cluster_product_batch(
-                    tuple(factor_data), nsites, tuple(edges for _, edges in missing),
-                    batch_size=batch_size)
+                if stats is not None and not is_factor:
+                    stats.products_evaluated += len(missing)
+                missing_edges = tuple(edges for _, edges in missing)
+                if factor_data.factor_data:
+                    batches = [PauliPEPOBasis._ordered_cluster_product_batch(
+                        data, nsites, missing_edges, batch_size=batch_size)
+                        for data in factor_data.factor_data]
+                    values = list(batches[0])
+                    for batch in batches[1:]:
+                        values = [ar.do("matmul", left, right) for left, right in zip(values, batch)]
+                else:
+                    values = PauliPEPOBasis._ordered_cluster_product_batch(
+                        (tuple(factor_data) if stats is None else
+                         EvaluationProductData(factor_data, stats, is_factor=True)),
+                        nsites, missing_edges, batch_size=batch_size)
                 factor_data.products.update(zip(missing, values))
             return tuple(permute_operator(factor_data.products[source], axes, 2)
                          for source, axes in entries)
+        if stats is not None and not is_factor:
+            stats.products_evaluated += len(edge_batches)
         reference = _backend_reference(
             tuple(
                 value
@@ -1826,6 +1930,8 @@ class PauliPEPOBasis:
                 local_exp = _backend_expm(
                     ar.do("multiply", -beta, hamiltonian_batch)
                 )
+                if stats is not None:
+                    stats.batches.append(len(chunk))
                 product_batch = (
                     local_exp
                     if product_batch is None
@@ -2061,6 +2167,10 @@ class PauliPEPOBasis:
                 records,
                 source_products,
             ):
+                stats = getattr(factor_data, "stats", None)
+                if stats is not None:
+                    stats.lower_contractions += 1
+                    stats.lower_requested += 1
                 lower = _contract_active_support_backend(
                     lower_active,
                     source_embeddings[0],
@@ -2132,7 +2242,7 @@ class PauliPEPOBasis:
                         one_exp.shape[0],
                     )
 
-    def _build_active(self, beta, values, *, factor_data=None):
+    def _build_active(self, beta, values, *, factor_data=None, stats=None):
         """Build one PEPO from local joint cluster products.
 
         A single :class:`PauliPEPOBasis` supplies one factor in the common
@@ -2159,10 +2269,24 @@ class PauliPEPOBasis:
             if not factor_data:
                 raise ValueError("factor_data must contain at least one factor.")
 
+        reference = _backend_reference(tuple(
+            value for _basis, beta, sites, edges in factor_data
+            for value in (beta, sites, edges)))
+        factor_data = tuple(
+            (basis, _as_backend(beta, like=reference),
+             _as_backend(sites, like=reference), _as_backend(edges, like=reference))
+            for basis, beta, sites, edges in factor_data)
         if self.spatial_reuse:
             key = ("uniform", tuple(basis for basis, *_ in factor_data))
             plan = self._spatial_plans.setdefault(key, ClusterReusePlan())
-            factor_data = SpatialProductData(factor_data, plan)
+            factor_plans = tuple(self._spatial_plans.setdefault(
+                ("uniform", (basis,)), ClusterReusePlan()) for basis, *_ in factor_data
+            ) if len(factor_data) > 1 else ()
+            factor_data = SpatialProductData(factor_data, plan, factor_plans, stats=stats)
+        elif stats is not None:
+            from ._cluster_stats import EvaluationProductData
+
+            factor_data = EvaluationProductData(factor_data, stats)
         self._last_spatial_evaluations = None
         one_exp = self._ordered_cluster_product(factor_data, 1, ())
         edge_exact = self._ordered_cluster_product(
@@ -2474,7 +2598,7 @@ class PauliPEPOBasis:
                 raise TypeError("exp requires step, tau, or beta.")
         values = self._coefficient_values(parameters, coefficients)
         beta = -step
-        if self.inhomogeneous:
+        if self._requires_localized_build:
             reference = _backend_reference((beta, *values))
             beta = _as_backend(beta, like=reference)
             active = self._build_inhomogeneous_active(

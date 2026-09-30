@@ -164,12 +164,15 @@ def test_fixed_policy_rejects_hidden_decompositions():
         ({"cutoff": 1e-8}, "cutoff"),
         ({"assembly_chi": 4, "assembly": "recursive", "graph": "chain"}, "assembly_chi"),
         ({"chi": 4}, "chi=None"),
-        ({"symmetry": "U1", "physical_charges": (0, 1)}, "dense physical"),
     ]:
         with pytest.raises(ValueError, match=message):
             exp_mpo_cluster(
                 terms, 0.1, **(dict(shape=2, factorization="fixed", cutoff=0.0) | options)
             )
+    # Fixed native sectors are now supported; they must keep the exact target.
+    native = exp_mpo_cluster(terms, 0.1, shape=2, factorization='fixed', cutoff=0.,
+                            symmetry='U1', physical_charges=(0, 1))
+    np.testing.assert_allclose(native.to_dense(), expm(.1*np.kron(Z, Z)), atol=1e-13)
     with pytest.raises(ValueError, match="max_tree_rank"):
         PauliPEPOBasis(1, 2, [("edge", "ZZ")], factorization="fixed", max_tree_rank=2)
     with pytest.raises(ValueError, match="factorization"):

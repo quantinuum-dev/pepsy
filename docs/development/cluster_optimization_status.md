@@ -1,10 +1,296 @@
 # Cluster PEPO backend and downstream optimization status
 
-Updated 2026-09-29. An earlier Pepsy `develop` publication at
+Updated 2026-09-30. An earlier Pepsy `develop` publication at
 **`b4c4631`** includes
 the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
+
+## Local cluster integration, 2026-09-30
+
+The user approved committing all pending Pepsy work and merging `develop`
+into local `main`, with no push and a return to `develop`. The approved
+package commit contains the implementations described below and their
+validation records; earlier working-tree descriptions are dated evidence.
+Pre-commit validation: 682 tests passed and eight default-precision JAX GPU
+checks failed; all 24 cases in the affected modules pass with explicit
+highest matrix-multiplication precision. Ruff, whitespace and catalog checks
+passed. No full-suite or remote-publication claim follows. See the
+[local integration handoff](../../history/2026-09-30-local-cluster-integration.md)
+and Git history for the content and merge commits.
+
+## Integrated cluster-MPO automaton plus QR API, 2026-09-30
+
+Pepsy's working-tree `exp_mpo_cluster` and `exp_mpo_cluster_product` now
+accept `preparation="automaton"`/`"frontier"` and `delinearize=True` with
+fixed uncapped construction. Channel-plan `exp` and `trace_exp` expose the
+same explicit NumPy QR step. Reports distinguish exact channel maps from
+numerically reduced output dimensions; exact sharing is no longer mislabeled
+as reference QR projection. The final affected selection passed 297 tests;
+Ruff and whitespace checks passed. This is uncommitted package integration,
+following the earlier notebook-only comparison below, not a new full-suite
+or publication result. See the [API and validation record](notes/2026-09-30-automaton-delinearisation-api.md).
+
+## Trace option and compact-plan API audit, 2026-09-30
+
+Constructed traces now reject a custom sparse `state_budget` when
+`contract_opts` requests materialized contraction, rather than silently
+ignoring the budget. Contraction options must be mappings. Compact-plan reports
+now distinguish exact structural methods from reference QR projection and
+count numerical residual evaluations. Symbolic and algebraic preparation skip
+those evaluations when the cap is absent or cannot bind. Exact numerical-layout
+methods retain their required base evaluation but skip optional samples and
+tangents in the same case. The focused operator,
+channel, algebra and PEPO suite passes 104 tests. See the
+[handoff](../../history/2026-09-30-trace-channel-api-review.md).
+
+## Automaton plus QR notebook comparison, 2026-09-30
+
+The single-exponential `cluster_1d` notebook now compares automaton plus
+numerical delinearisation against frontier plus delinearisation using the
+same settings. Both full OBC/PBC notebook runs passed, along with 27 focused
+delinearisation tests. At p=5 OBC, automaton's largest bond drops from 209
+to 50, matching frontier + QR. This reuses existing public APIs; package
+algorithms and the joint notebook are unchanged. Working-tree edits only;
+these checks do not replace earlier full-suite results. See the
+[measurements and scope](notes/2026-09-30-automaton-delinearisation-example.md).
+
+## Pauli MPO automaton reduction, 2026-09-29
+
+The working tree adds `preparation="automaton"` for dense qubit Pauli cluster
+MPOs. It combines the existing frontier construction with certified Pauli
+spans and rational state elimination. With full channels, preparation and
+replay need no SVD/QR and do not enumerate complete cluster collections.
+Optional caps retain reference QR; native sectors retain frontier support.
+This is exact for the declared cluster family, not global minimization.
+
+The 1D notebooks now compare automaton, frontier, numerical delinearisation,
+fixed and SVD construction for one selected boundary. Operator algebra can
+reduce the states of constrained models; the NN + NNN examples need not gain
+further bond reduction. See the [API](../api/operators/cluster_channels.md),
+[measurements and checks](notes/2026-09-29-mpo-automaton.md) and
+[handoff](../../history/2026-09-29-mpo-automaton.md).
+
+## Algebraic Pauli PEPO reduction, 2026-09-29
+
+The local working tree adds opt-in `preparation="algebraic"` for fixed
+graph/square Pauli PEPOs. It proves a closed Pauli span per cluster, then
+removes exact rational dependencies between complete edge slices before
+and after routing. Full channels use neither SVD nor QR, including during
+preparation. Replay uses fixed Walsh projections and contractions; optional
+smaller caps retain reference QR outside autodiff. No live coefficient is
+used to prove an identity or choose a structural rank.
+
+Measured exact loop bonds shrink 9→7 and a higher-body routed bond 25→13
+relative to identical-slice sharing. Branch/crossing probes gain no further
+chi reduction; algebraic preparation and some replay times are slower. This
+is a local reduction, not global minimality or a universal speedup. Dense
+cluster exponentials remain. See the [API](../api/operators/cluster_channels.md),
+[measurements](notes/2026-09-29-algebraic-pepo-channels.md) and
+[handoff](../../history/2026-09-29-algebraic-pepo-channels.md).
+
+## Numerical MPO delinearisation, 2026-09-29
+
+The local working tree adds `delinearize_mpo`, an opt-in NumPy column/transfer
+compression using pivoted QR without SVD. It acts on the frontier MPO already
+constructed, preserves the requested cluster target to checked numerical
+accuracy, and reports local tolerances separately from cluster error. The 1D
+notebooks compare fixed, frontier, delinearised frontier and SVD construction.
+This is not symbolic parameter-family minimization or an autodiff path; native
+arrays are rejected. See the [API](../api/operators/mpo_delinearize.md) and
+[validation record](notes/2026-09-29-mpo-delinearisation.md).
+
+## Symbolic PEPO preparation, 2026-09-29
+
+The local working tree adds `preparation="symbolic"` for fixed graph/square
+PEPOs. It shares parameter-independent graph-edge slices before routing,
+then square-edge slices, and reuses linear reference templates. Remaining
+routed blocks are enumerated once. Full channels preserve the chosen cluster
+target; capped approximations depend on the new gauge and can have larger
+errors. Replay remains fused with no SVD/QR. Gaugy only forwards options.
+
+Branching and higher-body probes show substantial preparation memory
+reductions; independent crossing wires do not share and gains are mixed.
+This is conservative exact reduction, not global minimality or a guarantee
+of small exact chi. See the [API](../api/operators/cluster_channels.md),
+[measurements and checks](notes/2026-09-29-symbolic-pepo-channels.md) and
+[handoff](../../history/2026-09-29-symbolic-pepo-channels.md).
+
+## Direct MPO frontier preparation, 2026-09-29
+
+`prepare_cluster_channels(..., preparation="frontier")` constructs exact MPO
+transitions by retaining only unfinished clusters across each cut. Complete
+collections are never enumerated, including during reference preparation.
+The path supports fixed interval/exact graph and uncapped recursive sources,
+crossing and gapped supports, and native bosonic sectors. It rejects bounded
+or auto graph targets; PEPOs use the separate modes above. Active-state and memory
+budgets raise rather than silently truncate. Optional chi projection is still
+approximate, while full channels reproduce the selected cluster expansion.
+
+A 40-site disjoint-crossing probe represents 1,048,575 nonempty collections
+with four active sets per cut. This does not establish global minimality or
+small ranks for general graphs. See the [API](../api/operators/cluster_channels.md),
+[measurement and remaining algebraic work](notes/2026-09-29-frontier-cluster-channels.md)
+and [handoff](../../history/2026-09-29-frontier-cluster-channels.md).
+
+## Exact symbolic MPO sharing, 2026-09-29
+
+Compact MPO preparation now merges formally equal prefixes/continuations
+within charge sectors before numerical QR selection. Independent residual
+atoms prevent reference-value equality from introducing invalid identities.
+Separate sum/select endpoint maps preserve multiplicity; replay remains fused
+and uses no SVD/QR. The opt-out is `structural_reuse=False`. Graph/square PEPOs
+retain their existing connectivity-aware construction.
+
+A fixed-order chi sweep records operator/gradient errors, forward/backward
+times and Torch tensor-allocation peaks. Full structural dimensions recover
+the uncompressed family; tighter caps remain approximations. Preparation still
+enumerates topology, and the conservative quotient is not a globally minimal
+automaton. See the [API](../api/operators/cluster_channels.md),
+[measurement](notes/2026-09-29-symbolic-cluster-channels.md) and
+[handoff](../../history/2026-09-29-symbolic-cluster-channels.md).
+
+## Fused compact construction, 2026-09-29
+
+The working tree now assembles compact tensors directly from local residual
+factors. Replay avoids sparse history buffers, unprojected crossing MPO
+products and routed square wire products. The separate reference preparation
+still enumerates channels. Fixed recursive MPO sources are accepted when
+their exact reference topology fits the source collection budget. This is
+not full symbolic minimization or an unrestricted compact recursive planner.
+Square channel preparation uses graph residuals, preserving the unprojected
+target while changing the virtual gauge of newly prepared capped plans.
+
+The residual-to-array assembly boundary is `pack_residuals` /
+`bind_assembler`; legacy block packing remains diagnostic. Gaugy's adapter
+requires no algorithm changes. See the [current API](../api/operators/cluster_channels.md),
+[new measurements and limits](notes/2026-09-29-fused-cluster-channels.md), and
+[validation handoff](../../history/2026-09-29-fused-cluster-channels.md).
+
+## Initial compact channel replay, 2026-09-29
+
+The local working tree adds experimental `prepare_cluster_channels` for
+fixed direct MPOs and fixed graph/square PEPOs, including native MPO sectors.
+Host QR selects fixed bases from explicit reference and tangent snapshots;
+replay constructs compact tensors from sparse blocks without SVD/QR. It
+supports actual projected-operator traces and an array-only compilation
+boundary. Graph materialization also removes global edge padding exactly.
+
+This is a bounded first implementation, not a complete symbolic history
+minimizer or environment-optimal compressor. Dense expanded virtual tensors
+are avoided; sparse histories and local residuals still grow. Small-case
+measurements show storage reductions but mixed timing gains, with measurable
+operator/gradient errors at tight caps. See the
+[API](../api/operators/cluster_channels.md),
+[literature and evidence](notes/2026-09-29-compact-cluster-channels.md), and
+[validation handoff](../../history/2026-09-29-compact-cluster-channels.md).
+
+## Native spin MPO autodiff and assembly, 2026-09-29
+
+The local follow-up adds exact structural sector factors and native
+materialization on Torch/JAX, including zero-parameter gradients. Direct
+and uncapped recursive construction support JAX tracing. Native recursive
+and streaming assembly now support NumPy/Torch sector compression; Torch
+uses paired-factor projector derivatives with numerical rank selection.
+Public semantic adaptive compression preserves sectors and index conventions;
+fixed-rank compression rejects an unspecified sector allocation.
+
+This supersedes the native backend/assembly restrictions in the earlier dated
+entries below. User scope is Pauli/spin only. JAX adaptive native compression,
+derivatives across rank changes, and large-lattice performance are not claimed.
+Tensor-network implementation remains entirely in Pepsy. The broad selection
+passed 555 tests and Gaugy's existing downstream selection passed 137; see the
+[final checks and limits](notes/2026-09-29-native-cluster-autodiff.md) and
+[handoff](../../history/2026-09-29-native-cluster-autodiff.md) for final focused
+rechecks and working-tree publication status.
+
+## Native MPO corrections and CUDA validation, 2026-09-29
+
+The remaining conserved-hopping and zero-cutoff native MPO failures are fixed
+in the local working tree. Residual SVDs preserve charge sectors, assembled
+virtual channels carry inferred flux, and the cutoff/cap selects from the
+combined spectrum. A further repeated-physical-charge dense-export ordering
+error is fixed. NumPy direct assembly is checked for U1, Z2, U1U1 and Z2Z2,
+including graph gaps and crossing/nested collections.
+
+Joint dense MPO and graph/square PEPO values and all tested parameter
+gradients now pass bounded CUDA checks; Gaugy also checks frozen-compression
+trace gradients against finite differences. This validates correctness on
+the tested device, not large-lattice performance. Native cluster autodiff,
+native streaming/recursive assembly, fermionic histories and derivatives
+through changing retained ranks remain outside the supported contract.
+See the [evidence](notes/2026-09-29-native-cluster-charges.md) and
+[handoff](../../history/2026-09-29-native-cluster-charges.md).
+
+## Joint versus single exponential review, 2026-09-29
+
+The dense joint MPO/PEPO/Gaugy workflows now have additional independent
+union-geometry, finite-cutoff, single-factor-limit and live-gradient checks.
+Unused Quimb compression options are rejected before joint PEPO evaluation.
+Gaugy graph factories expose Pepsy's spatial reuse switch. The review found
+native U(1) MPO hopping and zero-cutoff null-channel failures in both single
+and joint construction, now corrected by the scoped follow-up above.
+See the [capability review](notes/2026-09-29-joint-product-parity.md) and
+[validation handoff](../../history/2026-09-29-joint-product-parity.md).
+
+## Trace the constructed PEPO, 2026-09-29
+
+Local PEPO `trace_exp` now constructs and traces the selected operator.
+`trace_pepo`/active `.trace()` contract its actual physical blocks and virtual
+bonds, preserving Torch/JAX gradients and requested compression. The old
+scalar shortcut is explicit as `partition_trace_exp`; Gaugy exposes the
+corresponding bound `partition_trace`. Short periodic axes now use finite
+located construction even for uniform terms, fixing site/channel aliasing
+and parallel-bond counting hidden by the old scalar-only trace.
+
+See the [API contract](../api/operators/cluster_expansion.md#trace-of-the-constructed-pepo)
+and [handoff](../../history/2026-09-29-pepo-operator-trace.md). This supersedes
+older trace-only statements below; MPO scalar trace semantics are unchanged.
+Changes remain local. Sparse trace budgets bound work, and large exact PEPO
+contractions can still be expensive.
+
+## One-way package ownership, 2026-09-29
+
+Pepsy owns the independent graph/tensor-network implementation; Gaugy owns
+its Pauli expansion and domain objectives as a downstream public-API client.
+The runtime code already follows this direction. The Gaugy-importing graph
+handoff regression has moved into Gaugy, and a fresh-interpreter Pepsy test
+blocks Gaugy imports while exercising graph/square materialization,
+compression and reports. See [ownership](package_layout.md#pepsy-and-downstream-packages)
+and the [validation record](../../history/2026-09-29-package-ownership.md).
+
+## Square routing, frozen compression and reports, 2026-09-29
+
+The local working tree now implements explicit square virtual routing for
+diagonal/NNN/higher-body dense interactions, leaving the union interaction
+plan and cluster inventory intact. Reference tree subspaces provide explicit
+smaller differentiable materializations; ranks and reference bases remain
+fixed during replay. Ordered builder reports count actual exponentials,
+whole-product reuse and lower contractions. Gaugy exposes the same controls.
+
+These changes remain unpublished Pepsy edits. The
+[API contract](../api/operators/interaction_clusters.md#explicit-differentiable-compression)
+and [handoff](../../history/2026-09-29-square-routing-compression-reports.md)
+describe validation and limits. Rank-changing autodiff, global optimal
+compression, native symmetry routing and GPU performance remain unverified
+or unsupported as specified there. Earlier statements below about missing
+diagonal routing describe their dated baseline.
+
+## Factor exponential reuse and graph autodiff, 2026-09-29
+
+The local working tree adds per-factor exponential reuse to square and graph
+ordered products, plus Torch/JAX graph PEPO materialization. Numerical caches
+remain local to an evaluation; independent vector slots and opaque callbacks
+keep their binding semantics. Square batches now pool representatives across
+factors as well as clusters. Graph fixed splits preserve zero derivatives;
+uncapped tensor-backend auto construction uses the same fixed route.
+
+These changes are not yet published. See the
+[API contract](../api/operators/interaction_clusters.md#representation-boundaries),
+[implementation and validation handoff](../../history/2026-09-29-factor-reuse-graph-autodiff.md),
+and [compatibility evidence](notes/2026-09-29-factor-reuse-graph-autodiff.md).
+Rank-capped SVD derivatives, large fixed-channel memory costs, and GPU
+performance remain separate limits.
 
 ## Shared square-plan PEPO integration, 2026-09-29
 

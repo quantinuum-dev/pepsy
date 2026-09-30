@@ -203,7 +203,6 @@ def test_recursive_rejects_incompatible_controls():
         ({"graph_assembly": "bounded"}, "retains complete"),
         ({"max_collection_order": 1}, "retains complete"),
         ({"assembly_cutoff": 1e-8}, "requires assembly_chi"),
-        ({"symmetry": "U1", "physical_charges": (0, 1)}, "native symmetry"),
         ({"graph": None}, "requires graph"),
     ]:
         with pytest.raises(ValueError, match=message):

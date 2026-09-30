@@ -598,7 +598,7 @@ Storage estimates inspect shape/dtype metadata without detaching or converting
 Torch blocks, so they can guard dense allocation during autodiff. The estimate
 covers dense site tensors, not the contraction or backward graph.
 
-## Trace-only cluster evaluation
+## Trace of the constructed PEPO
 
 When the required observable is only the full trace, use
 `compiled.trace_exp(step, normalized=False)` on a compiled
@@ -607,7 +607,26 @@ is the default; `normalized=True` divides by `2**(lx * ly)`.
 `parameters` and `coefficients` follow the corresponding `exp` call.
 For an ordered product, the same factor order is used on every local cluster.
 
-The evaluator computes the normalized trace of each exact local ordered
+This constructs the PEPO with its selected rank/factorization policy and
+contracts the physical trace of its active blocks. `compression=plan` traces
+the projected PEPO. No dense site tensors or global operator matrix are
+needed for the default sparse contraction. `state_budget=100000` caps sparse
+site entries and pairwise join work; use a larger budget or `None` explicitly
+when appropriate. No terms are dropped to satisfy the budget. Numerical
+NumPy zeros can be skipped; Torch/JAX zeros remain live for
+derivatives. For Quimb contraction options, pass `contract_opts={...}` to
+construct a materialized network, or trace an existing result. A custom
+`state_budget` cannot be combined with materialized contraction, because that
+budget governs only sparse joins. `contract_opts` must be a mapping:
+
+```python
+from pepsy.operators import trace_pepo
+active = compiled.exp(0.01, materialize=False)
+value = trace_pepo(active, normalized=True)
+```
+
+The old scalar shortcut remains explicit as `partition_trace_exp`. That
+evaluator computes the normalized trace of each exact local ordered
 target, subtracts proper connected partitions as scalar residuals, then
 sums all compatible disjoint placements with a cached subset recursion.
 It never creates PEPO blocks, tree factorizations, virtual bonds, or a
@@ -622,11 +641,10 @@ approximations are part of the quantity you need, trace the constructed
 representation instead. The local exponentials still require matrices of
 size `2**p`; the subset recursion can also become costly for large
 lattices or cluster order. This is an ordinary bosonic full trace. Full `torch.compile` capture of
-`trace_exp` is currently unsupported by the local Autoray target path;
+these evaluators is currently unsupported by the local Autoray target path;
 eager Torch autodiff and JAX JIT on small instances are validated.
 
-To trace an already constructed active PEPO (including its factorization
-policy), close its physical blocks first:
+An alternative Quimb contraction closes the physical blocks first:
 
 
 ```python

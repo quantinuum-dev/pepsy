@@ -3,6 +3,9 @@
 import importlib
 import importlib.metadata
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import tomllib
 
@@ -216,6 +219,52 @@ def test_package_version_matches_installed_distribution():
         (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
     )
     assert pepsy.__version__ == importlib.metadata.version("pepsy") == project["project"]["version"]
+
+
+def test_cluster_workflows_do_not_depend_on_downstream_gaugy():
+    """Exercise public construction in a fresh interpreter that cannot load Gaugy."""
+    project = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    dependencies = [*project["dependencies"],
+                    *(dep for group in project["optional-dependencies"].values() for dep in group)]
+    assert "gaugy" not in {Requirement(dep).name.lower() for dep in dependencies}
+    program = textwrap.dedent("""
+        import importlib.abc
+        import sys
+
+        attempts = []
+        class BlockDownstream(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "gaugy" or fullname.startswith("gaugy."):
+                    attempts.append(fullname)
+                    raise AssertionError("Pepsy must not import Gaugy")
+
+        assert not any(name == "gaugy" or name.startswith("gaugy.") for name in sys.modules)
+        sys.meta_path.insert(0, BlockDownstream())
+
+        import numpy as np
+        from pepsy.operators import ClusterPlan, MPOProductTerm, PEPOClusterProductExpansion
+
+        factors = [[MPOProductTerm.from_pauli((0, 3), "XZ", coefficient=.3)],
+                   [MPOProductTerm.from_pauli((0,), "Y", coefficient=.2)]]
+        plan = ClusterPlan.from_terms([term for factor in factors for term in factor],
+                                      sites=4, shape=(2, 2), cluster_size=2)
+        graph = PEPOClusterProductExpansion.from_plan(plan, factors, layout="graph", factorization="fixed")
+        square = PEPOClusterProductExpansion.from_plan(plan, factors, layout="square", factorization="fixed")
+        target = graph.exp(-.1j).to_dense()
+        result, report = square.exp(-.1j, materialize=True, return_report=True)
+        np.testing.assert_allclose(result.to_dense(), target, atol=1e-13)
+        np.testing.assert_allclose(graph.trace_exp(-.1j), np.trace(target), atol=1e-13)
+        assert report["materialization"]["factor_exponentials_evaluated"] > 0
+        compression = square.prepare_compression(-.1j, max_tree_rank=4)
+        projected = square.exp(-.1j, compression=compression, materialize=True)
+        np.testing.assert_allclose(projected.to_dense(), target, atol=1e-13)
+        assert not attempts
+    """)
+    result = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True,
+                            text=True, timeout=60, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_optional_dependency_profiles_are_declared():

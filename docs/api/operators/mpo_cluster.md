@@ -107,13 +107,82 @@ The history-only keywords `order`, `mode`, `history_storage`, and
 `extension_budget` are deliberately not accepted here. They have no safe
 translation to spatial cluster size and remain part of `exp_mpo` only.
 
+For numerical dependency removal without SVD, see
+[delinearize_mpo](mpo_delinearize.md). Frontier construction can precede it
+to avoid materializing the original fixed collection MPO. For fixed qubit
+Pauli models, `prepare_cluster_channels(..., preparation="automaton")` also
+proves constant linear state identities within the declared operator algebra.
+The [automaton guide](cluster_channels.md#mpo-preparation-with-operator-aware-automaton-reduction)
+shows this no-SVD/QR option and its limits; it need not reduce bonds beyond
+frontier sharing.
+
+### Integrated automaton plus QR construction
+
+Both one-shot facades can prepare exact channels and delinearise the resulting
+MPO in one package call:
+
+```python
+mpo, report = exp_mpo_cluster(
+    terms, -1j*t, shape=N, graph=geometry, cluster_size=p,
+    factorization="fixed", cutoff=0.0, graph_assembly="exact",
+    preparation="automaton", delinearize=True,
+    delinearize_opts={"rtol": 1e-12, "preserve_zeros": True, "max_sweeps": 4},
+    return_report=True,
+)
+print(report["channel_bond_dimensions"], report["bond_dimensions"])
+print(report["delinearization"])
+```
+
+`exp_mpo_cluster_product(factors, ...)` accepts the same options and retains
+the supplied exponential matrix order. Use `preparation="frontier"` for the
+frontier + QR comparison, or omit `delinearize` to return exact channels.
+`preparation=None` preserves the existing facade and report behavior.
+
+Channel preparation requires fixed uncapped residuals and complete graph
+collections: use `graph_assembly="exact"`, or uncapped `assembly="recursive"`.
+Bounded/automatic direct graph targets are rejected rather than silently
+changed. `assembly_state_budget` limits frontier states; collection enumeration
+is avoided. This does not bound total memory or guarantee minimum bonds.
+Advanced channel controls and repeated evaluation use
+[`prepare_cluster_channels`](cluster_channels.md).
+
+This branch returns a Quimb MPO and a **channel-report dictionary** instead of
+the ordinary facade's analytical cluster-report dataclass. `return_semantic`
+is unsupported. The dictionary is also attached as `pepsy_cluster_report` and
+`pepsy_channel_report`; after QR its `bond_dimensions` and
+`output_dense_entries` describe the returned operator. `channel_bond_dimensions`
+records the exact channel construction before QR. The nested `delinearization`
+report gives the actual tolerance, zero policy, sweep count and local residual.
+
+QR postprocessing supports dense NumPy arrays only and is selected freshly
+at each evaluation. Native/autodiff arrays reject explicitly; uncapped
+frontier without QR retains native support. No SVD is used in this construction
+path, including the QR postprocessing, but it is not a differentiable
+parameter-family reduction. Check final operator error separately from both
+the local QR tolerance and spatial cluster error. No final `chi` compression
+is combined with fixed construction; compress the returned MPO separately.
+
 ## Exact construction for autodiff without SVD
+
+For an optional fixed cap on the assembled virtual channels, see
+[compact channel plans](cluster_channels.md). That separate reference-based
+projection accepts fixed direct or uncapped recursive source builders and
+fuses local factors and crossing paths into smaller tensors, with no
+history materialization or numerical decomposition during replay. Reference
+preparation still obeys the graph collection budget. It first shares formally
+equal MPO prefixes/continuations within charge sectors; the cap then controls
+the numerical representation independently of spatial cluster order.
+The opt-in `preparation="frontier"` shares completed histories directly and
+avoids complete collection enumeration, subject to an active-state budget.
+It preserves exact interval/direct-graph or uncapped recursive targets.
 
 Set `factorization="fixed"` to construct cluster residual MPOs with fixed index
 routing instead of a numerical operator-Schmidt basis. Both interval and graph
 constructors, `MPOBasis` cluster/compile helpers, and the exponential/product
 facades accept this policy. The existing `factorization="auto"` default keeps
-the numerical policy, including SVD and cutoff/rank controls.
+the numerical policy, including SVD and cutoff/rank controls, for NumPy.
+Native Torch/JAX residuals use exact fixed sector factors and require local
+`cutoff=0` or `None` and `max_bond=None` even under `"auto"`.
 
 ```python
 compiled = basis.compile_graph_cluster_expansion(
@@ -130,11 +199,12 @@ U, report = compiled(step, parameters=parameters, return_report=True)
 The exact factorization uses `M = I @ M` or `M = M @ I` according to the
 static matrix dimensions, preserving gradients even when M is zero. Channel
 shapes do not depend on coefficients or the time step. `cutoff=0.0` (or None)
-and `max_bond=None` are required; assembly rank/cutoff controls, a final facade
-`chi`, and native charge-sector compilation are rejected in fixed mode so
-construction cannot silently reintroduce decompositions. Compress the returned
-operator separately if a numerical approximation is wanted. Fermionic cluster
-construction remains unsupported.
+and `max_bond=None` are required; assembly rank/cutoff controls and a final
+facade `chi` are rejected in fixed mode so construction cannot silently
+reintroduce decompositions. Native bosonic sectors use the same identity split
+inside each allowed charge block. Compress the returned operator separately
+if a numerical approximation is wanted. Fermionic cluster construction remains
+unsupported.
 
 `report.factorization` and `compiled.cache_info["factorization"]` identify the
 policy. Geometry, supports, structural symmetry matches, coefficient bindings,
@@ -403,15 +473,15 @@ removes that guard explicitly. Small exact checks can use
 `assembly_chi=None, max_bond=None, cutoff=0.0` and omit final `chi`.
 
 Before each truncation the assembler prepares an orthonormal environment
-with an exact reverse sweep. `assembly_cutoff=None` then uses fixed ranks;
-a cutoff requests adaptive ranks. `assembly_form` sets the output sweep
+with an exact reverse sweep. For dense arrays, `assembly_cutoff=None` then
+uses fixed ranks; a cutoff requests adaptive ranks. `assembly_form` sets the output sweep
 direction. Fixed-rank derivatives retain the backend SVD's locally smooth,
 spectrally separated contract; adaptive rank selection is discrete. Dense
 NumPy and Torch paths are tested. If NumPy thin SVD does not converge on
 a finite two-dimensional compression matrix, an installed SciPy provides a
 `gesvd` retry; without SciPy the original failure propagates. The retry
 keeps the requested rank policy and is not a convergence guarantee. Native
-charge/fermionic recursive assembly is currently unsupported.
+bosonic assembly preserves sectors, with the compression contract below.
 
 This reduces collection enumeration, but does not guarantee low cost on wide
 graphs: subproblem counts, residual span ranks, and tensor multiplication
@@ -497,7 +567,7 @@ U = exp_mpo_cluster(
 )
 ```
 
-`assembly_cutoff=None` is the backend-differentiable fixed-rank policy.
+For dense arrays, `assembly_cutoff=None` is the backend-differentiable fixed-rank policy.
 Supplying a cutoff selects singular-value-dependent ranks. Tensor arithmetic
 stays on the requested backend, while the discrete rank decision is not
 suitable for a compiled/JIT trace. The report records the sweep direction
@@ -523,11 +593,63 @@ U = exp_mpo_cluster(
 ```
 
 The supported bosonic symmetries are `U1`, `Z2`, `U1U1`, and `Z2Z2`. Use
-`MPOPhysicalSpace` when the physical metadata is already bundled. Native
-sector compilation currently requires NumPy local blocks, and streaming
-and recursive intermediate compression are rejected for symmetric clusters
-until its SVD is sector-aware. Fermionic graded cluster histories remain a
-separate unsupported path.
+`MPOPhysicalSpace` when the physical metadata is already bundled. Single and
+joint products share the following construction policies:
+
+| Native policy | Backends and assembly |
+| --- | --- |
+| Exact `factorization="fixed"`, `cutoff=0`, `max_bond=None` | NumPy, Torch, JAX; direct or recursive with `assembly_chi=None` |
+| Numerical local sector SVD (`factorization="auto"`) | NumPy; local cutoff and total rank cap |
+| Intermediate sector compression (`assembly_chi` set) | NumPy, Torch; recursive or streaming, using `factorization="auto"` |
+
+For differentiable construction, keep local operators as static NumPy arrays
+and supply live coefficients, factor scales and step as Torch/JAX tensors.
+Conservation is proved for every independent coefficient binding before
+materialization; currently equal or zero independent values cannot justify
+discarding forbidden derivative channels. Shared `MPOParameter` identities
+can prove conservation of sums such as `XX + YY`. Structural virtual charges
+and zero blocks survive compilation, so fixed construction preserves
+derivatives at zero coefficients. Native blocks retain backend, dtype and
+device; JAX `jit(value_and_grad)` can return an array/scalar measurement of
+the constructed MPO. Fermionic graded histories are outside this spin API.
+
+NumPy numerical residual factorization uses separate charge blocks, then selects
+singular values from their combined spectrum. `max_bond` caps the total
+retained rank at each cut; it is not a separate allowance for every sector.
+At `cutoff=0`, retained null channels stay inside their charge sectors.
+Exactly zero NumPy numerical residuals retain the existing one-channel shortcut. Virtual
+charge labels follow the assembled paths, including graph gaps and crossing
+or nested collections. Targets that violate charge conservation raise rather
+than being projected into allowed sectors.
+
+Single and joint conserved hopping now materialize correctly, including at
+zero cutoff. Checks cover all four bosonic groups, repeated physical charges,
+three-site generators, zero parameters and total rank caps. Native dense
+export restores individual physical axes before reshaping to the requested
+matrix order, including degeneracies inside a charge sector. See the
+[native construction follow-up](../../development/notes/2026-09-29-native-cluster-charges.md)
+for the original direct NumPy checks, and the
+[autodiff follow-up](../../development/notes/2026-09-29-native-cluster-autodiff.md)
+for CPU/CUDA Torch and compiled JAX measurements.
+
+Native intermediate compression allocates the total `assembly_chi` across
+charge sectors using their combined singular spectrum. It removes numerical
+null channels even with `assembly_cutoff=None`; this is a discrete rank and
+sector decision. Torch differentiates the retained factor pairs using Pepsy's
+paired-factor projector VJP. First-order gradients require gauge-invariant
+factor use, a locally unchanged retained rank, and a resolved kept/discarded
+gap. They are checked against finite differences with actual truncation; no
+derivative through rank changes is claimed. Reports use
+`method="native-sector-projector"` and `differentiable=False` to identify
+the discrete selection policy. Discarded weights are local diagnostics,
+not a global accumulated error bound.
+
+Public `semantic.compress_adaptive(chi, cutoff=0)` uses the same sector
+compressor. `compress_fixed_rank` rejects native MPOs because a total cap
+does not specify a fixed allocation among charge sectors. Native JAX
+intermediate compression is unsupported; retain exact fixed construction
+with `assembly_chi=None` for JIT. Fixed exact channels can still create large
+bonds, while compressed assembly requires independent convergence checks.
 
 For a two-dimensional lattice at scale, prefer the graph-native PEPO active
 representation. An MPO must pay for the lattice-to-chain cutwidth, while a

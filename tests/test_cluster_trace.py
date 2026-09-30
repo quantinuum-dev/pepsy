@@ -83,12 +83,12 @@ def test_joint_square_trace_matches_constructed_operators(order, monkeypatch):
                         lambda *_args: pytest.fail("MPO residual matrices built"))
     monkeypatch.setattr(pepo.expansion.factors[0].basis, "_build_inhomogeneous_active",
                         lambda *_args, **_kwargs: pytest.fail("PEPO blocks built"))
-    for compiled in (mpo, pepo):
-        np.testing.assert_allclose(compiled.trace_exp(step), expected_mpo, atol=2e-11)
+    for trace in (mpo.trace_exp, pepo.partition_trace_exp):
+        np.testing.assert_allclose(trace(step), expected_mpo, atol=2e-11)
         np.testing.assert_allclose(
-            compiled.trace_exp(step, normalized=True), expected_mpo / 16, atol=2e-11,
+            trace(step, normalized=True), expected_mpo / 16, atol=2e-11,
         )
-        np.testing.assert_allclose(compiled.trace_exp(0), 16, atol=2e-11)
+        np.testing.assert_allclose(trace(0), 16, atol=2e-11)
 
 
 
@@ -105,7 +105,7 @@ def test_single_basis_coefficient_overrides_are_fresh():
         )
 
 
-def test_periodic_square_trace_keeps_parallel_bond_occurrences():
+def test_periodic_square_partition_trace_keeps_parallel_bond_occurrences():
     basis = PauliPEPOBasis.compile(
         2, 2, [("onsite", "X", .2), ("edge", "ZZ", .3)],
         order=4, cyclic=True, symmetry="C4", factorization="fixed",
@@ -119,16 +119,16 @@ def test_periodic_square_trace_keeps_parallel_bond_occurrences():
         matrices = [Z if i in edge else I for i in range(4)]
         # Length-two periodic dimensions have two directed bonds per pair.
         h += .6 * np.kron(np.kron(np.kron(*matrices[:2]), matrices[2]), matrices[3])
-    np.testing.assert_allclose(basis.compile_exp().trace_exp(step),
+    np.testing.assert_allclose(basis.compile_exp().partition_trace_exp(step),
                                np.trace(expm(step * h)), atol=2e-11)
 
 
 def test_trace_budget_is_explicit_and_does_not_drop_collections():
     mpo, pepo = _square_products(3)
-    for compiled in (mpo, pepo):
+    for trace in (mpo.trace_exp, pepo.partition_trace_exp):
         with pytest.raises(ValueError, match="state_budget"):
-            compiled.trace_exp(.1, state_budget=1)
-        np.testing.assert_allclose(compiled.trace_exp(0), 16, atol=1e-12)
+            trace(.1, state_budget=1)
+        np.testing.assert_allclose(trace(0), 16, atol=1e-12)
 
 
 

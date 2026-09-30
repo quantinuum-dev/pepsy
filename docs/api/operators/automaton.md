@@ -124,3 +124,12 @@ Torch/JAX arrays retain their backend and differentiation graph. Structural
 methods such as `add_product_term` do modify the automaton. Treat stored
 operator payloads as shared inputs rather than assuming the builder copies
 their array storage.
+
+## Cluster exponentials
+
+For automaton construction of a finite cluster exponential or ordered product,
+use [`prepare_cluster_channels(..., preparation="automaton")`](cluster_channels.md#mpo-preparation-with-operator-aware-automaton-reduction).
+It compiles reachable disjoint-cluster paths and reduces states with certified
+Pauli identities. `max_bond=None` uses no SVD/QR and preserves the declared
+cluster family. This separate opt-in path does not change `MPOAutomaton`'s raw
+transition conversion or make a Hamiltonian automaton an exponential evaluator.

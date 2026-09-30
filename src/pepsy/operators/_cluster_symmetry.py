@@ -120,10 +120,14 @@ class ClusterReusePlan:
 class SpatialProductData(tuple):
     """Ordered factor data with a numerical cache owned by one evaluation."""
 
-    def __new__(cls, factors, plan):
+    def __new__(cls, factors, plan, factor_plans=(), *, stats=None, is_factor=False):
         obj = super().__new__(cls, factors)
         obj.plan = plan
         obj.products = {}
+        obj.stats = stats
+        obj.is_factor = is_factor
+        obj.factor_data = tuple(cls((factor,), local_plan, stats=stats, is_factor=True)
+                                for factor, local_plan in zip(obj, factor_plans))
         return obj
 
 

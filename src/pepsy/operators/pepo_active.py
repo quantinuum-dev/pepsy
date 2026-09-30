@@ -167,6 +167,20 @@ def _site_after(site, direction, lx, ly, cyclic):
         return None
     return ni, nj
 
+
+def _graph_bond_sector_maps(active):
+    """Relabel only the structural channels used on each graph edge."""
+    maps = {}
+    for edge, endpoints in enumerate(active.edges):
+        sectors = {0}
+        for site in endpoints:
+            axis = active.site_directions[site].index(edge)
+            sectors.update(key[axis] for key in active.blocks[site])
+        mapping = {sector: i for i, sector in enumerate(sorted(sectors))}
+        for site in endpoints:
+            maps[site, edge] = mapping
+    return maps
+
 @dataclass
 class ActivePEPOBlocks:
     """Sparse active virtual-sector blocks for a finite PEPO lattice.
@@ -646,6 +660,12 @@ class ActivePEPOBlocks:
         """Explicitly materialize and contract the square PEPO as a matrix."""
         return self.to_pepo().to_dense()
 
+    def trace(self, *, normalized=False, state_budget=None):
+        """Close physical legs and contract this PEPO's sparse virtual bonds."""
+        from .pepo_trace import trace_pepo
+
+        return trace_pepo(self, normalized=normalized, state_budget=state_budget)
+
     materialize = to_pepo
 
 @dataclass
@@ -668,6 +688,16 @@ class GraphActivePEPOBlocks:
     physical_sectors: dict | None = None
     virtual_sector_charges: dict | None = None
 
+    def to_square(self, shape, *, cyclic=(False, False)):
+        """Route graph bonds onto a square lattice without changing the operator.
+
+        ``shape`` maps ``sites`` to row-major coordinates. Crossing wires
+        remain independent; routing can multiply square virtual dimensions.
+        """
+        from .pepo_routing import route_graph_blocks
+
+        return route_graph_blocks(self, shape, cyclic)
+
     @property
     def active_block_count(self):
         """Return the number of stored nonzero sector blocks."""
@@ -687,20 +717,27 @@ class GraphActivePEPOBlocks:
     def dense_nbytes(self):
         """Estimate bytes required by dense graph tensor-network tensors."""
         itemsize = _backend_dtype_itemsize(_graph_block_reference(self.blocks))
+        maps = _graph_bond_sector_maps(self)
         return sum(
-            self.bond_dim ** len(self.site_directions[site])
+            prod(len(maps[site, edge]) for edge in self.site_directions[site])
             * self.physical_dim**2
             * itemsize
             for site in self.sites
         )
 
+    @property
+    def bond_dimensions(self):
+        """Structural channel count on each graph edge, including live zeros."""
+        maps = _graph_bond_sector_maps(self)
+        return {edge: len(maps[a, edge]) for edge, (a, _b) in enumerate(self.edges)}
+
     def compact(self):
-        """Remove zero and globally orphaned graph-edge sectors."""
+        """Remove orphaned sectors and NumPy zeros; retain live backend zeros."""
         compact_blocks = {
             site: {
                 key: block
                 for key, block in site_blocks.items()
-                if _backend_nonzero(block)
+                if ar.infer_backend(block) not in {"numpy", "builtins"} or _backend_nonzero(block)
             }
             for site, site_blocks in self.blocks.items()
         }
@@ -769,9 +806,10 @@ class GraphActivePEPOBlocks:
 
     remove_orphans = compact
 
-    def to_tensor_network(self, *, remove_orphans=True):
+    def to_tensor_network(self, *, remove_orphans=True, compact_bonds=True):
         """Materialize the graph PEPO as a generic Quimb tensor network."""
         active = self.compact() if remove_orphans else self
+        maps = _graph_bond_sector_maps(active) if compact_bonds else None
         dtype = _graph_block_reference(active.blocks).dtype
         edge_inds = {
             edge_index: ("graph-bond", edge_index)
@@ -787,6 +825,8 @@ class GraphActivePEPOBlocks:
                 {key: block.T for key, block in active.blocks[site].items()},
                 active.bond_dim,
                 dtype,
+                sector_maps=(tuple(maps[site, edge] for edge in directions)
+                             if maps is not None else None),
             )
             bra = ("graph-bra", site)
             ket = ("graph-ket", site)
@@ -810,10 +850,16 @@ class GraphActivePEPOBlocks:
         output_inds = [("graph-bra", site) for site in active.sites]
         output_inds += [("graph-ket", site) for site in active.sites]
         tensor = network.contract(output_inds=output_inds)
-        return np.asarray(tensor.data).reshape(
-            active.physical_dim ** len(active.sites),
-            active.physical_dim ** len(active.sites),
+        return ar.do(
+            "reshape", tensor.data,
+            (active.physical_dim ** len(active.sites),) * 2,
         )
+
+    def trace(self, *, normalized=False, state_budget=None):
+        """Trace this graph PEPO with its retained ranks and live block values."""
+        from .pepo_trace import trace_pepo
+
+        return trace_pepo(self, normalized=normalized, state_budget=state_budget)
 
     to_pepo = to_tensor_network
     materialize = to_tensor_network

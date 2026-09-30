@@ -14,6 +14,119 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Cluster-MPO facades now accept `preparation="frontier"` or `"automaton"`
+  with fixed uncapped construction, plus `delinearize=True` for integrated
+  NumPy QR dependency removal. Single and ordered-product calls preserve the
+  cluster target and avoid collection enumeration. `ClusterChannelPlan.exp`
+  and `trace_exp` support the same opt-in QR step; `delinearize_opts` controls
+  its tolerance, zero policy and sweep count. Evaluation reports distinguish
+  channel bonds from final bonds. Defaults and static autodiff maps are unchanged.
+
+- Constructed PEPO traces now reject sparse-budget/materialized-contraction
+  combinations instead of silently ignoring a control, and require mapping
+  contraction options. Compact channel reports distinguish exact structural
+  plans from QR projections and count reference evaluations. Exact
+  symbolic/algebraic preparation with an uncapped or nonbinding cap skips
+  numerical reference residual builds. Exact reference/frontier/automaton plans
+  still perform their required base build but skip unused optional references.
+
+- Compact dense Pauli MPO plans accept `preparation="automaton"`: reachable
+  frontier states plus exact rational elimination of operator-aware linear
+  transition dependencies. Full channels avoid SVD/QR and preserve the whole
+  declared parameter family. Replay uses fixed Pauli projections and fused
+  contractions. Native sectors use frontier preparation; smaller caps remain
+  approximations, and global minimality or universal bond reduction is not
+  claimed. Both 1D cluster notebooks compare this mode explicitly.
+
+- Compact graph/square Pauli PEPO plans accept `preparation="algebraic"`.
+  Closed Pauli spans and exact rational edge-slice delinearisation preserve
+  the declared parameter family without SVD/QR for full channels. Replay uses
+  fixed projections and contractions; Torch CPU/CUDA gradients, JAX trace JIT
+  and Torch assembly capture are covered. Optional reference QR caps remain
+  approximations. This is local reduction, not global minimality, and it does
+  not remove dense local exponential work.
+
+- `pepsy.operators.delinearize_mpo` and `MPODelinearizationReport` provide
+  opt-in numerical dependency removal for open-chain dense NumPy MPOs.
+  Column/transfer sweeps use pivoted QR without SVD, with explicit residual
+  and zero-preservation policies. This is separate from symbolic sharing,
+  has no best-rank guarantee, and rejects native/autodiff arrays explicitly.
+
+- Compact graph/square PEPO plans accept `preparation="symbolic"`. Exact
+  edge-slice sharing reduces graph channels before square routing, then
+  shares routed channels; reference/tangent samples reuse linear templates.
+  Replay folds both quotients into constant maps, preserving Torch/JAX
+  derivatives without SVD/QR. Full channels retain the selected cluster
+  target; tight-cap accuracy can change with the gauge. Remaining routed
+  blocks are still enumerated once. Square wire labels now use mixed-radix
+  arithmetic instead of Cartesian dictionaries.
+
+- Experimental `prepare_cluster_channels` / `ClusterChannelPlan` for fixed
+  MPO and fixed graph/square PEPO construction into compact virtual
+  spaces. Multi-reference and finite-difference tangent snapshots select
+  charge-preserving bases with host QR; Torch/JAX replay fuses local factors
+  into compact tensors without expanded histories, product cores, SVD or QR.
+  `pack_residuals` / `bind_assembler` expose the complete assembly kernel for
+  explicit Torch compilation. Recursive MPO sources require exact reference
+  topology within their collection budget. Square plans use graph residuals
+  and wire routing; their projected gauge can differ from earlier plans.
+  Reduced spaces are approximate objectives.
+- Compact MPO plans now merge equal symbolic prefix/suffix transitions within
+  charge sectors before QR selection. Sum/select endpoint maps preserve
+  multiplicity for independent residual entries, including zero coefficients.
+  `structural_reuse=False` retains the previous MPO gauge; capped plans can
+  change with the new default gauge. PEPO symbolic sharing is opt-in as above.
+- Compact MPO plans accept `preparation="frontier"` to share completed
+  histories before allocation. Reachable active-cluster transitions replace
+  full collection enumeration, including crossing/gapped supports and native
+  sectors. `frontier_state_budget` is an explicit guard; exactness does not
+  depend on a collection-count cap. Bounded/auto graph targets keep reference
+  preparation. Full symbolic minimality is not claimed.
+- Graph PEPO materialization now relabels channels independently per edge,
+  removing global padding exactly. Physical Pauli transforms preserve
+  single-precision complex dtype through fixed square construction.
+
+- Native Abelian cluster MPOs now factor residuals by charge sector and
+  preserve virtual charges through direct interval and graph assembly.
+  Conserved hopping and zero-cutoff null channels work for single and joint
+  exponentials; rank caps apply across the combined sector spectrum. Native
+  MPO dense export also preserves physical basis ordering with repeated
+  charges. Exact fixed-sector construction now preserves Torch/JAX gradients,
+  including zero coefficients and JAX tracing. Native recursive/streaming
+  assembly and semantic adaptive compression preserve sectors on NumPy/Torch;
+  Torch uses paired-factor projector derivatives within fixed rank charts.
+  Native fixed-rank compression rejects unspecified sector allocations, and
+  JAX intermediate adaptive compression remains unsupported.
+
+- Joint PEPO evaluation now rejects Quimb compression keywords when
+  `compress=False` and rejects incompatible materialization options before
+  coefficient callbacks run. Joint MPO/PEPO and downstream Gaugy checks now
+  include CPU/CUDA values and gradients, with no adaptive-rank guarantee.
+
+- PEPO `trace_exp` now constructs and traces the selected PEPO, including
+  rank caps and compression. Public `trace_pepo` and active-block `.trace()`
+  measure existing square/graph operators with sparse virtual contraction
+  and backend gradients. `partition_trace_exp` explicitly retains the old
+  uncompressed scalar shortcut. Short periodic axes now use finite-lattice
+  construction to preserve wrapped clusters and repeated bond occurrences.
+
+- Explicit square layouts now route diagonal, long-range, higher-body and
+  other dense graph interactions onto square virtual bonds without changing
+  cluster supports. Ordered PEPO builders add reference-based
+  `prepare_compression` and `compression=plan` for smaller fixed subspaces
+  with Torch/JAX gradients through the projected operator. Materialization
+  reports now count actual exponential batches, product reuse and lower
+  contractions. Automatic layout selection is unchanged; rank/subspace
+  selection is outside autodiff.
+
+- Ordered graph PEPO construction now preserves Torch/JAX gradients through
+  active blocks and explicit materialization. Graph factories accept fixed
+  factorization; uncapped backend auto construction also uses exact fixed
+  splits, while NumPy auto keeps numerical SVD compression. Tensor zero
+  blocks retain their derivatives. Square and graph ordered products now
+  reuse individual factor exponentials when complete-product symmetry is
+  broken by other factors, with evaluation-local numerical caches.
+
 - Shared PEPO `from_plan` factories now select the existing square 2D builder
   for compatible nearest-neighbor Pauli plans, with explicit `layout="square"`
   and `"graph"` controls. The square adapter preserves term slots, ordered

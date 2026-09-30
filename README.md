@@ -6,6 +6,31 @@ PePsY (“PEPS in Python”) is a tensor-network library for circuit simulation,
 contraction, optimization, sampling, and variational Monte Carlo.
 The Python package is named `pepsy`.
 
+Pepsy is independent of downstream packages such as Gaugy. Graph planning,
+tensor-network construction, contraction, compression and general solvers
+live here; downstream packages call these public APIs for their own domain
+algorithms. See [package ownership](docs/development/package_layout.md#pepsy-and-downstream-packages).
+
+Cluster PEPO `trace_exp` constructs and traces the selected PEPO, including
+rank caps and compression. Use `pepsy.operators.trace_pepo(pepo)` to measure
+an existing result; `partition_trace_exp` is the explicit uncompressed scalar
+shortcut. See the [trace contract](docs/api/operators/cluster_expansion.md#trace-of-the-constructed-pepo).
+
+Native bosonic cluster MPOs support exact Torch/JAX autodiff and sector-preserving
+NumPy/Torch compressed assembly. See the [construction and gradient limits](docs/api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos).
+
+For repeated spin-cluster evaluations, experimental
+[`prepare_cluster_channels`](docs/api/operators/cluster_channels.md) assembles
+compact MPO/PEPO tensors directly from local factors with frozen QR-prepared
+bases, avoiding expanded histories and numerical decomposition during
+autodiff. MPO preparation first shares formally equivalent transitions;
+further numerical reductions define an explicit approximate operator.
+For exact graph MPOs, `preparation="frontier"` also avoids enumerating
+complete collections by retaining only clusters crossing the current cut.
+For graph/square PEPOs, `preparation="symbolic"` shares exact graph channels
+before routing and reuses a linear reference template. Full channels preserve
+the chosen expansion; capped accuracy and speed must be measured.
+
 Version **0.5.0** · Python **3.12+** · [Changelog](CHANGELOG.md)
 
 ## Install from GitHub

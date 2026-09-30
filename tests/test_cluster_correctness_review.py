@@ -259,6 +259,19 @@ def test_joint_square_mpo_and_pepo_match_independent_partition_sum(order, monkey
 
 def test_joint_order_four_pepo_reuse_preserves_torch_gradients():
     torch = pytest.importorskip("torch")
+
+    def dense_exp_reference(generator):
+        # Independent small-norm series avoids Torch 2.6's low-degree
+        # singleton error. Verify values against SciPy without changing the
+        # value/gradient tolerances for the actual cluster implementation.
+        result = torch.eye(generator.shape[0], dtype=generator.dtype)
+        term = result
+        for order in range(1, 33):
+            term = term @ generator / order
+            result = result + term
+        np.testing.assert_allclose(result.detach().numpy(), expm(generator.detach().numpy()),
+                                   atol=2e-14, rtol=2e-14)
+        return result
     sites = ((0, 0), (0, 1), (1, 0), (1, 1))
     terms_a = [
         PauliPEPOTerm("onsite", "X", MPOParameter("h"), where=site)
@@ -313,8 +326,8 @@ def test_joint_order_four_pepo_reuse_preserves_torch_gradients():
             for product in compiled
         ]
         expected = (
-            torch.matrix_exp(-1j * time * (h * hx + 0.4 * hzz))
-            @ torch.matrix_exp(-1j * time * (-0.15 * hz + 0.25 * hxx))
+            dense_exp_reference(-1j * time * (h * hx + 0.4 * hzz))
+            @ dense_exp_reference(-1j * time * (-0.15 * hz + 0.25 * hxx))
         )
         gradients = [
             torch.autograd.grad((output.real * weights).sum(), (h, time))

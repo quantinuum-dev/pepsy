@@ -146,7 +146,7 @@ def from_interaction_plan(plan, factors, *, layout="auto", **kwargs):
             return SquarePEPOClusterProductExpansion(plan, factors, **kwargs)
         except _UnsupportedSquare:
             if layout == "square":
-                raise
+                return RoutedSquarePEPOClusterProductExpansion(plan, factors, **kwargs)
     return GraphPEPOClusterProductExpansion.from_plan(plan, factors, **kwargs)
 
 
@@ -234,15 +234,41 @@ class SquarePEPOClusterProductExpansion:
         return self._local.residuals(step, parameters=parameters, coefficients=coefficients)
 
     def trace_exp(
+        self, step=1.0, parameters=None, *, coefficients=None, normalized=False, state_budget=100000,
+        compression=None, contract_opts=None,
+    ):
+        from .pepo_trace import _trace_options, trace_pepo
+
+        materialize = contract_opts is not None
+        trace_options = _trace_options(state_budget, contract_opts, materialized=materialize)
+        pepo = self.exp(step, parameters, coefficients=coefficients, compression=compression,
+                        materialize=materialize)
+        return trace_pepo(pepo, normalized=normalized, **trace_options)
+
+    def partition_trace_exp(
         self, step=1.0, parameters=None, *, coefficients=None, normalized=False, state_budget=100000
     ):
-        return self._square.trace_exp(
+        return self._square.partition_trace_exp(
             step,
             parameters,
             coefficients=coefficients,
             normalized=normalized,
             state_budget=state_budget,
         )
+
+    def prepare_compression(self, step=1.0, parameters=None, *, coefficients=None,
+                            max_tree_rank):
+        return self._projection_builder().prepare_compression(
+            step, parameters, coefficients=coefficients, max_tree_rank=max_tree_rank)
+
+    def _projection_builder(self):
+        if self.max_tree_rank is not None:
+            raise ValueError("compression supplies its own ranks; use max_tree_rank=None on the builder.")
+        if not hasattr(self, "_projection_source"):
+            self._projection_source = RoutedSquarePEPOClusterProductExpansion(
+                self.cluster_plan, self.factors, factorization="fixed",
+                spatial_reuse=self._square.factors[0].basis.spatial_reuse)
+        return self._projection_source
 
     def exp(
         self,
@@ -252,10 +278,18 @@ class SquarePEPOClusterProductExpansion:
         coefficients=None,
         materialize=False,
         return_report=False,
+        compression=None,
     ):
+        if compression is not None:
+            return self._projection_builder().exp(
+                step, parameters, coefficients=coefficients, compression=compression,
+                materialize=materialize, return_report=return_report)
         result = self._square.exp(
-            step, parameters, coefficients=coefficients, materialize=materialize
+            step, parameters, coefficients=coefficients, materialize=materialize,
+            return_report=return_report,
         )
+        if return_report:
+            result, evaluation_report = result
         report = dict(
             layout="square",
             cluster_size=self.cluster_size,
@@ -263,7 +297,88 @@ class SquarePEPOClusterProductExpansion:
             max_tree_rank=self.max_tree_rank,
             factorization=self._square.cache_info["factorization"],
         )
+        if return_report:
+            report.update(evaluation_report)
         return (result, report) if return_report else result
+
+    __call__ = exp
+    evaluate = exp
+
+
+class RoutedSquarePEPOClusterProductExpansion:
+    """Explicit square routing of a graph expansion on unchanged supports."""
+
+    def __init__(self, plan, factors, **kwargs):
+        from .graph_pepo_product import GraphPEPOClusterProductExpansion
+        from .pepo_routing import square_routes
+
+        factors = tuple(MPOClusterProductExpansion._normalize_factor(f) for f in factors)
+        for factor in factors:
+            for term in factor.terms:
+                if (getattr(term, "string_operators", None) is not None
+                        or getattr(term, "charge", None) is not None
+                        or any(getattr(term, "parities", ()))
+                        or getattr(getattr(term, "braiding", None), "fermionic", False)):
+                    raise ValueError("square routing does not support charge, fermion, or string metadata.")
+        if plan.shape is None or len(plan.shape) != 2:
+            raise ValueError("square routing requires a two-dimensional plan.shape.")
+        coordinates = tuple(product(*(range(n) for n in plan.shape)))
+        if all(isinstance(s, tuple) and len(s) == 2 for s in plan.sites) and plan.sites != coordinates:
+            raise ValueError("square coordinate sites must match shape in row-major order.")
+        square_routes(plan.sites, plan.lattice.edges, plan.shape, plan.cyclic)
+        self._graph = GraphPEPOClusterProductExpansion(plan, factors, **kwargs)
+        self.cluster_plan = plan
+        self.cluster_size = plan.cluster_size
+        self.factors = self._graph.factors
+
+    def compile_exp(self):
+        return self
+
+    @property
+    def cluster_inventory(self):
+        return self.cluster_plan.graph_shapes
+
+    @property
+    def cache_info(self):
+        return {**self._graph.cache_info, "representation": "routed-square-pepo"}
+
+    def residuals(self, *args, **kwargs):
+        return self._graph.residuals(*args, **kwargs)
+
+    def trace_exp(self, step=1.0, parameters=None, *, coefficients=None, normalized=False,
+                  state_budget=100000, compression=None, contract_opts=None):
+        from .pepo_trace import _trace_options, trace_pepo
+
+        materialize = contract_opts is not None
+        trace_options = _trace_options(state_budget, contract_opts, materialized=materialize)
+        pepo = self.exp(step, parameters, coefficients=coefficients, compression=compression,
+                        materialize=materialize)
+        return trace_pepo(pepo, normalized=normalized, **trace_options)
+
+    def partition_trace_exp(self, *args, **kwargs):
+        return self._graph.partition_trace_exp(*args, **kwargs)
+
+    def prepare_compression(self, *args, **kwargs):
+        return self._graph.prepare_compression(*args, **kwargs)
+
+    def exp(self, step=1.0, parameters=None, *, coefficients=None, materialize=False,
+            return_report=False, compression=None):
+        evaluated = self._graph.exp(
+            step, parameters, coefficients=coefficients, compression=compression,
+            return_report=return_report)
+        if return_report:
+            active, report = evaluated
+        else:
+            active = evaluated
+        square = active.to_square(self.cluster_plan.shape, cyclic=self.cluster_plan.cyclic)
+        result = square.to_pepo() if materialize else square
+        if return_report:
+            report.update(layout="square", routing="graph-wires",
+                          bond_dimensions=square.bond_dimensions, dense_nbytes=square.dense_nbytes)
+            report["materialization"].update(active_blocks=square.active_block_count,
+                                             dense_nbytes=square.dense_nbytes)
+            return result, report
+        return result
 
     __call__ = exp
     evaluate = exp

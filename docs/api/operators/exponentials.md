@@ -16,6 +16,10 @@ For 2D cluster MPOs, use `graph="square"` or an explicit `ClusterLattice`;
 `OneDMap`/snake ordering alone does not select square-lattice clusters. The
 [MPO compile example](mpo_cluster.md#repeated-evaluations) shows both inputs.
 
+For repeated MPO/PEPO autodiff with a fixed virtual cap, see experimental
+[compact channel plans](cluster_channels.md). Their trace measures the
+constructed projected operator for either representation.
+
 For the longer-term ownership map, canonical vocabulary, and staged
 refactoring roadmap, see the [operator and exponential API plan](../../development/plans/operator_api.md).
 
@@ -35,7 +39,8 @@ comparing representations:
 | Ordered product | `MPOClusterProductExpansion.from_bases(bases, cluster_size=p)` | `PEPOClusterProductExpansion.from_bases(bases)` | `PauliClusterProductExpansion.from_bases(bases)` |
 | Reusable evaluator | `plan.compile_exp()` | `plan.compile_exp()` | `plan.compile_exp()` |
 | Exponential | `compiled.exp(step, parameters=None, coefficients=None)` | Same | Same |
-| Complete partition trace | `compiled.trace_exp(step, parameters=None, coefficients=None, normalized=False)` | Same | Same |
+| Trace | `compiled.trace_exp(step, parameters=None, coefficients=None, normalized=False)` (scalar partition) | Same signature, constructs and traces the PEPO | Same as PEPO |
+| Explicit scalar partition trace | `compiled.trace_exp(...)` | `compiled.partition_trace_exp(...)` | `compiled.partition_trace_exp(...)` |
 | Spatial cutoff metadata | `plan.cluster_size` | `plan.cluster_size` | `plan.cluster_size` |
 
 `coefficients` and `normalized` are keyword-only; `parameters` may also be
@@ -67,10 +72,12 @@ Quimb MPO directly. A single Pauli PEPO basis returns
 active blocks by default; a PEPO product retains its materialized default
 (use `materialize=False` for active blocks). Gaugy returns a bound
 `PauliClusterOperator` with local Pauli channels and `.to_pepo()`. Its
-`connected_trace_exp` is a separate connected-log approximation; the shared
-`trace_exp` always means residual partition closure and defaults to the raw
-trace. These trace-only calls ignore operator rank/assembly truncations;
-`normalized=True` divides by the Hilbert-space dimension.
+`connected_trace_exp` is a separate connected-log approximation. PEPO and
+Gaugy `trace_exp` construct the PEPO and measure its actual trace, including
+rank caps and requested `compression=plan`. Use `partition_trace_exp` for
+their old uncompressed scalar shortcut. MPO `trace_exp` retains its scalar
+partition meaning. All default to the raw trace; `normalized=True` divides
+by the Hilbert-space dimension.
 
 The fixed dense `ClusterExpansionPlan` and `GraphClusterExpansionPlan` also
 expose `compile_exp().exp(step, materialize=False)`, with
@@ -83,6 +90,28 @@ builder retains its default cutoff of five.
 
 For Gaugy details, see its
 [Pauli cluster guide](https://github.com/rezaquant/gaugy/blob/develop/learning/pauli_cluster_api.md).
+
+### Single and joint cluster parity
+
+The cluster product engine supports a single factor and an ordered list of
+factors with the same spatial cutoff, bindings, backend, factorization and
+assembly controls. Construct a shared graph from every factor's supports.
+For each cluster, restrict every complete generator, multiply its local
+exponentials in the requested order, then perform connected subtraction.
+Setting the extra factors to zero recovers the single-exponential result.
+
+The current dense NumPy/Torch/JAX paths have independent small-system tests
+for noncommuting products, finite-cutoff residuals, repeated evaluation,
+step/factor-scale/term gradients, and zero parameters. PEPO frozen compression,
+trace-on-operator and work reports apply to joint products too. Quimb
+compression keywords require `compress=True`; they are rejected if they would
+otherwise be ignored. Native symmetry and large-system performance have
+separate limits: see the [joint-product review](../../development/notes/2026-09-29-joint-product-parity.md).
+
+This parity concerns connected-cluster exponentials. The separate MPO
+Taylor/history modes and their legacy convenience methods are not the same
+approximation. MPO scalar `trace_exp`, PEPO operator trace, and Gaugy's
+connected-log endpoints retain their explicit meanings above.
 
 ## Choose the analytical construction mode
 

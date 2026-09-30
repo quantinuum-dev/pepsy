@@ -16,11 +16,80 @@ fixed-channel basis in `pepsy.operators.pepo_basis`, and ordered products in
 The PEPO family is separate from both the paper-style higher-order MPO facade
 and the MPO product implementation in `pepsy.operators.mpo_product`.
 
+`cluster_channels` owns experimental fixed virtual projections for MPO and
+PEPO builders. It prepares charge-grouped local QR bases from explicit
+snapshots. `_cluster_channel_assembly` compiles local factors and identity
+wires directly into compact site tensors. Preparation uses sparse direct
+MPO or active graph/square reference blocks; replay does not materialize
+them. `_cluster_channel_structure` first shares exact symbolic MPO
+prefixes/continuations with separate sum/select endpoint maps; numerical QR
+operates on that quotient. `_cluster_channel_frontier` optionally constructs
+reachable active-cluster transitions without complete collection enumeration.
+Its Pauli `automaton` mode reuses `_cluster_channel_pauli` to certify closed
+local spans and `_cluster_channel_linear` for rational transition-slice
+elimination. `_cluster_channel_structure` folds those maps into the existing
+fused MPO assembly; dense Pauli projection is bound before replay.
+`_cluster_channel_pepo` optionally shares exact graph-edge slices before
+square routing, then shares routed slices and compiles linear reference
+gathers. Graph quotients are folded into replay constants. This treats full
+local tensor slices, preserving branching and loops independently of the
+MPO transition grammar. `pepo_routing` uses arithmetic Cartesian labels.
+Native charge gathers and tree permutations are bound before array
+kernel compilation. Gaugy only adapts public binding/materialization
+calls. See the [API and limits](../../api/operators/cluster_channels.md).
+
+`mpo_delinearize` owns opt-in NumPy MPO dependency removal using scaled
+pivoted-QR column solves and transfer sweeps. This numerical compression acts
+on a materialized MPO; it neither changes channel planning nor supplies
+parameter-family identities. See [scope and accuracy](../../api/operators/mpo_delinearize.md).
+
+`ClusterChannelPlan.exp` and `trace_exp` orchestrate this reduction when
+`delinearize=True`; array kernels remain unchanged. The one-shot facades in
+`mpo_product` route `preparation="frontier"`/`"automaton"` through channel
+plans, then their optional QR evaluation. This bypasses ordinary collection
+assembly while reusing the existing term parser and parameter bindings.
+Static plan reports track actual reference QR selection separately from exact
+structural sharing; evaluation reports additionally record numerical
+delinearisation and final stored dimensions.
+
+Native cluster MPOs use `_cluster_native` for static charge labels, exact
+sector factors on NumPy/Torch/JAX, and numerical NumPy sector SVDs. Direct,
+recursive and streaming assembly preserve those labels. NumPy/Torch bounded
+assembly and public semantic adaptive compression use per-sector paired-factor
+projectors; total ranks are selected from the combined spectrum. JAX uses
+uncapped exact assembly. The owning [API guide](../../api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos)
+records the local derivative and discrete-rank contracts.
+`mpo_semantic` unfuses contracted physical axes before native dense export
+so repeated physical charges retain their computational basis order.
+
 `ClusterExpansionPlan` caches lattice directions and cluster-orbit bookkeeping
 so different beta values do not rebuild geometry. Both active-block types
-store only nonzero virtual-sector blocks; `to_pepo()` is the explicit dense
+store active virtual-sector blocks, including zeros needed by autodiff;
+`to_pepo()` is the explicit dense
 materialization boundary for square tensors, while graph blocks use
 `to_tensor_network()`.
+
+The ordered `GraphPEPOClusterProductExpansion` adapter in `graph_pepo_product`
+uses the shared MPO graph residual evaluator and the backend tree splitter
+in `pepo_dense`. Fixed graph splits and uncapped tensor-backend auto splits
+preserve Torch/JAX graphs through materialization, including at zeros.
+Graph compaction drops numerical NumPy zeros but retains tensor-valued zeros.
+This differs from the legacy fixed-dense graph plan described above.
+
+`pepo_basis` and the graph local-product engine in `mpo_product` prove
+individual-factor equivalence in addition to complete-product equivalence.
+Only structural binding/axis plans persist across calls; cached exponentials
+belong to one evaluation. The square path batches representative factors.
+
+Explicit broader square routing lives in `pepo_routing`: cached Manhattan
+wire topology, per-leg product sectors, and pass-through blocks leave the
+original interaction inventory untouched. `square_pepo_product` selects it
+for explicit square layouts outside the specialized Pauli contract.
+`cluster_compression.ClusterCompressionPlan` owns explicitly prepared frozen
+tree subspaces; `pepo_dense` replays the corresponding linear projections.
+Projection happens on exact local residuals before routing, so preparation
+and replay cannot silently change the residual target. `_cluster_stats`
+contains evaluation-local work counters, returned by public product reports.
 
 The square plan's `build()` orchestrates pair, star, path, and plaquette
 helpers, then the existing generic higher-order solver and report assembly.
@@ -202,6 +271,16 @@ and PEPO outputs through order four, with reuse enabled and disabled; a
 two-site JAX JIT check covers complete fixed-mode joint values and gradients.
 
 ## Cluster order and dimension accounting
+
+PEPO `trace_exp` now calls construction followed by `pepo_trace.trace_pepo`.
+This helper contracts the actual sparse physical traces/virtual sectors, or
+uses Quimb's public trace on a materialized square/graph network. Join plans
+cache only indices, never tensor values. `partition_trace_exp` explicitly
+retains the former scalar partition evaluator. Rank caps and frozen
+compression therefore affect the default PEPO trace. Gaugy only forwards
+this public Pepsy API. Short periodic axes with length at most the cluster
+cutoff use the finite located construction even for uniform terms, preventing
+shape channels from aliasing sites or losing parallel bond occurrences.
 
 The cluster order `p` is a joint spatial cutoff, not a factor index. For
 local physical dimension `d`, a `p`-site dense cluster target has matrix shape

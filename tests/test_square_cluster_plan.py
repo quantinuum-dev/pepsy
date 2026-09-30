@@ -139,8 +139,15 @@ def test_unsupported_square_plans_keep_graph_path(reason):
     assert isinstance(
         PEPOClusterProductExpansion.from_plan(plan, [terms]), GraphPEPOClusterProductExpansion
     )
-    with pytest.raises(ValueError, match="square"):
-        PEPOClusterProductExpansion.from_plan(plan, [terms], layout="square")
+    if reason in {"one_dimensional", "permuted"}:
+        with pytest.raises(ValueError, match="square"):
+            PEPOClusterProductExpansion.from_plan(plan, [terms], layout="square")
+    else:
+        routed = PEPOClusterProductExpansion.from_plan(plan, [terms], layout="square")
+        graph = PEPOClusterProductExpansion.from_plan(plan, [terms], layout="graph")
+        assert routed.cluster_plan is plan
+        np.testing.assert_allclose(routed.exp(-.03j, materialize=True).to_dense(),
+                                   graph.exp(-.03j).to_dense(), atol=2e-13)
 
 
 def test_arbitrary_labels_explicit_shape_and_plan_validation():
@@ -220,8 +227,12 @@ def test_layout_does_not_infer_wraparound_bonds():
     assert isinstance(
         PEPOClusterProductExpansion.from_plan(plan, factors), GraphPEPOClusterProductExpansion
     )
-    with pytest.raises(ValueError, match="complete nearest-neighbor"):
-        PEPOClusterProductExpansion.from_plan(plan, factors, layout="square")
+    routed = PEPOClusterProductExpansion.from_plan(plan, factors, layout="square")
+    assert routed.cluster_plan is plan
+    assert routed.cluster_plan.index_edges == plan.index_edges
+    graph = PEPOClusterProductExpansion.from_plan(plan, factors, layout="graph")
+    np.testing.assert_allclose(routed.exp(-.03j, materialize=True).to_dense(),
+                               graph.exp(-.03j).to_dense(), atol=2e-13)
 
 
 def test_three_site_periodic_axis_routes_the_seam_with_correct_orientation():

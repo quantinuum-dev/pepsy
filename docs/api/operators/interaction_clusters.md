@@ -5,6 +5,11 @@ supports and shares structural bookkeeping across MPO, graph-PEPO and Gaugy
 Pauli expansions. It supports irregular graphs, triangular lattices,
 long-range edges, higher-body terms and disconnected components.
 
+This planner and the MPO/PEPO implementations belong entirely to Pepsy and
+work without Gaugy. Gaugy's optional downstream use calls public Pepsy APIs;
+its sparse Pauli expansion and optimization code stays in Gaugy. Reusing a
+Pepsy plan does not introduce a shared source package or reverse dependency.
+
 ```python
 from pepsy.operators import (
     ClusterPlan, MPOClusterFactor, MPOClusterProductExpansion,
@@ -111,6 +116,16 @@ finite multiplicities, and search-fallback counts. Above the local permutation
 budget it safely uses identity matching, potentially finding less reuse.
 
 MPO and graph-PEPO automatically use verified local operator/binding matches.
+The graph local-product engine and square Pauli PEPO builder also match each
+ordered factor separately. Thus a shared `A` can reuse its local exponential
+even when independent parameters in `B` prevent reuse of the complete
+`exp(A_C) @ exp(B_C)` target. Physical-axis permutations are applied before
+ordered multiplication. Equal-size square exponentials remain batched.
+`spatial_reuse=False` disables both levels of reuse. Explicit coefficient
+vectors keep separate slots, and opaque callback bindings do not gain
+factor-level sharing. Numerical factor caches live for one evaluation only;
+the reusable plans contain no coefficients, exponentials or autodiff graphs.
+
 Gaugy `ExactClusterBasis` supports `symmetry="auto"` for connected logs and
 `compile_trace`. It validates local Pauli words and parameter identities,
 including independent `PauliParameter` slots. Opaque bindings disable reuse.
@@ -142,18 +157,45 @@ combinatorial at large cutoff or graph width.
 `SquarePEPOClusterProductExpansion` for a complete square nearest-neighbor
 graph with a two-dimensional shape and fixed one-/two-site Pauli product
 terms. Other supported plans retain `GraphPEPOClusterProductExpansion`.
-`layout="square"` validates those requirements and raises on incompatibility;
+`layout="square"` also supports other dense bosonic graph interactions by
+explicitly routing their virtual bonds onto a rectangular square lattice;
 `layout="graph"` explicitly preserves the previous generic representation.
 Direct `GraphPEPOClusterProductExpansion.from_plan` always selects the graph
 builder.
 
 The graph builder supports nonuniform couplings and higher-body terms using
 exact local products and spanning-tree residual factorizations.
-`materialize=True` produces a generic Quimb `TensorNetwork`. Graph PEPO
-materialization currently requires NumPy values; scalar `trace_exp` and
-`residuals` retain Torch/JAX gradients. `max_tree_rank` affects materialization,
-not scalar trace closure; factorization errors in a report are local
-diagnostics, not a global error certificate.
+`materialize=True` produces a generic Quimb `TensorNetwork`. Ordered graph
+PEPO materialization, active-block `to_dense()`, PEPO `trace_exp` and
+`residuals` preserve Torch/JAX values and gradients. This applies to the
+`GraphPEPOClusterProductExpansion` route; the legacy fixed-dense
+`GraphClusterExpansionPlan` keeps its existing numerical construction.
+
+Graph products accept `factorization="auto"` (default) or `"fixed"`, and
+`spatial_reuse=True|False`. Fixed mode uses exact matrix-unit splits with
+shape-determined ranks, requires `max_tree_rank=None`, and preserves zero
+coefficient derivatives. Auto preserves the existing numerical SVD route for
+NumPy; uncapped tensor backends use fixed splits, while capped tensor backends
+use a static-rank backend SVD. Differentiation through a truncated or degenerate
+SVD has the usual rank/gap limitations; fixed mode avoids that decomposition.
+Tensor-valued zero blocks are retained during graph compaction. Fixed channels
+can require substantially larger bonds than numerical SVD compression.
+
+```python
+builder = PEPOClusterProductExpansion.from_plan(
+    plan, factors, layout="graph", factorization="fixed",
+)
+active = builder.exp(step, parameters=params)  # Torch/JAX inputs remain live.
+matrix = active.to_dense()                    # Explicit small-system check.
+# Or builder.exp(step, parameters=params, materialize=True) for the network.
+```
+
+`max_tree_rank` affects materialization and `trace_exp`, while the explicit
+`partition_trace_exp` shortcut ignores it. Reports
+include the requested factorization policy. NumPy SVD reconstruction errors
+are local diagnostics, not a global error certificate; backend/fixed
+factorizations report `None` for uncomputed reconstruction error and norm.
+No backend value is copied to the host to produce those diagnostics.
 
 ## Shared square plans and 2D PEPO construction
 
@@ -184,40 +226,119 @@ The square tensor network can use the existing 2D PEPO contraction workflows.
 Provide rectangular coordinates in row-major order, or supply `shape=(Lx, Ly)`
 for row-major integer/arbitrary labels. A one-dimensional inferred shape
 keeps graph output unless you explicitly provide a two-dimensional shape.
-The plan must contain exactly the full nearest-neighbor graph for its shape
-and `cyclic` metadata. Missing bonds, extra diagonal/NNN edges, permuted
-coordinate labels, higher-body terms, and non-Pauli operator matrices retain
-the graph path. Square conversion accepts fixed NumPy I/X/Y/Z matrices;
-scalar amplitudes belong in term coefficients. It does not convert charge,
-fermion, or string metadata. The square backend's cutoff limit remains nine.
+Automatic conversion uses the complete nearest-neighbor graph and fixed
+NumPy I/X/Y/Z terms; scalar amplitudes belong in term coefficients. Its
+specialized cutoff limit remains nine. Missing bonds, diagonal/NNN edges,
+higher-body terms and non-Pauli matrices retain graph output in automatic
+mode. Explicit `layout="square"` routes these through the graph residual
+engine, with `cache_info["representation"] == "routed-square-pepo"`.
+Permuted coordinate labels are rejected; arbitrary labels use row-major
+`shape`. Native charge, fermion and string routing is not supported.
 
 OBC, cylinders and fully periodic squares are supported. Wraparound terms
 must still be supplied explicitly. For a length-two periodic axis, each
 supplied term is assigned one deterministic virtual route, even though two
 routes share its endpoints. Terms are never implicitly doubled or dropped.
-Long-range routing onto square virtual bonds is not implemented in this step.
+Routing uses deterministic shortest Manhattan paths, tensor-products wires
+that share square bonds, and transmits wires independently of physical
+operators at intermediate sites. It preserves every disjoint cluster product
+even when its wires cross or pass through another occupied site. Routing
+does not add sites or edges to the interaction plan, change cluster counts,
+or reorder exponential factors. Bond dimensions can grow multiplicatively,
+which is why this broader routing is explicit. Existing graph blocks also
+offer `active.to_square((Lx, Ly), cyclic=(False, False))`.
 
 The default square result is `ActivePEPOBlocks`; `materialize=True` returns a
-Quimb `PEPO`. `compile_exp()` caches square structure. Square-specific options
-include `spatial_reuse` and `factorization`; `factorization="fixed"` supports
+Quimb `PEPO`. `compile_exp()` caches square structure. The options
+`spatial_reuse` and `factorization` also apply to graph output; `factorization="fixed"` supports
 Torch/JAX differentiable materialization without numerical rank selection
 and requires `max_tree_rank=None`. Its larger fixed channels are distinct
 from rank-capped numerical construction. `return_report=True` reports the
-layout, cutoff, cluster counts, factorization policy and rank cap. Scalar
-traces precede materialization. `residuals()` lazily uses the shared local
+layout, cutoff, cluster counts, factorization policy and rank cap. PEPO
+`trace_exp` builds and traces the selected operator. `residuals()` lazily uses the shared local
 MPO engine and keeps integer indices in plan order.
 
 Gaugy's shared-plan Pauli factories use the same layout selection;
 `bound.to_pepo()` returns a 2D PEPO for compatible square inputs. The
 connected-log and residual-partition scalar endpoints remain distinct.
 
+## Explicit differentiable compression
+
+Ordered square and graph builders offer reference-based compression:
+
+```python
+# Prepare outside JIT/grad, preferably at representative nonzero parameters.
+compression = builder.prepare_compression(
+    step, parameters=params, max_tree_rank=2,
+)
+# theta may now contain fresh Torch/JAX autodiff parameters.
+active, report = builder.exp(
+    step, parameters=theta, compression=compression, return_report=True,
+    materialize=False,
+)
+```
+
+The returned `ClusterCompressionPlan` stores immutable NumPy tree subspaces
+chosen by a reference SVD. Preparation explicitly copies reference residuals
+to the host. Replay projects fresh, exact local residuals into those fixed
+subspaces using backend matrix products, before virtual routing and dense
+materialization. Geometry remains cached; reference tensors and their
+autodiff graphs are not retained. Use `max_tree_rank=None` on the builder;
+the compression plan supplies its own ranks. This is separate from Quimb
+`compress=True` and the two options cannot be combined.
+
+This differentiates the **projected operator**, including at zero parameters,
+with fixed ranks and subspaces. It does not differentiate reference SVDs,
+adapt ranks inside an objective, or guarantee an accurate approximation far
+from the reference. Refresh the plan explicitly when needed. A zero reference
+can choose uninformative subspaces. `trace_exp(..., compression=plan)` builds
+and traces the projected PEPO. To measure an existing result, use
+`pepsy.operators.trace_pepo(active)` or `active.trace()`. The explicitly named
+`partition_trace_exp()` remains the uncompressed scalar expansion.
+
+`report["compression"]` records the method, ranks, and reference local
+Frobenius errors/norms. These are neither current-parameter error estimates
+nor a global error bound. Native symmetry compression and optimal global
+PEPO fitting are outside this dense local-projection API.
+
+## Materialization reports
+
+`exp(..., return_report=True)` returns `(result, report)` for ordered square
+and graph builders. `report["materialization"]` counts actual work in that
+evaluation: requested/evaluated/reused local products and factor exponentials,
+actual exponential batch sizes, lower-support contractions and their reuse,
+and graph partition products. Graph partition products and square tensor
+contractions are distinct operations; a zero count is meaningful. Uniform
+square counts refer to source-shape requests, not every translated placement.
+Counters are evaluation-local and do not inspect tensor values or synchronize
+backend arrays. Reports also give active-block counts and estimated dense site
+storage, excluding contraction/autodiff workspace and later Quimb compression.
+
+With matching Gaugy, `bound.to_pepo(return_report=True)` forwards the report.
+`bound.materialization_info()` performs a fresh active-block evaluation without
+allocating dense site tensors. It is distinct from structural connected-log
+`symmetry_info()`. Use `bound.prepare_compression(max_tree_rank=...)`, followed
+by later `bound.to_pepo(compression=plan)`, for the same compression workflow.
+
 The uniform `GraphClusterExpansionPlan` applies one `twosite_op` to each
 unique oriented graph edge. It does not infer distinct couplings or multiply
 by `plan.supports` occurrence counts; use the product frontend for those.
 
-`trace_exp` is the residual-partition trace, unnormalized by default. Gaugy's
-`connected_trace_exp`/`log_trace_density` use a different connected-log
-approximation. They need not agree at a partial spatial cutoff. Full-size
+PEPO `trace_exp` constructs and traces the PEPO, unnormalized by default;
+Gaugy's bound `trace()` follows that contract. Active blocks are a sparse
+PEPO representation: their physical traces and virtual bonds are contracted
+without allocating dense site tensors. The default `state_budget=100000`
+caps sparse site entries and pairwise join work; exceeding it raises rather
+than changing the approximation. Backend-valued zero blocks remain live for
+autodiff. Large PEPO contractions can still be expensive. Sparse
+`state_budget` and materialized `contract_opts` are mutually exclusive; a
+custom sparse budget is rejected instead of ignored, and `contract_opts` must
+be a mapping. For a materialized network,
+`trace_pepo(pepo, **contract_opts)` uses Quimb's public contraction.
+
+`partition_trace_exp` is the separate scalar partition shortcut (Gaugy bound
+`partition_trace`). Gaugy's `connected_trace_exp`/`log_trace_density` use a
+different connected-log approximation. They need not agree at a partial spatial cutoff. Full-size
 connected components recover the exact ordered product before rank
 truncation, up to numerical precision.
 

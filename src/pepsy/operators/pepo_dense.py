@@ -858,11 +858,15 @@ def _backend_pauli_basis(nsites, *, like=None):
         _PAULI_BASIS_CACHE[nsites] = matrices
     if like is None:
         return tuple(matrices)
-    return tuple(_as_backend(matrix, like=like) for matrix in matrices)
+    reference = like if 'complex' in str(like.dtype) else like + 0j
+    return tuple(ar.do('astype', _as_backend(matrix, like=reference, dtype=reference.dtype), reference.dtype)
+                 for matrix in matrices)
 
 
 def _backend_pauli_expand(operator, nsites):
     """Expand a local operator in the fixed physical Pauli basis."""
+    if 'complex' not in str(operator.dtype):
+        operator = operator + 0j
     basis = ar.do(
         "stack",
         _backend_pauli_basis(nsites, like=operator),
@@ -881,6 +885,8 @@ def _backend_pauli_expand(operator, nsites):
 def _backend_sum_pauli(coefficients, axis):
     """Return ``sum_p coefficients[p] * P_p`` for one physical site."""
     del axis  # retained for the old helper signature
+    if 'complex' not in str(coefficients.dtype):
+        coefficients = coefficients + 0j
     basis = ar.do(
         "stack",
         _backend_pauli_basis(1, like=coefficients),
@@ -2164,14 +2170,15 @@ def _add_graph_tree_factor_blocks(
     local_dim,
 ):
     """Insert a spanning-tree factorization into graph PEPO blocks."""
-    matrix_units = np.eye(local_dim**2).reshape(local_dim**2, local_dim, local_dim)
     root = next(site for site, value in parent.items() if value is None)
     for site, (child_nodes, tensor) in local_tensors.items():
         physical_axis = len(child_nodes)
-        local_blocks = np.tensordot(
-            tensor,
-            matrix_units,
-            axes=([physical_axis], [0]),
+        # Matrix-unit coefficients already contain the physical entries.
+        # Move that axis last and split it without a host array/contraction.
+        virtual_axes = tuple(i for i in range(tensor.ndim) if i != physical_axis)
+        local_blocks = ar.do(
+            "reshape", ar.do("transpose", tensor, virtual_axes + (physical_axis,)),
+            tuple(tensor.shape[i] for i in virtual_axes) + (local_dim, local_dim),
         )
         lattice_site = sites[site]
         directions = site_directions[lattice_site]
@@ -3255,12 +3262,12 @@ def _tree_factorize_operator(operator, edges, nsites, local_dim, max_rank):
 
 
 @lru_cache(maxsize=256)
-def _backend_tree_topology(nsites, edges):
+def _backend_tree_topology(nsites, edges, graph=False):
     """Cache immutable spanning-tree structure without numerical values."""
     adjacency = [[] for _ in range(nsites)]
     for source, target, direction in edges:
         adjacency[source].append((target, direction))
-        adjacency[target].append((source, _OPPOSITE_DIRECTION[direction]))
+        adjacency[target].append((source, direction if graph else _OPPOSITE_DIRECTION[direction]))
 
     parent = {0: None}
     parent_direction = {}
@@ -3294,6 +3301,8 @@ def _tree_factorize_operator_backend(
     max_rank=None,
     *,
     factorization="auto",
+    graph=False,
+    projectors=None,
 ):
     """Autodiff-safe exact spanning-tree factorization of a local operator.
 
@@ -3309,9 +3318,9 @@ def _tree_factorize_operator_backend(
         raise ValueError("fixed tree factorization requires max_rank=None.")
     operator_tensor = _backend_operator_tensor(operator, nsites, local_dim)
     operator_rank = local_dim**2
-    parent_items, direction_items, child_items, traversal = _backend_tree_topology(
-        nsites, tuple(edges)
-    )
+    topology = (_backend_tree_topology(nsites, tuple(edges), True) if graph
+                else _backend_tree_topology(nsites, tuple(edges)))
+    parent_items, direction_items, child_items, traversal = topology
     parent = dict(parent_items)
     parent_direction = dict(direction_items)
     children = {site: list(nodes) for site, nodes in child_items}
@@ -3338,17 +3347,29 @@ def _tree_factorize_operator_backend(
             transposed,
             (prod(row_shape), prod(column_shape)),
         )
-        if factorization == "fixed":
+        if projectors is not None:
+            # Explicit frozen reference subspaces: only the projected target
+            # is live. No SVD gauge or rank choice enters differentiation.
+            projector = projectors[site]
+            if projector.shape[0] != matrix.shape[0]:
+                raise ValueError("compression projector does not match this tree split.")
+            if np.iscomplexobj(projector) and "complex" not in str(matrix.dtype):
+                matrix = matrix + 0j
+            left = _as_backend(projector, like=matrix, dtype=matrix.dtype)
+            left = ar.do("astype", left, matrix.dtype)
+            weighted_right = ar.do("matmul", ar.do("conj", left).T, matrix)
+        elif factorization == "fixed":
             left, weighted_right = fixed_split(matrix)
         else:
             left, singular_values, right = _fixed_rank_svd(matrix)
-        rank = min(int(matrix.shape[-2]), int(matrix.shape[-1]))
-        if max_rank is not None:
+        rank = (int(left.shape[1]) if projectors is not None else
+                min(int(matrix.shape[-2]), int(matrix.shape[-1])))
+        if max_rank is not None and projectors is None:
             rank = min(rank, max_rank)
         if rank < 1:
             return None
         left = left[:, :rank]
-        if factorization != "fixed":
+        if factorization != "fixed" and projectors is None:
             singular_values = singular_values[:rank]
             right = right[:rank, :]
             weighted_right = ar.do(
