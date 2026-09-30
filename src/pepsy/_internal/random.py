@@ -5,7 +5,7 @@ from __future__ import annotations
 import autoray as ar
 import numpy as np
 
-__all__ = ["backend_random_array"]
+__all__ = ["backend_random_array", "fit_random_array"]
 
 
 def _fallback_dtype(dtype):
@@ -36,8 +36,18 @@ def backend_random_array(shape, *, like, dtype=None, scale=1.0, rng=None):
     Autoray 0.10's ``random.array`` is used directly, including its backend
     generator handling. Older Autoray releases do not expose that operation,
     so the deterministic NumPy fallback is converted through ``like``.
+    Both routes use ``E[abs(x)**2] = scale**2`` for zero-mean complex samples.
     """
     shape = tuple(int(size) for size in shape)
+    if dtype is None:
+        # Passing dtype=None explicitly disables Autoray's like-based
+        # injection and can turn a complex template into real samples.
+        dtype = ar.get_dtype_name(like)
+    elif not isinstance(dtype, str):
+        try:
+            dtype = np.dtype(dtype).name
+        except TypeError:
+            dtype = str(dtype).rsplit(".", 1)[-1]
     try:
         ar.get_lib_fn(ar.infer_backend(like), "random.array")
     except (AttributeError, ImportError, KeyError, LookupError):
@@ -45,9 +55,12 @@ def backend_random_array(shape, *, like, dtype=None, scale=1.0, rng=None):
         random_data = random_source.normal(size=shape)
         fallback_dtype = _fallback_dtype(dtype or getattr(like, "dtype", None))
         if np.issubdtype(fallback_dtype, np.complexfloating):
-            random_data = random_data + 1j * random_source.normal(size=shape)
+            random_data = (random_data + 1j * random_source.normal(size=shape)) / np.sqrt(2.0)
         random_data = (float(scale) * random_data).astype(fallback_dtype)
-        return ar.do("array", random_data, like=like)
+        return ar.do(
+            "array", random_data, like=like,
+            dtype=ar.to_backend_dtype(dtype, like=like),
+        )
 
     return ar.do(
         "random.array",
@@ -56,5 +69,30 @@ def backend_random_array(shape, *, like, dtype=None, scale=1.0, rng=None):
         scale=scale,
         dtype=dtype,
         like=like,
+        rng=rng,
+    )
+
+
+def fit_random_array(data, shape, *, strength, rng):
+    """Draw FIT initialization data using the template's real/complex precision.
+
+    Float32 and complex64 templates retain their precision; other real and
+    complex templates use float64 and complex128, respectively. The caller
+    owns the generator so successive tensor draws advance the same stream.
+    """
+    dtype_name = str(getattr(data, "dtype", "float64"))
+    if "complex64" in dtype_name:
+        random_dtype = np.complex64
+    elif "complex" in dtype_name:
+        random_dtype = np.complex128
+    elif "float32" in dtype_name:
+        random_dtype = np.float32
+    else:
+        random_dtype = np.float64
+    return backend_random_array(
+        shape,
+        like=data,
+        dtype=random_dtype,
+        scale=float(strength),
         rng=rng,
     )

@@ -1,8 +1,8 @@
-"""MPS normalization helpers.
+"""Reserved MPS normalization module; no implementation is extracted here.
 
-Extraction target for non-unitary normalization scheduling and exponent
-bookkeeping now implemented on
-:class:`pepsy.optimizers.mps.optimizer.MpsOptimizer`.
+Normalization execution lives in the private ``_norm`` module and receives
+the live :class:`pepsy.optimizers.mps.optimizer.MpsOptimizer`. This empty
+import path retains its compatibility contract without numerical imports.
 """
 
 __all__ = []

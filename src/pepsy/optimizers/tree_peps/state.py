@@ -10,6 +10,17 @@ import numpy as np
 import quimb.tensor as qtn
 import autoray as ar
 
+from ..._internal.quimb import (
+    quimb_1d_compression_function,
+    quimb_1d_compression_cutoff_mode,
+    require_quimb_1d_compression_method,
+    run_seeded_quimb,
+)
+from ._compression import (
+    iter_tree_compression_order,
+    normalize_tree_compression_order,
+    tree_edge_rank_key,
+)
 from .plan import TreePepsPlan
 
 __all__ = ["TreePeps"]
@@ -24,11 +35,25 @@ def _normalize_compression_mode(mode):
         "eigh": "dm",
         "density_matrix": "dm",
         "densitymatrix": "dm",
+        "zipup_first": "zipup_oversample",
     }
     mode = aliases.get(mode, mode)
-    if mode not in {"direct", "dm"}:
+    if mode not in {
+        "direct",
+        "dm",
+        "sdc",
+        "sdc_oversample",
+        "sdcr",
+        "sdcr_oversample",
+        "src",
+        "src_oversample",
+        "zipup",
+        "zipup_oversample",
+    }:
         raise ValueError(
-            "compression_mode must be 'direct' or 'dm'."
+            "compression_mode must be one of 'direct', 'dm', 'sdc', "
+            "'sdc-oversample', 'sdcr', 'sdcr-oversample', 'src', "
+            "'src-oversample', 'zipup', or 'zipup-oversample'."
         )
     return mode
 
@@ -36,7 +61,133 @@ def _normalize_compression_mode(mode):
 def _compression_method(mode):
     """Return the Quimb decomposition used by a compression mode."""
 
-    return "svd:eig" if _normalize_compression_mode(mode) == "dm" else "svd"
+    mode = _normalize_compression_mode(mode)
+    if mode == "dm":
+        return "svd:eig"
+    if mode in {"src", "sdcr"}:
+        # Branching trees cannot use Quimb's chain-only SRC environment
+        # sweep, but each local dense edge split can use randomized SVD.
+        return "svd:rand"
+    if mode in {"src_oversample", "sdcr_oversample"}:
+        return "svd:rand"
+    if mode in {"zipup", "zipup_oversample"}:
+        raise NotImplementedError(
+            "compression_mode='zipup' is only available for a complete "
+            "path compression or operator-state two-layer application."
+        )
+    # ``sdc`` is the deterministic successive edge sweep for a tree. The
+    # actual Quimb SDC kernel is selected separately for path topologies.
+    return "svd"
+
+
+_OVERSAMPLED_COMPRESSION_MODES = frozenset(
+    {"sdc_oversample", "sdcr_oversample", "src_oversample"}
+)
+_SUCCESSIVE_COMPRESSION_MODES = frozenset(
+    {
+        "sdc",
+        "sdc_oversample",
+        "sdcr",
+        "sdcr_oversample",
+        "src",
+        "src_oversample",
+    }
+)
+_PATH_COMPRESSION_MODES = _SUCCESSIVE_COMPRESSION_MODES | {
+    "zipup",
+    "zipup_oversample",
+}
+
+
+def _normalize_oversample_bond(
+    max_bond, max_bond_oversample=None, *, zipup_default=False
+):
+    """Resolve an intermediate rank using Quimb's oversampling convention."""
+
+    if max_bond is None:
+        if not zipup_default:
+            raise ValueError("oversampled compression requires max_bond")
+    elif isinstance(max_bond, bool) or not isinstance(max_bond, Integral):
+        raise TypeError("max_bond must be a positive integer")
+    else:
+        max_bond = int(max_bond)
+        if max_bond < 1:
+            raise ValueError("max_bond must be positive")
+    if max_bond_oversample is None:
+        if zipup_default and max_bond is not None:
+            return 2 * max_bond
+        if max_bond is None:
+            raise ValueError(
+                "zipup oversampling without max_bond requires an integer "
+                "max_bond_oversample"
+            )
+        return max(round(1.5 * max_bond), max_bond + 10)
+    if isinstance(max_bond_oversample, bool):
+        raise TypeError(
+            "max_bond_oversample must be a positive rank, multiplier, or None"
+        )
+    if isinstance(max_bond_oversample, Integral):
+        result = int(max_bond_oversample)
+    else:
+        try:
+            multiplier = float(max_bond_oversample)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "max_bond_oversample must be a positive rank, multiplier, or None"
+            ) from exc
+        if not np.isfinite(multiplier) or multiplier <= 0.0:
+            raise ValueError("max_bond_oversample must be positive")
+        if max_bond is None:
+            raise ValueError(
+                "a floating max_bond_oversample multiplier requires max_bond"
+            )
+        result = round(max_bond * multiplier)
+    if result < 1:
+        raise ValueError("max_bond_oversample must be positive")
+    return result
+
+
+def _normalize_oversample_cutoff(value, *, default=0.0):
+    """Normalize a cutoff used only by an oversampled intermediate pass."""
+
+    if value is None:
+        value = default
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return 0.0
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "cutoff_oversample must be 'auto' or a non-negative number"
+        ) from exc
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(
+            "cutoff_oversample must be 'auto' or a non-negative number"
+        )
+    return value
+
+
+def _normalize_oversample_cutoff_mode(value):
+    """Normalize the cutoff mode for an oversampled intermediate pass."""
+
+    if value is None or (
+        isinstance(value, str) and value.strip().lower() == "auto"
+    ):
+        return "rel"
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        if 1 <= value <= 6:
+            return int(value)
+        raise ValueError(
+            "cutoff_mode_oversample must be 'auto', 'abs', 'rel', 'sum1', "
+            "'sum2', 'rsum1', 'rsum2', or a Quimb integer code 1..6"
+        )
+    value = str(value).strip().lower()
+    if value not in {"abs", "rel", "sum1", "sum2", "rsum1", "rsum2"}:
+        raise ValueError(
+            "cutoff_mode_oversample must be 'auto', 'abs', 'rel', 'sum1', "
+            "'sum2', 'rsum1', or 'rsum2'"
+        )
+    return value
 
 
 class TreePeps(qtn.TensorNetworkGenVector):
@@ -200,6 +351,12 @@ class TreePeps(qtn.TensorNetworkGenVector):
         return self._tree_peps_plan
 
     @property
+    def map_mode(self) -> str | None:
+        """Canonical lattice spanning-tree mode, if the plan has one."""
+
+        return self.plan.map_mode
+
+    @property
     def plan_signature(self):
         """Immutable geometry signature used by state/operator adapters."""
 
@@ -261,7 +418,7 @@ class TreePeps(qtn.TensorNetworkGenVector):
 
     @property
     def is_branching(self) -> bool:
-        """Whether this state has a rank-four, three-virtual-bond site."""
+        """Whether this state has a site with at least three virtual bonds."""
 
         return self.plan.is_branching
 
@@ -287,8 +444,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
         """Whether the rooted TreePeps has at most two children per site.
 
         A degree-three root is allowed by default, matching the binary-tree
-        convention used by :class:`TreeTensorNetwork` while retaining the
-        TreePeps hard limit of three total virtual bonds.
+        convention used by :class:`TreeTensorNetwork`. ``span-middle`` may
+        additionally use degree-four backbone sites.
         """
 
         root = self.plan.root
@@ -353,6 +510,16 @@ class TreePeps(qtn.TensorNetworkGenVector):
             self._canonical_region = None
         else:
             self._canonical_region = frozenset({self.plan.resolve_site(site)})
+
+    @property
+    def center(self):
+        """Compatibility alias for the unique orthogonality center."""
+
+        return self.orthogonality_center
+
+    @center.setter
+    def center(self, site):
+        self.orthogonality_center = site
 
     def coordinate(self, site, *rest) -> tuple[int, ...]:
         return self.plan.coordinate(self.plan.resolve_site(site, *rest))
@@ -561,8 +728,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
     def validate(self, *, check_canonical=False, tol=1e-9):
         """Validate tags, physical legs, and the live virtual tree graph."""
 
-        if self.plan.max_virtual_degree > 3 or self.plan.max_degree > 3:
-            raise ValueError("TreePeps tensors may have at most three virtual bonds")
+        if self.plan.max_virtual_degree > 4 or self.plan.max_degree > 4:
+            raise ValueError("TreePeps tensors may have at most four virtual bonds")
 
         physical_counts = Counter()
         virtual_counts = Counter()
@@ -576,10 +743,10 @@ class TreePeps(qtn.TensorNetworkGenVector):
             }
             if not required_tags.issubset(tensor.tags):
                 raise ValueError(f"tensor at site {q} is missing TreePeps tags")
-            if len(tensor.inds) > 4:
+            if len(tensor.inds) > 5:
                 raise ValueError(
-                    f"tensor at site {q} exceeds TreePeps rank four "
-                    "(one physical leg plus three virtual bonds)"
+                    f"tensor at site {q} exceeds TreePeps rank five "
+                    "(one physical leg plus four virtual bonds)"
                 )
             physical = self.site_ind_1d(q)
             if physical not in tensor.inds:
@@ -908,6 +1075,71 @@ class TreePeps(qtn.TensorNetworkGenVector):
         self._set_isometry_metadata_from_region(region)
         return self
 
+    def _prepare_canonical_region(self, region, *, absorb="right", info_c=None):
+        """Move the cached canonical proof to ``region`` without scanning it.
+
+        The tracked ``left_inds`` metadata is the proof that the exterior is
+        already isometric toward the current canonical region.  A larger
+        requested region can therefore adopt that proof directly.  Otherwise
+        only the unique path from the current centre (or the nearest point of
+        the current region) to the requested region is traversed.  A full
+        region peel is reserved for states whose canonical metadata is
+        genuinely unknown.
+        """
+
+        region = frozenset(self.plan.resolve_site(site) for site in region)
+        if not region or not self.plan.is_connected(region):
+            raise ValueError("region must be a non-empty connected subtree")
+        current_region = self.canonical_region
+        if current_region and current_region.issubset(region):
+            self._canonical_region = region
+            self._sync_info_c(info_c)
+            return self
+
+        hub = min(
+            region,
+            key=lambda q: (
+                max(len(self.plan.path(q, other)) for other in region),
+                sum(len(self.plan.path(q, other)) for other in region),
+                q,
+            ),
+        )
+        current = self.orthogonality_center
+        if current is not None:
+            entry = next(
+                node for node in self.plan.path(current, hub) if node in region
+            )
+            return self.shift_orthogonality_center(
+                entry,
+                absorb=absorb,
+                info_c=info_c,
+                _skip_validate=True,
+            )
+
+        if current_region:
+            anchor = min(
+                current_region,
+                key=lambda node: min(
+                    len(self.plan.path(node, target)) for target in region
+                ),
+            )
+            entry = next(
+                node for node in self.plan.path(anchor, hub) if node in region
+            )
+            return self.shift_orthogonality_center(
+                entry,
+                absorb=absorb,
+                info_c=info_c,
+                _skip_validate=True,
+            )
+
+        return self.canonize_subtree(
+            region,
+            inplace=True,
+            absorb=absorb,
+            info_c=info_c,
+        )
+
     def _recover_center_from_region(self, region, target, *, absorb="right"):
         """Peel a tracked canonical region down to one site."""
 
@@ -1025,7 +1257,15 @@ class TreePeps(qtn.TensorNetworkGenVector):
             **canonize_opts,
         )
 
-    def shift_orthogonality_center(self, site, *, absorb="right", info_c=None, **canonize_opts):
+    def shift_orthogonality_center(
+        self,
+        site,
+        *,
+        absorb="right",
+        info_c=None,
+        _skip_validate=False,
+        **canonize_opts,
+    ):
         """Move a known one-site canonical center along the tree."""
 
         q = self.plan.resolve_site(site)
@@ -1065,7 +1305,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
                 raise ValueError("absorb must be 'right' or 'left'")
             self.canonize_edge_(source, target, absorb=absorb, **canonize_opts)
         self._canonical_region = frozenset({q})
-        self.validate()
+        if not _skip_validate:
+            self.validate()
         self._sync_info_c(info_c)
         return self
 
@@ -1128,6 +1369,158 @@ class TreePeps(qtn.TensorNetworkGenVector):
         self._sync_info_c(info_c)
         return self
 
+    def _compress_path_region_1d(
+        self,
+        region,
+        *,
+        max_bond,
+        max_bond_oversample=None,
+        cutoff,
+        cutoff_oversample=0.0,
+        cutoff_mode,
+        cutoff_mode_oversample="rel",
+        compression_mode,
+        compression_seed=None,
+    ):
+        """Apply Quimb's environment compressor to a path-shaped region.
+
+        ``TreePeps`` deliberately wraps a plain temporary ``TensorNetwork``
+        here. Quimb's 1D compressors reconstruct their input class, whereas
+        this class needs its plan and coordinate metadata retained explicitly.
+        The temporary network keeps the original site tags and boundary bonds;
+        only the resulting tensors in ``region`` are installed back.
+        """
+        compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode not in _PATH_COMPRESSION_MODES:
+            return False
+        if not self.plan.is_mps_topology or len(region) <= 1:
+            return self.plan.is_mps_topology
+        if cutoff is None:
+            cutoff = 1e-10
+        cutoff = float(cutoff)
+        if cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative")
+        if compression_mode in _OVERSAMPLED_COMPRESSION_MODES:
+            max_bond_oversample = _normalize_oversample_bond(
+                max_bond,
+                max_bond_oversample,
+                zipup_default=compression_mode == "zipup_oversample",
+            )
+            cutoff_oversample = _normalize_oversample_cutoff(cutoff_oversample)
+            cutoff_mode_oversample = _normalize_oversample_cutoff_mode(
+                cutoff_mode_oversample
+            )
+        if max_bond is None:
+            if compression_mode in {"sdc", "zipup", "sdcr"} and float(cutoff) == 0.0:
+                return False
+            if compression_mode in {"src", "sdcr"}:
+                raise ValueError(
+                    f"compression_mode={compression_mode!r} requires a finite "
+                    "max_bond/chi."
+                )
+        require_quimb_1d_compression_method(compression_mode)
+        compressor = quimb_1d_compression_function(compression_mode)
+        if not callable(compressor):
+            raise NotImplementedError(
+                f"Quimb compression method {compression_mode!r} is not "
+                "available in the installed Quimb build."
+            )
+
+        region = frozenset(self.plan.resolve_site(site) for site in region)
+        endpoints = sorted(
+            site for site in region
+            if sum(neighbor in region for neighbor in self.plan.neighbors(site)) <= 1
+        )
+        if len(endpoints) != 2:
+            raise ValueError("a non-trivial path compression region needs two endpoints")
+        order = self.plan.path(endpoints[0], endpoints[1])
+        if set(order) != set(region):
+            raise ValueError("path compression region must be connected")
+
+        temporary = qtn.TensorNetwork(
+            [self.node_tensor(site).copy() for site in order]
+        )
+        if hasattr(self, "exponent"):
+            temporary.exponent = self.exponent
+        options = {
+            "max_bond": None if max_bond is None else int(max_bond),
+            "cutoff": float(cutoff),
+            "site_tags": [self.site_tag(site) for site in order],
+            "permute_arrays": False,
+            "canonize": True,
+            "inplace": False,
+        }
+        if compression_mode in {"sdc", "zipup"}:
+            options["cutoff_mode"] = cutoff_mode
+        if compression_mode in _OVERSAMPLED_COMPRESSION_MODES:
+            options.update(
+                max_bond_oversample=max_bond_oversample,
+                cutoff_oversample=cutoff_oversample,
+            )
+        if compression_mode in {"src", "src_oversample"} and compression_seed is not None:
+            options["seed"] = int(compression_seed)
+        if compression_mode in {"sdcr", "sdcr_oversample"}:
+            options["cutoff_mode"] = quimb_1d_compression_cutoff_mode(
+                compression_mode, cutoff_mode
+            )
+            if compression_seed is not None:
+                options["compress_opts"] = {"seed": int(compression_seed)}
+        if compression_mode == "sdcr_oversample":
+            # Quimb's combined SDCR-oversample helper forwards one shared
+            # ``compress_opts`` mapping to its final direct sweep, whose
+            # deterministic SVD driver does not accept ``seed``. Split the
+            # two native stages here so the randomized intermediate remains
+            # reproducible without leaking that option into the final pass.
+            intermediate = dict(options)
+            intermediate["max_bond"] = max_bond_oversample
+            intermediate["cutoff"] = cutoff_oversample
+            intermediate.pop("max_bond_oversample", None)
+            intermediate.pop("cutoff_oversample", None)
+            if compression_seed is not None:
+                intermediate["compress_opts"] = {"seed": int(compression_seed)}
+            intermediate_compressor = quimb_1d_compression_function("sdcr")
+            final_compressor = quimb_1d_compression_function("direct")
+            if not callable(intermediate_compressor) or not callable(final_compressor):
+                raise NotImplementedError(
+                    "sdcr-oversample requires Quimb's sdcr and direct "
+                    "1D compression methods."
+                )
+            result = intermediate_compressor(temporary, **intermediate)
+            result = final_compressor(
+                result,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                site_tags=[self.site_tag(site) for site in order],
+                permute_arrays=False,
+                canonize=True,
+                inplace=False,
+            )
+        else:
+            result = run_seeded_quimb(
+                options.pop("seed", None), compressor, temporary,
+                quimb_method=compression_mode, **options,
+            )
+
+        for site in order:
+            tag = self.site_tag(site)
+            tids = tuple(result.tag_map[tag])
+            if len(tids) != 1:
+                raise ValueError(
+                    f"path compressor did not preserve a unique tensor for site {site}"
+                )
+            compressed = result.tensor_map[tids[0]]
+            self.node_tensor(site).modify(
+                data=compressed.data,
+                inds=compressed.inds,
+                tags=compressed.tags,
+                left_inds=compressed.left_inds,
+            )
+        if hasattr(result, "exponent"):
+            self.exponent = result.exponent
+        self._canonical_region = None
+        return True
+
     def compress_edge(
         self,
         site0,
@@ -1135,10 +1528,14 @@ class TreePeps(qtn.TensorNetworkGenVector):
         *,
         max_bond=None,
         cutoff=1e-10,
+        max_bond_oversample=None,
+        cutoff_oversample=0.0,
         cutoff_mode="rsum2",
+        cutoff_mode_oversample="rel",
         absorb="right",
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
         inplace=False,
         info_c=None,
         **compress_opts,
@@ -1154,11 +1551,15 @@ class TreePeps(qtn.TensorNetworkGenVector):
             q0,
             q1,
             max_bond=max_bond,
+            max_bond_oversample=max_bond_oversample,
+            cutoff_oversample=cutoff_oversample,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            cutoff_mode_oversample=cutoff_mode_oversample,
             absorb=absorb,
             reduced=reduced,
             compression_mode=compression_mode,
+            compression_seed=compression_seed,
             info_c=info_c,
             **compress_opts,
         )
@@ -1171,30 +1572,46 @@ class TreePeps(qtn.TensorNetworkGenVector):
         *,
         max_bond=None,
         cutoff=1e-10,
+        max_bond_oversample=None,
+        cutoff_oversample=0.0,
         cutoff_mode="rsum2",
+        cutoff_mode_oversample="rel",
         absorb="right",
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
         info_c=None,
+        _validate=True,
         **compress_opts,
     ):
         """In-place compression of one edge with canonical-center tracking.
 
-        ``compression_mode="direct"`` uses SVD and ``"dm"`` uses the
-        density-matrix-equivalent local ``svd:eig`` decomposition after the
-        state has been brought into the required tree gauge.
+        ``compression_mode="direct"`` uses SVD, ``"dm"`` uses the
+        density-matrix-equivalent local ``svd:eig`` decomposition, and
+        ``"src"``/``"sdcr"`` use randomized SVD on local edge splits.
+        ``"sdc"`` and the ``*-oversample`` modes select successive or
+        two-stage compression; the latter first uses
+        ``max_bond_oversample`` and ``cutoff_oversample`` before the final
+        direct cap. ``"zipup"`` is available only for path operator-state
+        compression. On a path, the higher-level whole/subtree methods use
+        Quimb's environment compressor for these multi-tensor methods.
         """
 
         return self._compress_edge_inplace(
             site0,
             site1,
             max_bond=max_bond,
+            max_bond_oversample=max_bond_oversample,
+            cutoff_oversample=cutoff_oversample,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            cutoff_mode_oversample=cutoff_mode_oversample,
             absorb=absorb,
             reduced=reduced,
             compression_mode=compression_mode,
+            compression_seed=compression_seed,
             info_c=info_c,
+            _validate=_validate,
             **compress_opts,
         )
 
@@ -1205,11 +1622,16 @@ class TreePeps(qtn.TensorNetworkGenVector):
         *,
         max_bond=None,
         cutoff=1e-10,
+        max_bond_oversample=None,
+        cutoff_oversample=0.0,
         cutoff_mode="rsum2",
+        cutoff_mode_oversample="rel",
         absorb="right",
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
         info_c=None,
+        _validate=True,
         **compress_opts,
     ):
         q0 = self.plan.resolve_site(site0)
@@ -1229,6 +1651,55 @@ class TreePeps(qtn.TensorNetworkGenVector):
                 raise ValueError("max_bond must be at least one")
 
         compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode in {"src", "sdcr"} and max_bond is None:
+            raise ValueError(
+                f"compression_mode={compression_mode!r} requires a finite "
+                "max_bond/chi."
+            )
+        if compression_mode in _OVERSAMPLED_COMPRESSION_MODES:
+            max_bond_oversample = _normalize_oversample_bond(
+                max_bond, max_bond_oversample
+            )
+            cutoff_oversample = _normalize_oversample_cutoff(cutoff_oversample)
+            cutoff_mode_oversample = _normalize_oversample_cutoff_mode(
+                cutoff_mode_oversample
+            )
+        if compression_mode in {"zipup", "zipup_oversample"}:
+            raise NotImplementedError(
+                "zipup compression is only available for a complete path "
+                "compression or operator-state two-layer application."
+            )
+
+        if compression_mode in _OVERSAMPLED_COMPRESSION_MODES:
+            base_mode = compression_mode.removesuffix("_oversample")
+            self._compress_edge_inplace(
+                q0,
+                q1,
+                max_bond=max_bond_oversample,
+                cutoff=cutoff_oversample,
+                cutoff_mode=cutoff_mode_oversample,
+                absorb=absorb,
+                reduced=reduced,
+                compression_mode=base_mode,
+                compression_seed=compression_seed,
+                info_c=None,
+                _validate=False,
+                **compress_opts,
+            )
+            return self._compress_edge_inplace(
+                q0,
+                q1,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb=absorb,
+                reduced=reduced,
+                compression_mode="direct",
+                compression_seed=None,
+                info_c=info_c,
+                _validate=_validate,
+                **compress_opts,
+            )
 
         bond = self.bond(q0, q1)
         before_bond = int(self.ind_size(bond))
@@ -1242,6 +1713,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
             )
 
         compress_opts.setdefault("method", _compression_method(compression_mode))
+        if compression_mode in {"src", "sdcr"} and compression_seed is not None:
+            compress_opts.setdefault("seed", int(compression_seed))
         previous = self.orthogonality_center
         qtn.TensorNetworkGenVector.compress_between(
             self,
@@ -1256,7 +1729,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
         )
         self._track_edge_center(q0, q1, absorb, previous=previous)
         self._sync_info_c(info_c)
-        self.validate()
+        if _validate:
+            self.validate()
         return self
 
     def _track_edge_center(self, q0, q1, absorb, *, previous):
@@ -1273,13 +1747,25 @@ class TreePeps(qtn.TensorNetworkGenVector):
         *,
         center=None,
         max_bond=None,
+        max_bond_oversample=None,
         cutoff=1e-10,
+        cutoff_oversample=0.0,
         cutoff_mode="rsum2",
+        cutoff_mode_oversample="rel",
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
+        order="rank",
         info_c=None,
     ):
-        """Compress the tree inward toward a selected canonical center."""
+        """Compress the tree inward toward a selected canonical center.
+
+        ``order="rank"`` greedily removes the currently cheapest leaf
+        branch from the live tree, using physical and virtual dimensions
+        after each reduction. ``order="depth"`` retains the simple
+        farthest-first schedule. Both policies preserve the selected
+        ``TreePepsPlan`` topology.
+        """
 
         if form is not None:
             if center is not None:
@@ -1295,23 +1781,59 @@ class TreePeps(qtn.TensorNetworkGenVector):
             if center is None:
                 center = self.plan.root
         center = self.plan.resolve_site(center)
-        self.shift_orthogonality_center(center, info_c=info_c)
-
-        order = sorted(
-            (q for q in self.sites if q != center),
-            key=lambda q: (-len(self.plan.path(q, center)), q),
+        order = normalize_tree_compression_order(order)
+        compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode in _PATH_COMPRESSION_MODES and self.plan.is_mps_topology:
+            self._prepare_canonical_region(self.sites, info_c=info_c)
+            self._compress_path_region_1d(
+                self.sites,
+                max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
+                cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
+                compression_mode=compression_mode,
+                compression_seed=compression_seed,
+            )
+            self._canonical_region = frozenset(self.sites)
+            self.shift_orthogonality_center(
+                center,
+                info_c=info_c,
+                _skip_validate=True,
+            )
+            self.validate()
+            self.validate_isometry_metadata()
+            return self
+        self.shift_orthogonality_center(
+            center,
+            info_c=info_c,
+            _skip_validate=True,
         )
-        for q in order:
-            toward = self.plan.path(q, center)[1]
+
+        edge_order = iter_tree_compression_order(
+            self.plan,
+            center=center,
+            nodes=self.sites,
+            order=order,
+            tensor_getter=self.node_tensor,
+            bond_getter=self.bond,
+        )
+        for q, toward in edge_order:
             self._compress_edge_inplace(
                 q,
                 toward,
                 max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
                 cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
                 cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
                 absorb="right",
                 reduced=reduced,
                 compression_mode=compression_mode,
+                compression_seed=compression_seed,
+                _validate=False,
             )
         # The inward sweep has already established the defining isometries.
         # Record the final center directly instead of running a second full
@@ -1329,10 +1851,15 @@ class TreePeps(qtn.TensorNetworkGenVector):
         span=False,
         center=None,
         max_bond=None,
+        max_bond_oversample=None,
         cutoff=1e-10,
+        cutoff_oversample=0.0,
         cutoff_mode="rsum2",
+        cutoff_mode_oversample="rel",
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
+        order="rank",
         inplace=False,
         info_c=None,
     ):
@@ -1364,11 +1891,32 @@ class TreePeps(qtn.TensorNetworkGenVector):
         center = work.plan.resolve_site(center)
         if center not in region:
             raise ValueError("center must lie inside the compressed subtree")
+        order = normalize_tree_compression_order(order)
 
-        if work.canonical_region != frozenset(region) or not work.is_subtree_canonical_form(region):
-            work._canonicalize_region_fast(region)
+        compression_mode = _normalize_compression_mode(compression_mode)
+        if compression_mode in _PATH_COMPRESSION_MODES and work.plan.is_mps_topology:
+            work._prepare_canonical_region(region, info_c=info_c)
+            work._compress_path_region_1d(
+                region,
+                max_bond=max_bond,
+                max_bond_oversample=max_bond_oversample,
+                cutoff=cutoff,
+                cutoff_oversample=cutoff_oversample,
+                cutoff_mode=cutoff_mode,
+                cutoff_mode_oversample=cutoff_mode_oversample,
+                compression_mode=compression_mode,
+                compression_seed=compression_seed,
+            )
             work._canonical_region = frozenset(region)
-            work._set_isometry_metadata_from_region(region)
+            work.shift_orthogonality_center(
+                center,
+                info_c=info_c,
+                _skip_validate=True,
+            )
+            work.validate()
+            work.validate_isometry_metadata()
+            return work
+        work._prepare_canonical_region(region, info_c=info_c)
 
         if len(region) > 1:
             # Recover a single hub first, then process each branch as a
@@ -1392,21 +1940,44 @@ class TreePeps(qtn.TensorNetworkGenVector):
                 return cutoff
 
             def descend(node, parent):
-                children = sorted(
+                pending = {
                     neighbor
                     for neighbor in work.plan.neighbors(node)
                     if neighbor in region and neighbor != parent
-                )
-                for child in children:
+                }
+                while pending:
+                    if order == "rank":
+                        # Re-score after each completed branch: its
+                        # compression can reduce a bond on ``node`` and
+                        # change the cost of the remaining siblings.
+                        child = min(
+                            pending,
+                            key=lambda candidate: (
+                                *tree_edge_rank_key(
+                                    work.node_tensor(node),
+                                    work.node_tensor(candidate),
+                                    work.bond(node, candidate),
+                                ),
+                                int(candidate),
+                            ),
+                        )
+                    else:
+                        child = min(pending)
+                    pending.remove(child)
                     work._compress_edge_inplace(
                         node,
                         child,
                         max_bond=max_bond,
+                        max_bond_oversample=max_bond_oversample,
                         cutoff=edge_cutoff(node, child),
+                        cutoff_oversample=cutoff_oversample,
                         cutoff_mode=cutoff_mode,
+                        cutoff_mode_oversample=cutoff_mode_oversample,
                         absorb="right",
                         reduced=reduced,
                         compression_mode=compression_mode,
+                        compression_seed=compression_seed,
+                        _validate=False,
                     )
                     descend(child, node)
                     work.canonize_edge_(child, node, absorb="right")
@@ -1415,7 +1986,8 @@ class TreePeps(qtn.TensorNetworkGenVector):
 
         work._canonical_region = frozenset({center})
         work._set_isometry_metadata_from_region({center})
-        work.validate(check_canonical=True)
+        work.validate()
+        work.validate_isometry_metadata()
         work._sync_info_c(info_c)
         return work
 
@@ -1426,10 +1998,15 @@ class TreePeps(qtn.TensorNetworkGenVector):
         span=False,
         center=None,
         max_bond=None,
+        max_bond_oversample=None,
         cutoff=1e-10,
+        cutoff_oversample=0.0,
         cutoff_mode="rsum2",
+        cutoff_mode_oversample="rel",
         reduced=True,
         compression_mode="direct",
+        compression_seed=None,
+        order="rank",
         info_c=None,
     ):
         """In-place alias for :meth:`compress_subtree`."""
@@ -1439,10 +2016,15 @@ class TreePeps(qtn.TensorNetworkGenVector):
             span=span,
             center=center,
             max_bond=max_bond,
+            max_bond_oversample=max_bond_oversample,
             cutoff=cutoff,
+            cutoff_oversample=cutoff_oversample,
             cutoff_mode=cutoff_mode,
+            cutoff_mode_oversample=cutoff_mode_oversample,
             reduced=reduced,
             compression_mode=compression_mode,
+            compression_seed=compression_seed,
+            order=order,
             inplace=True,
             info_c=info_c,
         )

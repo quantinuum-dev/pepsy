@@ -10,6 +10,7 @@ _SYMBOL_MODULES = {
     "build_bra_ket": ".metrics",
     "contract_boundary": ".metrics",
     "contract_flat": ".metrics",
+    "contract_layered": ".metrics",
     "infidelity": ".metrics",
     "normalize": ".metrics",
     "peps_fidelity": ".metrics",
@@ -29,6 +30,11 @@ _DEPRECATED_ALIASES = {
     "normalize": "peps_normalize",
     "infidelity": "peps_infidelity",
 }
+
+
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
 
 
 def __getattr__(name):

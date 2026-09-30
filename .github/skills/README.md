@@ -1,7 +1,8 @@
 # Pepsy agent skills
 
-Each skill is self-contained in one directory with a required `SKILL.md` and
-optional `references/` and `agents/` subdirectories.
+Each skill has a required `SKILL.md` and `agents/openai.yaml`, with optional
+`references/` and `scripts/` subdirectories. Repository scope and environment
+selection are defined in [`AGENTS.md`](../../AGENTS.md), not in each skill.
 
 Start with [`pepsy-maintainer/SKILL.md`](pepsy-maintainer/SKILL.md) for a
 cross-cutting task. The repository-level
@@ -16,11 +17,19 @@ deprecating, or removing a skill. It defines the selection workflow, package
 contract, lifecycle, and quality gate. Run the catalog validator after any
 catalog or skill-package change.
 
+Use skills for the subsystem being changed. Read their linked references only
+when the task needs them. Notes and plans may contain historical versions,
+benchmarks, or unimplemented proposals; verify these against current code and
+tests. Machine-specific paths belong in the device-local override, which must
+not be uploaded. The maintainer's numerical-contract reference carries the
+shared Torch/CTMRG safeguards previously embedded in the root guide.
+
 ## Core workflows
 
 - [MPS optimizer](mps-optimizer/SKILL.md)
 - [Tensor fitting](tensor-fitting/SKILL.md)
-- [Tree optimizer](tree-optimizer/SKILL.md)
+- [Tree optimizer](tree-optimizer/SKILL.md): tree replay, unitary stabilization,
+  device-aware FIT environments, opt-in CPU thread limits, and bounded histories.
 - [qMERA energy optimizer](qmera-energy-optimizer/SKILL.md)
 
 ## Domain workflows

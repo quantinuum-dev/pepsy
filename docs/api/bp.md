@@ -4,8 +4,31 @@ The BP namespace contains message-passing, loop-expansion, and partitioned
 norm-estimation helpers. It is an advanced extension and is loaded lazily by
 the top-level package.
 
+Jump to [boundary measurements](#peps-boundary-measurements),
+[fermionic PEPO norms](#native-fermionic-pepo-norm-workflow),
+[loop-cluster compression](#reduced-loop-cluster-compression), or
+[reduced density matrices](#local-reduced-density-matrices).
 
-> API details are maintained as handwritten Markdown in this page.
+## PEPS boundary measurements
+
+`compute_boundary_expectation` separates compression `method` from measurement
+`route`. `mode` remains a compatibility alias for `method`; conflicting
+explicit values raise. `route="boundary"` is the default. Newer Quimb builds
+also support `route="envs"`, with a route-appropriate compressor such as
+`method="direct"`; older builds reject that explicit route. Pepsy adapts
+Quimb's legacy `mode` and modern `method` keywords by capability.
+
+`normalized=True` divides each term by its local norm; `False` returns raw
+expectations. `return_all=True` returns a dictionary of those scalars. Use
+`normalized="return", return_all=True` for `(numerator, norm)` pairs. With
+`return_all=False`, `"return"` produces the sum of normalized expectations.
+These results now have the same format on legacy and current Quimb.
+
+A single row or column uses exact operator-inserted contractions without
+building a full state vector or dense reduced density matrix. It needs no 2D
+boundary truncation, so `max_bond` and boundary cutoffs do not affect this
+case. Precomputed 2D plaquette environments cannot be used for this route.
+
 
 ## Native fermionic PEPO norm workflow
 
@@ -290,6 +313,17 @@ messages. If converting D2BP messages to SU form with
 `simple_update_core_and_gauges_from_d2bp`, pass the returned core and gauge
 mapping together so the gauge transformation and boundary messages describe
 the same network.
+
+With newer Quimb/Symmray stacks, D2BP messages represent positive fermionic
+operators. Their raw dense matrices need not be positive semidefinite.
+Pepsy probes that convention and applies the dual-leg parity metric when
+converting to SU gauges. It also validates native pair normalization on a
+private snapshot and repairs only affected solver instances. Cluster bras
+are conjugated jointly so internal virtual legs receive the correct phases.
+Explicit loop projectors use matching matrix messages and physical-leg bra
+conjugation, preserving their existing projector convention.
+See the [Symmray compatibility record](../development/notes/symmray_2026_09.md)
+for tested revisions and compatibility limits.
 
 By default, `B_reduce` is only Hermitianized; it is not eigendecomposed. Set
 `psd_project=True` when an explicit PSD projection is wanted, or set
@@ -655,6 +689,41 @@ the private cluster copy, and lets Quimb perform its usual QR/SVD compressed
 contraction. Pass `optimize="auto-hq"`, another Quimb optimizer string, or a
 standard Cotengra path optimizer through either path-cluster helper.
 
+## Expectation inputs and outputs
+
+The expectation helpers above accept a term mapping. Use a tuple of sites
+as each key, in the same order as the operator's physical axes. For dense
+operators, one-site shape is `(d, d)`; two-site shape is `(d0*d1, d0*d1)`
+or `(d0, d1, d0, d1)`, with all output axes before all input axes. Native
+fermionic operators must preserve their graded basis and site order.
+
+The helpers work on private contraction networks and leave the input PEPS
+and operators unchanged. Path-cluster `gauges` supplies external SU bond
+vectors, which are also left unchanged. Returned scalars stay in the active
+array backend; they are not guaranteed to be Python floats.
+
+| Option | Result |
+| --- | --- |
+| `normalized=True`, `return_all=False` | Sum of locally normalized expectations |
+| `normalized=False`, `return_all=False` | Sum of unnormalized numerators |
+| `return_all=True` with either Boolean normalization | Mapping from the original term keys to scalar values |
+| Boundary helper with `normalized="return", return_all=True` | Mapping to `(numerator, local_norm)` pairs |
+
+For a small dense example with known expectations:
+
+```python
+import numpy as np
+import quimb.tensor as qtn
+from pepsy.bp import compute_boundary_expectation
+
+zero = np.array([1.0, 0.0])
+peps = qtn.PEPS.product_state([[zero, zero], [zero, zero]])
+z = np.diag([1.0, -1.0])
+terms = {((0, 0),): z, ((0, 0), (1, 1)): np.kron(z, z)}
+values = compute_boundary_expectation(peps, terms, max_bond=4, return_all=True)
+assert all(np.isclose(value, 1.0) for value in values.values())
+```
+
 ## Local reduced density matrices
 
 For a single route-independent entry point, use `rho_expand`. Its
@@ -739,6 +808,14 @@ energy = compute_local_expectation_edge_loop_series(
 
 `partial_trace_edge_loop_series_expand` supplies the matching diagnostic RDM.
 The scalar function is the fermion-safe choice for its supported cases.
+With `multi_excitation_correct=True`, D2 norm weights supplied to Quimb's
+real suppression solver are checked for finiteness and reality. An imaginary
+residue up to `64 * eps * max(1, abs(real_weight))` is treated as contraction
+roundoff, using the weight's precision. Larger residues raise `ValueError`;
+check message Hermiticity, or explicitly choose the unsuppressed expansion
+with `multi_excitation_correct=False`. Observable numerators, returned
+complex values, and cached input weights are preserved.
+
 Explicit terms can be passed as `LoopSeriesTerm` objects (or virtual-edge sets); at present they cannot put
 Q on a bond wholly internal to the selected observable support. A nonzero-Q
 fermionic scalar correction is currently restricted to one-site gates; the

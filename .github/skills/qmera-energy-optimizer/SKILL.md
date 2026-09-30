@@ -26,11 +26,11 @@ storage and contraction.
   `pepsy.set_default_grad_backend(...)`.
 - Pepsy operator/tensor surfaces: `src/pepsy/operators/` and
   `src/pepsy/tensors/symmetric.py`.
-- Optional prototype, if present: `/home/reza.haghshenas@quantinuum.com/mera/`.
+- Optional prototype, if present: `../mera/`.
 
-Use quimb MERA, quimb circuit docs, and the `~/mera` prototype as design
-references only. Do not rebuild Pepsy qMERA around `qtn.Circuit`, `PTensor`, or
-copied prototype scripts.
+Use quimb MERA, quimb circuit docs, and the optional sibling `../mera`
+prototype as design references only. Do not rebuild Pepsy qMERA around
+`qtn.Circuit`, `PTensor`, or copied prototype scripts.
 
 ## Implementation Map
 
@@ -216,24 +216,25 @@ Fermi-Hubbard mode/symmetry preservation before exposing top-level exports.
 
 ## Validation
 
-Run focused validation after qMERA edits:
+Activate the environment selected by `AGENTS.md` and any local override, then
+run focused validation after qMERA edits:
 
 ```bash
 env NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX=/tmp \
-  /home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pytest -q tests/test_optimize_qmera.py
+  python -m pytest -q tests/test_optimize_qmera.py
 ```
 
 For API/export changes, also run:
 
 ```bash
 env NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX=/tmp \
-  /home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pytest -q tests/test_public_api.py tests/test_package_layout.py
+  python -m pytest -q tests/test_public_api.py tests/test_package_layout.py
 ```
 
 For syntax-only checks:
 
 ```bash
-/home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pyflakes src/pepsy/optimizers/qmera tests/test_optimize_qmera.py
+python -m pyflakes src/pepsy/optimizers/qmera tests/test_optimize_qmera.py
 ```
 
 The focused suite also covers independent 2D PBC Jordan-Wigner Fock-space

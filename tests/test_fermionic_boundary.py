@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import pepsy
+from pepsy._internal.quimb import call_quimb_2d
 
 
 torch = pytest.importorskip("torch")
@@ -14,7 +15,8 @@ def _torch_float64(array):
 
 
 def _untruncated_boundary_norm(state, *, strip_exponent=False):
-    return (state.H & state).contract_boundary(
+    return call_quimb_2d(
+        (state.H & state).contract_boundary,
         max_bond=None,
         cutoff=0.0,
         canonize=True,

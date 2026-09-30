@@ -6,6 +6,7 @@ import quimb.tensor as qtn
 
 import pepsy
 from pepsy.optimizers.tree import (
+    SubTreeMPO,
     TreeMPO,
     TreeOptimizer,
     TreePlan,
@@ -476,6 +477,33 @@ def test_tree_mpo_from_pauli_sum_has_compact_steiner_support():
     np.testing.assert_allclose(
         state.to_dense(), operator.to_dense()[:, 0], atol=1e-12,
     )
+
+
+def test_subtree_mpo_from_pauli_sum_omits_exterior_identity_tensors():
+    """The compact Pauli-sum constructor stores only its active region."""
+    plan = TreePlan.from_order(range(8), structure="balanced", top_arity=2)
+    terms = [
+        (0.7, {0: "X", 2: "Y", 7: "Z"}),
+        (0.2, {0: "Z", 7: "X"}),
+    ]
+    operator = SubTreeMPO.from_pauli_sum(plan, terms)
+    active = set(operator.active_nodes)
+
+    assert operator.operator_support == (0, 2, 7)
+    assert operator.num_tensors == len(active) < len(plan.nodes())
+    assert set(operator.sites) == {
+        plan.qubit_of_node[node]
+        for node in active
+        if node in plan.qubit_of_node
+    }
+    assert operator.validate() is operator
+
+    full = TreeMPO.from_pauli_sum(plan, terms)
+    compact_state = TreeOptimizer(None, n=8, tree=plan, chi=16, run=False)
+    full_state = TreeOptimizer(None, n=8, tree=plan, chi=16, run=False)
+    compact_state.apply_sub_mpotree(operator, operator.operator_support, cutoff=0.0)
+    full_state.apply_sub_mpotree(full, full.operator_support, cutoff=0.0)
+    np.testing.assert_allclose(compact_state.to_dense(), full_state.to_dense(), atol=1e-12)
 
 
 def test_native_tree_mpo_from_gate_preserves_symmetry_and_tree_geometry():

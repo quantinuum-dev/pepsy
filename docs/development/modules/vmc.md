@@ -1,5 +1,27 @@
 # VMC module map
 
+## NetKet bridge
+
+`netket.py` owns packing, configuration adapters, amplitude factories, and
+NetKet setup/driver orchestration. Within its amplitude factories:
+
+- Spin and fermion adapters map their own input configurations to physical
+  indices. The fermion adapter also owns the ordering phase.
+- `_make_eager_config_evaluator` builds the shared non-JIT evaluator: select
+  physical indices, contract one network, then format the amplitude as a
+  scalar, logarithm, or mantissa/exponent pair.
+- JIT factories retain native JAX indices and `vmap`. The eager evaluator's
+  Python integer conversions must not be moved into a traced path.
+- `_make_jax_scaled_contractor` supplies the identical contraction dispatch
+  for both JIT factories. It returns a mantissa and base-10 exponent; each
+  adapter retains its configuration mapping, fermion phase, and output format.
+
+The evaluator captures only the supplied ansatz and contraction settings;
+it does not own sampler state, observables, or optimizer updates. JAX/NetKet
+remain optional and are resolved by the existing requirement helpers.
+
+## Torch implementation
+
 The Torch VMC package keeps the public surface in
 `pepsy.vmc.torch.__init__`. The implementation is organized by responsibility:
 
@@ -32,3 +54,30 @@ now have physically-owned modules. `_common.py` owns the shared leaf helpers;
 `_core.py` keeps compatibility imports and cross-workflow dispatch. New code
 should use the public symbols from `pepsy.vmc` or `pepsy.vmc.torch`, and the
 proposal entry point `TorchVMCDriver.measure_from_proposal(...)`.
+
+Within `driver.py`, retained-sample measurement has three preparation stages:
+`_resolve_measurement_source` validates provenance and distributed ownership,
+`_measurement_configurations` preserves chain axes while moving configurations
+to the model device, and `_measurement_amplitudes` reuses or refreshes parent
+amplitudes. Weighting, observable connections, and result assembly remain in
+`measure_samples`. Both sampling estimators use `_run_sampling_sweeps`; each
+caller owns its cumulative counters, profiling dictionary, and progress bar.
+
+`TorchPEPSAmplitude.connected_amplitudes` documents parent/target row shapes,
+site encoding, device/dtype, ordering, and amplitude ownership. The boundary
+subclass adds cache and diagnostic mutation, fallback/chunking behavior, and
+the cache lifetime required when starting a new autograd graph. See the
+[connected-amplitude contract](../../api/vmc.md#connected-amplitude-contract)
+for a small measurement example.
+
+The boundary implementation separates compiled group dispatch
+(`_reuse_compiled_connections`), parent/window cache construction
+(`_connected_boundary_context`), and eager/alternative-axis evaluation
+(`_reuse_eager_connections`). Worker threads return values or bounded error
+strings; the caller writes caches, output rows, and diagnostics. The public
+method retains diagonal reuse, group selection, and final batched fallback.
+
+`estimate_observables` uses `_make_observable_estimates` for both modern and
+legacy sampling. This helper assembles result records using the existing
+statistics kernels, without changing sample axes, shared amplitudes, or
+adaptive stopping rules.

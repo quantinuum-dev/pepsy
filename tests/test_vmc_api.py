@@ -1362,6 +1362,7 @@ def test_netket_setup_benchmarks_amplitude_without_sampling_in_timer():
 
 
 def test_netket_setup_to_peps_unpacks_current_flax_parameters():
+    pytest.importorskip("jax")
     import jax
     import jax.numpy as jnp
     import quimb.tensor as qtn

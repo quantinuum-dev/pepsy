@@ -1,7 +1,8 @@
 # `pepsy.optimizers.tree_stabilizer`
 
-`TreeStabOptimizer` is the first tree-backed Stabilizer Tensor Network
-milestone. It represents the state as
+`StabilizerTreeSimulator` is the first tree-backed Stabilizer Tensor Network
+milestone. `TreeStabOptimizer` remains a deprecated compatibility alias. It
+represents the state as
 
 ```text
 |psi> = C |p>
@@ -94,7 +95,7 @@ The first milestone supports:
 ```python
 import pepsy
 
-sim = pepsy.TreeStabOptimizer(4, gates=[
+sim = pepsy.StabilizerTreeSimulator(4, gates=[
     ("h", 0),
     ("cnot", 0, 1),
     ("rz", 0.2, 0),
@@ -186,7 +187,7 @@ MpsStab: `submpo_event`, `submpo_event_parts`, `is_submpo_event`,
 Sampling is not bounded by `max_dense_sample_qubits`; that constructor
 argument remains accepted for compatibility with older callers.
 
-`TreeStabOptimizer.run` also accepts the shared shot and MPI options:
+`StabilizerTreeSimulator.run` also accepts the shared shot and MPI options:
 
 ```python
 result = sim.run(
@@ -224,7 +225,7 @@ state ``|p>`` in the same way as the MPS STN API; it is not conjugated through
 the physical Clifford frame. The payload must expose a usable MPO interface,
 or TreeOptimizer may lower it to a bounded dense operator. A complete
 ``TreeMPO``/TTNO can instead be scheduled with
-``TreeStabOptimizer.subtreempo_event(tree_operator)`` (or ``subttno_event``). Its
+``StabilizerTreeSimulator.subtreempo_event(tree_operator)`` (or ``subttno_event``). Its
 TreePlan must match the coefficient tree and its declared support must include
 all TreePlan physical sites, or exactly the complete operator's explicit
 ``operator_support`` (for example, one produced by ``TreeMPO.from_gate``); the
@@ -255,6 +256,22 @@ while TreeOptimizer applies the coefficient update on the inferred backend.
 Stim and trajectory-generated matrices are converted by the library before
 they enter this user-stream boundary.
 
+Named coefficient rotations and Pauli sums are constructed on the state
+backend through Autoray. Exact cooling also keeps the leaf matrix on that
+backend: one thin SVD supplies its candidate vector and rank test, followed
+by backend Bloch reductions. Only the Boolean rank decision and three Bloch
+values cross to the CPU tableau. The cooling algorithm remains enabled by
+default and preserves its existing tolerance and canonicalization rules.
+
+The coefficient tree retains norm/log-fidelity scalars on-device during
+ordinary replay. Public diagnostics/readout and explicit extracted-exponent
+bookkeeping materialize host scalars. Profiling, FIT finite/overlap checks,
+and spectrum/bond diagnostics remain off by default. MPI shot replay now
+also defaults to `collect_diagnostics=False`. Measurement decisions, dense
+physical gate classification, native QR safety, and upstream rank selection
+can still synchronize; explicit reporting/injection runners retain their
+existing timing reports.
+
 TreeStab's `norm_diagnostics()` keeps two coefficient-state diagnostics
 separate. `local_fidelity` and `cumulative_fidelity` are cheap
 canonical-centre compression metrics measured from retained norms, controlled by
@@ -270,6 +287,3 @@ per-edge singular-spectrum and discarded-weight records returned by
 `truncation_report()` and `get_infidelity_samples()`. Neither metric is a
 physical target-state overlap; the tableau frame does not turn a norm proxy
 into directional fidelity.
-
-
-> API details are maintained as handwritten Markdown in this page.

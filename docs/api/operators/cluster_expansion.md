@@ -1,9 +1,34 @@
 # PEPO cluster expansion and joint ordered products
 
+For arbitrary interaction graphs and a common MPO/PEPO/Pauli plan, see the
+[shared interaction-cluster guide](interaction_clusters.md).
+
 For the canonical MPO/PEPO entry-point map, step convention, and return-type
 summary, see the [unified exponential API](exponentials.md). This page gives
 the detailed `pepsy.operators.pepo_cluster` cluster and fixed-channel PEPO
 reference. The higher-order MPO and MPO cluster families are separate APIs.
+
+`cluster_size` is the common spatial cutoff keyword across PEPO, MPO and
+Gaugy Pauli clusters. PEPO's existing `order` keyword is an equivalent alias;
+conflicting values are rejected. Both reusable dense plans and the Pauli
+basis expose `.cluster_size`. Defaults remain three for dense plans and four
+for the Pauli basis. Ordered products inherit the cutoff of their bases.
+See the [shared call table](exponentials.md#shared-connected-cluster-calls).
+Shared-plan factories now select the square 2D builder automatically for
+compatible nearest-neighbor Pauli plans. Use `layout="graph"` for generic
+graph output, or `layout="square"` to require a square layout. See
+[selection, boundaries and limits](interaction_clusters.md#shared-square-plans-and-2d-pepo-construction).
+For the dense square dataclass, retain `order` when copying configuration with
+`dataclasses.replace(plan, order=p)`; `cluster_size` aliases this field rather
+than storing a second cutoff.
+
+For a fixed dense generator, `plan.compile_exp().exp(step)` now gives the
+same sign convention as Pauli PEPO and MPO exponentials. It returns active
+blocks by default; use `materialize=True` for a Quimb operator. This is
+`plan.build(-step, materialize=False)` with reusable geometry, not backend
+JIT. Existing `build(beta)` defaults and numerical behavior are unchanged.
+Use `PauliPEPOBasis` for runtime coefficient vectors, autodiff and trace-only
+calls.
 
 `build_itf_cluster_expansion_pepo` constructs a dense square-lattice PEPO
 approximation to `exp(-beta * H)` for Pepsy's transverse-field Ising
@@ -55,6 +80,36 @@ active = plan.build(0.05, materialize=False)
 pepo = active.to_pepo()
 ```
 
+`build(beta)` uses the `exp(-beta * H)` convention with real or complex
+`beta`. It rebuilds numerical blocks using NumPy and the combined dtype of
+the plan and `beta`, reusing the planned geometry. Input operators are not
+modified. The default result is a Quimb `PEPO`; `materialize=False` returns
+`ActivePEPOBlocks`. Every successful block assembly updates `plan.last_report`
+before optional dense materialization.
+The C4 path requires a real/Hermitian reshuffled edge residual; complex
+evolution that violates this condition needs a plan with `symmetry=None`.
+
+### Shapes, tensor ordering, and ownership
+
+For local dimension `d`, `onesite_op` has shape `(d, d)` and `twosite_op`
+has shape `(d**2, d**2)`. Both are matrices with output rows and input
+columns; two-site product order follows the edge's source then target.
+They must use the same local physical basis.
+
+`active.blocks[site][sector_tuple]` holds an `(output, input)` matrix of
+shape `(d, d)`. The sector tuple follows `active.site_directions[site]`.
+`active.to_pepo()` transposes each physical block into Quimb's `urdlbk`
+layout: present virtual directions up/right/down/left, then physical input
+`b` and output `k`. Missing open-boundary virtual legs are omitted. Use the
+returned tensor's named indices when manipulating arrays.
+
+Building updates the plan's report, and materialization leaves the active
+blocks unchanged. Inputs are not mutated, but input arrays can be retained
+by the plan; keep them fixed during reuse. `compact_bonds=True` remaps sector
+labels only in the returned PEPO. This structural compaction preserves the
+operator exactly; `max_tree_rank` and cutoff settings instead control
+approximations during construction.
+
 Use `return_report=True` to receive local residual and storage diagnostics
 alongside the result. For a four-site path, `max_tree_rank` optionally caps
 the internal path SVD rank:
@@ -86,6 +141,198 @@ For the broader
 cluster-expansion design, the reference implementation is the Julia
 [`ClusterExpansions`](https://github.com/sanderdemeyer/ClusterExpansions)
 package.
+
+## Hamiltonian-aware reuse in Pauli PEPOs
+
+`PauliPEPOBasis.compile(..., spatial_reuse=True)` enables automatic local
+Hamiltonian equivalence checks by default, for both homogeneous and located
+Pauli terms. Ordered `PEPOClusterProductExpansion` factors must use the same
+`spatial_reuse` setting. The check preserves the complete ordered factor
+list, Pauli labels, coefficients and directed/parallel bond occurrences.
+Allowed translations, rotations, reflections and other graph relabelings can
+share an exact local target. Located builds also reuse contractions of the
+frozen lower-order PEPO under the same verified site permutation. Each
+placement still receives its own residual subtraction and tensor insertion;
+backend values are cached only for that evaluation and cluster order. No
+extra truncation is introduced. A [5×6 stage and memory profile](../../development/notes/2026-09-28-pepo-stage-profile.md)
+measures target evaluation, lower contraction, Pauli expansion, insertion and
+process peak RSS separately.
+
+```python
+from pepsy.operators import PauliPEPOBasis
+
+basis = PauliPEPOBasis.compile(
+    5, 6, [("onsite", "X", 0.2), ("edge", "ZZ", 0.7)],
+    order=4, spatial_reuse=True,
+)
+compiled = basis.compile_exp()
+active = compiled.exp(-0.01j)
+print(compiled.cache_info["spatial_plans"])
+print(compiled.cache_info["last_local_targets_evaluated"])
+```
+
+Compilation prepares structural plans for the usual default and coefficient
+vector bindings; mixed binding modes in ordered products are added on demand.
+A `coefficients=` override preserves each slot's independence, even if values
+are equal. Repeated `MPOParameter` references can establish equivalence for
+located terms; distinct parameter names or differing defaults cannot. Opaque
+PEPO coefficients retain their own slot identity. Numerical targets are held
+only during the current call, preserving repeated Torch evaluation/gradients.
+
+Each `spatial_plans` entry reports `targets`, `representatives`, `reused` and
+`search_fallbacks`. Entries can describe different binding modes, so do not
+sum them as one build's work. `last_local_targets_evaluated` counts local
+ordered targets evaluated in the latest call (zero before a build; `None`
+for the unreduced homogeneous route); it does not count lower-support
+contractions. Set `spatial_reuse=False` for a reference comparison. Search is limited to 4096 permutations per cluster; beyond that,
+identity-only matching retains safe translation reuse.
+
+This automatic local-target policy is separate from the existing
+`symmetry="C4"` policy that transports PEPO blocks. Keep `symmetry=None` for
+models without that stronger symmetry. The legacy dense
+`ClusterExpansionPlan` retains its existing TI/C4 handling; it does not accept
+`spatial_reuse`. Physical spin rotations and fermionic site permutations are
+not inferred by the new matcher.
+
+For uniform onsite plus symmetric nearest-neighbor interactions, different
+square-lattice embeddings may have identical local Hamiltonian graphs: the
+19 oriented four-site shapes have three such graph types (path, star, loop).
+This can reduce local exponential work beyond geometric C4 grouping, while
+all 19 shapes and their finite placements are still assembled.
+
+## SVD-free differentiable construction
+
+`PauliPEPOBasis(..., factorization="fixed")` requests exact fixed-index
+construction throughout, including the generic homogeneous tree route at
+orders five through nine. The existing `factorization="auto"` default retains
+its fixed Pauli channels at low orders and numerical tree factorization where
+applicable. `max_tree_rank=None` is required in fixed mode.
+
+```python
+from pepsy.operators import MPOParameter, PauliPEPOBasis, PauliPEPOTerm
+
+basis = PauliPEPOBasis.compile(
+    5, 6,
+    [PauliPEPOTerm("onsite", "X", MPOParameter("h")),
+     PauliPEPOTerm("edge", "ZZ", MPOParameter("J"))],
+    order=4, factorization="fixed", spatial_reuse=True,
+)
+compiled = basis.compile_exp()
+active = compiled(step, parameters={"h": h, "J": J})
+```
+
+The lattice, local embeddings, verified symmetry matches, Pauli channels and
+tree topology are prepared independently of coefficient values. Each call
+builds fresh backend arrays and an autodiff graph with fixed structural channel
+shapes, including at zero coefficients/residuals. Generic tree topology has a
+bounded immutable cache and is warmed by compilation. Python scalar constants
+are converted at the precision of trainable coefficient slots.
+
+Ordered `PEPOClusterProductExpansion` factors must agree on the factorization
+policy. Fixed products reject `compress=True`; users may compress the resulting
+operator separately. `cache_info["factorization"]` identifies the policy.
+This policy concerns the Pauli/fixed-channel constructors, not the separate
+legacy dense numerical `ClusterExpansionPlan` solver.
+
+Fixed mode does not guarantee small PEPO tensors or cheap contraction. Keep
+`ActivePEPOBlocks` when possible, use physical-trace pruning only where its
+structural certificate applies, and inspect `active_nbytes`/`dense_nbytes`
+before materialization. Native charge conversion and boundary contraction are
+separate stages with their own decomposition and differentiation contracts.
+A scalar array-valued loss wrapping complete fixed PEPO construction has
+passed JAX `jit(value_and_grad)` on a three-site order-three chain, a
+2×2 square at order four, and a two-site complex-time case, including zero
+parameters and zero time. Return
+an array or scalar from the JIT function: `ActivePEPOBlocks` and Quimb PEPO
+objects are Python containers, not JAX outputs. This finite-case check does
+not establish arbitrary-geometry JIT support or a speedup.
+
+Torch `torch.compile(backend="aot_eager", fullgraph=True)` captures the local
+matrix exponential and fixed PEPO tree factorization with correct values
+and gradients. Complete PEPO construction remains an eager Torch autograd
+path: full-graph capture currently stops in Autoray coefficient/map preparation
+before materialization. Structural
+`compile_exp()` reuse is separate from Torch graph capture.
+
+### Automatic and supplied spatial symmetries
+
+`spatial_reuse=True` proves local equivalence under translations, rotations,
+reflections and graph relabelings, preserving directed terms and coefficient
+bindings. Spin labels do not rotate automatically. Independent parameters
+are not merged because their current numbers agree.
+
+Optional `spatial_symmetries` declares full finite-lattice site permutations.
+Each entry is a coordinate-to-coordinate mapping or a target-coordinate
+sequence in lexicographic source-site order. For example, on a 2x2 lattice:
+
+```python
+rotation = {(i, j): (j, 1 - i) for i in range(2) for j in range(2)}
+reflection = {(i, j): (i, 1 - j) for i in range(2) for j in range(2)}
+basis = PauliPEPOBasis(
+    2, 2, [("onsite", "X"), ("edge", "ZZ")], order=4,
+    factorization="fixed", spatial_symmetries=[rotation, reflection],
+)
+```
+
+Declarations must preserve lattice edges, including multiplicities, and term
+bindings; invalid or unprovable declarations raise. They are checked against
+the configured term bindings, while independent `coefficients=` overrides
+still get their own safe local reuse plan. Declarations never force equality
+of overridden values. Cache diagnostics expose `declared_spatial_symmetry_count`.
+A periodic translation can be declared as a permutation; an open-boundary
+wraparound translation is rejected. Automatic reuse still recognizes equal
+translated local clusters on open lattices.
+
+The older `symmetry="C4"` option transports entire PEPO blocks. In fixed mode,
+its homogeneous edge slots must each be invariant under endpoint reversal,
+which keeps transport valid under independent coefficient overrides. For
+other oriented interactions use `symmetry=None` and term-aware automatic reuse
+or validated declarations. Geometric inventories still distinguish the 19
+oriented four-site shapes; reusing their local values does not remove placements.
+
+## Cluster shapes and geometry reuse
+
+Both `ClusterExpansionPlan` and `PauliPEPOBasis` expose `cluster_inventory`,
+a fresh dictionary keyed by exact site count, from one through `order`:
+
+```python
+plan = ClusterExpansionPlan(5, 6, np.kron(np.diag([1., -1.]), np.diag([1., -1.])),
+                            np.array([[0., 0.5], [0.5, 0.]]), order=4)
+print(plan.cluster_inventory[4])
+# {'shapes': 19, 'trees': 18, 'loops': 1,
+#  'c4_shapes': 7, 'c4_trees': 6, 'c4_loops': 1}
+```
+
+These counts describe shapes on the infinite nearest-neighbor square lattice.
+Unprefixed counts identify translations only; `c4_*` additionally identifies
+rotations, keeping reflections distinct. Both views are reported regardless
+of the plan's numerical symmetry policy. `loops` counts shapes containing a
+cycle, not the number of independent cycles. The singleton counts as a tree.
+
+| Exactly four sites | Oriented shapes | Topology |
+| --- | ---: | --- |
+| Straight line | 2 | Tree |
+| L | 8 | Tree |
+| Zigzag (S/Z) | 4 | Tree |
+| T | 4 | Tree |
+| Plaquette | 1 | Loop |
+
+These are not placement counts: on a 5-by-6 open lattice the four-site shapes
+have 275 tree placements and 20 plaquette placements. Nor are they counts of
+factorization solves or virtual channels. On a periodic lattice, wrapping can
+change the induced graph and different oriented embeddings can share a site
+set; do not interpret summed shape-embedding counts as unique periodic site
+clusters. Inspect the finite topology and the builder's report separately.
+
+Geometry caches are bounded and contain immutable Python data only. Shape
+levels are reused when increasing the cutoff, and finite translated embeddings
+are reused for identical shapes, lattice dimensions and boundary flags. Cached
+embeddings preserve orientation and multiplicity required by the builder.
+No coefficients, exponentials, residual tensors or autodiff graphs are retained
+by these caches. Reuse a plan (or `basis.compile_exp()`) across parameter values;
+numerical targets and residuals are still evaluated for the current parameters.
+This reduces geometry setup work; it does not accelerate matrix exponentials
+or PEPO contraction directly.
 
 ## Finite model adapters
 
@@ -343,10 +590,169 @@ separate from `exp(A + B + C)`, which is a different operator unless the
 factors commute. Contract the returned PEPO with the network contraction
 workflow appropriate for the observable you need.
 
+Pass `materialize=False` to `product.exp(...)` or `compiled.exp(...)` to
+receive `ActivePEPOBlocks` before allocating dense Quimb site tensors. This is
+useful for checking `bond_dimensions` and `dense_nbytes`; `compress=True`
+requires materialization.
+Storage estimates inspect shape/dtype metadata without detaching or converting
+Torch blocks, so they can guard dense allocation during autodiff. The estimate
+covers dense site tensors, not the contraction or backward graph.
+
+## Trace of the constructed PEPO
+
+When the required observable is only the full trace, use
+`compiled.trace_exp(step, normalized=False)` on a compiled
+`PauliPEPOBasis` or `PEPOClusterProductExpansion`. The unnormalized trace
+is the default; `normalized=True` divides by `2**(lx * ly)`.
+`parameters` and `coefficients` follow the corresponding `exp` call.
+For an ordered product, the same factor order is used on every local cluster.
+
+This constructs the PEPO with its selected rank/factorization policy and
+contracts the physical trace of its active blocks. `compression=plan` traces
+the projected PEPO. No dense site tensors or global operator matrix are
+needed for the default sparse contraction. `state_budget=100000` caps sparse
+site entries and pairwise join work; use a larger budget or `None` explicitly
+when appropriate. No terms are dropped to satisfy the budget. Numerical
+NumPy zeros can be skipped; Torch/JAX zeros remain live for
+derivatives. For Quimb contraction options, pass `contract_opts={...}` to
+construct a materialized network, or trace an existing result. A custom
+`state_budget` cannot be combined with materialized contraction, because that
+budget governs only sparse joins. `contract_opts` must be a mapping:
+
+```python
+from pepsy.operators import trace_pepo
+active = compiled.exp(0.01, materialize=False)
+value = trace_pepo(active, normalized=True)
+```
+
+The old scalar shortcut remains explicit as `partition_trace_exp`. That
+evaluator computes the normalized trace of each exact local ordered
+target, subtracts proper connected partitions as scalar residuals, then
+sums all compatible disjoint placements with a cached subset recursion.
+It never creates PEPO blocks, tree factorizations, virtual bonds, or a
+boundary contraction. Static geometry and Hamiltonian symmetry reuse apply
+to local targets. The default `state_budget=100000` caps subset states and
+raises if exceeded; no collection is silently omitted. The coefficient and
+step values remain backend-native, including Torch gradients and JAX JIT.
+
+This returns the **complete selected-order cluster trace**, independent of
+`max_tree_rank`, PEPO compression, or boundary approximations. If those
+approximations are part of the quantity you need, trace the constructed
+representation instead. The local exponentials still require matrices of
+size `2**p`; the subset recursion can also become costly for large
+lattices or cluster order. This is an ordinary bosonic full trace. Full `torch.compile` capture of
+these evaluators is currently unsupported by the local Autoray target path;
+eager Torch autodiff and JAX JIT on small instances are validated.
+
+An alternative Quimb contraction closes the physical blocks first:
+
+
+```python
+active = compiled.exp(0.01, materialize=False)
+print(active.dense_nbytes, active.trace_nbytes)
+trace_network = active.to_trace_network()
+trace = trace_network.contract(all, optimize="greedy")
+normalized_trace = trace / 2**(active.lx * active.ly)
+```
+
+The returned `TensorNetwork2D` is an **unnormalized** trace of the same PEPO.
+It uses at most `dense_nbytes / physical_dim**2` bytes. Located exact
+Pauli-history builders additionally certify which sectors survive a complete
+physical trace: each nonroot selector must carry identity on every site in
+its subtree. Removing the other sectors is algebraic and independent of
+coefficient values, backend, or gradient tracking. Allowed channels remain
+even when their current coefficient is zero. The full operator and the
+lower-cluster operator subtraction retain every history.
+
+`trace_sectors` records this optional builder certificate. It is not valid
+for partial traces or after arbitrary edits to physical blocks. Builders
+without a certificate, including rank-capped SVD trees, retain all sectors.
+There is no value-based pruning or detached coefficient graph. This is a
+dense bosonic trace, not a graded fermionic trace. Boundary contraction adds
+its own approximation and workspace beyond these storage estimates.
+
+Located cluster targets are evaluated in bounded batches of equal matrix
+size. Each batch keeps the complete ordered factor sequence and independent
+coefficients; it does not imply translation symmetry or split noncommuting
+generators. A mixed located/uniform ordered product uses the located route
+for every factor. The verified joint symmetry plan shares equivalent local
+targets and frozen lower-support contractions; numerical values remain local
+to the evaluation. The located route only constructs its site/edge component
+maps, without unused homogeneous component tensors.
+
+An independent 2×2 set-partition reference checks noncommuting joint MPO
+and PEPO products at orders 2, 3 and 4, with reuse enabled and disabled.
+Complete two-site fixed-channel joint MPO/PEPO scalar losses also pass JAX
+`jit(value_and_grad)` for the coefficient and step. These finite checks do
+not establish arbitrary-geometry JIT support or large-system bond convergence.
+
 The order `p` controls local dimension: for physical dimension `d`, each
 `p`-site target is a `(d**p) x (d**p)` matrix, or `d**(2*p)` coefficients.
 The cost is exponential in `p` but not in the total lattice size `N` at fixed
 `p`; the number of translated/graph-embedded clusters scales with `N`.
+
+## Compile once, construct repeatedly
+
+Fix the lattice dimensions, boundary conditions, Pauli term supports, cluster
+order and rank/symmetry policy when creating a basis. Compile it once, then
+reuse the callable for each time step or coefficient vector:
+
+```python
+from pepsy.operators import PauliPEPOBasis, PauliPEPOTerm
+
+basis = PauliPEPOBasis.compile(
+    5, 6,
+    [PauliPEPOTerm("onsite", "X", coefficient=0.5),
+     PauliPEPOTerm("edge", "ZZ", coefficient=1.0)],
+    order=4,
+    cyclic=False,
+)
+compiled = basis.compile_exp()
+active = compiled.exp(-1j * 0.05)  # fixed H, sparse PEPO representation
+next_active = compiled.exp(-1j * 0.02)  # reuse topology at another step
+# Optional: active.to_pepo() materializes the Quimb PEPO tensors.
+```
+
+`PauliPEPOBasis.compile()` establishes the term maps and lattice structure;
+`compile_exp()` prepares the required cluster geometry and static local
+operator maps. Located Hamiltonians also prepare deterministic tree topology.
+Identical ordered local graphs share their static Pauli maps across different
+placements, while global site and bond indices still select distinct
+coefficients. Directed endpoint order and parallel bond occurrences are
+preserved. Mixed uniform/located ordered products compile every factor for
+the located evaluation route. Homogeneous orders five through nine prepare
+their generic shape records and source operator maps during compilation too.
+
+Each evaluation assembles the current cluster Hamiltonians, evaluates their
+exponentials (or the ordered product), subtracts the lower-order PEPO and fills
+fresh active blocks. Compilation does not freeze coefficient values, numerical
+residuals, SVD factors or gradients. A complete fixed Hamiltonian can use its
+stored term coefficients as above; pass `coefficients=` to override values
+without changing supports. If both H and the step are fixed and no new
+autodiff graph is needed, retain the constructed PEPO itself for reuse.
+
+Rebuild the basis when changing geometry, term supports, boundary conditions,
+order or rank/symmetry policy; mutating an existing compiled basis is not a
+cache-invalidation API. `cache_info` exposes `prepared_exp_modes`,
+`localized_embedding_plans` and `localized_tree_plans` alongside the existing
+homogeneous embedding and cluster counts. Static-map preparation and memory
+grow with cluster size; compilation moves this cost out of evaluation.
+
+The compiled single-factor and ordered-product PEPO callables both expose
+`cache_info` and `cluster_inventory` directly:
+
+```python
+print(compiled.cache_info)
+print(compiled.cluster_inventory[4])  # 19 oriented shapes: 18 trees + one loop
+```
+
+For an ordered product, `cache_info["factor_cache_info"]` contains each basis's
+preparation diagnostics. Its shape inventory is counted once at the shared
+spatial cutoff, not multiplied by the number of factors. These dictionaries
+are independent inspection snapshots; editing them does not change a plan.
+They report topology and preparation, not measured operator error or numerical
+PEPO residual norms. The dense `ClusterExpansionPlan.build(return_report=True)`
+interface remains the numerical residual-report surface for that construction.
 
 ## Fixed Pauli coefficient slots
 
@@ -392,6 +798,62 @@ such as `("edge", "ZZ", J)`, and `PauliPEPOTerm` values are accepted. Pass
 `beta=1j * tau` explicitly when using the cluster convention
 `exp(-beta * H)` rather than the real-time `tau` shorthand.
 
+For finite colorings or independent coefficients, add an explicit location:
+
+```python
+from pepsy.operators import PauliPEPOBasis, PauliPEPOTerm
+
+basis = PauliPEPOBasis.compile(
+    2,
+    3,
+    [
+        PauliPEPOTerm("onsite", "X", coefficient=h00, where=(0, 0)),
+        PauliPEPOTerm(
+            "edge",
+            "ZZ",
+            coefficient=j01,
+            where=((0, 0), (0, 1)),
+        ),
+    ],
+    order=2,
+)
+```
+
+Unlocated and located slots can be mixed, including across
+`PEPOClusterProductExpansion` factors. The localized builder enumerates each
+connected finite-lattice site subset independently, forms its actual ordered
+local product, and subtracts the completed lower-order PEPO on that support.
+It supports open and periodic square lattices at orders one through nine.
+Translation/C4 orbit reuse remains disabled because independently varying
+coefficients do not share one residual.
+
+On a periodic dimension of length two, two distinct PEPO bonds connect the
+same endpoints. Select one unambiguously with the direction measured from the
+first endpoint:
+
+```python
+wrapped = PauliPEPOTerm(
+    "edge",
+    "XY",
+    coefficient=j_wrap,
+    where=((0, 0), (1, 0)),
+    direction="d",
+)
+```
+
+Endpoint-only locations remain valid when exactly one lattice bond occurrence
+matches. Ambiguous periodic locations raise and require `direction`; they are
+never silently merged. Every bond occurrence internal to a connected site set
+is included in its local Hamiltonian, including parallel length-two PBC bonds.
+
+With `max_tree_rank=None`, each localized residual is represented by an exact,
+coefficient-independent Pauli-history tree. This avoids differentiating
+through an SVD gauge. Setting `max_tree_rank` below the required exact history
+rank opts into the existing fixed-rank backend SVD and is a controlled PEPO
+approximation. Orders four and above can still have large materialized local
+legs. Inspect `active.bond_dimensions` and `active.dense_nbytes` before calling
+`to_pepo()` on a larger lattice.
+
 The Pauli basis is physical and fixed. The PEPO virtual channels are separate
 active history sectors for edge, pair, star, and path clusters. Coefficient
 slots are fused into the 4 onsite and 16 edge Pauli components before local
@@ -404,6 +866,12 @@ the numerical SVD reference, while its stored blocks remain sparse.
 `cache_info` reports the prepared embedding-plan count and fused slot count.
 PEPO–PEPS contraction and expectation-value routines are outside this
 operator-construction API.
+
+`ActivePEPOBlocks.to_pepo()` remaps global history ids separately on each
+physical bond by default, so occurrence-specific channels do not pad every
+leg to the network-wide history count. Pass `compact_bonds=False` only to
+inspect that global labeling. `bond_dimensions` reports the compact dimension
+of every oriented leg; the two maps for opposite ends of one bond agree.
 
 ## Native symmetry blocks
 

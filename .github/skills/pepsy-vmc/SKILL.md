@@ -18,8 +18,8 @@ signs, amplitude contraction mode, and numerical scaling explicit.
   `.github/skills/pepsy-fermion-operators/SKILL.md` and
   `.github/skills/pepsy-fermion-operators/references/design.md` when changing
   spinful operators, basis conventions, or Symmray signs.
-- For Fermi-Hubbard workflows, inspect
-  `/home/reza.haghshenas@quantinuum.com/pepsy_examples/fermi_hubbard/fh_peps.ipynb`
+- For Fermi-Hubbard workflows, inspect, if available in this workspace,
+  `../pepsy_examples/fermi_hubbard/fh_peps.ipynb`
   and `fh_mps.ipynb`. Treat notebook source cells as authoritative over
   stale stored outputs.
 - Read `references/vmc_torch.md` when using patterns from the upstream
@@ -255,10 +255,10 @@ optimizer tests.
 
 ## Pepsy-specific validation
 
-Use Python 3.12 and run focused checks first:
+Use the selected project environment and run focused checks first:
 
 ```bash
-source ~/envs/py312/bin/activate
+# Activate the environment selected by AGENTS.md and any local override.
 pytest -q -o addopts='' tests/test_vmc_api.py
 pytest -q tests/test_symmetric_tensors.py
 ```

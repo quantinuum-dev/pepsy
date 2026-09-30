@@ -2,10 +2,12 @@
 
 ## Source map
 
-Use the checkout at `/Users/rezah/Documents/pepsy`.
+Resolve source paths from the current Pepsy repository root.
 
-- Direct sampler: `src/pepsy/sampling/samplers.py`, class `PepsSampler`.
-- Existing BP sampler: the neighboring class `PepsBpSampler` in the same file.
+- Direct sampler: `src/pepsy/sampling/peps.py`, class `PepsSampler`.
+- BP proposal sampler: `src/pepsy/sampling/bp.py`, class `PepsBpSampler`.
+- Shared records: `src/pepsy/sampling/results.py`; historical imports remain
+  available through `src/pepsy/sampling/samplers.py`.
 - Public sampling exports: `src/pepsy/sampling/__init__.py` and
   `src/pepsy/__init__.py`.
 - Tagged ket/norm construction: `src/pepsy/boundary/metrics.py`,
@@ -15,11 +17,8 @@ Use the checkout at `/Users/rezah/Documents/pepsy`.
 - Design plan: `docs/development/plans/peps_sampler.md`.
 - Reference tests: `tests/test_peps_sampler.py`.
 
-Before Python, tests, or package commands, run:
-
-```bash
-source /Users/rezah/envs/genpy/bin/activate
-```
+Before Python, tests, or package commands, activate the environment selected
+by `AGENTS.md` and any local override.
 
 ## Phase 1: current serial reference path
 
@@ -159,6 +158,6 @@ the source PEPS tags, indices, and tensor data are unchanged. Run:
 pytest -o addopts='' -q tests/test_peps_sampler.py
 pytest -o addopts='' -q tests/test_sampler.py
 pytest -o addopts='' -q tests/test_public_api.py
-ruff check src/pepsy/sampling/samplers.py tests/test_peps_sampler.py
+ruff check src/pepsy/sampling tests/test_peps_sampler.py
 pytest -q
 ```

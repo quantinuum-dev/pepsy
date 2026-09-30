@@ -2,16 +2,22 @@
 
 import importlib
 import importlib.metadata
-import tomllib
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
+
+import tomllib
 
 import pytest
+from packaging.requirements import Requirement
 import pepsy
 
 from pepsy.boundary import (
     BdyMPS,
     contract_boundary,
     contract_flat,
+    contract_layered,
     peps_fidelity,
     peps_infidelity,
     peps_norm,
@@ -27,7 +33,6 @@ from pepsy.optimizers import (
     QMeraEnergyOptimizer,
     QMeraGeometry,
     QMeraLayoutFinder,
-    QMeraParametricEnergyOptimizer,
     SimulatorCandidate,
     SimulatorPlan,
     SimulatorPlanner,
@@ -45,18 +50,20 @@ from pepsy.tensors import (
     Fermion,
     OneDMap,
     SpinfulFermion,
-    SpinfulFermionHubbard,
     SymmFermions,
     SymGateStream,
     SymMPS,
     SymPEPS,
-    backend_torch,
     default_physical_sectors,
     haar_random_state,
     hrs_to_ttn,
     ps_to_3dpeps,
     ps_to_peps,
     ps_to_ttn,
+    site_charge_from_occupations,
+)
+from pepsy.backends import (
+    backend_torch,
     reg_complex_qr_torch,
     reg_complex_svd_jax,
     reg_complex_svd_torch,
@@ -69,7 +76,6 @@ from pepsy.tensors import (
     reg_rel_svd_torch,
     register_jax_linalg,
     reset_linalg_registrations,
-    site_charge_from_occupations,
 )
 from pepsy.vmc import (
     ContractionConfig,
@@ -114,6 +120,7 @@ def test_new_namespace_imports_resolve():
     assert BdyMPS is not None
     assert callable(contract_boundary)
     assert callable(contract_flat)
+    assert callable(contract_layered)
     assert callable(peps_norm)
     assert callable(peps_normalize)
     assert callable(peps_infidelity)
@@ -128,7 +135,6 @@ def test_new_namespace_imports_resolve():
     assert QMeraEnergyOptimizer is not None
     assert QMeraGeometry is not None
     assert QMeraLayoutFinder is not None
-    assert QMeraParametricEnergyOptimizer is not None
     assert SimulatorCandidate is not None
     assert SimulatorPlan is not None
     assert SimulatorPlanner is not None
@@ -147,7 +153,6 @@ def test_new_namespace_imports_resolve():
     assert OneDMap is not None
     assert Fermion is not None
     assert SpinfulFermion is not None
-    assert SpinfulFermionHubbard is not None
     assert SymmFermions is not None
     assert SymGateStream is not None
     assert SymMPS is not None
@@ -216,12 +221,75 @@ def test_package_version_matches_installed_distribution():
     assert pepsy.__version__ == importlib.metadata.version("pepsy") == project["project"]["version"]
 
 
+def test_cluster_workflows_do_not_depend_on_downstream_gaugy():
+    """Exercise public construction in a fresh interpreter that cannot load Gaugy."""
+    project = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    dependencies = [*project["dependencies"],
+                    *(dep for group in project["optional-dependencies"].values() for dep in group)]
+    assert "gaugy" not in {Requirement(dep).name.lower() for dep in dependencies}
+    program = textwrap.dedent("""
+        import importlib.abc
+        import sys
+
+        attempts = []
+        class BlockDownstream(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "gaugy" or fullname.startswith("gaugy."):
+                    attempts.append(fullname)
+                    raise AssertionError("Pepsy must not import Gaugy")
+
+        assert not any(name == "gaugy" or name.startswith("gaugy.") for name in sys.modules)
+        sys.meta_path.insert(0, BlockDownstream())
+
+        import numpy as np
+        from pepsy.operators import ClusterPlan, MPOProductTerm, PEPOClusterProductExpansion
+
+        factors = [[MPOProductTerm.from_pauli((0, 3), "XZ", coefficient=.3)],
+                   [MPOProductTerm.from_pauli((0,), "Y", coefficient=.2)]]
+        plan = ClusterPlan.from_terms([term for factor in factors for term in factor],
+                                      sites=4, shape=(2, 2), cluster_size=2)
+        graph = PEPOClusterProductExpansion.from_plan(plan, factors, layout="graph", factorization="fixed")
+        square = PEPOClusterProductExpansion.from_plan(plan, factors, layout="square", factorization="fixed")
+        target = graph.exp(-.1j).to_dense()
+        result, report = square.exp(-.1j, materialize=True, return_report=True)
+        np.testing.assert_allclose(result.to_dense(), target, atol=1e-13)
+        np.testing.assert_allclose(graph.trace_exp(-.1j), np.trace(target), atol=1e-13)
+        assert report["materialization"]["factor_exponentials_evaluated"] > 0
+        compression = square.prepare_compression(-.1j, max_tree_rank=4)
+        projected = square.exp(-.1j, compression=compression, materialize=True)
+        np.testing.assert_allclose(projected.to_dense(), target, atol=1e-13)
+        assert not attempts
+    """)
+    result = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True,
+                            text=True, timeout=60, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_optional_dependency_profiles_are_declared():
     """User-facing backend profiles must remain present in project metadata."""
     metadata = tomllib.loads(
         (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
     )
     extras = metadata["project"]["optional-dependencies"]
+    base_dependencies = {
+        Requirement(value).name for value in metadata["project"]["dependencies"]
+    }
+    assert not {
+        "torch",
+        "jax",
+        "netket",
+        "flax",
+        "optax",
+        "symmray",
+        "stim",
+        "mpi4py",
+        "nlopt",
+        "nevergrad",
+        "guppylang",
+        "matplotlib",
+    } & base_dependencies
     assert {
         "layout",
         "contraction",
@@ -234,6 +302,38 @@ def test_optional_dependency_profiles_are_declared():
         "vmc-torch",
         "viz",
     } <= set(extras)
+
+
+def test_composed_dependency_profiles_preserve_feature_boundaries():
+    """Composite extras are acyclic and retain the intended backend sets."""
+    project = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    extras = project["optional-dependencies"]
+
+    def expand(extra, parents=()):
+        assert extra not in parents, f"cyclic extra: {parents + (extra,)}"
+        dependencies = set()
+        for value in extras[extra]:
+            requirement = Requirement(value)
+            if requirement.name == project["name"]:
+                assert requirement.extras, f"self-reference without extras: {value}"
+                for child in requirement.extras:
+                    dependencies.update(expand(child, parents + (extra,)))
+            else:
+                dependencies.add(str(requirement))
+        return dependencies
+
+    expanded = {extra: expand(extra) for extra in extras}
+    assert expanded["vmc-torch"] == expanded["torch"]
+    assert expanded["vmc"] == expanded["vmc-torch"] | expanded["vmc-netket"]
+    assert expanded["symmetry"] <= expanded["vmc-netket"]
+    assert not {"jax", "netket", "flax", "optax"} & {
+        Requirement(value).name for value in expanded["vmc-torch"]
+    }
+    assert expanded["test-extended"] == set().union(
+        *(expanded[name] for name in ("layout", "solvers", "stabilizer", "symmetry", "torch", "viz"))
+    ) | {"autograd>=1.7"}
 
 
 @pytest.mark.parametrize(

@@ -290,7 +290,7 @@ class TorchVMCConvergenceEstimate:
     @property
     def tau(self):
         """Alias for :attr:`integrated_autocorrelation_time`."""
-        return self.integrated_autorrelation_time
+        return self.integrated_autocorrelation_time
 
     @property
     def tau_max(self):

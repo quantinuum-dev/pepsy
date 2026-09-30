@@ -7,8 +7,8 @@ Symmray implementation.
 ## Current Pepsy state
 
 Pepsy exposes the canonical `Fermion` helper from `pepsy` and `pepsy.tensors`.
-The implementation lives in `src/pepsy/tensors/symmetric.py`, is re-exported
-by `src/pepsy/tensors/symm_fermions.py`, and provides:
+The implementation lives in `src/pepsy/tensors/symm_fermions.py`; historical
+imports from `src/pepsy/tensors/symmetric.py` resolve lazily to it. It provides:
 
 - spinless `U1`/`Z2` and spinful `U1`/`Z2`/`U1U1`/`Z2Z2` local spaces;
 - dense local operators and aliases;

@@ -54,6 +54,16 @@ _GATE_EXPORTS = [
     "fsimg",
 ]
 _SYMBOL_MODULES = {name: ".gates" for name in _GATE_EXPORTS}
+_SYMBOL_MODULES["GraphPEPOClusterProductExpansion"] = ".graph_pepo_product"
+_SYMBOL_MODULES["SquarePEPOClusterProductExpansion"] = ".square_pepo_product"
+_SYMBOL_MODULES["ClusterCompressionPlan"] = ".cluster_compression"
+_SYMBOL_MODULES["ClusterChannelPlan"] = ".cluster_channels"
+_SYMBOL_MODULES["prepare_cluster_channels"] = ".cluster_channels"
+_SYMBOL_MODULES["delinearize_mpo"] = ".mpo_delinearize"
+_SYMBOL_MODULES["MPODelinearizationReport"] = ".mpo_delinearize"
+_SYMBOL_MODULES["trace_pepo"] = ".pepo_trace"
+_SYMBOL_MODULES["ClusterPlan"] = ".cluster_plan"
+_SYMBOL_MODULES["ClusterSymmetryPlan"] = ".cluster_plan"
 _SYMBOL_MODULES["ham_tn"] = ".hamiltonians"
 _SYMBOL_MODULES["build_cluster_expansion_pepo"] = ".pepo_cluster"
 _SYMBOL_MODULES["build_model_cluster_expansion_pepo"] = ".pepo_cluster"
@@ -99,10 +109,16 @@ _MPO_EXPORTS = [
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
+    "MPOAdaptiveCompressionReport",
+    "MPOChargeValidationReport",
+    "MPOBlock",
+    "MPOBlockPlan",
     "FirstDegreeMPO",
     "CompiledMPOExp",
     "MPOBasis",
     "exp_mpo",
+    "TrotterMPOReport",
+    "exp_trotter",
 ]
 _SYMBOL_MODULES.update({name: ".mpo_higher_order" for name in _MPO_EXPORTS})
 _MPO_COMPATIBILITY_EXPORTS = ["CompiledMPOEvolution"]
@@ -116,6 +132,9 @@ _MPO_CLUSTER_EXPORTS = [
     "MPOClusterProductExpansion",
     "MPOGraphClusterProductExpansion",
     "CompiledMPOClusterProduct",
+    "compress_mpo_product",
+    "exp_mpo_cluster",
+    "exp_mpo_cluster_product",
 ]
 _SYMBOL_MODULES.update({name: ".mpo_product" for name in _MPO_CLUSTER_EXPORTS})
 _MPO_CLUSTER_COMPATIBILITY_EXPORTS = [
@@ -140,11 +159,14 @@ _SYMBOL_MODULES["PauliCompressionReport"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliBondCompressionReport"] = ".pauli_mpo"
 _SUBMODULES = (
     "cluster",
+    "cluster_plan",
     "gates",
     "hamiltonians",
     "mpo",
     "mpo_semantic",
+    "mpo_block_plan",
     "mpo_higher_order",
+    "mpo_trotter",
     "mpo_automaton",
     "mpo_cluster",
     "mpo_product",
@@ -166,6 +188,12 @@ __all__ = [
     "generate_connected_cluster_shapes",
     "build_graph_cluster_expansion_pepo",
     *_CLUSTER_EXPORTS,
+    "GraphPEPOClusterProductExpansion",
+    "SquarePEPOClusterProductExpansion",
+    "ClusterCompressionPlan",
+    "trace_pepo",
+    "ClusterPlan",
+    "ClusterSymmetryPlan",
     "ham_tn",
     *_AUTOMATON_EXPORTS,
     *_MPO_EXPORTS,
@@ -179,6 +207,11 @@ __all__ = [
     "PauliBondCompressionReport",
     *_SUBMODULES,
 ]
+
+
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
 
 
 def __getattr__(name):

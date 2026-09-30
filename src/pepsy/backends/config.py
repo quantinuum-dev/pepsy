@@ -66,11 +66,14 @@ class TorchLinalgConfig:
         for native SVD and ``"scipy_gesvd"`` for stabilized SVD.
     allow_approximate : bool, default=False
         Safety acknowledgement required for CUDA's approximate ``gesvda``.
-    qr_rank_policy : {"warn", "native", "error"}, default="warn"
+    qr_rank_policy : {"warn", "native", "adaptive", "error"}, default="warn"
         Rank-deficiency response for stabilized QR VJPs. ``"warn"`` reports
         the condition and uses the finite regularized rule, ``"native"``
         accepts Torch's native fallback silently, and ``"error"`` stops the
-        optimization.
+        optimization. ``"adaptive"`` preserves finite native VJPs and uses
+        a warned regularized fallback for exactly singular pivots or
+        nonfinite native results.
+        The policy is captured during the forward pass.
     qr_rank_tol_factor : float, default=1.0
         Scale-relative multiplier used by the stabilized real QR rule.
     quimb_split_drivers : bool, default=False
@@ -132,8 +135,8 @@ class TorchLinalgConfig:
                 "svd_driver='gesvda' is approximate; pass "
                 "allow_approximate=True to enable it explicitly."
             )
-        if self.qr_rank_policy not in {"warn", "native", "error"}:
-            raise ValueError("qr_rank_policy must be one of: warn, native, error")
+        if self.qr_rank_policy not in {"warn", "native", "adaptive", "error"}:
+            raise ValueError("qr_rank_policy must be one of: warn, native, adaptive, error")
         try:
             qr_factor = float(self.qr_rank_tol_factor)
         except (TypeError, ValueError) as exc:
@@ -228,7 +231,7 @@ def get_torch_linalg_config():
     return _ACTIVE_TORCH_LINALG_CONFIG
 
 def _patch_unhashable_device_namespace_key():
-    """Patch autoray namespace cache keys for unhashable backend device objects."""
+    """Bypass broken legacy namespace caching without changing device objects."""
     try:
         import autoray  # pylint: disable=import-outside-toplevel
         import autoray.autoray as ar_core  # pylint: disable=import-outside-toplevel
@@ -238,28 +241,37 @@ def _patch_unhashable_device_namespace_key():
     if getattr(ar_core, "_pepsy_unhashable_device_patch", False):
         return
 
-    original_get_namespace = ar_core.get_namespace
+    original_get_namespace = getattr(ar_core, "get_namespace", None)
+    if original_get_namespace is None:
+        return
+
+    # Only the namespace cache key is exercised; no arrays are allocated.
+    # Modern Autoray normalizes unhashable keys while preserving the device.
+    try:
+        original_get_namespace(like="numpy", device=[])
+    except TypeError:
+        pass
+    else:
+        return
 
     def _safe_get_namespace(like=None, device=None, dtype=None, submodule=None):
-        if (device is None) and (like is not None) and (not isinstance(like, str)):
+        try:
+            return original_get_namespace(
+                like=like, device=device, dtype=dtype, submodule=submodule,
+            )
+        except TypeError:
+            inferred_device = device
+            if inferred_device is None and like is not None and not isinstance(like, str):
+                inferred_device = getattr(like, "device", None)
             try:
-                device = like.device
-            except AttributeError:
-                device = None
-
-        if device is not None:
-            try:
-                hash(device)
+                hash(inferred_device)
             except TypeError:
-                dev_id = getattr(device, "id", None)
-                device = f"device:{dev_id}" if dev_id is not None else str(device)
-
-        return original_get_namespace(
-            like=like,
-            device=device,
-            dtype=dtype,
-            submodule=submodule,
-        )
+                # Use Autoray's public namespace class without its old cache.
+                # A string cache key must never become the creation device.
+                return ar_core.AutoNamespace(
+                    like=like, device=device, dtype=dtype, submodule=submodule,
+                )
+            raise
 
     ar_core.get_namespace = _safe_get_namespace
     autoray.get_namespace = _safe_get_namespace
@@ -324,11 +336,21 @@ def reset_default_backends():
 
 
 def backend_torch(device="cpu", dtype=None, requires_grad=False):
-    """Return a converter that materializes arrays as torch tensors."""
+    """Return a converter that materializes arrays as torch tensors.
+
+    Existing Torch tensors keep their autograd history when
+    ``requires_grad=False`` (the default); NumPy and other inputs remain
+    ordinary non-trainable tensors. Set ``requires_grad=True`` to create or
+    re-leaf converted inputs explicitly.
+
+    Read-only NumPy inputs are copied before conversion so the returned
+    tensor can be written safely. Writable NumPy inputs may share storage
+    when the requested device and dtype permit it.
+    """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "backend_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
 
     def cast_array(x, device=device, dtype=dtype, requires_grad=requires_grad):
@@ -361,6 +383,10 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
                 out = out.to(device=device, dtype=dtype)
 
         else:
+            # Torch cannot enforce NumPy's read-only flag on shared storage.
+            # Own a writable copy before exposing that memory as a tensor.
+            if isinstance(x, np.ndarray) and not x.flags.writeable:
+                x = x.copy()
             if dtype is None:
                 out = torch.as_tensor(x, device=device)
             else:
@@ -372,8 +398,11 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
 
         if requires_grad:
             out.requires_grad_(True)
-        else:
-            out.requires_grad_(False)
+        # With ``requires_grad=False``, preserve an existing Torch tensor's
+        # autograd history. This is the normal backend-conversion mode for
+        # user-supplied trainable gates/vectors. Calling ``requires_grad_(False)``
+        # after a dtype/device cast is illegal for a non-leaf tensor and would
+        # contradict the graph-preserving contract.
 
         return out
 
@@ -548,7 +577,7 @@ def _install_torch_linalg_config(config):
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "Torch linalg configuration requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -654,7 +683,7 @@ def register_torch_linalg(
         ``"scipy_gesvd"`` for stabilized SVD.
     allow_approximate : bool, default=False
         Explicitly acknowledge the accuracy tradeoff of ``svd_driver="gesvda"``.
-    qr_rank_policy : {"warn", "native", "error"}, default="warn"
+    qr_rank_policy : {"warn", "native", "adaptive", "error"}, default="warn"
         Response to rank-deficient inputs when stabilized QR is active.
     qr_rank_tol_factor : float, default=1.0
         Multiplier for the scale-aware real-QR rank threshold.
@@ -753,7 +782,7 @@ def reg_native_svd_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_native_svd_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -780,14 +809,14 @@ def reg_rel_svd_torch():
     """Advanced compatibility helper for stabilized Torch SVD.
 
     The registered autoray ``torch`` SVD uses Townsend's rectangular SVD
-    reverse-mode update, Lorentzian broadening of singular-value denominators
-    from differentiable tensor-network practice, and the complex phase/gauge
+    reverse-mode update, compact relative stabilization of near-zero spectral
+    denominators (exact reciprocals outside that region), and the phase/gauge
     correction for complex-valued SVDs.
     """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_rel_svd_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -807,7 +836,7 @@ def reg_complex_svd_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_complex_svd_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -825,14 +854,14 @@ def reg_real_svd_torch():
     This is the real counterpart of :func:`reg_rel_svd_torch`. It shares the
     robust forward path (``gesvd`` driver on CUDA plus a batched SciPy ``gesvd``
     fallback), the same Townsend rectangular reverse-mode update, and the
-    scale-aware Lorentzian broadening of the singular-value denominators, while
+    compact relative stabilization of the singular-value denominators, while
     dropping the complex phase/gauge correction. It supports rectangular and
     batched real inputs.
     """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_real_svd_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -849,7 +878,7 @@ def reg_complex_qr_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_complex_qr_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -861,7 +890,7 @@ def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_real_qr_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
@@ -921,7 +950,7 @@ def reg_stop_gradient_torch():
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_stop_gradient_torch requires optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch] (or pip install torch)."
+            "From a Pepsy checkout, run: python -m pip install '.[torch]'."
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 

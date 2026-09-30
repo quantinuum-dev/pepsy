@@ -2405,7 +2405,9 @@ def _metric_weight_factor(metric):
     scale = _metric_scale(hermitian)
     try:
         return _dag(ar.do("linalg.cholesky", hermitian))
-    except Exception:
+    except (np.linalg.LinAlgError, RuntimeError):
+        # NumPy and Torch report a singular PSD metric differently. Both
+        # permit the spectral fallback; malformed inputs should still raise.
         eigenvalues, eigenvectors = ar.do("linalg.eigh", hermitian)
         negative_tolerance = 128.0 * np.finfo(float).eps * scale
         if eigenvalues.shape[0] and _scalar_float(eigenvalues[0]) < -negative_tolerance:
@@ -3255,12 +3257,12 @@ def _warm_start_core_from_physical_tn(physical_tn, gauges):
                 # Autoray has no generic ``ones`` rule for Symmray.  Build a
                 # charge-preserving block vector in the bond's native charge
                 # layout instead of densifying the warm-start gauge.
-                from .gauges import _symmray_block_vector
+                from .gauges import _symmray_block_vector, _symmray_bond_chargemap
 
                 gauge = _symmray_block_vector(
                     physical_tn,
                     index,
-                    np.ones(physical_tn.ind_size(index)),
+                    np.ones(sum(_symmray_bond_chargemap(physical_tn, index).values())),
                 )
             else:
                 gauge = _ones(physical_tn.ind_size(index), like=sample)

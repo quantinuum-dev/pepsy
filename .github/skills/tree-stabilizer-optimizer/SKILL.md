@@ -1,9 +1,9 @@
 ---
 name: tree-stabilizer-optimizer
-description: 'Implement, review, test, or extend pepsy.TreeStabOptimizer: a stabilizer-tableau plus tree-tensor-network coefficient simulator. Use for TTN-backed C|p⟩ evolution, frame-mapped Pauli operations, measurements/reset, exact cooling, Clifford gauge disentangling, magic-state injection, trajectory replay, or TreeOptimizer integration.'
+description: 'Implement, review, test, or extend pepsy.StabilizerTreeSimulator: a stabilizer-tableau plus tree-tensor-network coefficient simulator. Use for TTN-backed C|p⟩ evolution, frame-mapped Pauli operations, measurements/reset, exact cooling, Clifford gauge disentangling, magic-state injection, trajectory replay, or TreeOptimizer integration.'
 ---
 
-# TreeStabOptimizer in Pepsy
+# StabilizerTreeSimulator in Pepsy
 
 Use this skill for code, tests, or documentation under
 `src/pepsy/optimizers/tree_stabilizer/`. Read these shared contracts first:
@@ -32,7 +32,7 @@ Preserve
 ```
 
 where `C` is the Stim tableau frame and `|p>` is a `TreeTensorNetwork` owned
-by `TreeOptimizer`. Do not subclass `MpsStabOptimizer`: site maps, layout,
+by `TreeOptimizer`. Do not subclass `StabilizerMpsSimulator`: site maps, layout,
 swap/split updates, and linear canonical metadata are chain-specific. Keep
 `to_statevector()` equal to `C @ p_dense` in logical big-endian order, and
 delegate `norm()` to the coefficient tree.
@@ -99,8 +99,8 @@ For shared trajectory or public API changes, also run the corresponding MPS
 STN and package-layout tests.
 
 ```bash
-source ~/envs/py312/bin/activate
-cd /home/reza.haghshenas@quantinuum.com/pepsy
+# Activate the environment selected by AGENTS.md and any local override.
+# Run from the Pepsy repository root.
 NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig \
   PYTHONPYCACHEPREFIX=/tmp pytest -q -o addopts='' \
   tests/test_optimize_tree_stabilizer.py

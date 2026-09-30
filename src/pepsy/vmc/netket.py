@@ -6,6 +6,7 @@ packages only when the concrete helpers are used.
 
 from __future__ import annotations
 
+from pepsy._internal.quimb import call_quimb_2d
 from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral
@@ -2072,7 +2073,7 @@ def _maybe_register_stable_jax_svd(contraction):
     if _CONTRACTION_ALIASES.get(key) not in {"hotrg", "ctmrg", "boundary"}:
         return
     try:
-        from ..tensors import reg_rel_svd_jax  # pylint: disable=import-outside-toplevel
+        from ..backends import reg_rel_svd_jax  # pylint: disable=import-outside-toplevel
 
         reg_rel_svd_jax()
     except ImportError:
@@ -2110,7 +2111,8 @@ def _contract_boundary_for_vmc(tn, *, max_bond, cutoff, method_opts):
     global _FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED
     kwargs = dict(method_opts)
     try:
-        return tn.contract_boundary(
+        return call_quimb_2d(
+            tn.contract_boundary,
             max_bond=max_bond,
             cutoff=cutoff,
             strip_exponent=True,
@@ -2132,7 +2134,8 @@ def _contract_boundary_for_vmc(tn, *, max_bond, cutoff, method_opts):
                 )
                 _FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED = True
             kwargs["max_separation"] = 1
-            return tn.contract_boundary(
+            return call_quimb_2d(
+                tn.contract_boundary,
                 max_bond=max_bond,
                 cutoff=cutoff,
                 strip_exponent=True,
@@ -2156,7 +2159,8 @@ def _contract_ctmrg_for_vmc(tn, *, max_bond, cutoff, method_opts):
     kwargs = dict(method_opts)
     with quimb_ctmrg_projector_compat():
         try:
-            return tn.contract_ctmrg(
+            return call_quimb_2d(
+                tn.contract_ctmrg,
                 max_bond=max_bond,
                 cutoff=cutoff,
                 strip_exponent=True,
@@ -2178,7 +2182,8 @@ def _contract_ctmrg_for_vmc(tn, *, max_bond, cutoff, method_opts):
                     )
                     _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED = True
                 kwargs["max_separation"] = 1
-                return tn.contract_ctmrg(
+                return call_quimb_2d(
+                    tn.contract_ctmrg,
                     max_bond=max_bond,
                     cutoff=cutoff,
                     strip_exponent=True,
@@ -2382,7 +2387,7 @@ def prepare_fermionic_peps_for_netket(peps, *, device=None):
             stacklevel=2,
         )
 
-    from ..tensors import backend_jax  # pylint: disable=import-outside-toplevel
+    from ..backends import backend_jax  # pylint: disable=import-outside-toplevel
 
     if device is None:
         device = os.environ.get("PEPSY_FH_JAX_DEVICE")
@@ -3134,7 +3139,20 @@ def _pack_peps_ansatz(
 
 
 def pack_peps_ansatz(peps, *, lattice_shape=None, config_sites=None):
-    """Pack a quimb/Symmray PEPS for use as a Flax parameter pytree."""
+    """Pack a PEPS and its site ordering for NetKet amplitude evaluation.
+
+    ``peps`` is a Quimb PEPS-like network or a wrapper exposing it as ``.tn``.
+    ``config_sites`` specifies the site order of input configuration columns;
+    use the same sites as the PEPS. Its default is ``tuple(peps.sites)``, or
+    row-major ``(x, y)`` order when ``lattice_shape=(Lx, Ly)`` is supplied.
+    An explicit ``config_sites`` takes precedence over ``lattice_shape``.
+
+    Return :class:`PackedPEPS` with Quimb's ``params``/``skeleton`` pair,
+    flattened parameter metadata, physical indices, and maps between PEPS and
+    configuration order. JAX is required to describe the parameter pytree.
+    Packing does not run sampling or optimization; amplitude factories consume
+    this record and accept replacement parameter trees at evaluation time.
+    """
     return _pack_peps_ansatz(
         peps,
         lattice_shape=lattice_shape,
@@ -3156,6 +3174,40 @@ def pack_fermionic_peps_ansatz(peps, *, lattice_shape=None, orbital_sites=None):
         config_sites=orbital_sites,
         packed_cls=PackedFermionicPEPS,
     )
+
+
+def _make_jax_scaled_contractor(*, contraction, chi, cutoff, method_opts, jnp, real_dtype):
+    """Build contraction dispatch shared by the JAX spin and fermion adapters.
+
+    Return a mantissa and base-10 exponent without converting traced values
+    to Python scalars. Each adapter owns physical indices and fermion phases.
+    """
+    def contract_mantissa_exponent(tnx):
+        if contraction == "hotrg":
+            return tnx.contract_hotrg(
+                max_bond=chi,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **method_opts,
+            )
+        if contraction == "ctmrg":
+            return _contract_ctmrg_for_vmc(
+                tnx,
+                max_bond=chi,
+                cutoff=cutoff,
+                method_opts=method_opts,
+            )
+        if contraction == "boundary":
+            return _contract_boundary_for_vmc(
+                tnx,
+                max_bond=chi,
+                cutoff=cutoff,
+                method_opts=method_opts,
+            )
+        amp = tnx.contract(all)
+        return amp, jnp.zeros((), dtype=real_dtype)
+
+    return contract_mantissa_exponent
 
 
 def _make_peps_batched_amplitude_apply(
@@ -3209,30 +3261,14 @@ def _make_peps_batched_amplitude_apply(
             for k, site in enumerate(ansatz.sites)
         })
 
-    def contract_mantissa_exponent(tnx):
-        if contraction == "hotrg":
-            return tnx.contract_hotrg(
-                max_bond=chi,
-                cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
-            )
-        if contraction == "ctmrg":
-            return _contract_ctmrg_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        if contraction == "boundary":
-            return _contract_boundary_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        amp = tnx.contract(all)
-        return amp, jnp.zeros((), dtype=real_dtype)
+    contract_mantissa_exponent = _make_jax_scaled_contractor(
+        contraction=contraction,
+        chi=chi,
+        cutoff=cutoff,
+        method_opts=method_opts,
+        jnp=jnp,
+        real_dtype=real_dtype,
+    )
 
     def log_from_mantissa_exponent(mantissa, exponent):
         return (
@@ -3263,27 +3299,17 @@ def _make_peps_batched_amplitude_apply(
     return apply
 
 
-def _make_peps_batched_amplitude_nojit(
-    ansatz,
-    config_map=None,
-    *,
-    contraction="exact",
-    chi=None,
-    cutoff=0.0,
-    contraction_opts=None,
-    output="log",
+def _make_eager_config_evaluator(
+    ansatz, *, contraction, chi, cutoff, method_opts, output,
+    jnp, real_dtype, complex_dtype,
 ):
-    contraction = _validate_contraction("contraction", contraction, chi)
-    if output not in {"log", "amplitude", "mantissa_exponent"}:
-        raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
+    """Build the shared contraction evaluator for non-JIT configuration rows.
 
-    config_map = _coerce_config_map(config_map)
-    method_opts = _contraction_options(contraction_opts)
-    if contraction == "boundary":
-        method_opts.setdefault("mode", "mps")
-    jax, jnp = _require_jax()
-    real_dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
-    complex_dtype = jnp.complex128 if jax.config.x64_enabled else jnp.complex64
+    Spin and fermion adapters own their configuration mapping and phase.
+    This evaluator only selects physical indices, contracts one network,
+    and formats the amplitude. Its Python integer indices are deliberate:
+    traced JAX/vmap evaluation retains its separate native-index path.
+    """
     log10 = jnp.log(jnp.asarray(10.0, dtype=real_dtype))
     site_inds = tuple(ansatz.site_inds)
 
@@ -3334,6 +3360,36 @@ def _make_peps_batched_amplitude_nojit(
             + jnp.asarray(exponent, dtype=real_dtype) * log10
         )
 
+    return evaluate_one
+
+
+def _make_peps_batched_amplitude_nojit(
+    ansatz,
+    config_map=None,
+    *,
+    contraction="exact",
+    chi=None,
+    cutoff=0.0,
+    contraction_opts=None,
+    output="log",
+):
+    contraction = _validate_contraction("contraction", contraction, chi)
+    if output not in {"log", "amplitude", "mantissa_exponent"}:
+        raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
+
+    config_map = _coerce_config_map(config_map)
+    method_opts = _contraction_options(contraction_opts)
+    if contraction == "boundary":
+        method_opts.setdefault("mode", "mps")
+    jax, jnp = _require_jax()
+    real_dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
+    complex_dtype = jnp.complex128 if jax.config.x64_enabled else jnp.complex64
+    evaluate_one = _make_eager_config_evaluator(
+        ansatz, contraction=contraction, chi=chi, cutoff=cutoff,
+        method_opts=method_opts, output=output, jnp=jnp,
+        real_dtype=real_dtype, complex_dtype=complex_dtype,
+    )
+
     def apply(config_rows, params):
         tn = qtn.unpack(params, ansatz.skeleton)
         phys_rows = config_to_phys_indices(
@@ -3364,7 +3420,26 @@ def make_peps_batched_amplitude_function(
     output="mantissa_exponent",
     jit=True,
 ):
-    """Return a batched JAX amplitude function for NetKet local configs."""
+    """Build ``evaluate(config_rows, params=None)`` for a packed PEPS.
+
+    Supply rows of shape ``(batch, ansatz.n_sites)`` in the configuration-site
+    order recorded by :func:`pack_peps_ansatz`. ``config_map`` maps input
+    values to local physical indices. Omitted ``params`` uses ``ansatz.params``;
+    evaluating another compatible parameter tree does not perform an optimizer
+    update.
+
+    ``output="mantissa_exponent"`` returns two JAX arrays of shape ``(batch,)``
+    representing ``psi = mantissa * 10**exponent``. ``"amplitude"`` returns
+    raw complex amplitudes and ``"log"`` returns complex log amplitudes.
+    Select exact or approximate contraction with ``contraction``, ``chi``,
+    ``cutoff``, and ``contraction_opts``; these settings are fixed in the
+    returned callable.
+
+    ``jit=True`` compiles the JAX/vmap path and requires its supported static
+    shapes and cutoff settings. ``jit=False`` evaluates rows eagerly through
+    the shared physical-configuration evaluator. Install the JAX/NetKet extra
+    for this optional workflow.
+    """
     contraction, chi, cutoff, contraction_opts = _resolve_netket_contraction(
         contraction,
         chi,
@@ -3565,30 +3640,14 @@ def _make_fermionic_peps_batched_amplitude_apply(
             for k, site in enumerate(ansatz.sites)
         })
 
-    def contract_mantissa_exponent(tnx):
-        if contraction == "hotrg":
-            return tnx.contract_hotrg(
-                max_bond=chi,
-                cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
-            )
-        if contraction == "ctmrg":
-            return _contract_ctmrg_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        if contraction == "boundary":
-            return _contract_boundary_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        amp = tnx.contract(all)
-        return amp, jnp.zeros((), dtype=real_dtype)
+    contract_mantissa_exponent = _make_jax_scaled_contractor(
+        contraction=contraction,
+        chi=chi,
+        cutoff=cutoff,
+        method_opts=method_opts,
+        jnp=jnp,
+        real_dtype=real_dtype,
+    )
 
     def log_from_mantissa_exponent(mantissa, exponent):
         return (
@@ -3645,55 +3704,11 @@ def _make_fermionic_peps_batched_amplitude_nojit(
     jax, jnp = _require_jax()
     real_dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
     complex_dtype = jnp.complex128 if jax.config.x64_enabled else jnp.complex64
-    log10 = jnp.log(jnp.asarray(10.0, dtype=real_dtype))
-    site_inds = tuple(ansatz.site_inds)
-
-    def select_phys(tn, phys):
-        if site_inds:
-            return tn.isel({ind: int(phys[k]) for k, ind in enumerate(site_inds)})
-        return tn.isel({
-            tn.site_ind(site): int(phys[k])
-            for k, site in enumerate(ansatz.sites)
-        })
-
-    def evaluate_one(tn, phys):
-        tnx = select_phys(tn, phys)
-        if contraction == "hotrg":
-            mantissa, exponent = tnx.contract_hotrg(
-                max_bond=chi,
-                cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
-            )
-        elif contraction == "ctmrg":
-            mantissa, exponent = _contract_ctmrg_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        elif contraction == "boundary":
-            mantissa, exponent = _contract_boundary_for_vmc(
-                tnx,
-                max_bond=chi,
-                cutoff=cutoff,
-                method_opts=method_opts,
-            )
-        else:
-            mantissa = tnx.contract(all)
-            exponent = jnp.zeros((), dtype=real_dtype)
-
-        if output == "mantissa_exponent":
-            return mantissa, exponent
-        if output == "amplitude":
-            return (
-                jnp.asarray(mantissa).astype(complex_dtype)
-                * jnp.power(jnp.asarray(10.0, dtype=real_dtype), exponent)
-            )
-        return (
-            jnp.log(jnp.asarray(mantissa).astype(complex_dtype))
-            + jnp.asarray(exponent, dtype=real_dtype) * log10
-        )
+    evaluate_one = _make_eager_config_evaluator(
+        ansatz, contraction=contraction, chi=chi, cutoff=cutoff,
+        method_opts=method_opts, output=output, jnp=jnp,
+        real_dtype=real_dtype, complex_dtype=complex_dtype,
+    )
 
     def apply(occ_rows, params):
         tn = qtn.unpack(params, ansatz.skeleton)

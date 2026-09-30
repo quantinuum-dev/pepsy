@@ -1,8 +1,12 @@
 # `pepsy.vmc`
 
-Optional VMC integrations live under `pepsy.vmc`. The NetKet bridge can now
+Optional VMC integrations live under `pepsy.vmc`. The NetKet bridge can
 wrap a packed PEPS as a Flax model for spin systems, while keeping the
 Fermi-Hubbard helper as a specialization.
+
+Start with the [public workflow](#recommended-public-workflow), or jump to
+[imports](#import-boundaries) and
+[Torch sampling and energy kernels](#torch-sampling-and-local-energy-kernels).
 
 ## Import boundaries
 
@@ -28,6 +32,21 @@ private `_core` module, but new code should use the public package exports or
 the responsibility-specific leaf module when inspecting implementation code.
 
 ## Recommended public workflow
+
+Keep the workflow in four steps: build a setup, collect samples, measure
+those samples, and optimize only when an update is wanted. Use
+`SamplingConfig` for chain count/burn-in/thinning, `ContractionConfig` for
+amplitude approximation, and `OptimizationConfig` for update settings through
+the backend-neutral `VMC` API. The backend-specific builders retain their
+documented keyword interfaces.
+
+| Question | Inspect or configure |
+| --- | --- |
+| Which tensor/basis order is used? | Packed ansatz sites and the spin or fermion configuration adapter |
+| Which approximation evaluates amplitudes? | Exact/boundary/HOTRG/CTMRG settings, bond cap, and cutoff |
+| Are fresh samples needed? | `sample(...)`; pass a retained batch to `measure_samples(...)` to reuse it |
+| Will parameters change? | Measurement keeps parameters; optimization updates them |
+| Is execution traced? | JIT requires supported static shapes/cutoffs; eager evaluation is a separate route |
 
 Use the model-specific builders for NetKet-backed VMC:
 
@@ -386,6 +405,58 @@ never used for gradient-enabled or custom-parameter calls.
 
 ### Native Torch throughput probes and rank-sharded sampling
 
+For exact dense or flat-Z2 PEPS on a stable GPU workload, the Torch amplitude
+model also has an explicit compiled path matching the
+`torch.export -> torch.vmap -> torch.compile` pipeline:
+
+```python
+# Compile once using the same fixed number of walkers used by the sampler.
+model.export_and_compile(configs, compile_log=True)
+amplitudes = model.compiled_forward(configs)
+phase, log_abs = model.compiled_forward_log(configs)
+```
+
+`forward` and `forward_log` automatically use the compiled graph when their
+batch has the compiled size. During Metropolis sweeps, proposal rows are
+temporarily padded to that fixed size and the auxiliary results are discarded;
+this avoids recompiling for every changing subset of walkers. Parameter values
+remain explicit graph inputs, so optimizer updates do not require rebuilding
+the graph. Moving or casting the model invalidates it; call
+`export_and_compile` again afterward. This opt-in path for ordinary amplitudes
+currently supports only `contraction="exact"`; approximate CTMRG/HOTRG
+contractions retain their existing eager/vmap behavior. Boundary-MPS models
+have a separate compiled reuse path described below.
+
+For the diagnostic `backend="eager"`, Pepsy uses the exported/vmapped graph
+directly rather than wrapping it in TorchDynamo's eager backend. This avoids a
+PyTorch 2.6 FakeTensor issue in the stable-log path while retaining the same
+fixed-batch behavior. Other backends continue through `torch.compile`.
+
+The compiled path follows the fixed-shape strategy of the paper and the
+reference [`vmc_torch` implementation](https://github.com/sjdu10/vmc_torch).
+
+For a finite rectangular boundary-MPS PEPS, compile the paper's geometry
+classes as well as their environment builders:
+
+```python
+model.export_and_compile_boundary_reuse(
+    configs,
+    directions=("x", "y"),
+    widths=(1, 2),
+    compile_log=True,
+)
+```
+
+Each row/column window receives a fixed-shape `torch.export -> torch.vmap ->
+torch.compile` graph. Connected local-energy targets are grouped by window
+across parent walkers, while the two endpoint environments are batched as
+graph inputs. The default `environment_mode="full-bond"` is selected because
+Quimb's MPS compression path currently contains data-dependent SVD shape
+guards that PyTorch export cannot represent reliably. The static reuse path
+uses `reuse_mode="direct"`, matching the reference implementation's direct
+assembly of cached boundary MPSs and the selected strip. Unsupported windows
+fall back to the existing eager boundary cache.
+
 Use `benchmark_torch_amplitudes` (or
 `TorchVMCDriver.benchmark_amplitudes`) with an existing configuration batch to
 compare the supported amplitude batching and chunk sizes without drawing more
@@ -499,18 +570,86 @@ Local-energy evaluation also coalesces repeated `(walker, configuration)`
 connections and batches each unique off-diagonal target amplitude once before
 scattering the values back to the Hamiltonian terms.
 
+### Connected-amplitude contract
+
+`model.connected_amplitudes(configs, amplitudes, connections)` evaluates
+the target configurations for a local estimator:
+
+| Input or result | Shape and meaning |
+| --- | --- |
+| `configs` | `(n_samples, n_sites)` parent configurations in model site order and physical encoding |
+| `amplitudes` | `(n_samples,)` parent amplitudes from the current model parameters and contraction settings |
+| `connections.configs` | `(n_connections, n_sites)` target configurations |
+| `connections.batch_ids` | `(n_connections,)` parent row index for each target |
+| Return | `(n_connections,)` raw target amplitudes, preserving connection order and repetitions |
+
+Keep configurations and connection indices on the model device and supply
+parent amplitudes with its amplitude dtype. `connections.coeffs` belongs to
+the estimator: this method does not multiply coefficients or divide by parent
+amplitudes. Empty connections produce an empty result. Inputs are not modified.
+
+For example, this small CPU measurement evaluates two connected targets:
+
+```python
+import quimb.tensor as qtn
+import torch
+from pepsy.vmc.torch import TorchConnections, TorchPEPSBoundaryAmplitude
+
+peps = qtn.PEPS.rand(2, 2, bond_dim=2, seed=7, dtype="float64")
+model = TorchPEPSBoundaryAmplitude(peps, chi=4, dtype=torch.float64)
+configs = torch.tensor([[0, 0, 0, 0], [1, 0, 0, 0]])
+connections = TorchConnections(
+    configs=configs.flip(0),
+    coeffs=torch.ones(2, dtype=torch.float64),
+    batch_ids=torch.arange(2),
+)
+with torch.no_grad():
+    parents = model(configs)
+    targets = model.connected_amplitudes(configs, parents, connections)
+print(targets.shape)  # torch.Size([2])
+```
+
+`reuse_diagonal=True` reuses the supplied parent amplitude when a target is
+unchanged. `chunk_size` controls forwarded amplitude calls; compiled boundary
+reuse retains its separately configured batch size. Boundary evaluation updates
+caches and reuse statistics. Parameter updates invalidate cached environments;
+before building a new autograd graph, call `model.clear_boundary_cache()` and
+recompute parent amplitudes because the cache key tracks parameter versions,
+not graph lifetime. Measurement calls should use `torch.no_grad()`.
+
 For boundary-MPS contractions, `make_torch_peps_amplitude_model(...,
 contraction="boundary")` now constructs `TorchPEPSBoundaryAmplitude`. It
 reuses bounded row or column environment caches for local Hamiltonian
 connections and for local Metropolis proposals, rather than rebuilding a full
 boundary contraction for every proposal. During a local-energy measurement,
-connected configurations are grouped by parent and preferred boundary strip.
-A cached parent-selected strip is copied and only its changed physical
+connected configurations are grouped by preferred boundary strip. In the
+eager path they are further grouped by parent; after
+`export_and_compile_boundary_reuse(...)`, compatible windows are batched
+across parent walkers and use the compiled geometry-class graphs. A cached
+parent-selected strip is copied and only its changed physical
 projectors are replaced, so all terms in that strip share two-sided boundary
 environments and unchanged tensor data. The cache is keyed by the parent and
 target configurations and automatically invalidated when torch PEPS leaves
 change. The optional VMC profile exposes `num_groups`,
-`num_strip_cache_hits`, and `num_strip_builds` alongside reuse/fallback counts:
+`num_compiled_groups`, `num_compiled_connections`, `num_strip_cache_hits`, and
+`num_strip_builds` alongside reuse/fallback counts.
+
+Recovered boundary-reuse exceptions are available in
+`model.last_connected_reuse_stats["fallback_errors"]`; proposal retries use
+`model.last_proposal_cache_stats["fallback_errors"]`. Each record contains a
+`stage` and an `error` string with the exception type and message. Each call
+keeps at most eight records, with at most 400 characters per error, and
+`num_fallback_errors` counts all recovered exceptions. A clean call resets
+these per-call records. Counts include failed attempts recovered by another
+axis, so they differ from `num_fallback`, which describes the existing
+route-specific fallback counter. Opt-in accumulated profiles sum the error
+count; detailed strings are available on the model for the latest call.
+
+Sparse cutoff retries also retain their latest reason in
+`model.cutoff_fallback_error`, alongside the cumulative `cutoff_fallbacks`.
+Diagnostics store strings rather than exceptions, keeping autograd graphs
+and traceback frames out of the retained records. They do not change retry
+choices, truncation settings, or propagation of a failed final contraction.
 
 ```python
 model = pvmc.TorchPEPSBoundaryAmplitude(
@@ -678,7 +817,11 @@ building, all requested observable contractions, and final statistics.
 
 `local_observables({"energy": ham.terms, "eta": eta_terms})` provides the
 same connected-amplitude sharing for the driver's current walkers without a
-sampling pass. For one observable, pass `profile=True` to
+sampling pass. It returns a dictionary of local-value tensors, each with
+shape `(n_configs,)`; it does not compute chain statistics or weighted
+averages. Explicit `configs` use shape `(n_configs, n_sites)` and the model's
+site/basis order; supplied `amplitudes` must match that batch and the current
+model parameters. For one observable, pass `profile=True` to
 `estimate_observable` or `step` to record phase timings and the available PEPS
 boundary-cache counters.
 
@@ -701,6 +844,13 @@ observables = driver.measure_samples(
 )
 print(energy.energy_mean, energy.chain_diagnostics)
 ```
+
+Saved Markov samples carry model/contraction provenance. After changing that
+state, draw fresh Markov samples; `measure_samples` rejects a stale batch.
+Saved `TorchImportanceSamples` instead describe an external proposal and can
+be reused: target amplitudes refresh when the target provenance changes.
+Raw configuration tensors carry no provenance, so the caller is responsible
+for their sampling distribution. Measurement does not advance the sampler.
 
 For repeated runs with a fixed walker shape, set `compile_kernels=True` on
 `TorchVMCDriver`, `TorchFermionVMC`, or `TorchMetropolisSampler`. It only
@@ -989,6 +1139,14 @@ samples = bp_mcmc.sample(
 Each proposal uses
 
 `min(1, |psi(y)|**2 q_BP(x) / (|psi(x)|**2 q_BP(y)))`.
+
+`bp_mcmc.sample_sweep(n_sweeps=k)` returns the final chain state with
+`n_proposed` and `n_accepted` summed over all `k` sweeps, as does `burn_in(k)`.
+These totals include every BP proposal attempt, including sector rejections.
+BP proposes whole configurations: local-move diagnostics
+(`track_proposal_stats=True`) and `warmup_proposal_mix()` are unsupported and
+raise `ValueError` before drawing proposals. Use the aggregate counters and
+`acceptance_rate` to monitor BP sampling.
 
 The BP adapter supports four-state spinful fermion PEPS with `U1`, `U1U1`,
 `Z2`, and `Z2Z2` physical symmetries. Since Quimb's current D2BP interface
@@ -1364,9 +1522,10 @@ print(report.reliable, report.recommended_sweep_size)
 print(report.energy.split_r_hat, report.energy.tau_max)
 ```
 
+Each observable estimate exposes `tau` as a shorthand for
+`integrated_autocorrelation_time`, and `tau_max` for the maximum per-chain
+value.
+
 The live progress display is sampling acceptance only. The check uses a
 cloned random stream, leaves the active walker configurations and RNG state
 unchanged, and is intentionally separate from fixed-size production sampling.
-
-
-> API details are maintained as handwritten Markdown in this page.

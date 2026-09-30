@@ -136,18 +136,17 @@ boundary, not an immediate package rename or compatibility break.
 - Keep the root compatibility surface in a reviewed machine-readable
   manifest.
 - Prefer one canonical namespace for each public symbol.
-- Deprecate redundant namespace aliases before removing them in a planned
-  breaking release.
+- Remove unused aliases once their consumers have moved to the owning
+  namespace; record the migration in the public guide.
 
 The first phase of this work is complete: the root inventory is recorded in
 `docs/development/api-manifest.txt`, canonical ownership is enforced by the
-public API tests, backend aliases in `pepsy.tensors` warn and redirect to
-`pepsy.backends`, and `pepsy.experimental.mera` redirects to `qmera`. The
-sampling facade is also lazy, and the maintained notebook example uses
-canonical namespace imports. The compatibility registry now lives in the
-private lazy-safe `pepsy._api` module, the migration table is in
-`docs/development/api-migration.md`, and repeatable import measurements are
-provided by `tools/measure_imports.py`. No public names have been removed.
+public API tests, backend helpers live in `pepsy.backends`, and unused tensor,
+sampler, qMERA, and discovery aliases have been removed. The sampling facade is
+also lazy, and maintained examples are moving to canonical namespace imports.
+The compatibility registry lives in the private lazy-safe `pepsy._api` module,
+the migration table is in `docs/development/api-migration.md`, and repeatable
+import measurements are provided by `tools/measure_imports.py`.
 
 ## Acceptance criteria
 

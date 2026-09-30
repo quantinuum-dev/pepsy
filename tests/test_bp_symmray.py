@@ -49,7 +49,7 @@ from pepsy.tensors import (  # noqa: E402
 
 
 def test_quimb_safe_inverse_compat_handles_symmray_block_vector():
-    """The old Quimb axis reduction must not break projector compression."""
+    """Symmray vector inversion works on old and fixed Quimb builds."""
     install_quimb_symmray_compat()
     from quimb.tensor.decomp import safe_inverse
 
@@ -1735,6 +1735,43 @@ def test_explicit_edge_loop_series_uses_fermion_safe_gate_path():
     np.testing.assert_allclose(np.trace(rho.to_dense()), 1.0)
 
 
+def test_fermionic_pair_normalizer_probe_preserves_live_messages(monkeypatch):
+    """Probe privately, preserve the norm, and leave a corrected upstream alone."""
+    from pepsy.bp._symmray import (
+        _normalize_fermionic_message_pairs,
+        align_d2bp_messages,
+        align_message_pair,
+        d2bp_uses_fermionic_operators,
+    )
+    from quimb.tensor.belief_propagation import D2BP
+
+    if not d2bp_uses_fermionic_operators():
+        pytest.skip("Quimb uses the legacy fermionic message convention")
+    state = SymPEPS.random(
+        1, 3, symmetry="U1", bond_dim=3, phys_dim=2,
+        fermionic=True, seed=1931, dtype="complex128",
+    )
+    # Start with upstream directly: two_norm_bp has already run the probe,
+    # which would make the preservation assertion exercise only its no-op path.
+    bp = D2BP(state.tn)
+    assert not getattr(bp, "_pepsy_pair_normalization_checked", False)
+    expected = complex(bp.contract())
+    snapshot = {key: value.copy() for key, value in bp.messages.items()}
+    original = D2BP.normalize_message_pairs
+    align_d2bp_messages(bp)
+    assert D2BP.normalize_message_pairs is original
+    for key, value in snapshot.items():
+        actual, expected_message = align_message_pair(bp.messages[key], value)
+        np.testing.assert_allclose(actual.to_dense(), expected_message.to_dense())
+    bp.normalize_message_pairs()
+    np.testing.assert_allclose(complex(bp.contract()), expected, rtol=1e-10)
+
+    monkeypatch.setattr(D2BP, "normalize_message_pairs", _normalize_fermionic_message_pairs)
+    corrected = D2BP(state.tn)
+    align_d2bp_messages(corrected)
+    assert "normalize_message_pairs" not in vars(corrected)
+
+
 def test_open_scalar_series_uses_native_fermion_projectors_for_long_range_hopping():
     """Long-range native hopping stays graded while using one BP solve."""
     state = SymPEPS.random(
@@ -2188,6 +2225,7 @@ def test_cyclic_native_route_skips_open_edge_enumeration(monkeypatch):
     assert np.isfinite(value)
 
 
+@pytest.mark.filterwarnings("error:Casting complex values to real")
 def test_explicit_edge_loop_series_preserves_dense_edge_degree_terms():
     """Edge-degree terms are distinct from the local-region cutoff API."""
     state = qtn.PEPS.rand(2, 2, bond_dim=2, seed=1906, dtype="complex128")
@@ -2215,6 +2253,25 @@ def test_explicit_edge_loop_series_preserves_dense_edge_degree_terms():
     assert info["edge_rho_terms"]
     assert all(len(term.edges) <= 4 for term in info["edge_rho_terms"])
     np.testing.assert_allclose(value, np.trace(rho @ gate))
+
+
+def test_edge_suppression_rejects_nonreal_norm_weights():
+    options = dict(num_tensors=4, multi_excitation_correct=True,
+                   tol_correction=1e-14, maxiter_correction=100)
+    edge = ("a", "b", "c", "d")
+    for dtype in (np.complex64, np.complex128):
+        eps = np.finfo(np.empty((), dtype=dtype).real.dtype).eps
+        close = {edge: dtype(-0.07 + 2j * eps)}
+        result = bp_series._edge_series_suppression(close, **options)
+        reference = bp_series._edge_series_suppression({edge: dtype(-0.07).real}, **options)
+        np.testing.assert_allclose(result[edge], reference[edge])
+        assert close[edge].imag != 0  # Validation must leave caller data intact.
+    for value in (complex(-0.07, 0.01), complex(np.nan, 0), complex(0, np.inf)):
+        with pytest.raises(ValueError, match="finite real norm weights"):
+            bp_series._edge_series_suppression({edge: value}, **options)
+    assert bp_series._edge_series_suppression(
+        {edge: -0.07 + 0.01j}, **{**options, "multi_excitation_correct": False}
+    ) == {edge: 1.0}
 
 
 def test_explicit_edge_loop_series_rejects_multisite_fermionic_q_terms():

@@ -624,11 +624,12 @@ than rebuilding tensor networks inside a traced function.
 
 ## Validation Checklist
 
-Run the focused qMERA suite after implementation changes:
+Activate the environment selected by `AGENTS.md` and any local override, then
+run the focused qMERA suite after implementation changes:
 
 ```bash
 env NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX=/tmp \
-  /home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pytest -q tests/test_optimize_qmera.py
+  python -m pytest -q tests/test_optimize_qmera.py
 ```
 
 The focused suite should continue to cover:
@@ -653,11 +654,11 @@ For API/export changes, also run:
 
 ```bash
 env NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX=/tmp \
-  /home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pytest -q tests/test_public_api.py tests/test_package_layout.py
+  python -m pytest -q tests/test_public_api.py tests/test_package_layout.py
 ```
 
 For syntax-only checks:
 
 ```bash
-/home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pyflakes src/pepsy/optimizers/qmera tests/test_optimize_qmera.py
+python -m pyflakes src/pepsy/optimizers/qmera tests/test_optimize_qmera.py
 ```

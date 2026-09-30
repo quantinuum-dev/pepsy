@@ -1,9 +1,17 @@
 # `pepsy.tensors.core`
 
+This module preserves existing imports. For new code, use `pepsy.tensors`
+for [constructors](constructors.md), [contractions](contractions.md), and
+[observables](observables.md), or `pepsy.backends` for backend configuration.
+
+## Backend setup
+
 Use one public setup call for a Torch-autodiff PEPS run:
 
 ```python
-py.register_torch_linalg(
+from pepsy.backends import register_torch_linalg, reset_linalg_registrations
+
+register_torch_linalg(
     mode="real", stabilized=True, quimb_split_drivers=True,
 )
 ```
@@ -16,7 +24,7 @@ automatically from its input dtype.
 
 The Quimb split-driver registration is process-global. Passing
 `quimb_split_drivers=False` does not undo a previous registration; use
-`py.reset_linalg_registrations("torch")` to explicitly restore Quimb's and
+`reset_linalg_registrations("torch")` to explicitly restore Quimb's and
 Autoray's native Torch rules.
 
 `stabilized=True` selects Pepsy's relative-regularized SVD and validated
@@ -28,6 +36,29 @@ real-only VJP. The lower-level `reg_*_torch()` helpers remain for advanced
 compatibility use; ordinary applications should not combine them. The
 stabilized SVD CPU forward path falls back to SciPy `gesvd` if
 `torch.linalg.svd` fails.
+
+`TorchLinalgConfig(stabilized=True, qr_rank_policy="adaptive")` retains native
+QR VJPs when finite, rather than automatically regularizing every small pivot.
+Exactly singular pivots and nonfinite native VJPs use a warned regularized
+fallback, separately for each batch member. Backward retains the policy
+selected during forward even after the configuration context exits. Existing
+`warn`, `native`, and `error` policies remain available.
+
+Adaptive QR is a finite first-order extension at singular charts, not proof
+that a factorization is differentiable there. Stabilized SVD uses exact
+reciprocals for singular sums and gaps of magnitude at least
+`1e-6 * max(singular_values)` per matrix/block. The inverse singular values
+in the rectangular and complex-phase terms use a numerical-rank threshold
+`max(m, n) * finfo(dtype).eps * max(singular_values)` instead: a small but
+resolved singular value must not be treated as a degenerate gap.
+Below each threshold it uses a bounded cubic extension, with matching value
+and slope at the boundary and value zero at zero. Unlike the previous
+Lorentzian rule, it does not damp resolved spectral derivatives. The gap
+threshold is unchanged; derivatives inside either stabilization region
+remain surrogate derivatives.
+Check directional derivatives of the complete
+truncated calculation; rank changes and ties across a retained/discarded
+boundary can be nonsmooth.
 
 The Torch QR split driver uses the zero-safe phase convention `phase(0)=1`.
 This preserves a lossless QR/LQ reconstruction even for rank-deficient dense
@@ -51,6 +82,3 @@ real and complex modes use the finite rank-aware QR VJPs; native mode keeps
 Torch's direct QR implementation.
 Calling `reset_linalg_registrations()` restores native Torch/JAX mappings and
 clears Pepsy's registration caches.
-
-
-> API details are maintained as handwritten Markdown in this page.

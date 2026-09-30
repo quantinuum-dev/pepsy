@@ -1,15 +1,131 @@
 """Focused compatibility tests for optional Quimb capabilities."""
 
+import inspect
+
 import numpy as np
+import pytest
 import quimb.tensor as qtn
 
 import pepsy
+from pepsy.bp._symmray import (
+    _quimb_safe_inverse_supports_symmray,
+    install_quimb_symmray_compat,
+)
 from pepsy._internal.quimb import (
     quimb_bp_constructor_option_supported,
     quimb_bp_constructor_options,
+    quimb_gloop_options,
+    quimb_process_loop_series_expansion_weights,
     quimb_mpo_auto_swap_function,
 )
 from pepsy._internal.random import backend_random_array
+
+
+@pytest.mark.parametrize("native_seed", (False, True))
+def test_randomized_compression_seed_support_preserves_reproducibility(monkeypatch, native_seed):
+    """Legacy RNG seeding never becomes a contraction keyword."""
+    import quimb
+    from pepsy._internal import quimb as compat
+
+    def legacy(*, method):
+        return quimb.rand_matrix(3, dtype="complex128")
+
+    def modern(*, method, seed):
+        return np.random.default_rng(seed).normal(size=(3, 3))
+
+    compressor = modern if native_seed else legacy
+    monkeypatch.setattr(compat, "quimb_1d_compression_function", lambda method: compressor)
+    first = compat.run_seeded_quimb(17, compressor, method="src")
+    second = compat.run_seeded_quimb(17, compressor, method="src")
+    different = compat.run_seeded_quimb(18, compressor, method="src")
+    np.testing.assert_array_equal(first, second)
+    assert not np.array_equal(first, different)
+
+
+def test_single_precision_eig_fallback_preserves_truncation_and_dtype(monkeypatch):
+    """A broken upstream driver must not change requested rank or precision."""
+    from pepsy._internal import quimb as compat
+
+    monkeypatch.setattr(compat, "_numpy_eig_split_supported", lambda dtype: False)
+    tensor = qtn.Tensor(np.diag([1.0, 1e-4]).astype("complex64"), inds=("a", "b"))
+    with pytest.warns(RuntimeWarning, match="same dtype, cutoff, and bond limit"):
+        method = compat.quimb_safe_split_method("svd:eig", tensor.data)
+    left, right = tensor.split(
+        left_inds=("a",), method=method, max_bond=1, cutoff=1e-6, cutoff_mode="rsum2",
+    )
+    assert left.dtype == right.dtype == "complex64"
+    assert left.bonds_size(right) == 1
+    np.testing.assert_allclose((left @ right).data, np.diag([1.0, 0.0]), atol=1e-7)
+    assert compat.quimb_safe_split_method("svd:eig", tensor.data.astype("complex128")) == "svd:eig"
+
+
+def test_trotter_facades_report_missing_upstream_scheduler(monkeypatch):
+    """Unavailable interacting schedules fail clearly on supported releases."""
+    monkeypatch.delattr(qtn.LocalHamGen, "get_trotter_gates", raising=False)
+    terms = [(("ZZ", 0.3), (0, 1))]
+    with pytest.raises(NotImplementedError, match="get_trotter_gates"):
+        pepsy.operators.exp_trotter(terms, -0.1j, shape=2)
+    state = pepsy.GibbsMps(terms, shape=2)
+    with pytest.raises(RuntimeError, match="get_trotter_gates"):
+        state.prepare(0.1, n_steps=1)
+
+
+@pytest.mark.parametrize("backend", ("numpy", "torch"))
+@pytest.mark.parametrize("override_dtype", (False, True))
+def test_complex_random_fallback_matches_native_variance(monkeypatch, backend, override_dtype):
+    """Scale measures total complex variance on both supported code paths."""
+    import autoray as ar
+
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        like = torch.zeros(1, dtype=torch.complex64)
+    else:
+        like = np.zeros(1, dtype=np.complex64)
+
+    kwargs = dict(like=like, scale=0.2, rng=123)
+    if override_dtype:
+        kwargs.update(like=like.real, dtype="complex64")
+    native = backend_random_array((50_000,), **kwargs)
+    get_lib_fn = ar.get_lib_fn
+
+    def without_random_array(name, fn):
+        if fn == "random.array":
+            raise ImportError("simulate pre-0.10 Autoray")
+        return get_lib_fn(name, fn)
+
+    monkeypatch.setattr(ar, "get_lib_fn", without_random_array)
+    fallback = backend_random_array((50_000,), **kwargs)
+    repeated = backend_random_array((50_000,), **kwargs)
+    np.testing.assert_array_equal(ar.to_numpy(fallback), ar.to_numpy(repeated))
+    for value in (native, fallback):
+        assert ar.infer_backend(value) == backend
+        assert value.dtype == like.dtype
+        if backend == "torch":
+            assert value.device == like.device
+        samples = ar.to_numpy(value)
+        assert np.mean(abs(samples) ** 2) == pytest.approx(0.2**2, rel=0.03)
+        assert np.var(samples.real) == pytest.approx(0.2**2 / 2, rel=0.03)
+        assert np.var(samples.imag) == pytest.approx(0.2**2 / 2, rel=0.03)
+
+
+def test_random_fallback_preserves_real_low_precision_dtype(monkeypatch):
+    """The NumPy staging precision must not override the requested dtype."""
+    import autoray as ar
+
+    get_lib_fn = ar.get_lib_fn
+
+    def without_random_array(name, fn):
+        if fn == "random.array":
+            raise ImportError("simulate pre-0.10 Autoray")
+        return get_lib_fn(name, fn)
+
+    monkeypatch.setattr(ar, "get_lib_fn", without_random_array)
+    for kwargs in ({}, {"dtype": np.float16}):
+        like = np.zeros(1, dtype=np.float16 if not kwargs else np.float64)
+        result = backend_random_array((8,), like=like, scale=0.2, rng=123, **kwargs)
+        expected = (0.2 * np.random.default_rng(123).normal(size=8)).astype(np.float16)
+        assert result.dtype == np.float16
+        np.testing.assert_array_equal(result, expected)
 
 
 def test_bp_constructor_capability_probe_keeps_run_options_out_of_ctor():
@@ -41,12 +157,67 @@ def test_backend_random_array_is_seeded_and_native_for_numpy():
     np.testing.assert_array_equal(first, second)
 
 
+def test_gloop_options_are_capability_checked():
+    """Explicit generalized-loop controls fail clearly when unavailable."""
+    options = {"join_overlap": 2}
+    if "join_overlap" in inspect.signature(
+        qtn.TensorNetwork.gen_gloops
+    ).parameters:
+        assert quimb_gloop_options(options) == options
+    else:
+        with pytest.raises(NotImplementedError, match="generalized-loop"):
+            quimb_gloop_options(options)
+
+
+def test_loop_series_weight_adapter_handles_num_tensors_change():
+    """Loop-series resummation adapts to Quimb's new tensor-count argument."""
+    from quimb.tensor.belief_propagation.bp_common import (
+        process_loop_series_expansion_weights,
+    )
+
+    weights = {frozenset((0, 1)): 0.1}
+    suppression = quimb_process_loop_series_expansion_weights(
+        weights,
+        num_tensors=2,
+        multi_excitation_correct=True,
+        tol_correction=1e-14,
+        maxiter_correction=100,
+        return_all=True,
+    )
+
+    assert np.isfinite(suppression[frozenset((0, 1))])
+    if "num_tensors" in inspect.signature(
+        process_loop_series_expansion_weights
+    ).parameters:
+        assert suppression[frozenset((0, 1))] == pytest.approx(
+            0.9127652716086229
+        )
+
+
+def test_safe_inverse_compat_defers_to_fixed_quimb():
+    """Do not replace Quimb's implementation after its upstream fix."""
+    qd = pytest.importorskip("quimb.tensor.decomp")
+    pytest.importorskip("symmray")
+    if getattr(qd, "_pepsy_symmray_safe_inverse", False):
+        pytest.skip("the compatibility wrapper was already installed")
+    if not _quimb_safe_inverse_supports_symmray(qd):
+        pytest.skip("the installed Quimb build needs the compatibility wrapper")
+
+    original = qd.safe_inverse
+    install_quimb_symmray_compat()
+
+    assert qd.safe_inverse is original
+
+
 def test_mpo_auto_swap_is_explicit_and_preserves_long_range_identity():
     """The prototype delegates to Quimb without changing ordinary gate paths."""
     mpo = qtn.MPO_identity(4, phys_dim=2)
     gate = np.eye(4).reshape(2, 2, 2, 2)
 
-    assert quimb_mpo_auto_swap_function(mpo) is not None
+    if quimb_mpo_auto_swap_function(mpo) is None:
+        with pytest.raises(NotImplementedError, match="Quimb"):
+            pepsy.gate_mpo_auto_swap(mpo, gate, (0, 3))
+        return
     result = pepsy.gate_mpo_auto_swap(
         mpo,
         gate,

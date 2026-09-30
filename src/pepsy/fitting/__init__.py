@@ -2,9 +2,18 @@
 
 from importlib import import_module
 
-_SYMBOL_MODULES = {"FIT": ".local", "internal_inds": ".local"}
+_SYMBOL_MODULES = {
+    "FIT": ".local",
+    "TreeFIT": ".tree",
+    "internal_inds": ".local",
+}
 
 __all__ = [*_SYMBOL_MODULES, "local"]
+
+
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
 
 
 def __getattr__(name):

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import quimb.tensor as qtn
 
-from pepsy import hrs_to_peps, id_to_pepo, ps_to_3dpeps, ps_to_peps
+from pepsy import id_to_pepo, ps_to_3dpeps, ps_to_peps
 from pepsy.operators.gates import (
     build_mpo_from_gates,
     build_pepo_from_gates,
@@ -558,9 +558,16 @@ def test_gates_tn_1d_applies_mixed_site_specs():
 @pytest.mark.parametrize("transform", ("dagger", "transpose"))
 def test_gate_forwards_gate_transform_to_quimb(transform):
     """Gate transforms affect the user gate while preserving the route."""
+    from pepsy._internal.quimb import quimb_callable_option_supported
+
     mps = qtn.MPS_computational_state("01", dtype=np.complex128)
     gate = np.arange(16, dtype=float).reshape(2, 2, 2, 2) + 1j
     transform_opts = {transform: True}
+
+    if not quimb_callable_option_supported(qtn.tensor_network_gate_inds, transform):
+        with pytest.raises(NotImplementedError, match="does not support gate option"):
+            apply_gate(mps, gate, (0, 1), **transform_opts)
+        return
 
     actual = apply_gate(
         mps.copy(), gate, (0, 1), contract="split", inplace=True,
@@ -1355,8 +1362,8 @@ def test_build_pepo_from_gates_forwards_smart_max_bond_api(monkeypatch):
     assert kwargs["ind_id"] == "k{},{}"
 
 
-def test_build_pepo_from_gates_preserves_k_input_and_b_output_families():
-    """PEPO builders should leave upper/input k and lower/output b legs visible."""
+def test_build_pepo_from_gates_preserves_k_output_and_b_input_families():
+    """PEPO builders leave upper/output k and lower/input b legs visible."""
     x_gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
     pepo = build_pepo_from_gates(x_gate, where=((1, 1),), max_bond=8)
 
@@ -1423,7 +1430,8 @@ def test_gate_simple_2d_routes_swaps_with_real_torch_dtype():
     """Internal SWAP tensors should match real torch PEPS dtype."""
     torch = pytest.importorskip("torch")
 
-    peps = hrs_to_peps(2, 3, dtype="float64", chi=2)
+    peps = ps_to_peps(2, 3, dtype="float64", theta=0.31)
+    peps.expand_bond_dimension_(2)
     peps.apply_to_arrays(lambda x: torch.as_tensor(x, dtype=torch.float64))
     gate = torch.eye(4, dtype=torch.float64).reshape(2, 2, 2, 2)
     gauges = {}

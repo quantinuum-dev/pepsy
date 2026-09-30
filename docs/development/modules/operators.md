@@ -23,10 +23,10 @@ These are the names to use in new code.
 
 | Area | Canonical names | Owner |
 | --- | --- | --- |
-| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (semantic implementation: `operators.mpo_semantic`; basis implementation: `operators.mpo_basis`) |
-| MPO exponential metadata | `MPOPhysicalSpace`, `MPOBraiding`, `MPOCompressionReport`, `MPONumericalCompressionReport`, `MPODifferentiableCompressionReport` | `operators.mpo_higher_order` (space implementation in `operators.mpo_space`) |
+| Higher-order MPO | `MPOBasis`, `MPOParameter`, `MPOProductTerm`, `MPOLocalOperatorTerm`, `FirstDegreeMPO`, `MPOBlock`, `MPOBlockPlan`, `MPOChargeValidationReport`, `CompiledMPOExp`, `exp_mpo` | `operators.mpo_higher_order` (semantic implementation: `operators.mpo_semantic`; basis implementation: `operators.mpo_basis`; structural plan implementation: `operators.mpo_block_plan`) |
+| MPO exponential metadata | `MPOPhysicalSpace`, `MPOBraiding`, `MPOCompressionReport`, `MPONumericalCompressionReport`, `MPODifferentiableCompressionReport`, `MPOAdaptiveCompressionReport` | `operators.mpo_higher_order` (space implementation in `operators.mpo_space`) |
 | Shared report summary | `OperatorReportInfo` and each concrete report's `.api_info` | `operators.diagnostics` |
-| Ordered MPO cluster products | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterProductExpansion`, `MPOGraphClusterProductExpansion`, `CompiledMPOClusterProduct` | `operators.mpo_product` |
+| Ordered MPO cluster products | `MPOClusterFactor`, `MPOClusterExpansionReport`, `MPOClusterProductExpansion`, `MPOGraphClusterProductExpansion`, `CompiledMPOClusterProduct`, `exp_mpo_cluster`, `exp_mpo_cluster_product` | `operators.mpo_product` |
 | PEPO active results | `ActivePEPOBlocks`, `GraphActivePEPOBlocks` | `operators.pepo_cluster` (implementation: `operators.pepo_active`) |
 | Square-lattice PEPO exponential | `PauliPEPOTerm`, `PauliPEPOBasis`, `CompiledPEPOExp` | `operators.pepo_cluster` (implementation: `operators.pepo_basis`) |
 | Dense/graph PEPO clusters | `ClusterExpansionPlan`, `GraphClusterExpansionPlan`, `ClusterExpansionReport`, `ClusterLattice`, `ConnectedClusterShape`, `GraphConnectedClusterShape` | `operators.pepo_cluster` (implementation: `operators.pepo_dense`; planner boundary: `operators.pepo_geometry`) |
@@ -35,6 +35,7 @@ These are the names to use in new code.
 | PEPO composition | `compose_pepo_layers`, `compose_cluster_expansion_pepo` | `operators.pepo_cluster` |
 | Pauli operator algebra | `PauliMPO`, `decompose_pauli`, `PauliCompressionReport`, `PauliBondCompressionReport` | `operators.pauli_mpo` |
 | Exact MPO structural layer | `MPOAutomaton`, `MPOChannel`, `MPOTransition` | `operators.mpo_automaton` |
+| Native tree operators | `TreeMPO`, `TreePEPO`, `TreeSubPEPO`, `ham_tn.to_tree_mpo`, `ham_tn.to_tree_pepo` | `optimizers.tree`, `optimizers.tree_peps`, `operators.hamiltonians` |
 | Elementary gates/builders | gate constructors (`x`, `rx`, `cnot`, etc.), `gate`, `build_mpo_from_gates`, `build_pepo_from_gates` | `operators.gates` |
 
 The API lifecycle is:
@@ -68,6 +69,18 @@ then inserts the residual into one MPO/PEPO topology. It is not a sequence of
 three independently truncated full-lattice layers. The PEPO implementation
 records this invariant as `cache_info["joint_cluster_residual"]`.
 
+`PauliPEPOTerm.where` is the finite-square exception to the homogeneous PEPO
+slot model. Located onsite and nearest-neighbour edge slots dispatch to the
+finite-lattice connected-subset builder for every supported order (one through
+nine) on open or periodic boundaries. On a length-two periodic dimension,
+`PauliPEPOTerm.direction` distinguishes the two physical bonds with identical
+endpoints. Each embedding subtracts the completed lower-order active PEPO and
+stores its correction in a fixed Pauli-history tree; dense materialization
+then compacts those global histories independently on each physical bond.
+Exact localized ranks grow exponentially with cluster size, so inspect the
+active representation or set `max_tree_rank` before materializing larger
+higher-order lattices.
+
 The public facades are:
 
 - `operators.mpo_higher_order` — paper-style higher-order MPOs;
@@ -80,6 +93,12 @@ The public facades are:
 
 The older `operators.mpo` and `operators.cluster` modules remain importable
 compatibility facades; they no longer own the large implementation sources.
+
+The private `operators._symmetric_mpo` module owns symmetric MPO assembly,
+native local-term factorization, and charge-sector grouping used by
+`SymHamiltonian.to_mpo`, `SymHamiltonian.to_pepo`, fermion observables, and
+native gate builders. Shared charge and basis helpers live in
+`tensors.symmetric`, which retains historical builder imports lazily.
 
 Every construction/compression report keeps its detailed algorithm-specific
 fields and also exposes `.api_info`. That common summary has the keys
@@ -94,6 +113,8 @@ These names are public and documented, but most users should reach them
 through the higher-level basis or plan objects first:
 
 - `MPOLevelToken`, `MPOLevel`: symbolic higher-order MPO history metadata.
+- `MPOBlock`, `MPOBlockPlan`, `MPOChargeValidationReport`: backend-neutral
+  virtual-state/local-block structure and charge validation for compiled MPOs.
 - `MPOAutomaton`, `MPOChannel`, `MPOTransition`: exact channel/path assembly.
 - `ClusterLattice` and connected-cluster shape records: geometry planning
   independent of tensor values.
@@ -123,9 +144,9 @@ new examples:
 | `ClusterExpansionBasis` | `MPOClusterProductExpansion` | Historical class alias |
 | `ClusterExpBasis` | `MPOClusterProductExpansion` | Historical class alias |
 | `MPOClusterExpansion` | `MPOClusterProductExpansion` | Historical class alias |
-| `mode="paper_algorithm4"` | `mode="algorithm4"` | Historical mode spelling |
-| `mode="paper_optimal"` | `mode="optimal"` | Historical mode spelling |
-| `mode="paper_approximate"` | `mode="approximate"` | Historical mode spelling |
+| `mode="algorithm4"` / `mode="paper_algorithm4"` | `mode="folded"` | Historical mode spellings |
+| `mode="optimal"` / `mode="paper_optimal"` | `mode="exact"` | Historical mode spellings |
+| `mode="approximate"` / `mode="paper_approximate"` | `mode="hybrid"` | Historical mode spellings |
 
 `ham_tn` is a stable, older Hamiltonian-builder spelling documented in its
 own API page. It should remain available while a future naming review decides
@@ -173,26 +194,12 @@ guard for this decision is [`test_operator_api_contract.py`](../../../tests/test
 | Pauli sparse algebra/trace | `PauliMPO` | Treating it as a second unrelated exponential engine |
 | PEPS/PEPO contraction corrections | `pepsy.bp` loop/cluster APIs | Operator cluster expansion; BP acts on contractions/environments |
 
-## Example smoke set
+## Maintained smoke coverage
 
-The five small scripts in
-[`examples/operators`](https://github.com/quantinuum-dev/pepsy/tree/develop/examples/operators)
-are the canonical smoke examples:
-
-1. [`higher_order_mpo.py`](../../../examples/operators/higher_order_mpo.py)
-   — compile and materialize a higher-order MPO.
-2. [`fixed_channel_pepo.py`](../../../examples/operators/fixed_channel_pepo.py)
-   — evaluate sparse fixed-channel PEPO blocks and materialize explicitly.
-3. [`dense_cluster_pepo.py`](../../../examples/operators/dense_cluster_pepo.py)
-   — build a finite dense connected-cluster PEPO.
-4. [`ordered_pepo_product.py`](../../../examples/operators/ordered_pepo_product.py)
-   — build an ordered `exp(A) @ exp(B)` product through one joint topology.
-5. [`ordered_mpo_product.py`](../../../examples/operators/ordered_mpo_product.py)
-   — build the MPO analogue through the joint local-residual path.
-
-They intentionally use small systems, public namespace imports, and no
-notebook output. They are examples of API selection, not performance
-benchmarks.
+`tests/test_operator_comparison.py` is the maintained comparison matrix for
+higher-order MPOs, fixed-channel and dense-cluster PEPOs, and ordered MPO/PEPO
+products. It uses small dense references and public APIs. The focused tests
+for each owning module cover construction details and materialization.
 
 ## Review rule for future additions
 

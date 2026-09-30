@@ -14,7 +14,9 @@ and validate small systems against exact contractions before optimizing.
 ## Current implementation
 
 The reference implementation is `pepsy.PepsSampler` in
-`src/pepsy/sampling/samplers.py`.
+`src/pepsy/sampling/peps.py`. Shared result records live in `sampling/results.py`;
+`sampling/samplers.py` preserves historical imports and serialized class paths.
+The distinct BP proposal implementation lives in `sampling/bp.py`.
 
 - It is dense, Quimb-based, and samples in increasing `y`, then increasing `x`
   order. `sample(...)` is serial; `sample_batch(...)` shares identical prefix
@@ -100,11 +102,8 @@ fixed PEPS + conditioned boundary MPS + future environment
    native array updates rather than assuming `isel_` can select per-shot
    values in one ordinary Quimb network.
 6. Run the focused tests, existing sampler tests, public API tests, Ruff, and
-   the repository smoke suite. Activate the Pepsy environment first:
-
-```bash
-source /Users/rezah/envs/genpy/bin/activate
-```
+   the repository smoke suite. First activate the environment selected by
+   `AGENTS.md` and any local override.
 
 ## Non-negotiable checks
 

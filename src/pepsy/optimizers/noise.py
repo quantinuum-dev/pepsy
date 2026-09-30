@@ -4,7 +4,7 @@ Pepsy's native design is stream-local: users can place stochastic instructions
 such as ``("depolarize1", p, q)`` or ``("amplitude_damping", gamma, q)`` exactly
 where the hardware schedule says the channel acts. The trajectory runners
 sample a *concrete* branch for each shot and replay the resulting ordinary gate
-stream with either :class:`MpsOptimizer` or :class:`MpsStabOptimizer`. The older
+stream with MPS, tree, or stabilizer tensor-network optimizers. The older
 ``PauliErrorModel`` helpers remain convenience macros for inserting uniform
 post-gate Pauli faults into a clean deterministic stream.
 """
@@ -18,9 +18,14 @@ from numbers import Integral
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
+import autoray as ar
 import numpy as np
 
-from .mps.optimizer import MpsOptimizer, _resolve_conditional
+from ..backends import to_float as _backend_to_float
+from .._internal.quimb import quimb_callable_option_supported
+from .mps.optimizer import MpsOptimizer
+from ._stream_events import _resolve_conditional
+from . import _stim_compile
 from .tree.optimizer import TreeOptimizer
 
 __all__ = [
@@ -139,56 +144,12 @@ _CONTROL_NAMES = frozenset(
         "submpo",
     }
 )
-_STIM_NOISE_NAMES = frozenset(
-    {
-        "DEPOLARIZE1",
-        "DEPOLARIZE2",
-        "E",
-        "ELSE_CORRELATED_ERROR",
-        "HERALDED_ERASE",
-        "HERALDED_PAULI_CHANNEL_1",
-        "II_ERROR",
-        "I_ERROR",
-        "PAULI_CHANNEL_1",
-        "PAULI_CHANNEL_2",
-        "X_ERROR",
-        "Y_ERROR",
-        "Z_ERROR",
-    }
-)
-_STIM_IGNORED_NAMES = frozenset(
-    {
-        "DETECTOR",
-        "MPAD",
-        "OBSERVABLE_INCLUDE",
-        "QUBIT_COORDS",
-        "SHIFT_COORDS",
-        "TICK",
-    }
-)
-_STIM_SINGLE_MEASUREMENTS = {
-    "M": "Z",
-    "MX": "X",
-    "MY": "Y",
-}
-_STIM_SINGLE_MEASURE_RESETS = {
-    "MR": "Z",
-    "MRX": "X",
-    "MRY": "Y",
-}
-_STIM_PAIR_MEASUREMENTS = {
-    "MXX": "XX",
-    "MYY": "YY",
-    "MZZ": "ZZ",
-}
-_STIM_RESETS = {"R": "Z", "RX": "X", "RY": "Y"}
 _STIM_PAULI_2_OUTCOMES = tuple(
     (left, right)
     for left in "IXYZ"
     for right in "IXYZ"
     if (left, right) != ("I", "I")
 )
-_STIM_UNITARY_CACHE: dict[str, np.ndarray] = {}
 _AUTO_MAX_EXPECTED_FAULTS = 0.1
 _AUTO_MAX_BRANCHES = 128
 
@@ -441,8 +402,8 @@ class TrajectoryDiagnostics:
 
     ``max_kraus_probability_residual`` is measured before the branch
     probabilities are normalized for sampling. A small nonzero value is
-    expected from finite-MPS truncation; a large value indicates that the
-    channel, local contraction, or compression path needs attention.
+    expected from floating-point contraction error; a large value indicates
+    that the channel or probability calculation needs attention.
     ``used_kraus_copy_fallback`` reports whether any local Kraus probability
     could not use the environment contraction fast path.
     """
@@ -1239,11 +1200,23 @@ class CoalescedSampleResult:
     :class:`CoalescedTrajectoryLeaf` produced ``configs[row]``. ``probs`` is
     available for ordinary MPS leaves and is ``None`` for STN leaves, whose
     scalable ``sample_bits`` path intentionally returns configurations only.
+    ``lengths[row]`` gives the number of surviving sites. When conditional
+    caps produce different lengths, shorter rows are padded on the right
+    with ``-1``; only ``configs[row, :lengths[row]]`` contains measured bits.
     """
 
     configs: np.ndarray
     leaf_indices: np.ndarray
     probs: np.ndarray | None = None
+    lengths: np.ndarray | None = None
+
+    def __post_init__(self):
+        # Keep the existing three-argument constructor useful for uniform
+        # batches. Sampling supplies explicit lengths for a ragged register.
+        if self.lengths is None:
+            object.__setattr__(self, "lengths", np.full(
+                self.configs.shape[0], self.configs.shape[1], dtype=np.int64
+            ))
 
     @property
     def shots(self) -> int:
@@ -1439,13 +1412,11 @@ def _is_unitary_matrix(matrix: np.ndarray, *, atol: float = 1e-10) -> bool:
 
 def _trajectory_real_scalar(value, *, label: str) -> float:
     """Convert a backend scalar expected to be real into a Python float."""
-    item = getattr(value, "item", None)
-    if callable(item):
-        value = item()
-    value = complex(value)
-    if abs(value.imag) > 1e-9:
+    real_value = _backend_to_float(ar.do("real", value), real=False)
+    imag_value = _backend_to_float(ar.do("imag", value), real=False)
+    if abs(imag_value) > 1e-9:
         raise ValueError(f"{label} must be real, got {value!r}.")
-    return float(value.real)
+    return real_value
 
 
 def _as_entries(gates) -> list[object]:
@@ -2389,10 +2360,10 @@ def run_noisy_shots(
     """Build and replay independent noisy trajectories with either MPS optimizer.
 
     ``optimizer_factory`` must create a fresh :class:`MpsOptimizer` or
-    :class:`MpsStabOptimizer` for each trajectory. For example::
+    :class:`StabilizerMpsSimulator` for each trajectory. For example::
 
         result = run_noisy_shots(
-            lambda: pepsy.MpsStabOptimizer(8, chi=32), gates,
+            lambda: pepsy.StabilizerMpsSimulator(8, chi=32), gates,
             PauliErrorModel.depolarizing(1e-3), shots=1_000, seed=7,
         )
 
@@ -2982,7 +2953,7 @@ def _is_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 
 def _is_tree_stabilizer_trajectory_optimizer(optimizer) -> bool:
-    """Recognize TreeStabOptimizer through its lightweight protocol marker."""
+    """Recognize StabilizerTreeSimulator through its lightweight protocol marker."""
     return bool(getattr(optimizer, "_is_tree_stabilizer_trajectory_optimizer", False))
 
 
@@ -3003,9 +2974,15 @@ def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 
 def _trajectory_norm_squared(optimizer) -> float:
-    """Read the represented state norm through the optimizer's public API."""
+    """Read a working norm; common stored exponents cancel from Born ratios."""
     norm = getattr(optimizer, "norm", None)
-    if callable(norm):
+    if isinstance(optimizer, MpsOptimizer):
+        # A common represented exponent cancels from every Born ratio.
+        value = optimizer._control_state_norm(include_exponent=False)
+    elif isinstance(optimizer, TreeOptimizer):
+        value, _ = optimizer._ledger_norm()
+        value = _trajectory_real_scalar(value, label="trajectory state norm")
+    elif callable(norm):
         value = _trajectory_real_scalar(norm(), label="trajectory state norm")
     else:
         p = getattr(optimizer, "p", None)
@@ -3020,18 +2997,41 @@ def _trajectory_norm_squared(optimizer) -> float:
 def _mps_local_kraus_norm_squared(optimizer, matrix, where):
     """Evaluate ``<psi|K^dagger K|psi>`` without copying the MPS.
 
-    Quimb's environment contraction works for canonical and non-canonical open
-    MPS states and returns the normalized local expectation directly. Returning
-    ``None`` keeps the conservative copied-state path available for custom MPS
-    lookalikes and backends that cannot contract the generated dense operator.
+    Canonical MPS replay reuses and updates the live center metadata. Quimb's
+    environment contraction remains available for noncanonical MPS lookalikes;
+    returning ``None`` retains the conservative copied-state fallback.
     """
     p = getattr(optimizer, "p", None)
     compute = getattr(p, "compute_local_expectation", None)
     if not callable(compute):
         return None
     try:
+        if (isinstance(optimizer, MpsOptimizer)
+                and optimizer.mode not in {"exact", "exact-batch", "su"}
+                and len(where) == 1 and not optimizer._replay_has_symmray_data(p)):
+            site = int(where[0])
+            optimizer.canonize_mps(p, site)
+            tensor = p[site]
+            normalized = tensor / tensor.norm()
+            projected = normalized.gate(matrix, p.site_ind(site))
+            amplitude = _trajectory_real_scalar(projected.norm(), label="local Kraus amplitude")
+            return amplitude * amplitude
         gram = matrix.conj().T @ matrix
         support = tuple(int(site) for site in where)
+        canonical = getattr(p, "local_expectation_canonical", None)
+        if (
+            isinstance(optimizer, MpsOptimizer)
+            and optimizer.mode not in {"exact", "exact-batch", "su"}
+            and callable(canonical)
+        ):
+            value = canonical(
+                gram, support, normalized=True, info=optimizer.info_c,
+                optimize=optimizer.contraction_opt,
+            )
+            value = _trajectory_real_scalar(value, label="local Kraus probability")
+            if not np.isfinite(value) or value < -1e-10:
+                raise ValueError("local Kraus contraction produced an invalid probability.")
+            return max(0.0, value)
         # Quimb's environment helper has a known length-one edge case. The
         # represented state is only a two-component vector there, so evaluate
         # the local Gram form directly instead of copying/applying a candidate
@@ -3052,6 +3052,9 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
                             "local Kraus contraction produced an invalid probability."
                         )
                     return max(0.0, value)
+        # New Quimb names the environment selector ``route``; older builds
+        # use ``method``. Choose from the signature without changing the solve.
+        route_key = "route" if quimb_callable_option_supported(compute, "route") else "method"
         value = compute(
             # ``compute_local_expectation`` accepts scalar keys in some
             # Quimb releases, but the environment implementation used by
@@ -3060,7 +3063,7 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
             {support: gram},
             normalized=True,
             return_all=True,
-            method="envs",
+            **{route_key: "envs"},
         )
         if isinstance(value, Mapping):
             value = next(iter(value.values()))
@@ -3079,7 +3082,7 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
     remap = getattr(optimizer, "_logical_to_physical_where", None)
     if p is None or not callable(apply_gate) or not callable(remap):
         raise TypeError(
-            "State-dependent trajectory channels require MpsOptimizer or MpsStabOptimizer."
+            "State-dependent trajectory channels require MpsOptimizer or StabilizerMpsSimulator."
         )
     matrix = _to_trajectory_backend(matrix, optimizer)
     physical_where = tuple(remap(where))
@@ -3095,6 +3098,8 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
         physical_where[0] if len(physical_where) == 1 else physical_where,
         contract=True,
     )
+    if isinstance(optimizer, MpsOptimizer):
+        candidate.exponent = 0.0
     value = _trajectory_real_scalar(candidate.norm(), label="Kraus branch norm")
     if not np.isfinite(value) or value < 0.0:
         raise ValueError("Kraus branch produced an invalid MPS norm.")
@@ -3102,7 +3107,26 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
 
 
 def _tree_outcome_norm_squared(optimizer, matrix, where) -> float:
-    """Evaluate one Kraus branch on a copied ordinary TTN without mutation."""
+    """Evaluate a Kraus weight independently of tree replay/compression policy."""
+    if isinstance(optimizer, TreeOptimizer):
+        matrix = _to_trajectory_backend(matrix, optimizer)
+        support = optimizer._validate_support(_trajectory_where(where))
+        gram = ar.do("conj", ar.do("transpose", matrix)) @ matrix
+        # Copy only the TTN wrapper, preserving live gauge, histories and RNG.
+        # This exact local contraction neither compresses a trial branch nor
+        # restores its nonunitary norm through inherited stabilization.
+        state = optimizer.tn.copy()
+        state.exponent = 0.
+        value = state.local_expectation(
+            gram, support, normalized=True, _preserve_gauge=False,
+        )
+        # K†K is Hermitian; discard imaginary contraction roundoff before
+        # the scalar readout, including complex64 device arithmetic.
+        value = _trajectory_real_scalar(ar.do("real", value), label="local Kraus probability")
+        if not np.isfinite(value) or value < -1e-10:
+            raise ValueError("local Kraus contraction produced an invalid probability.")
+        return max(0., value) * _trajectory_norm_squared(optimizer)
+    # Retain the copy/apply protocol for external optimizer lookalikes.
     copy = getattr(optimizer, "copy", None)
     if not callable(copy):
         raise TypeError(
@@ -3215,8 +3239,8 @@ def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.nda
     if total <= 0.0:
         raise ValueError("Kraus channel has no nonzero trajectory outcome for this state.")
     _record_kraus_probability_diagnostic(optimizer, residual=total - 1.0)
-    # A complete channel sums to one. Normalize the tiny residual caused by
-    # finite-MPS truncation so the shot sampler remains a proper distribution.
+    # A complete channel sums to one. Normalize contraction roundoff so the
+    # shot sampler remains a proper distribution.
     return probabilities / total
 
 
@@ -3310,6 +3334,11 @@ def _run_trajectory_entries(
         kwargs["normalize_final"] = False
         if isinstance(optimizer, MpsOptimizer):
             kwargs["_trajectory_non_unitary"] = True
+            # Kraus branches retain their physical norm until branch
+            # normalization. Override only this segment's copied options;
+            # surrounding unitary segments keep the caller's stabilization.
+            kwargs["stabilize_unitary"] = False
+            kwargs.pop("fit_stabilize_unitary", None)
     optimizer.run(**kwargs)
 
 
@@ -3326,7 +3355,7 @@ def _new_magic_context(optimizer, ancillas, *, recycle=True, reset_ancillas=True
     validate = getattr(optimizer, "_validate_magic_ancilla_pool", None)
     if not callable(validate):
         raise TypeError(
-            "magic injection requires MpsStabOptimizer or TreeStabOptimizer "
+            "magic injection requires StabilizerMpsSimulator or StabilizerTreeSimulator "
             "with a validated ancilla pool."
         )
     try:
@@ -3410,17 +3439,24 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
         )
     if isinstance(norm_event, dict) and "input_norm" in norm_event:
         probability = float(norm_event["branch_probability"])
-        projected_norm = optimizer._real_float(optimizer.p.norm())
+        projected_norm = optimizer._control_state_norm(include_exponent=False)
         optimizer._record_norm_event(
             "trajectory_kraus",
             expected_norm=float(norm_event["input_norm"]) * np.sqrt(probability),
             observed_norm=projected_norm,
+            expected_exponent=norm_event.get("input_exponent", 0.0),
+            observed_exponent=optimizer._real_float(optimizer.p.exponent),
             where=_trajectory_where(where),
             branch_probability=probability,
             physical_boundary=True,
             renormalized=True,
         )
-    normalize()
+    if isinstance(optimizer, TreeOptimizer):
+        # A sampled branch has positive Born weight, even when importance
+        # sampling selected an amplitude below the general normalization eps.
+        normalize(eps=0.)
+    else:
+        normalize()
     # MpsOptimizer stores removed scale in ``p.exponent`` so norm diagnostics
     # see the represented non-unitary norm. A quantum-trajectory branch is
     # physically renormalized, therefore clear that bookkeeping scale.
@@ -3435,6 +3471,36 @@ class _LeakageState:
 
     leaked: set[int] = field(default_factory=set)
     leak2depolar: bool = False
+
+
+def _resolve_trajectory_conditional(optimizer, entry):
+    """Return the selected concrete action, or None for a false predicate."""
+    while True:
+        parts = MpsOptimizer.control_event_parts(entry)
+        if parts is None or parts[0] != "conditional":
+            return entry
+        _name, payload, _where = parts
+        record_index, expected = _resolve_conditional(
+            payload, len(getattr(optimizer, "measurements", ()))
+        )
+        record = optimizer.measurements[record_index]
+        outcome = int(getattr(record, "outcome", record[2]))
+        if int(outcome < 0) != expected:
+            return None
+        entry = payload["action"]
+
+
+def _apply_trajectory_cap(optimizer, entry, where, state, run_kwargs, shot_stream):
+    """Commit a structural cap before remapping classical leakage labels."""
+    _run_trajectory_entries(optimizer, (entry,), run_kwargs)
+    # Site labels after a cap refer to the shortened logical chain, including
+    # in perm mode. A cap removes even a leaked site's placeholder tensor.
+    # Update only after successful replay; failed caps retain the old labels.
+    (removed,) = where
+    state.leaked = {
+        site - (site > removed) for site in state.leaked if site != removed
+    }
+    shot_stream.append(entry)
 
 
 def _single_leakage_site(where) -> int:
@@ -3738,7 +3804,8 @@ def _apply_trajectory_event(
         norm_event = {
             "kind": "trajectory_kraus",
             "branch_probability": float(probability),
-            "input_norm": optimizer._real_float(optimizer.p.norm()),
+            "input_norm": optimizer._control_state_norm(include_exponent=False),
+            "input_exponent": optimizer._real_float(optimizer.p.exponent),
         }
     else:
         norm_event = None
@@ -3786,7 +3853,7 @@ def _check_coalesced_optimizer(optimizer):
     if not callable(getattr(optimizer, "copy", None)):
         raise TypeError(
             "coalesced trajectory replay requires an optimizer with copy(); "
-            "use MpsOptimizer, TreeOptimizer, or MpsStabOptimizer."
+            "use MpsOptimizer, TreeOptimizer, or StabilizerMpsSimulator."
         )
 
 
@@ -3849,6 +3916,11 @@ def _coalesced_probabilities(probabilities, *, context):
     return probabilities / total
 
 
+def _remaining_coalesced_budget(limit, *reserved):
+    """Reserve slots for retained leaves and parents not yet processed."""
+    return None if limit is None else limit - sum(reserved)
+
+
 def _split_coalesced_nodes(
     nodes,
     outcomes,
@@ -3867,14 +3939,15 @@ def _split_coalesced_nodes(
     if len(outcomes) != len(probabilities):
         raise ValueError(f"{context} has mismatched outcomes and probabilities.")
     split = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         counts = rng.multinomial(node.count, probabilities)
         nonempty = [
             (outcome, float(probability), int(count))
             for outcome, probability, count in zip(outcomes, probabilities, counts)
             if int(count) > 0
         ]
-        if max_branches is not None and len(split) + len(nonempty) > max_branches:
+        live_count = len(split) + len(nonempty) + len(nodes) - index - 1
+        if max_branches is not None and live_count > max_branches:
             raise _CoalescedBranchCapExceeded(
                 f"coalesced trajectory branch cap ({max_branches}) exceeded "
                 f"while splitting {context}."
@@ -3962,23 +4035,38 @@ def _run_coalesced_entries(
         parts = MpsOptimizer.control_event_parts(entry)
         if parts is not None and parts[0] == "conditional":
             flush()
-            _name, payload, _where = parts
+            selected = []
+            for index, node in enumerate(nodes):
+                action = _resolve_trajectory_conditional(node.optimizer, entry)
+                if action is None:
+                    selected.append(node)
+                else:
+                    # Selected controls use the same branching/cap/leakage
+                    # path as unconditional controls. Retain the concrete
+                    # stream once, not both the action and its wrapper.
+                    selected.extend(_run_coalesced_entries(
+                        [node], [(event_index, action)], run_kwargs, rng,
+                        max_branches=_remaining_coalesced_budget(
+                            max_branches, len(selected), len(nodes) - index - 1,
+                        ),
+                        max_branch_factor=max_branch_factor,
+                        parallel_workers=parallel_workers,
+                        parallel_backend=parallel_backend,
+                    ))
+                if max_branches is not None and len(selected) > max_branches:
+                    raise _CoalescedBranchCapExceeded(
+                        f"coalesced trajectory branch cap ({max_branches}) exceeded "
+                        "during conditional replay."
+                    )
+            nodes = selected
+            continue
+        if parts is not None and parts[0] == "cap":
+            flush()
             for node in nodes:
-                record_index, expected = _resolve_conditional(
-                    payload, len(getattr(node.optimizer, "measurements", ()))
+                _apply_trajectory_cap(
+                    node.optimizer, entry, parts[2], node.leakage_state,
+                    run_kwargs, node.gate_stream,
                 )
-                record = node.optimizer.measurements[record_index]
-                outcome = int(getattr(record, "outcome", record[2]))
-                if (
-                    int(outcome < 0) == expected
-                    and not _entry_touches_leaked_qubit(
-                        payload["action"], node.leakage_state
-                    )
-                ):
-                    _run_trajectory_entries(
-                        node.optimizer, (payload["action"],), run_kwargs
-                    )
-                node.gate_stream.append(entry)
             continue
         if parts is None or parts[0] not in {"measure", "reset", "measure_reset"}:
             pending.append((event_index, entry))
@@ -4031,7 +4119,7 @@ def _coalesced_leakage_measure_leaked(
 ):
     """Replay ``measure_leaked`` while preserving count-bearing branches."""
     result = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         state = node.leakage_state
         if site in state.leaked:
             node.leakage_records.append(
@@ -4048,7 +4136,7 @@ def _coalesced_leakage_measure_leaked(
             result.append(node)
             continue
 
-        p_plus = _coalesced_measurement_probability(node.optimizer, "Z", (site,))
+        probabilities = _coalesced_measurement_probabilities(node.optimizer, "Z", (site,))
 
         def apply(child, outcome, probability):
             outcome = int(outcome)
@@ -4081,11 +4169,13 @@ def _coalesced_leakage_measure_leaked(
             _split_coalesced_nodes(
                 [node],
                 (+1, -1),
-                (p_plus, 1.0 - p_plus),
+                probabilities,
                 apply,
                 rng,
                 context="leakage measurement",
-                max_branches=max_branches,
+                max_branches=_remaining_coalesced_budget(
+                    max_branches, len(result), len(nodes) - index - 1,
+                ),
                 max_branch_factor=max_branch_factor,
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
@@ -4136,7 +4226,7 @@ def _coalesced_leakage_event(
         )
 
     result = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
         initially_leaked = site in node.leakage_state.leaked
         probability = float(payload["probability"])
         if kind == "leakage":
@@ -4170,12 +4260,8 @@ def _coalesced_leakage_event(
                     if initially_leaked:
                         branch = "already_leaked"
                     else:
-                        _run_leakage_entries(
-                            child.optimizer,
-                            (_reset_zero_entry(site),),
-                            run_kwargs,
-                            child.gate_stream,
-                        )
+                        # Reset after the classical split, where its hidden
+                        # measurement can create separate count-bearing leaves.
                         child.leakage_state.leaked.add(site)
                         branch = "leaked"
                 child.leakage_records.append(
@@ -4237,21 +4323,47 @@ def _coalesced_leakage_event(
         else:  # pragma: no cover - parser guards the event names
             raise AssertionError(f"Unhandled leakage event kind {kind!r}.")
 
-        result.extend(
-            _split_coalesced_nodes(
-                [node],
-                labels,
-                probabilities,
-                apply,
-                rng,
-                context=f"leakage {kind}",
-                max_branches=max_branches,
-                max_branch_factor=max_branch_factor,
+        budget = _remaining_coalesced_budget(
+            max_branches, len(result), len(nodes) - index - 1,
+        )
+        children = _split_coalesced_nodes(
+            [node], labels, probabilities, apply, rng,
+            context=f"leakage {kind}", max_branches=budget,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers, parallel_backend=parallel_backend,
+        )
+        resetting = []
+        retained = []
+        for child in children:
+            needs_reset = kind == "leakage" and child.leakage_records[-1].branch == "leaked"
+            (resetting if needs_reset else retained).append(child)
+        if resetting:
+            entry = _reset_zero_entry(site)
+            resetting = _coalesced_control_event(
+                resetting, event_index, MpsOptimizer.control_event_parts(entry),
+                run_kwargs, rng, entry=entry,
+                max_branches=_remaining_coalesced_budget(budget, len(retained)),
+                max_branch_factor=_remaining_coalesced_budget(max_branch_factor, len(retained)),
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
             )
-        )
+            for child in resetting:
+                child.leakage_state.leaked.add(site)
+        result.extend(retained + resetting)
     return result
+
+
+def _coalesced_measurement_probabilities(optimizer, pauli, where):
+    """Use both backend Born weights without subtractive cancellation."""
+    if isinstance(optimizer, MpsOptimizer):
+        return optimizer._measurement_probabilities(
+            pauli, optimizer._logical_to_physical_where(where),
+        )
+    probabilities = getattr(optimizer, "_measurement_probabilities", None)
+    if callable(probabilities):
+        return probabilities(pauli, where)
+    p_plus = _coalesced_measurement_probability(optimizer, pauli, where)
+    return p_plus, 1.0 - p_plus
 
 
 def _coalesced_measurement_probability(optimizer, pauli, where) -> float:
@@ -4272,7 +4384,7 @@ def _coalesced_measurement_probability(optimizer, pauli, where) -> float:
         if not callable(mapped) or not callable(state_expectation):
             raise TypeError(
                 "coalesced measurement branching requires MpsOptimizer, "
-                "MpsStabOptimizer, or TreeOptimizer expectation support."
+                "StabilizerMpsSimulator, or TreeOptimizer expectation support."
             )
         value = state_expectation(pauli, mapped(where))
     return min(max(0.5 * (1.0 + float(value)), 0.0), 1.0)
@@ -4292,12 +4404,30 @@ def _coalesced_reset_needs_branch(optimizer, where) -> bool:
         return True
     site = where[0]
     try:
+        if isinstance(optimizer, MpsOptimizer):
+            # Only a structural product certificate may discard hidden
+            # outcomes. A purity tolerance can erase rare but physical
+            # branches, and three Pauli contractions cost more than these
+            # two bond lookups. Nonminimal product MPS safely take the
+            # branching path (deterministic outcomes still create one leaf).
+            (physical_site,) = optimizer._logical_to_physical_where((site,))
+            p = optimizer.p
+            length = int(p.L)
+            if getattr(p, "cyclic", False):
+                return True
+            return any(
+                p.bond_size(physical_site, neighbor) != 1
+                for neighbor in (physical_site - 1, physical_site + 1)
+                if 0 <= neighbor < length
+            )
         values = []
         state_expectation = getattr(optimizer, "_state_expectation", None)
         expectation = getattr(optimizer, "expectation", None)
         for axis in ("X", "Y", "Z"):
             if callable(state_expectation):
-                value = state_expectation(axis, (site,))
+                remap = getattr(optimizer, "_logical_to_physical_where", None)
+                support = remap((site,)) if callable(remap) else (site,)
+                value = state_expectation(axis, support)
             elif callable(expectation):
                 value = expectation(axis, site)
             else:
@@ -4364,8 +4494,8 @@ def _apply_coalesced_measurement(
         # recorded value is still the Born probability before that collapse.
         checked = []
         for node in nodes:
-            p_plus = _coalesced_measurement_probability(node.optimizer, pauli, where)
-            checked.append(p_plus if outcome > 0 else 1.0 - p_plus)
+            probabilities = _coalesced_measurement_probabilities(node.optimizer, pauli, where)
+            checked.append(probabilities[0 if outcome > 0 else 1])
         result = []
         for node, branch_probability in zip(nodes, checked):
             apply(node, outcome, branch_probability)
@@ -4375,17 +4505,19 @@ def _apply_coalesced_measurement(
     # The state can differ between nodes, so each node gets its own binomial
     # draw. This is exactly the result of independent per-shot Born draws.
     result = []
-    for node in nodes:
-        p_plus = _coalesced_measurement_probability(node.optimizer, pauli, where)
+    for index, node in enumerate(nodes):
+        probabilities = _coalesced_measurement_probabilities(node.optimizer, pauli, where)
         result.extend(
             _split_coalesced_nodes(
                 [node],
                 (+1, -1),
-                (p_plus, 1.0 - p_plus),
+                probabilities,
                 apply,
                 rng,
                 context="measurement",
-                max_branches=max_branches,
+                max_branches=_remaining_coalesced_budget(
+                    max_branches, len(result), len(nodes) - index - 1,
+                ),
                 max_branch_factor=max_branch_factor,
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
@@ -4454,7 +4586,7 @@ def _coalesced_control_event(
                     absorb_basis=absorb_basis,
                     run_kwargs=run_kwargs,
                     rng=rng,
-                    max_branches=max_branches,
+                    max_branches=_remaining_coalesced_budget(max_branches, len(direct)),
                     max_branch_factor=max_branch_factor,
                     parallel_workers=parallel_workers,
                     parallel_backend=parallel_backend,
@@ -4526,9 +4658,10 @@ def _coalesced_control_event(
                 event_index,
                 parts,
                 run_kwargs,
+                rng,
                 entry=entry,
                 absorb_basis=absorb_basis,
-                max_branches=max_branches,
+                max_branches=_remaining_coalesced_budget(max_branches, len(leaked_nodes)),
                 max_branch_factor=max_branch_factor,
                 parallel_workers=parallel_workers,
                 parallel_backend=parallel_backend,
@@ -4592,6 +4725,10 @@ def _coalesced_result(nodes, *, plan=None, retain="all") -> CoalescedTrajectoryR
             shot_count=shot_count,
             diagnostics=diagnostics,
         )
+    for node in nodes:
+        detach_histories = getattr(node.optimizer, "_detach_branch_histories", None)
+        if callable(detach_histories):
+            detach_histories()
     return CoalescedTrajectoryResult(
         tuple(
             CoalescedTrajectoryLeaf(
@@ -4626,7 +4763,7 @@ def sample_coalesced_bits(
 
     Ordinary MPS leaves use :class:`pepsy.sampling.MpsSampler`'s batched native
     path, preserving device-local sampling until the final compact NumPy
-    result. STN leaves use :meth:`MpsStabOptimizer.sample_bits`, which is
+    result. STN leaves use :meth:`StabilizerMpsSimulator.sample_bits`, which is
     already a count-coalesced measurement tree. The function never materializes
     one optimizer per trajectory.
 
@@ -4670,6 +4807,7 @@ def sample_coalesced_bits(
     configs = []
     probs = []
     leaf_indices = []
+    lengths = []
     all_have_probs = True
     for leaf_index, (leaf, child_seed) in enumerate(zip(leaves, child_seeds)):
         count = int(leaf.count)
@@ -4699,17 +4837,33 @@ def sample_coalesced_bits(
             probs.append(np.asarray(batch.probs, dtype=float))
         configs.append(batch_configs)
         leaf_indices.append(np.full(count, leaf_index, dtype=np.int64))
+        lengths.append(np.full(count, batch_configs.shape[1], dtype=np.int64))
 
-    configs = np.concatenate(configs, axis=0)
+    max_length = max(batch.shape[1] for batch in configs)
+    if all(batch.shape[1] == max_length for batch in configs):
+        configs = np.concatenate(configs, axis=0)
+    else:
+        # Rectangular output remains convenient without inventing measured
+        # zeros for removed sites. Avoid padded copies of each leaf batch.
+        padded = np.full((sum(batch.shape[0] for batch in configs), max_length),
+                         -1, dtype=np.int8)
+        offset = 0
+        for batch in configs:
+            stop = offset + batch.shape[0]
+            padded[offset:stop, :batch.shape[1]] = batch
+            offset = stop
+        configs = padded
     leaf_indices = np.concatenate(leaf_indices, axis=0)
+    lengths = np.concatenate(lengths, axis=0)
     probabilities = np.concatenate(probs, axis=0) if all_have_probs else None
     if shuffle and len(configs) > 1:
         permutation = np.random.default_rng(seed).permutation(len(configs))
         configs = configs[permutation]
         leaf_indices = leaf_indices[permutation]
+        lengths = lengths[permutation]
         if probabilities is not None:
             probabilities = probabilities[permutation]
-    return CoalescedSampleResult(configs, leaf_indices, probabilities)
+    return CoalescedSampleResult(configs, leaf_indices, probabilities, lengths)
 
 
 def run_trajectory_shots(
@@ -4745,8 +4899,8 @@ def run_trajectory_shots(
     ``("amplitude_damping", gamma, q)`` without forming a density matrix.
 
     ``optimizer_factory`` must create a fresh :class:`MpsOptimizer`,
-    :class:`TreeOptimizer`, :class:`MpsStabOptimizer`, or
-    :class:`TreeStabOptimizer` per shot. Gate segments
+    :class:`TreeOptimizer`, :class:`StabilizerMpsSimulator`, or
+    :class:`StabilizerTreeSimulator` per shot. Gate segments
     between channel events are batched, so a trajectory does not rebuild an
     optimizer for every gate.
     Set ``strategy="coalesced"`` to share deterministic prefixes and retain one
@@ -5022,7 +5176,23 @@ def run_trajectory_shots(
                     )
                     continue
                 control_parts = MpsOptimizer.control_event_parts(entry)
+                if control_parts is not None and control_parts[0] == "conditional":
+                    # Resolve after the preceding measurement is committed.
+                    # The concrete action then follows ordinary control and
+                    # leakage dispatch, including nested conditional caps.
+                    flush_pending()
+                    entry = _resolve_trajectory_conditional(optimizer, entry)
+                    if entry is None:
+                        continue
+                    control_parts = MpsOptimizer.control_event_parts(entry)
                 if control_parts is not None:
+                    if control_parts[0] == "cap":
+                        flush_pending()
+                        _apply_trajectory_cap(
+                            optimizer, entry, control_parts[2], leakage_state,
+                            run_kwargs, shot_stream,
+                        )
+                        continue
                     if control_parts[0] == "reset":
                         flush_pending()
                         _apply_leakage_reset_control(
@@ -5273,7 +5443,8 @@ def _apply_coalesced_trajectory_outcome(
         norm_event = {
             "kind": "trajectory_kraus",
             "branch_probability": float(target_probability),
-            "input_norm": node.optimizer._real_float(node.optimizer.p.norm()),
+            "input_norm": node.optimizer._control_state_norm(include_exponent=False),
+            "input_exponent": node.optimizer._real_float(node.optimizer.p.exponent),
         }
     else:
         norm_event = None
@@ -5403,7 +5574,7 @@ def run_coalesced_trajectory_shots(
             )
         else:
             split = []
-            for node in nodes:
+            for index, node in enumerate(nodes):
                 probabilities = _kraus_probabilities(
                     node.optimizer, entry.channel, entry.where
                 )
@@ -5440,7 +5611,9 @@ def run_coalesced_trajectory_shots(
                         apply,
                         rng,
                         context="trajectory Kraus channel",
-                        max_branches=max_branches,
+                        max_branches=_remaining_coalesced_budget(
+                            max_branches, len(split), len(nodes) - index - 1,
+                        ),
                         max_branch_factor=max_branch_factor,
                         parallel_workers=parallel_workers,
                         parallel_backend=parallel_backend,
@@ -5617,201 +5790,8 @@ def run_coalesced_noisy_shots(
 
 
 # ---------------------------------------------------------------------------
-# Stim circuit compilation and complete native noise-channel sampling.
+# Stim plan entry point and native noise-channel sampling.
 # ---------------------------------------------------------------------------
-def _require_stim():
-    try:
-        import stim
-    except ImportError as exc:  # pragma: no cover - only without optional stim
-        raise ImportError(
-            "Stim circuit noise support requires the optional 'stim' package. "
-            "Install it with `python -m pip install stim`."
-        ) from exc
-    return stim
-
-
-def _coerce_stim_circuit(circuit):
-    stim = _require_stim()
-    if isinstance(circuit, stim.Circuit):
-        return circuit
-    if isinstance(circuit, str):
-        return stim.Circuit(circuit)
-    raise TypeError("circuit must be a stim.Circuit, Stim source string, or StimCircuitPlan.")
-
-
-def _stim_qubit_targets(instruction, *, allow_inverted_result=False) -> tuple[int, ...]:
-    targets = []
-    for target in instruction.targets_copy():
-        if not target.is_qubit_target:
-            raise NotImplementedError(
-                f"Stim instruction {instruction!s} has a non-qubit target that "
-                "cannot be replayed as an MPS gate stream."
-            )
-        if target.is_inverted_result_target and not allow_inverted_result:
-            raise NotImplementedError(
-                f"Stim instruction {instruction!s} has a classical-record "
-                "controlled/inverted target that cannot be replayed as an MPS gate stream."
-            )
-        targets.append(int(target.value))
-    return tuple(targets)
-
-
-def _stim_pauli_targets(instruction) -> tuple[tuple[str, int], ...]:
-    terms = []
-    for target in instruction.targets_copy():
-        if target.is_combiner:
-            raise NotImplementedError(
-                f"Stim noise instruction {instruction!s} unexpectedly contains a combiner."
-            )
-        if target.is_x_target:
-            axis = "X"
-        elif target.is_y_target:
-            axis = "Y"
-        elif target.is_z_target:
-            axis = "Z"
-        else:
-            raise NotImplementedError(
-                f"Stim noise instruction {instruction!s} has a non-Pauli target."
-            )
-        terms.append((axis, int(target.value)))
-    return tuple(terms)
-
-
-def _stim_record_targets(instruction) -> tuple[tuple[int, bool], ...]:
-    """Normalize Stim ``rec[k]`` targets to ``(offset, inverted)`` pairs."""
-    targets = []
-    for target in instruction.targets_copy():
-        if not target.is_measurement_record_target:
-            raise NotImplementedError(
-                f"Stim annotation {instruction!s} has a non-record target."
-            )
-        targets.append((int(target.value), bool(target.is_inverted_result_target)))
-    if not targets:
-        raise ValueError(f"Stim annotation {instruction!s} needs record targets.")
-    return tuple(targets)
-
-
-def _stim_unitary_matrix(name: str) -> np.ndarray:
-    """Return a cached small Clifford matrix from Stim's public tableau API."""
-    try:
-        return _STIM_UNITARY_CACHE[name]
-    except KeyError:
-        stim = _require_stim()
-        matrix = np.asarray(
-            stim.Tableau.from_named_gate(name).to_unitary_matrix(endian="big"),
-            dtype=np.complex128,
-        )
-        _STIM_UNITARY_CACHE[name] = matrix
-        return matrix
-
-
-def _compile_stim_measurement(instruction, name: str) -> tuple[object, ...]:
-    if name in _STIM_SINGLE_MEASUREMENTS:
-        axis = _STIM_SINGLE_MEASUREMENTS[name]
-        return tuple(
-            ("measure", axis, site)
-            for site in _stim_qubit_targets(instruction, allow_inverted_result=True)
-        )
-    if name in _STIM_SINGLE_MEASURE_RESETS:
-        axis = _STIM_SINGLE_MEASURE_RESETS[name]
-        return tuple(
-            ("measure_reset", axis, site)
-            for site in _stim_qubit_targets(instruction, allow_inverted_result=True)
-        )
-    if name in _STIM_PAIR_MEASUREMENTS:
-        targets = _stim_qubit_targets(instruction, allow_inverted_result=True)
-        if len(targets) % 2:
-            raise ValueError(f"Stim instruction {instruction!s} needs target pairs.")
-        axis = _STIM_PAIR_MEASUREMENTS[name]
-        return tuple(
-            ("measure", axis, targets[offset : offset + 2])
-            for offset in range(0, len(targets), 2)
-        )
-    if name != "MPP":
-        raise NotImplementedError(f"Unsupported Stim measurement instruction {instruction!s}.")
-
-    groups = []
-    targets = instruction.targets_copy()
-    offset = 0
-    while offset < len(targets):
-        axes = []
-        sites = []
-        while True:
-            target = targets[offset]
-            if target.is_x_target:
-                axis = "X"
-            elif target.is_y_target:
-                axis = "Y"
-            elif target.is_z_target:
-                axis = "Z"
-            else:
-                raise ValueError(f"Malformed Stim MPP instruction {instruction!s}.")
-            axes.append(axis)
-            sites.append(int(target.value))
-            offset += 1
-            if offset == len(targets) or not targets[offset].is_combiner:
-                break
-            offset += 1
-            if offset == len(targets):
-                raise ValueError(f"Malformed Stim MPP instruction {instruction!s}.")
-        groups.append(("measure", "".join(axes), tuple(sites)))
-    return tuple(groups)
-
-
-def _compile_stim_unitary(instruction, name: str) -> tuple[object, ...]:
-    stim = _require_stim()
-    if name in {"I", "II"}:
-        return ()
-    gate_data = stim.gate_data(name)
-    if gate_data.is_single_qubit_gate:
-        targets = _stim_qubit_targets(instruction)
-        matrix = _stim_unitary_matrix(name)
-        return tuple((matrix, site) for site in targets)
-    if gate_data.is_two_qubit_gate:
-        targets = _stim_qubit_targets(instruction)
-        if len(targets) % 2:
-            raise ValueError(f"Stim instruction {instruction!s} needs target pairs.")
-        matrix = _stim_unitary_matrix(name)
-        return tuple(
-            (matrix, targets[offset : offset + 2])
-            for offset in range(0, len(targets), 2)
-        )
-    raise NotImplementedError(
-        f"Stim instruction {instruction!s} is not a one- or two-qubit unitary "
-        "supported by both MPS optimizers."
-    )
-
-
-def _compile_stim_classical_control(instruction, name: str):
-    """Lower one Stim measurement-record-controlled Pauli gate.
-
-    The supported form is CX/CY/CZ rec[k] q, including an inverted record
-    target. It becomes the backend-independent ("if", k, bit, action) event.
-    More elaborate classical arithmetic remains intentionally outside this
-    compiler so a record cannot be mistaken for a quantum wire.
-    """
-    targets = instruction.targets_copy()
-    records = [target for target in targets if target.is_measurement_record_target]
-    qubits = [target for target in targets if target.is_qubit_target]
-    if len(targets) != 2 or len(records) != 1 or len(qubits) != 1:
-        raise NotImplementedError(
-            f"Stim instruction {instruction!s} must contain exactly one "
-            "measurement-record control and one qubit target."
-        )
-    if name not in {"CX", "CY", "CZ"}:
-        raise NotImplementedError(
-            f"Stim classical-record-controlled gate {name} is not supported."
-        )
-    record = records[0]
-    # Stim's inverted record target means 'apply when the recorded bit is 0'.
-    expected_bit = 0 if record.is_inverted_result_target else 1
-    axis = {"CX": "X", "CY": "Y", "CZ": "Z"}[name]
-    return (
-        "if",
-        int(record.value),
-        expected_bit,
-        (_stim_unitary_matrix(axis), int(qubits[0].value)),
-    )
 
 
 def compile_stim_circuit(circuit) -> StimCircuitPlan:
@@ -5826,93 +5806,7 @@ def compile_stim_circuit(circuit) -> StimCircuitPlan:
     feed-forward events. General classical arithmetic and record-to-record
     operations remain rejected.
     """
-    if isinstance(circuit, StimCircuitPlan):
-        return circuit
-    stim_circuit = _coerce_stim_circuit(circuit)
-    stim = _require_stim()
-    operations = []
-    detectors = []
-    observables = []
-    measurement_count = 0
-    for instruction_index, instruction in enumerate(stim_circuit.flattened()):
-        name = instruction.name.upper()
-        args = tuple(float(value) for value in instruction.gate_args_copy())
-        if name == "DETECTOR":
-            detectors.append(
-                StimDetector(
-                    instruction_index=instruction_index,
-                    detector_index=len(detectors),
-                    rec_targets=_stim_record_targets(instruction),
-                    coordinates=args,
-                    measurement_count=measurement_count,
-                )
-            )
-            continue
-        if name == "OBSERVABLE_INCLUDE":
-            if len(args) != 1 or int(args[0]) != args[0] or args[0] < 0:
-                raise ValueError(
-                    f"Stim OBSERVABLE_INCLUDE needs one nonnegative integer id: {instruction!s}."
-                )
-            observables.append(
-                StimObservable(
-                    instruction_index=instruction_index,
-                    observable_index=int(args[0]),
-                    rec_targets=_stim_record_targets(instruction),
-                    measurement_count=measurement_count,
-                )
-            )
-            continue
-        if name in _STIM_NOISE_NAMES:
-            targets = (
-                _stim_pauli_targets(instruction)
-                if name in {"E", "ELSE_CORRELATED_ERROR"}
-                else tuple(("I", site) for site in _stim_qubit_targets(instruction))
-            )
-            operations.append(
-                _StimPlanOperation(
-                    instruction_index, name, args, targets, is_noise=True
-                )
-            )
-            continue
-        if name in _STIM_IGNORED_NAMES:
-            continue
-        if any(
-            target.is_measurement_record_target
-            for target in instruction.targets_copy()
-        ):
-            entries = (_compile_stim_classical_control(instruction, name),)
-            operations.append(
-                _StimPlanOperation(instruction_index, name, args, (), entries)
-            )
-            continue
-        if name in _STIM_SINGLE_MEASUREMENTS or name in _STIM_SINGLE_MEASURE_RESETS:
-            entries = _compile_stim_measurement(instruction, name)
-        elif name in _STIM_PAIR_MEASUREMENTS or name == "MPP":
-            entries = _compile_stim_measurement(instruction, name)
-        elif name in _STIM_RESETS:
-            entries = tuple(
-                ("reset", site, _STIM_RESETS[name])
-                for site in _stim_qubit_targets(instruction)
-            )
-        else:
-            gate_data = stim.gate_data(name)
-            if not gate_data.is_unitary:
-                raise NotImplementedError(
-                    f"Stim instruction {instruction!s} is not a supported quantum "
-                    "operation for MPS replay."
-                )
-            entries = _compile_stim_unitary(instruction, name)
-        if name in _STIM_SINGLE_MEASUREMENTS or name in _STIM_SINGLE_MEASURE_RESETS:
-            measurement_count += len(entries)
-        elif name in _STIM_PAIR_MEASUREMENTS or name == "MPP":
-            measurement_count += len(entries)
-        operations.append(_StimPlanOperation(instruction_index, name, args, (), entries))
-    return StimCircuitPlan(
-        int(stim_circuit.num_qubits),
-        tuple(operations),
-        tuple(detectors),
-        tuple(observables),
-    )
+    return _stim_compile.compile_stim_circuit(circuit)
 
 
 def _sample_label(

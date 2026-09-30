@@ -73,8 +73,8 @@ editing the solver or its MpsOptimizer integration.
 
 ## Validation
 
-Activate `/Users/rezah/envs/genpy` before Python commands on the documented Mac
-checkout. Run the smallest relevant tests first, then the MPS/MPO and symmetry
+Activate the environment selected by `AGENTS.md` and any local override.
+Run the smallest relevant tests first, then the MPS/MPO and symmetry
 regressions listed in the architecture reference. Finish with Ruff, docs, and
 the repository's default smoke suite when the change is cross-cutting.
 

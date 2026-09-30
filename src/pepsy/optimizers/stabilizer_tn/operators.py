@@ -17,6 +17,8 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ._backend import array_namespace
+
 _I = np.eye(2, dtype=complex)
 _PAULI = {
     "I": _I,
@@ -29,6 +31,16 @@ _PAULI = {
 def pauli_matrix(axis: str) -> np.ndarray:
     """Return the 2x2 Pauli matrix for ``'I'/'X'/'Y'/'Z'``."""
     return _PAULI[str(axis).upper()]
+
+
+def _backend_paulis(like):
+    """Construct the Pauli basis on the selected device without host staging."""
+    xp = array_namespace(like)
+    identity = ar.do("eye", 2, like=like)
+    one = ar.do("ones", (), like=like)
+    x = xp.flip(identity, 0)
+    z = xp.diag(xp.stack((one, -one)))
+    return xp, {"I": identity, "X": x, "Y": 1j * (x @ z), "Z": z}
 
 
 def _kron_pauli(labels: Sequence[str]) -> np.ndarray:
@@ -199,6 +211,7 @@ def pauli_combo_submpo(
     *,
     dtype: str = "complex128",
     compact_support: bool = False,
+    like=None,
 ):
     """Sub-MPO for ``c I + coef (prod_i P_i)`` placed on its true sites.
 
@@ -209,6 +222,7 @@ def pauli_combo_submpo(
     omitted and the MPO is built only on the active sites. This compact form
     is intended for TreeOptimizer, where the site list is routed over the
     actual Tree geodesic rather than over a fictitious chain interval.
+    ``like`` selects the construction backend, device, and dtype when supplied.
 
     Returns
     -------
@@ -222,7 +236,21 @@ def pauli_combo_submpo(
     axes = [terms.get(i, "I") for i in where]
     w = len(axes)  # >= 2 by contract (single-support handled by the caller)
     arrays = []
+    if like is not None:
+        xp, paulis = _backend_paulis(like)
+        identity = paulis["I"]
+        zero = xp.zeros_like(identity)
     for i, ch in enumerate(axes):
+        if like is not None:
+            pmat = paulis[ch]
+            if i == 0:
+                tensor = xp.stack((identity, pmat))
+            elif i == w - 1:
+                tensor = xp.stack((c * identity, coef * pmat))
+            else:
+                tensor = xp.stack((xp.stack((identity, zero)), xp.stack((zero, pmat))))
+            arrays.append(tensor)
+            continue
         pmat = _PAULI[ch]
         if i == 0:
             t = np.zeros((2, 2, 2), dtype=complex)  # (right, up, down)
@@ -247,6 +275,7 @@ def pauli_sum_submpo(
     *,
     dtype: str = "complex128",
     compact_support: bool = False,
+    like=None,
 ):
     """Windowed sub-MPO for a sparse sum of coefficient-frame Pauli strings.
 
@@ -257,6 +286,7 @@ def pauli_sum_submpo(
     window, as required by a one-dimensional MPS. With
     ``compact_support=True``, it contains only the active sites and is
     suitable for TreeOptimizer's geodesic routing.
+    ``like`` selects the construction backend, device, and dtype when supplied.
 
     Returns
     -------
@@ -292,6 +322,23 @@ def pauli_sum_submpo(
         else tuple(range(lo, hi + 1))
     )
     width = len(where)
+
+    if like is not None:
+        xp, paulis = _backend_paulis(like)
+        rank = len(terms)
+        diagonal = ar.do("eye", rank, like=like) if width > 2 else None
+        arrays = []
+        for j, site in enumerate(where):
+            local = [paulis[sites.get(site, "I")] for _, sites in terms]
+            if j == 0:
+                local = [weight * matrix for (weight, _), matrix in zip(terms, local)]
+            tensor = xp.stack(local)
+            if width == 1:
+                tensor = xp.sum(tensor, axis=0)
+            elif 0 < j < width - 1:
+                tensor = xp.einsum("ab,aij->abij", diagonal, tensor)
+            arrays.append(tensor)
+        return qtn.MatrixProductOperator(arrays, sites=where, L=L, shape="lrud"), where
 
     if width == 1:
         q = where[0]

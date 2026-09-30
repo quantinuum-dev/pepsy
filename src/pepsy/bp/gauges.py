@@ -11,9 +11,11 @@ import autoray as ar
 import numpy as np
 
 from ._symmray import (
+    d2bp_uses_fermionic_operators,
     dense_bp_tn as _dense_bp_tn,
     dense_message_tree as _dense_message_tree,
     from_blocks_compatible as _from_blocks_compatible,
+    fermionic_operator_to_matrix,
     restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     uses_symmray as _uses_symmray,
 )
@@ -506,12 +508,19 @@ def _d2bp_diagonal_message(tn, ix, tid, gauge, *, smudge=0.0):
     # Do not copy the PEPS tensor's dummy modes: these auxiliary density
     # messages are not physical fermion legs and must have no dummy mode.
     message_cls = type(data)
-    return _from_blocks_compatible(
+    message = _from_blocks_compatible(
         message_cls,
         blocks,
         duals=(bond_index.dual, not bond_index.dual),
         phases={},
     )
+    if (
+        hasattr(message, "phase_flip")
+        and bond_index.dual
+        and d2bp_uses_fermionic_operators()
+    ):
+        message = message.phase_flip(0)
+    return message
 
 
 def d2bp_from_simple_update_gauges(
@@ -1749,6 +1758,9 @@ def simple_update_core_and_gauges_from_d2bp(
             m_from_b = _symmray_align_message_to_bond(
                 bp.tn, ix, tidb, m_from_b
             )
+            if d2bp_uses_fermionic_operators():
+                m_from_a = fermionic_operator_to_matrix(m_from_a)
+                m_from_b = fermionic_operator_to_matrix(m_from_b)
         sqrt_a, sqrt_a_inv = _psd_sqrt_and_inverse(
             m_from_a,
             smudge=smudge,

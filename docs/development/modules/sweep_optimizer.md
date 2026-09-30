@@ -16,16 +16,22 @@ build_bra_ket(...) -> BdyMPS(...) -> CompBdy.move_bdy/move_step_bdy(...)
 ```
 
 `boundary_engine="quimb-mps"` uses Quimb MPS environments for local row/column
-boundaries. At the start of each half-sweep it computes the opposite-side
-environments once, then moves the active boundary one row or column at a time
-and caches it. The adapter lives in `environments.py` and exposes the legacy
-surface expected by the current local objective:
+boundaries. The first half-sweep computes the opposite-side environments once;
+subsequent alternating half-sweeps reuse that static side because the moving
+side has already rebuilt it from the updated planes. Each active boundary then
+moves one row or column at a time and is cached. The adapter lives in
+`environments.py` and exposes the legacy surface expected by the current local
+objective:
 
 - `mps_b`
 - `chi`
 - `expand_bnd(...)`
 - `normalize()`
 - `norm`
+
+Call `store.clear("x")`, `store.clear("y")`, or `store.clear()` after an
+external tensor-network mutation when the cached environments should no longer
+be reused.
 
 `boundary_engine="auto"` keeps dense inputs on the Pepsy path and routes
 Symmray-looking inputs to Quimb MPS.

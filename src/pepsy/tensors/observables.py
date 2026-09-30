@@ -7,10 +7,210 @@ from string import Formatter
 from typing import Any
 
 import autoray as ar
+import numpy as np
 
+from ..backends import get_torch_linalg_config, to_float
 from .contractions import build_optimizer, tn_norm
 
-__all__ = ["measure_obs", "tn_fidelity"]
+__all__ = ["measure_obs", "mps_entanglement_entropy", "tn_fidelity"]
+
+
+def _is_symmray_array(value):
+    """Return whether ``value`` is a native Symmray block-sparse array."""
+    try:
+        return ar.infer_backend(value) == "symmray"
+    except (AttributeError, TypeError):
+        return hasattr(value, "blocks") and hasattr(value, "indices")
+
+
+def _normalize_mps_entropy_method(method):
+    """Normalize the supported MPS Schmidt-spectrum decomposition method."""
+    method = str(method).strip().lower().replace("_", ":")
+    if method == "eig":
+        method = "svd:eig"
+    if method not in {"svd", "svd:eig"}:
+        raise ValueError("MPS entropy method must be 'svd', 'eig', or 'svd:eig'.")
+    return method
+
+
+def _copy_mps_for_entropy(mps):
+    """Copy MPS data and metadata before a diagnostic canonicalization sweep."""
+    work = mps.copy()
+
+    def copy_block(block):
+        if ar.infer_backend(block) == "torch":
+            block = block.detach()
+        return ar.do("copy", block)
+
+    for tensor in work.tensors:
+        data = tensor.data
+        if _is_symmray_array(data):
+            data = data.copy_with(
+                blocks={key: copy_block(block) for key, block in data.blocks.items()}
+            )
+        else:
+            data = copy_block(data)
+        # Ignore possibly stale source isometry metadata during the diagnostic
+        # sweep. The source MPS and its canonical metadata remain untouched.
+        tensor.modify(data=data, left_inds=None)
+    if hasattr(work, "exponent"):
+        work.exponent = 0.0
+    return work
+
+
+def _mps_bond_singular_values(mps, cut, *, method):
+    """Extract the Schmidt values at ``cut`` from a private canonical MPS."""
+    info = {"cur_orthog": "calc"}
+    mps.canonicalize_(cut, info=info)
+    center = mps[cut]
+    previous = mps[cut - 1]
+    left_inds = tuple(ind for ind in center.inds if ind in previous.inds)
+    if len(left_inds) != 1:
+        raise ValueError("MPS entropy requires one incoming bond at the selected cut.")
+    right_inds = tuple(ind for ind in center.inds if ind not in left_inds)
+    transposed = center.transpose(*left_inds, *right_inds)
+    matrix = ar.do(
+        "fuse",
+        transposed.data,
+        range(len(left_inds)),
+        range(len(left_inds), len(transposed.inds)),
+    )
+
+    if _is_symmray_array(matrix):
+        if method == "svd:eig":
+            return matrix.svd_via_eig(
+                absorb=None,
+                max_bond=-1,
+                cutoff=-1.0,
+            )[1]
+        return matrix.svd(
+            absorb=None,
+            max_bond=-1,
+            cutoff=-1.0,
+        )[1]
+
+    if method == "svd:eig":
+        rows, cols = tuple(matrix.shape)
+        if rows <= cols:
+            gram = ar.do(
+                "matmul",
+                matrix,
+                ar.do("transpose", ar.do("conj", matrix)),
+            )
+        else:
+            gram = ar.do(
+                "matmul",
+                ar.do("transpose", ar.do("conj", matrix)),
+                matrix,
+            )
+        eig_result = ar.do("linalg.eigh", gram)
+        eigenvalues = (
+            eig_result.eigenvalues
+            if hasattr(eig_result, "eigenvalues")
+            else eig_result[0]
+        )
+        eigenvalues = ar.do("where", eigenvalues > 0.0, eigenvalues, 0.0)
+        return ar.do("flip", ar.do("sqrt", eigenvalues), axis=0)
+
+    backend = ar.infer_backend(matrix)
+    if backend == "torch":
+        # ``svdvals`` keeps the decomposition native and avoids allocating U
+        # and Vh. Apply the active Pepsy CUDA driver when configured; Torch
+        # rejects ``driver=`` for CPU tensors. Deliberately customized CPU or
+        # stabilized policies use the registered full-SVD wrapper instead.
+        config = get_torch_linalg_config()
+        use_native_values = config is None or (
+            not config.stabilized and config.cpu_svd == "torch"
+        )
+        if use_native_values:
+            svd_kwargs = {}
+            driver = None if config is None else config.svd_driver
+            if getattr(matrix, "is_cuda", False) and driver not in {None, "auto"}:
+                svd_kwargs["driver"] = driver
+            return ar.do("linalg.svdvals", matrix, **svd_kwargs)
+
+    try:
+        return ar.do(
+            "linalg.svd",
+            matrix,
+            full_matrices=False,
+            compute_uv=False,
+        )
+    except TypeError:
+        return ar.do("linalg.svd", matrix, full_matrices=False)[1]
+
+
+def _entropy_from_singular_values(singular_values):
+    """Reduce a backend-native Schmidt spectrum to normalized base-2 entropy."""
+    if hasattr(singular_values, "to_dense"):
+        singular_values = singular_values.to_dense()
+    weights = ar.do("abs", singular_values) ** 2
+    total = ar.do("sum", weights)
+    # Keep normalization and the zero-norm branch on the active backend. This
+    # avoids an intermediate scalar readback (and GPU synchronization) before
+    # the final Python result is requested.
+    safe_total = ar.do("where", total > 0.0, total, 1.0)
+    probabilities = weights / safe_total
+    # Keep zero entries backend-native while avoiding 0 * log2(0).
+    safe_probabilities = ar.do(
+        "where", probabilities > 0.0, probabilities, 1.0,
+    )
+    value = -ar.do(
+        "sum",
+        probabilities * ar.do("log2", safe_probabilities),
+    )
+    value = to_float(value, real=True)
+    if not np.isfinite(value):
+        raise ValueError("MPS entropy requires a finite state norm and result.")
+    return max(0.0, value)
+
+
+def mps_entanglement_entropy(mps, cut=None, *, method="svd"):
+    """Measure normalized base-2 entropy across one open-MPS bond.
+
+    Parameters
+    ----------
+    mps : quimb.tensor.MatrixProductState
+        Open-boundary MPS to measure. The input tensors, exponent, and
+        canonical metadata are preserved.
+    cut : int | None, optional
+        Bipartition index, with sites ``0 .. cut - 1`` on the left. ``None``
+        selects the middle cut ``mps.L // 2``.
+    method : {"svd", "eig", "svd:eig"}, default="svd"
+        Backend-native decomposition method. ``"eig"`` is an alias for
+        ``"svd:eig"`` and uses the smaller Gram matrix.
+
+    Returns
+    -------
+    float
+        Von Neumann entropy in bits.
+
+    Notes
+    -----
+    Canonicalization and the local SVD run on a private copy. Dense Torch and
+    CuPy tensors stay on their original device through Autoray/native linalg;
+    native Symmray spectra use their sector-aware SVD. Only scalar reductions
+    are read back for this Python ``float`` result. Cyclic MPSs are rejected
+    because their loop environment has no single open-chain Schmidt cut.
+    """
+    if not hasattr(mps, "L") or not hasattr(mps, "canonicalize_"):
+        raise TypeError("mps must be an open Quimb MatrixProductState.")
+    if getattr(mps, "cyclic", False):
+        raise ValueError("mps_entanglement_entropy requires an open MPS.")
+    n_sites = int(mps.L)
+    if n_sites < 2:
+        raise ValueError("mps_entanglement_entropy requires at least two sites.")
+    if cut is None:
+        cut = n_sites // 2
+    elif isinstance(cut, bool) or not isinstance(cut, Integral):
+        raise TypeError("cut must be an integer bipartition index.")
+    cut = int(cut)
+    if not 0 < cut < n_sites:
+        raise ValueError(f"cut must satisfy 0 < cut < {n_sites}, got {cut}.")
+    method = _normalize_mps_entropy_method(method)
+    work = _copy_mps_for_entropy(mps)
+    singular_values = _mps_bond_singular_values(work, cut, method=method)
+    return _entropy_from_singular_values(singular_values)
 
 def _count_format_fields(fmt):
     return sum(field is not None for _, field, _, _ in Formatter().parse(fmt))

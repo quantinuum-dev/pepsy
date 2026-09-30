@@ -4,23 +4,26 @@ from importlib import import_module
 
 
 _SYMBOL_MODULES = {
-    "FermionConfigurationEncoding": ".samplers",
-    "MpsDiagonalEstimate": ".samplers",
-    "MpsBatchSampleResult": ".samplers",
-    "MpsSampleResult": ".samplers",
-    "MpsSampler": ".samplers",
-    "MpsStabSampler": ".stabilizer",
-    "PEPSSampleResult": ".samplers",
-    "PepsSampler": ".samplers",
-    "PepsBpSampler": ".samplers",
+    "FermionConfigurationEncoding": ".results",
+    "MpsDiagonalEstimate": ".results",
+    "MpsBatchSampleResult": ".results",
+    "MpsSampleResult": ".results",
+    "MpsSampler": ".mps",
+    "StabilizerMpsSampler": ".stabilizer",
+    "PEPSSampleResult": ".results",
+    "PepsSampler": ".peps",
+    "PepsBpSampler": ".bp",
     "TreeBatchSampleResult": ".tree",
     "TreeSampleResult": ".tree",
     "TreeSampler": ".tree",
-    "StabilizerMpsSampler": ".stabilizer",
-    "VecSampler": ".samplers",
+    "VecSampler": ".vector",
 }
 
 __all__ = [*_SYMBOL_MODULES, "tree"]
+
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
 
 
 def __getattr__(name):

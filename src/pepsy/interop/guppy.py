@@ -63,7 +63,7 @@ class GuppyGateStream(list):
 
     The object is intentionally a ``list`` subclass, so it can be passed
     directly to ``MpsOptimizer``, ``MpoOptimizer``, ``PepsOptimizer``, or
-    ``MpsStabOptimizer``.  ``n_qubits`` is the number of statically allocated
+    ``StabilizerMpsSimulator``.  ``n_qubits`` is the number of statically allocated
     qubits (all start in ``|0>`` for Pepsy's product-state constructors).
     """
 
@@ -240,7 +240,7 @@ def _named_entry(name: str, sites: tuple[int, ...], theta: float | None):
         return ("sqrt_x", sites[0])
     if name == "Vdg":
         return ("sqrt_x_dag", sites[0])
-    # MpsStabOptimizer accepts dense matrices as well, which is the safest
+    # StabilizerMpsSimulator accepts dense matrices as well, which is the safest
     # representation for Toffoli and controlled rotations.
     return (_matrix_gate(name, theta), sites)
 
@@ -269,10 +269,10 @@ def guppy_gate_stream(
     program
         A Guppy definition (normally decorated with ``@guppy``) or its HUGR
         ``Package``.  Guppy itself is an optional dependency; install it with
-        ``pip install 'pepsy[guppy]'``.
+        ``python -m pip install '.[guppy]'`` from a Pepsy checkout.
     format : {"matrix", "named"}, default="matrix"
         ``"matrix"`` is accepted by dense MPS/MPO/PEPS optimizers and by
-        ``MpsStabOptimizer``.  ``"named"`` uses Pepsy's compact named entries
+        ``StabilizerMpsSimulator``.  ``"named"`` uses Pepsy's compact named entries
         where possible and is convenient for stabilizer replay; operations
         without an exact named equivalent remain dense matrices.
 

@@ -1,6 +1,6 @@
 # Simulate magic circuits with STN
 
-`MpsStabOptimizer` represents a state as `|psi> = C |nu>`: a Clifford tableau
+`StabilizerMpsSimulator` represents a state as `|psi> = C |nu>`: a Clifford tableau
 `C` plus a coefficient MPS `|nu>`. Clifford gates change `C` and do not grow
 `|nu>`. The choices below control the work caused by non-Clifford rotations.
 
@@ -18,10 +18,10 @@ not a collection of SVD trials. It is cheap enough to leave on in ordinary
 simulation. It simply does nothing when the required pivot is absent.
 
 ```python
-from pepsy.optimizers import MpsStabOptimizer
+from pepsy.optimizers import StabilizerMpsSimulator
 from pepsy.optimizers.stabilizer_tn import run_stabilizer_mps_stream
 
-sim = MpsStabOptimizer(n_qubits, chi=64, exact_cooling=True)
+sim = StabilizerMpsSimulator(n_qubits, chi=64, exact_cooling=True)
 sim.apply(circuit)
 print(sim.exact_cooling_events)  # Empty when no rotation met the exact condition.
 ```
@@ -67,7 +67,7 @@ their magic resource has the same non-Clifford cost as applying the rotation.
 The broad advisor works directly on a Pepsy stream, independent of Stim:
 
 ```python
-advice = MpsStabOptimizer.recommend_settings(
+advice = StabilizerMpsSimulator.recommend_settings(
     circuit,
     n_qubits=n_qubits,
     ancilla_budget=1,
@@ -103,7 +103,7 @@ settings, replay/projection time, measurements, and injection reports.
 Use the gate stream to make the first decision without running the circuit:
 
 ```python
-advice = MpsStabOptimizer.recommend_magic_strategy(
+advice = StabilizerMpsSimulator.recommend_magic_strategy(
     circuit,
     ancilla_budget=1,
     prioritize_peak_bond=False,
@@ -126,7 +126,7 @@ Stim is just a parsing/onboarding adapter here; the queued Pepsy stream is what
 the advisor inspects:
 
 ```python
-sim = MpsStabOptimizer.from_stim(
+sim = StabilizerMpsSimulator.from_stim(
     stim_circuit,
     stream_transform=lambda stream: [*stream, ("t", 0)],
 )
@@ -144,7 +144,7 @@ its gate is teleported, resets it before reuse, and returns used ancillas to
 `|0>` at the end, so one ancilla can serve the full circuit.
 
 ```python
-sim = MpsStabOptimizer.with_injection(
+sim = StabilizerMpsSimulator.with_injection(
     n_data,
     circuit,
     n_ancilla=1,
@@ -171,7 +171,7 @@ physical basis-updating magic-register projections only after the circuit has
 finished.
 
 ```python
-sim = MpsStabOptimizer.with_deferred_injection(
+sim = StabilizerMpsSimulator.with_deferred_injection(
     n_data,
     circuit,
     chi=64,

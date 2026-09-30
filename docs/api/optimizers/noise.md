@@ -5,6 +5,41 @@ where the hardware schedule says the channel acts, then choose trajectory
 sampling settings (`shots`, `seed`, independent/coalesced replay, and
 `run_kwargs`) at the runner.
 
+## Choose the workflow and interpret its result
+
+| Need | Entry point | Retained state unit |
+| --- | --- | --- |
+| Stochastic entries or custom channels | `run_trajectory_shots` | One state per shot for independent replay, or one per coalesced leaf |
+| Uniform post-gate Pauli faults | `run_noisy_shots` with `PauliErrorModel` | Independent shots |
+| Stim circuit input | `compile_stim_circuit`, then `run_stim_shots` | Independent shots with detector/observable records |
+| Shared noisy prefixes | `run_coalesced_trajectory_shots` / `run_coalesced_stim_shots` | One state per leaf, with a shot count |
+| Existing prepared optimizer | Shot-aware `optimizer.run(shots=...)` | `NoisyResult` wraps independent or coalesced storage |
+
+These functions are available from `pepsy.optimizers.noise`. Compile a Stim
+plan once and reuse it across runs. Compilation translates circuit syntax;
+the runner makes random choices and evolves optimizer state. Stim is an
+optional dependency loaded when compiling circuit input.
+
+With retained results, `estimate(values)` expects one real scalar per stored
+state: per shot for independent replay, per leaf for coalesced replay.
+For independent trajectories it computes `sum(weight * value) / shots`;
+for coalesced leaves it computes `sum(count * weight * value) / shots`.
+The denominator is the represented shot count, not the sum of weights.
+Weights are target/proposal likelihood ratios, equal to one for ordinary
+unbiased draws. `effective_sample_size` accounts for those ratios and leaf
+counts; it is not an error bar. An empty estimate returns NaN.
+
+`NoisyResult.optimizers`, `counts`, and `weights` are aligned by retained
+state. `shots` can exceed their length when branches are coalesced, and
+retention settings can omit data. Use `retain="all"` when inspecting replay
+history. Terminal bit samples have a separate row per sampled shot; their
+`leaf_indices` identify the source branch.
+
+Jump to [MPS shots](#shot-aware-mpsoptimizer-api),
+[coalesced ensembles](#exact-coalesced-ensembles-for-rare-noise),
+[MPI](#mpi-shot-ensembles), or
+[custom channels](#user-defined-quantum-trajectories).
+
 ```python
 stream = [
     ("h", 0),
@@ -16,7 +51,7 @@ stream = [
 ]
 
 result = pepsy.run_coalesced_trajectory_shots(
-    lambda: pepsy.MpsStabOptimizer(2, chi=64),
+    lambda: pepsy.StabilizerMpsSimulator(2, chi=64),
     stream,
     shots=10_000,
     seed=7,
@@ -27,7 +62,7 @@ Equivalently, select the sampling strategy on the trajectory runner:
 
 ```python
 result = pepsy.run_trajectory_shots(
-    lambda: pepsy.MpsStabOptimizer(2, chi=64),
+    lambda: pepsy.StabilizerMpsSimulator(2, chi=64),
     stream,
     shots=10_000,
     seed=7,
@@ -36,7 +71,7 @@ result = pepsy.run_trajectory_shots(
 )
 ```
 
-Supported first-cut stochastic entries are:
+Supported stochastic entries are:
 
 - `("x_error", p, q)`, `("y_error", p, q)`, `("z_error", p, q)`
 - `("depolarize1", p, q)`, `("depolarize2", p, q0, q1)`
@@ -67,11 +102,18 @@ leaked-qubit measurement as bit `1`. The sampled diagnostics live in
 streams support independent and coalesced replay; coalescing branches only when
 the classical leakage outcome changes the represented state.
 
+An MPS `cap` is a structural boundary in both strategies. It always removes
+the selected site, including a leaked site's placeholder, then removes that
+site's leakage flag and shifts higher logical labels down by one. Subsequent
+gate suppression, reset, and measurement use those updated labels. Conditional
+caps apply this update only to the selected branches; persistent layouts still
+reject caps, while `perm` maintains its shortened logical mapping.
+
 `PauliErrorModel` remains a convenience macro for clean deterministic streams.
 It samples independent **physical Pauli trajectories**, not a density matrix.
 Each non-identity X/Y/Z fault is inserted into a concrete gate stream after every
 target of an ordinary gate. The resulting stream can be replayed by either
-`MpsOptimizer` or `MpsStabOptimizer`; for STN, every sampled fault is a Clifford
+`MpsOptimizer` or `StabilizerMpsSimulator`; for STN, every sampled fault is a Clifford
 that is absorbed by the Stim tableau. Do not mix this macro with stream-local
 stochastic entries; use `run_trajectory_shots(...)` or
 `run_coalesced_trajectory_shots(...)` when the stream already contains noise.
@@ -81,7 +123,7 @@ import pepsy
 
 noise = pepsy.PauliErrorModel.depolarizing(1e-3)
 result = pepsy.run_noisy_shots(
-    lambda: pepsy.MpsStabOptimizer(6, chi=32),
+    lambda: pepsy.StabilizerMpsSimulator(6, chi=32),
     gates,
     noise,
     shots=1_000,
@@ -97,7 +139,7 @@ fresh state for every shot:
 
 ```python
 result = pepsy.run_noisy_shots(
-    lambda: pepsy.MpsOptimizer(initial_mps, chi=64, mode="mpo"),
+    lambda: pepsy.MpsOptimizer(initial_mps, chi=64, mode="direct"),
     gates,
     pepsy.PauliErrorModel.bit_flip(0.01),
     shots=100,
@@ -122,7 +164,7 @@ simulator = pepsy.MpsOptimizer(
     initial_mps,
     gate_stream,
     chi=64,
-    mode="mpo",
+    mode="direct",  # default compression algorithm
 )
 result = simulator.run(
     shots=10_000,
@@ -185,7 +227,7 @@ and copies an MPS only when two nonempty branches genuinely diverge:
 
 ```python
 result = pepsy.run_coalesced_noisy_shots(
-    lambda: pepsy.MpsStabOptimizer(6, chi=32),
+    lambda: pepsy.StabilizerMpsSimulator(6, chi=32),
     gates,
     pepsy.PauliErrorModel.depolarizing(1e-3),
     shots=100_000,
@@ -205,6 +247,24 @@ leakage, and mid-circuit controls. It branches `measure`, `reset`, and
 can change the pure state. Product-state resets use a one-leaf fast path; leaf
 `measurements` records selected projective outcomes.
 
+For ordinary MPS states, the reset fast path requires dimension-one bonds on
+both sides of the logical target (after layout mapping). A numerical purity
+tolerance cannot discard rare entangled outcomes. A product state with larger,
+redundant bonds may therefore retain separate equivalent leaves. Leakage of an
+entangled site also branches its hidden reset outcome before marking the
+placeholder leaked. Branch limits count all live leaves, including retained
+siblings and parents awaiting processing.
+
+Canonical MPS Kraus probabilities use local Gram-operator expectations with
+the optimizer's tracked center. Control norms use that center and the stored
+exponent; exact and simple-update states retain their general norm paths.
+Ordinary tree Kraus probabilities likewise use exact local expectations of
+`K.conj().T @ K` on a private TTN wrapper. Probability evaluation does not
+compress trial branches or apply unitary stabilization, and the common stored
+exponent cancels from the ratios. Only the selected branch is replayed with
+the requested direct/DMRG settings, then physically normalized, including
+very small positive branches selected by importance sampling.
+
 Every trajectory result exposes a lightweight `diagnostics` summary:
 
 ```python
@@ -214,9 +274,10 @@ print(result.diagnostics.used_kraus_copy_fallback)
 
 `max_kraus_probability_residual` is the largest deviation of the raw Kraus
 branch probabilities from one before the sampler normalizes them. A small
-residual is expected from finite-bond truncation; a large residual indicates
-that the channel, local contraction, or compression settings should be
-checked.
+residual can arise from floating-point contraction error; a large residual
+indicates that the channel or probability calculation should be checked.
+The exact local MPS/tree probability paths do not include trial-branch
+truncation in these weights.
 
 This is normally more useful than `torch.vmap` for rare faults: after a fault
 or collapse, states have different tensor data and often different bond
@@ -232,6 +293,15 @@ assert samples.shots == result.shots
 # samples.configs: (shots, n) computational-basis rows
 # samples.leaf_indices: source coalesced leaf for each row
 ```
+
+Conditional caps can leave different register lengths across leaves. In that
+case `samples.configs` has width equal to the longest surviving register and
+pads shorter rows on the right with `-1`. `samples.lengths[row]` gives the valid
+prefix length, so use `samples.configs[row, :samples.lengths[row]]` for measured
+bits. Columns use each leaf's current logical numbering after its caps, not
+the original register labels. Lengths, leaf indices, and probabilities remain
+aligned when rows are shuffled. Uniform-length batches keep their previous
+configuration values and shape, and also expose `lengths`.
 
 ### Conservative automatic strategy
 
@@ -344,14 +414,14 @@ expect an explicit `"independent"` or `"coalesced"` strategy.
 
 Use `MPIShotRunner` when the shot ensemble should be distributed across MPI
 processes. It is an orchestration layer rather than another optimizer, so the
-same factory works for `MpsOptimizer`, `MpsStabOptimizer`, `TreeOptimizer`,
-and `TreeStabOptimizer`:
+same factory works for `MpsOptimizer`, `StabilizerMpsSimulator`, `TreeOptimizer`,
+and `StabilizerTreeSimulator`:
 
 ```python
 import pepsy
 
 runner = pepsy.MPIShotRunner(
-    lambda: pepsy.MpsStabOptimizer(32, chi=64),
+    lambda: pepsy.StabilizerMpsSimulator(32, chi=64),
     noisy_stream,
 )
 result = runner.run(
@@ -365,7 +435,7 @@ For a single ensemble, `run_mpi_shots` is the concise equivalent:
 
 ```python
 result = pepsy.run_mpi_shots(
-    lambda: pepsy.MpsStabOptimizer(32, chi=64),
+    lambda: pepsy.StabilizerMpsSimulator(32, chi=64),
     noisy_stream,
     shots=1_000_000,
     seed=7,
@@ -392,11 +462,11 @@ an observable:
 
 Independent MPI execution supports all four optimizer families. Coalesced
 execution additionally requires the backend's trajectory-copy contract; the
-current coalesced backends are `MpsOptimizer`, `MpsStabOptimizer`, and
-`TreeOptimizer`. Use independent MPI execution for `TreeStabOptimizer`.
+current coalesced backends are `MpsOptimizer`, `StabilizerMpsSimulator`, and
+`TreeOptimizer`. Use independent MPI execution for `StabilizerTreeSimulator`.
 
 The same orchestration is available directly from `MpsOptimizer.run`,
-`MpsStabOptimizer.run`, `TreeOptimizer.run`, and `TreeStabOptimizer.run` by
+`StabilizerMpsSimulator.run`, `TreeOptimizer.run`, and `StabilizerTreeSimulator.run` by
 passing `shots=...` and `mpi=...`. Direct calls create fresh per-shot copies
 from the current optimizer state and leave the caller's state and queued
 stream unchanged. Use `MPIShotRunner` when the factory/stream needs to be
@@ -442,32 +512,16 @@ rank-zero aggregate bar for independent ordinary, streaming, and checkpointed
 runs; coalesced runs intentionally suppress shot-level progress because their
 work is branch-based rather than one optimizer per shot.
 
-For rank-scaling measurements, use the repository benchmark script and vary
-only the MPI process count between runs:
+For rank-scaling measurements, call `MPIShotRunner.run` from the workload you
+intend to measure and vary only the MPI process count between runs. Record the
+slowest-rank wall time and global completed-shot count. Use
+`local_workers=1` for a process-only baseline and compare independent and local
+coalesced execution separately; coalescing is not rank-count invariant.
 
-```bash
-mpiexec --oversubscribe -n 4 python benchmarks/mpi_shots.py \
-  --shots 10000 --qubits 16 --depth 8
-```
-
-The script defaults to `--workers auto` and reports the slowest-rank wall time
-and global shots per second. Pass `--workers 1` for a process-only baseline.
-Compare independent and local coalesced execution separately; coalescing is
-not rank-count invariant.
-
-For a multi-node Slurm allocation, the repository includes a launcher smoke
-template:
-
-```bash
-sbatch benchmarks/mpi_slurm.sh
-```
-
-It uses `srun` and the cluster's configured PMI/PMIx transport. Set
-`PEPSY_MPI_SHOTS`, `PEPSY_MPI_QUBITS`, `PEPSY_MPI_DEPTH`,
-`PEPSY_MPI_WORKERS`, or `PEPSY_MPI_STRATEGY` in the batch environment to adjust
-the workload; the
-script assumes Pepsy and its MPI-enabled Python environment are already
-available on every node.
+On a scheduler, launch that workload with the site's supported MPI transport
+and ensure Pepsy and its MPI-enabled Python environment are available on every
+node. The repository's multi-process integration tests validate the API
+contract without prescribing a cluster-specific launcher.
 
 ### Resuming a streaming run
 
@@ -535,8 +589,10 @@ A resumed result exposes `resumed=True`, keeps the prefix in
 `result.checkpoint_path`, and publishes one `MPIRankDiagnostics` record per
 rank through `result.rank_diagnostics` with shot ownership and elapsed time.
 Set `checkpoint_sync=False` only when an external filesystem policy provides
-the required durability; set `collect_diagnostics=False` to skip the final
-diagnostics gather on very large communicators.
+the required durability; set `collect_diagnostics=False` to skip profiling
+clock reads and the final diagnostics gather on very large communicators.
+The `MpsOptimizer.run` facade defaults this option to `False`; enable it
+explicitly to obtain the rank summaries described above.
 After a successful run, call `result.cleanup_checkpoints()` collectively on
 all ranks when the files are no longer needed.
 
@@ -544,7 +600,7 @@ all ranks when the files are no longer needed.
 
 `TrajectoryEvent` is the general independent noise-simulation interface. Put
 one directly inside an ordinary gate stream and run independently sampled shots
-with `MpsOptimizer`, `TreeOptimizer`, or `MpsStabOptimizer`. It does not require
+with `MpsOptimizer`, `TreeOptimizer`, or `StabilizerMpsSimulator`. It does not require
 Stim or a density matrix.
 
 Use a `mixture` for a user-defined random-unitary channel. Its outcomes have
@@ -578,7 +634,7 @@ stream = [
     (pepsy.h(), 0),
 ]
 result = pepsy.run_trajectory_shots(
-    lambda: pepsy.MpsStabOptimizer(1, chi=32),
+    lambda: pepsy.StabilizerMpsSimulator(1, chi=32),
     stream,
     shots=10_000,
     seed=7,
@@ -594,15 +650,21 @@ one- or multi-qubit `TrajectoryEvent` support. For ordinary MPS or TTN replay,
 replace the factory above with a fresh `MpsOptimizer(initial_mps, ...)` or
 `TreeOptimizer(...)` and pass its usual options through `run_kwargs`.
 
+Tree FIT controls such as `fit_n_iter` are constructor settings, rather than
+`run_kwargs` entries. The default is at most four iterations per fitted gate
+window, each with two directional passes; see [tree FIT controls](tree_fit.md)
+for early stopping and the single-node shortcut. Read the actual count with
+`optimizer.get_fit_diagnostics()["iterations"]` after a fitted update.
+
 For ordinary `MpsOptimizer`, Kraus normalization is tracked automatically in
 the optimizer's norm-survival ledger. The selected branch event retains its
 Born `branch_probability` and is marked as a `physical_boundary`; the expected
 norm includes that probability, so physical renormalization is not reported as
 compression infidelity. Inspect `optimizer.norm_diagnostics()` and
 `optimizer.get_norm_events()` after independent or coalesced replay. Fidelity
-tracking is automatic for `MpsStabOptimizer`; no tracking flag is needed.
+tracking is automatic for `StabilizerMpsSimulator`; no tracking flag is needed.
 
-For `MpsStabOptimizer`, a selected Kraus outcome is a
+For `StabilizerMpsSimulator`, a selected Kraus outcome is a
 normalized trajectory boundary, just like a measurement/reset: its Born weight
 is retained in the trajectory record but is not treated as compression loss.
 `sim.norm_diagnostics()["norm"]` is the square root of the product of all
@@ -626,7 +688,7 @@ HERALDED_PAULI_CHANNEL_1(0, 0, 0, 0.02) 0
 """
 
 result = pepsy.run_stim_shots(
-    lambda: pepsy.MpsStabOptimizer(2), circuit, shots=10_000, seed=7,
+    lambda: pepsy.StabilizerMpsSimulator(2), circuit, shots=10_000, seed=7,
 )
 print(result.faults[0])
 print(result.heralds[0])
@@ -649,6 +711,10 @@ available directly. In a hand-written stream, `("if", record, bit, action)`
 uses computational bits (`+1 -> 0`, `-1 -> 1`), with negative records counting
 back from the latest measurement. Independent and coalesced trajectory replay
 resolve the predicate separately for every shot/leaf before applying `action`.
+Selected actions inherit the configured replay/FIT settings. Trajectory
+runners retain the concrete executed action rather than both an action and its
+conditional wrapper; nested conditional controls use normal measurement,
+reset, and cap handling, including coalesced branching and leakage updates.
 The `PauliErrorModel` convenience macro treats the conditional wrapper as a
 control event and automatically samples ordinary named or matrix gate actions
 only on the branch where the predicate is true. Conditional measurements,
@@ -680,8 +746,8 @@ noisy_stream = model.transform(gates, seed=7)
 ```
 
 For coherent-noise and QEC studies, both STN frontends provide
-`MpsStabOptimizer.truncation_convergence(...)` and
-`TreeStabOptimizer.truncation_convergence(...)`. They replay the same stream
+`StabilizerMpsSimulator.truncation_convergence(...)` and
+`StabilizerTreeSimulator.truncation_convergence(...)`. They replay the same stream
 at several `chi` values and report peak bond, norm diagnostics, and an
 optional observable. `chi=None` is the lossless reference up to the configured
 cutoff.
@@ -691,6 +757,3 @@ For an end-to-end repeated-check validation, use the public
 `run_stabilizer_tree_stream` APIs directly. Keep performance experiments in
 the external benchmark workspace so the package remains focused on reusable
 simulation APIs.
-
-
-> API details are maintained as handwritten Markdown in this page.

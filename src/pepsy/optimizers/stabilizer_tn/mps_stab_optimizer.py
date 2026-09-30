@@ -1,4 +1,4 @@
-"""``MpsStabOptimizer``: an ``MpsOptimizer``-style gate-stream simulator for STN.
+"""``StabilizerMpsSimulator``: an ``MpsOptimizer``-style gate-stream simulator for STN.
 
 Analogous to :class:`pepsy.MpsOptimizer`, but the state is a *stabilizer tensor
 network*: a stim tableau (basis ``B(S, D)``) times a coefficient MPS ``|nu>``
@@ -50,8 +50,10 @@ from __future__ import annotations
 import math
 import time
 import warnings
+from contextlib import contextmanager
 from copy import deepcopy
 from collections.abc import Mapping
+from dataclasses import replace
 from numbers import Integral
 from typing import List, Optional
 
@@ -60,26 +62,37 @@ import numpy as np
 import quimb.tensor as qtn
 
 from ...backends import (
+    to_float,
     backend_infer,
     backend_signatures_compatible,
     infer_backend_converter_from_sample,
     infer_backend_signature,
 )
 from ...fitting.local import FIT
-from ..._internal.random import backend_random_array
+from ..._internal.cutoff import dtype_auto_cutoff, resolve_fit_rtol
+from ..._internal.random import fit_random_array
+from ..._internal.quimb import (
+    require_quimb_1d_compression_method as _require_quimb_compression_method,
+    run_seeded_quimb as _run_seeded_quimb,
+)
 from .._fidelity import (
     fidelity_from_log,
     infidelity_from_log,
     log_fidelity_from_norms,
 )
-from ..mps.layout import MpsGateStreamLayoutFinder
-from ..mps.optimizer import (
+from ._backend import (
+    compression_event, diagnostic_scalar, scalar_to_host,
+    stabilizer_product_eigenstate,
+)
+from ..mps.compression import (
     _MPO_COMPRESSION_METHODS,
+    _MPO_METHODS_IGNORE_CUTOFF_MODE,
     _MPO_METHODS_IGNORE_CUTOFF,
     _MPO_METHODS_NEED_INTERIOR_WORKAROUND,
     _MPO_METHODS_USE_SEED,
     _apply_submpo_with_interior_workaround,
-    _run_seeded_quimb,
+)
+from .._stream_events import (
     _resolve_conditional,
     conditional_event_parts,
     is_submpo_event,
@@ -90,8 +103,6 @@ from .operators import (
     pauli_decomposition,
     pauli_matrix,
     pauli_sum_submpo,
-    single_qubit_combo_matrix,
-    single_qubit_rotation_matrix,
 )
 from .dense import _as_gate_matrix, _is_unitary, _tableau_from_exact_unitary
 from .paulis import (
@@ -116,6 +127,50 @@ from .settings import (
 )
 from .stn_state import STNState, _tableau_gate_stream, _validate_bits
 
+from ._stream_helpers import (  # noqa: F401 -- historical aliases
+    _CLIFFORD_NAMES,
+    _ROTATION_AXES,
+    _ROTATION_AXES_2Q,
+    _RESET_FLIP_CLIFFORDS,
+    _RESET_AXIS_ALIASES,
+    _MR_ALIASES,
+    _MR_AXIS_ALIASES,
+    _H_MAT,
+    _I2,
+    _SDG_MAT,
+    _CNOT_MAT,
+    _S_MAT,
+    _TWO_Q_CLIFFORD_REPS,
+    _normalize_event_name,
+    _normalize_sites,
+    _normalize_measurement_order,
+    _unique_ordered,
+    _layout_angle_weight,
+    _operator_schmidt_tail_weight,
+    _dense_operator_schmidt_layout_weight,
+    _submpo_operator_layout_weight,
+    _is_axis_string,
+    _normalize_pauli_axes,
+    _normalize_outcomes,
+    _validate_forced_outcome,
+    _parse_reset_args,
+    _parse_measure_reset_args,
+    _normalize_absorb,
+    _cnot_matrix,
+    _two_qubit_tableau_unitary,
+    _two_qubit_clifford_representatives,
+    _localizing_clifford,
+    _zyz_angles,
+)
+
+from . import _advice, _layout
+
+
+_LN10 = math.log(10.0)
+_LOG10_FLOAT_MAX = math.log10(np.finfo(float).max)
+_LOG10_FLOAT_MIN_SUBNORMAL = math.log10(np.nextafter(0.0, 1.0))
+
+
 __all__ = [
     "DeferredInjectionRecord",
     "DeferredInjectionReport",
@@ -123,25 +178,15 @@ __all__ = [
     "ImmediateInjectionReport",
     "ImmediateProjectionRecord",
     "MeasurementRecord",
+    "StabilizerMpsSimulator",
     "MpsStabOptimizer",
     "NormEventRecord",
     "StabilizerMpsSettingsAdvice",
-    "StabilizerMpsSimulator",
     "StabilizerMpsRunResult",
     "StreamAnalysisRecord",
     "run_stabilizer_mps_stream",
 ]
 
-_CLIFFORD_NAMES = {
-    "h", "x", "y", "z", "s", "sdg", "sdag", "sqrt_x", "sqrt_x_dag",
-    "cnot", "cx", "cy", "cz", "swap",
-}
-_ROTATION_AXES = {"rx": "X", "ry": "Y", "rz": "Z"}
-_ROTATION_AXES_2Q = {"rxx": "X", "ryy": "Y", "rzz": "Z"}
-_RESET_FLIP_CLIFFORDS = {"X": "z", "Y": "x", "Z": "x"}
-_RESET_AXIS_ALIASES = {"reset_x": "X", "reset_y": "Y", "reset_z": "Z"}
-_MR_ALIASES = {"measure_reset", "mr", "mreset", "measure_and_reset"}
-_MR_AXIS_ALIASES = {"mrx": "X", "mry": "Y", "mrz": "Z"}
 _MAX_PAULI_SUM_SUBMPO_TERMS = 4
 _FIT_INIT_STRATEGIES = frozenset(
     {"auto", "direct", "random", "random_expand", "svd_guess"}
@@ -177,402 +222,8 @@ def _format_tableau_pauli(pauli, *, compact=True):
     ]
     return sign + ("I" if not support else " ".join(support))
 
-# Single-qubit Clifford matrices used to localize a signed Pauli string onto one
-# qubit for the basis-updating measurement (H, S-dagger, CNOT).
-_H_MAT = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2)
-_SDG_MAT = np.array([[1, 0], [0, -1j]], dtype=complex)
-_CNOT_MAT = np.array(
-    [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], dtype=complex
-)
-_S_MAT = np.array([[1, 0], [0, 1j]], dtype=complex)
 
-# Populated lazily by ``_two_qubit_clifford_representatives``.  There are 20
-# two-qubit Cliffords modulo a Clifford acting independently on each *output*
-# qubit.  Such output-local Cliffords leave the Schmidt spectrum invariant, so
-# testing one representative per coset finds the same best entanglement score
-# as testing all 11,520 two-qubit Cliffords.
-_TWO_Q_CLIFFORD_REPS = None
-
-
-def _normalize_event_name(name):
-    """Normalize a named stream event for matching."""
-    return str(name).replace("-", "_").strip().lower()
-
-
-def _normalize_sites(where):
-    """Return ``where`` as a non-empty tuple of integer qubit indices."""
-    if isinstance(where, Integral):
-        return (int(where),)
-    try:
-        sites = tuple(int(site) for site in where)
-    except TypeError as exc:
-        raise TypeError("where must be an integer or a sequence of integers.") from exc
-    if not sites:
-        raise ValueError("where must contain at least one qubit.")
-    return sites
-
-
-def _normalize_measurement_order(order, *, count, targets=None):
-    """Normalize a batch measurement order without touching the MPS."""
-    if isinstance(order, str) or order is None:
-        key = "min_span" if order is None else _normalize_event_name(order)
-        if key in {"auto", "span", "min_span", "shortest"}:
-            return "min_span"
-        if key in {"input", "given", "original"}:
-            return "input"
-        raise ValueError(
-            "measurement order must be 'min_span', 'input', or an explicit "
-            "permutation of the batch entries."
-        )
-    try:
-        requested = tuple(int(index) for index in order)
-    except TypeError as exc:
-        raise TypeError(
-            "measurement order must be a supported string or an entry permutation."
-        ) from exc
-    if len(requested) != int(count) or len(set(requested)) != int(count):
-        raise ValueError(
-            "an explicit measurement order must be a permutation of the batch."
-        )
-    if set(requested) == set(range(int(count))):
-        return requested
-    if targets is not None and len(set(targets)) == int(count):
-        target_to_index = {int(target): index for index, target in enumerate(targets)}
-        if set(requested) == set(target_to_index):
-            return tuple(target_to_index[target] for target in requested)
-    raise ValueError(
-        "an explicit measurement order must contain batch indices or each "
-        "target qubit exactly once."
-    )
-
-
-def _unique_ordered(items):
-    """Return items with duplicates removed while preserving first occurrence."""
-    seen = set()
-    unique = []
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        unique.append(item)
-    return tuple(unique)
-
-
-def _layout_angle_weight(theta):
-    """Bound an angle-derived layout weight to a simple non-negative scalar."""
-    try:
-        angle = abs(float(theta))
-    except (TypeError, ValueError):
-        return 1.0
-    return min(1.0, max(0.0, angle)) if np.isfinite(angle) else 1.0
-
-
-def _operator_schmidt_tail_weight(theta):
-    """Return the non-leading Schmidt-weight fraction of a Pauli rotation.
-
-    A Pauli rotation has two operator-Schmidt branches, ``I`` and ``P``.
-    The returned value is zero for a product operator and reaches one half
-    for the maximally balanced two-branch case.  The layout event keeps a
-    unit baseline separately so weak rotations still contribute locality
-    pressure while strongly operator-entangling rotations receive priority.
-    """
-    try:
-        theta = float(theta)
-    except (TypeError, ValueError):
-        return 0.0
-    if not np.isfinite(theta):
-        return 0.0
-    weights = np.asarray(
-        [np.cos(theta / 2.0) ** 2, np.sin(theta / 2.0) ** 2],
-        dtype=float,
-    )
-    total = float(weights.sum())
-    if total <= 0.0:
-        return 0.0
-    return float((total - weights.max()) / total)
-
-
-def _dense_operator_schmidt_layout_weight(gate, n_qubits):
-    """Return a baseline-plus-tail weight for a small dense operator.
-
-    The two-qubit case is evaluated exactly from the operator-Schmidt
-    singular values. Wider matrices retain the unit baseline and are handled
-    by their frame supports, avoiding a potentially large dense reshape in
-    the static layout pre-pass.
-    """
-    if int(n_qubits) != 2:
-        return 1.0
-    try:
-        array = np.asarray(ar.to_numpy(gate))
-        if array.shape != (4, 4):
-            return 1.0
-        reshaped = array.reshape(2, 2, 2, 2).transpose(0, 2, 1, 3)
-        singular_values = np.linalg.svd(
-            reshaped.reshape(4, 4),
-            compute_uv=False,
-        )
-        weights = np.abs(singular_values) ** 2
-        total = float(weights.sum())
-        if total <= 0.0:
-            return 1.0
-        tail = (total - float(weights.max())) / total
-    except (TypeError, ValueError, np.linalg.LinAlgError):
-        return 1.0
-    return 1.0 + float(tail)
-
-
-def _submpo_operator_layout_weight(mpo):
-    """Return an MPO-bond-rank proxy for a coefficient-frame sub-MPO."""
-    try:
-        max_bond = int(mpo.max_bond())
-    except (AttributeError, TypeError, ValueError):
-        return 1.0
-    if max_bond < 1:
-        return 1.0
-    # A bond-two Pauli-rotation MPO has one unit of operator cut load. Wider
-    # MPOs receive proportionally more priority in the weighted interaction
-    # graph, while rank-one operators retain the locality baseline.
-    return max(1.0, float(np.log2(max_bond)))
-
-
-def _is_axis_string(value):
-    """Return whether ``value`` is a non-empty X/Y/Z Pauli-basis string."""
-    if not isinstance(value, str):
-        return False
-    axes = [axis for axis in value.upper() if not axis.isspace()]
-    return bool(axes) and all(axis in _RESET_FLIP_CLIFFORDS for axis in axes)
-
-
-def _normalize_pauli_axes(pauli, where, *, event):
-    """Return one X/Y/Z axis per site for reset-like events."""
-    axes = [axis for axis in str(pauli).upper() if not axis.isspace()]
-    if not axes:
-        raise ValueError(f"{event} basis must contain at least one Pauli axis.")
-    invalid = [axis for axis in axes if axis not in _RESET_FLIP_CLIFFORDS]
-    if invalid:
-        raise ValueError(
-            f"{event} basis must use only X, Y, or Z axes, got {pauli!r}."
-        )
-    if len(axes) == 1 and len(where) > 1:
-        axes = axes * len(where)
-    if len(axes) != len(where):
-        raise ValueError(
-            f"{event} basis {pauli!r} has {len(axes)} axis/axes but where "
-            f"{where!r} has {len(where)} site(s)."
-        )
-    return tuple(axes)
-
-
-def _normalize_outcomes(outcome, where, *, event):
-    """Return one optional forced outcome per site."""
-    if outcome is None:
-        return (None,) * len(where)
-    if isinstance(outcome, Integral):
-        return (int(outcome),) * len(where)
-    if isinstance(outcome, (tuple, list)):
-        if len(outcome) != len(where):
-            raise ValueError(
-                f"{event} outcome sequence has length {len(outcome)} but where "
-                f"{where!r} has {len(where)} site(s)."
-            )
-        return tuple(None if value is None else int(value) for value in outcome)
-    raise ValueError(
-        f"{event} outcome must be an int, None, or a sequence matching where."
-    )
-
-
-def _parse_reset_args(params, *, default_axis=None):
-    """Parse ``reset`` stream parameters into ``(axes, where)``."""
-    if not params:
-        raise ValueError('"reset" expects where, optionally with a basis.')
-    if default_axis is not None:
-        if len(params) != 1:
-            raise ValueError("basis-specific reset aliases accept only where.")
-        where = _normalize_sites(params[0])
-        basis = default_axis
-    elif len(params) >= 2 and _is_axis_string(params[0]):
-        if len(params) != 2:
-            raise ValueError('"reset" accepts only basis and where.')
-        basis = params[0]
-        where = _normalize_sites(params[1])
-    else:
-        if len(params) > 2:
-            raise ValueError('"reset" accepts where and optional basis only.')
-        where = _normalize_sites(params[0])
-        basis = params[1] if len(params) == 2 else "Z"
-    return _normalize_pauli_axes(basis, where, event="reset"), where
-
-
-def _parse_measure_reset_args(params, *, default_axis=None):
-    """Parse MR stream parameters into ``(axes, where, outcomes, absorb_basis)``."""
-    if default_axis is None:
-        if len(params) < 2:
-            raise ValueError(
-                '"measure_reset" expects basis, where, optional outcome, '
-                "and optional absorb_basis."
-            )
-        basis = params[0]
-        where = _normalize_sites(params[1])
-        outcome = params[2] if len(params) > 2 else None
-        absorb = bool(params[3]) if len(params) > 3 else False
-        if len(params) > 4:
-            raise ValueError('"measure_reset" accepts at most four arguments.')
-    else:
-        if not params:
-            raise ValueError("basis-specific MR aliases expect where.")
-        where = _normalize_sites(params[0])
-        basis = default_axis
-        outcome = params[1] if len(params) > 1 else None
-        absorb = bool(params[2]) if len(params) > 2 else True
-        if len(params) > 3:
-            raise ValueError("basis-specific MR aliases accept at most three arguments.")
-    axes = _normalize_pauli_axes(basis, where, event="measure_reset")
-    outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
-    return axes, where, outcomes, absorb
-
-
-def _normalize_absorb(absorb):
-    """Validate and normalize a cap absorption direction."""
-    direction = str(absorb).strip().lower()
-    if direction not in {"left", "right"}:
-        raise ValueError("cap absorb direction must be 'left' or 'right'.")
-    return direction
-
-
-def _cnot_matrix(control: int, target: int) -> np.ndarray:
-    """Return the big-endian two-qubit CNOT matrix for local sites 0 and 1."""
-    gate = np.zeros((4, 4), dtype=complex)
-    for x in range(4):
-        bits = [(x >> 1) & 1, x & 1]
-        bits[target] ^= bits[control]
-        y = (bits[0] << 1) | bits[1]
-        gate[y, x] = 1.0
-    return gate
-
-
-def _two_qubit_tableau_unitary(tableau) -> np.ndarray:
-    """Synthesize an exact NumPy unitary for a two-qubit stim tableau.
-
-    ``Tableau.to_unitary_matrix`` currently returns ``complex64``.  The local
-    gauge sweep can run repeatedly, so replay its elimination circuit (H, S,
-    and CX only) using the exact double-precision matrices instead.
-    """
-    unitary = np.eye(4, dtype=complex)
-    for instruction in tableau.to_circuit("elimination"):
-        name = instruction.name
-        targets = [target.value for target in instruction.targets_copy()]
-        if name == "H":
-            for target in targets:
-                gate = np.kron(_H_MAT, _I2) if target == 0 else np.kron(_I2, _H_MAT)
-                unitary = gate @ unitary
-        elif name == "S":
-            for target in targets:
-                gate = np.kron(_S_MAT, _I2) if target == 0 else np.kron(_I2, _S_MAT)
-                unitary = gate @ unitary
-        elif name == "CX":
-            if len(targets) % 2:
-                raise ValueError("stim emitted a CX instruction with an odd target count.")
-            for control, target in zip(targets[::2], targets[1::2]):
-                unitary = _cnot_matrix(control, target) @ unitary
-        else:  # pragma: no cover - stim's documented elimination basis is H/S/CX
-            raise ValueError(f"Unsupported tableau-elimination gate {name!r}.")
-    return unitary
-
-
-_I2 = np.eye(2, dtype=complex)
-
-
-def _two_qubit_clifford_representatives():
-    """Return 20 ``(stim.Tableau, unitary)`` entanglement representatives.
-
-    The representatives are left cosets of the local-Clifford subgroup.  If
-    ``D`` is a representative and ``L`` is local, ``L D`` has the same
-    Schmidt spectrum across the two sites as ``D``.  This keeps a sweep small
-    enough to use at every selected MPS bond while retaining the complete
-    two-qubit Clifford search space for the chosen objective.
-    """
-    global _TWO_Q_CLIFFORD_REPS
-    if _TWO_Q_CLIFFORD_REPS is not None:
-        return _TWO_Q_CLIFFORD_REPS
-
-    import stim
-
-    one_qubit = tuple(stim.Tableau.iter_all(1))
-    local = []
-    for first in one_qubit:
-        for second in one_qubit:
-            tableau = stim.Tableau(2)
-            tableau.append(first, [0])
-            tableau.append(second, [1])
-            local.append(tableau)
-
-    unseen = {str(tableau): tableau for tableau in stim.Tableau.iter_all(2)}
-    identity = stim.Tableau(2)
-    representatives = []
-    while unseen:
-        # Keep I first: a bond that cannot improve avoids needless gate work.
-        tableau = unseen.pop(str(identity), None)
-        if tableau is None:
-            _, tableau = unseen.popitem()
-        representatives.append((tableau, _two_qubit_tableau_unitary(tableau)))
-        # ``D.then(L)`` is the circuit D followed by local L, i.e. L D.
-        for local_tableau in local:
-            unseen.pop(str(tableau.then(local_tableau)), None)
-
-    if len(representatives) != 20:  # pragma: no cover - guards stim API changes
-        raise RuntimeError(
-            "Expected 20 two-qubit Clifford local-equivalence representatives, "
-            f"got {len(representatives)}."
-        )
-    _TWO_Q_CLIFFORD_REPS = tuple(representatives)
-    return _TWO_Q_CLIFFORD_REPS
-
-
-def _localizing_clifford(terms, n, *, site_position=None):
-    """Return ``(ops, v_tableau, pivot)`` for a Clifford ``V`` with ``V M V^dag = +/-Z_k``.
-
-    ``terms`` maps ``site -> 'X'/'Y'/'Z'`` (the support of the signed Pauli ``M``
-    on the coefficient qubits).  ``ops`` is a list of ``(name, targets)`` gates
-    applied to ``|nu>`` in order (``'h'``, ``'sdg'``, ``'cnot'``); ``v_tableau``
-    is the matching :class:`stim.Tableau`; ``pivot`` is the target qubit ``k``.
-    Single-qubit axes are rotated to ``Z`` (``X`` via ``H``; ``Y`` via ``S^dag``
-    then ``H``) and a CNOT ladder (control ``j``, target ``k``) merges every
-    ``Z_j`` onto the pivot ``Z_k``.
-    """
-    import stim
-
-    if site_position is None:
-        site_position = int
-    support = sorted(terms, key=lambda site: (site_position(site), int(site)))
-    # Pivot = median of the support: the CNOT ladder swaps every other support
-    # site next to the pivot, so the median minimises the total MPS swap distance
-    # (sum_j |j - pivot|) versus using an endpoint.
-    pivot = support[len(support) // 2]
-    ops = []
-    for j in support:
-        axis = terms[j]
-        if axis == "X":
-            ops.append(("h", (j,)))
-        elif axis == "Y":
-            ops.append(("sdg", (j,)))  # S^dag then H maps Y -> Z
-            ops.append(("h", (j,)))
-        # 'Z' needs no single-qubit rotation
-    # Merge nearest support sites first so each swap+split spans the shortest gap.
-    pivot_pos = site_position(pivot)
-    for j in sorted(
-        (s for s in support if s != pivot),
-        key=lambda s: (abs(site_position(s) - pivot_pos), site_position(s), int(s)),
-    ):
-        ops.append(("cnot", (j, pivot)))  # control j, target pivot: merge Z_j -> Z_k
-    vsim = stim.TableauSimulator()
-    vsim.set_num_qubits(n)
-    for name, targ in ops:
-        getattr(vsim, "s_dag" if name == "sdg" else name)(*targ)
-    v_tableau = vsim.current_inverse_tableau().inverse()
-    return ops, v_tableau, pivot
-
-
-class MpsStabOptimizer:
+class StabilizerMpsSimulator:
     """Replay a gate stream against a stabilizer + MPS (STN) state.
 
     Parameters
@@ -643,11 +294,13 @@ class MpsStabOptimizer:
     layout_report : bool
         Print a concise before/after frame-layout report when a finder plan is
         installed.
-    mode : {"direct", "dm", "zipup", "src", "fit-*", "dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "swap", "perm", "exact"}
+    mode : str
         Compression backend for coefficient-MPS updates. Native compression
         names are used directly, for example ``"direct"``, ``"zipup"``, or
-        ``"src"``; the ``"*-first"`` and ``"*-oversample"`` variants are
-        available as well. The DMRG modes use local FIT on the coefficient
+        ``"src"``; ``"dm"``, ``"sdc"``, ``"fit-*"``, and the
+        ``"*-first"`` / ``"*-oversample"`` variants are available as well.
+        The ``"dmrg"``, ``"dmrg1"``, ``"dmrg2"``, and ``"dmrg3"``
+        modes use local FIT on the coefficient
         target; ``fit_init_strategy`` controls their disposable initial guess.
         On dense backends, DMRG retains the exact coefficient sub-MPO as a
         tagged lazy FIT target layer after canonicalizing the active MPS window;
@@ -674,6 +327,17 @@ class MpsStabOptimizer:
     compression_seed : int | None
         Seed forwarded to randomized native compression methods. This is kept
         separate from ``seed``, which controls STN measurement sampling.
+    cutoff : float | {"auto"}, default="auto"
+        Dtype-aware truncation cutoff. ``"auto"`` matches
+        :class:`MpsOptimizer` and resolves to ``1e-12`` for 64-bit data,
+        ``1e-6`` for 32-bit data, and ``1e-3`` for 16-bit data.
+    cutoff_mode : str | None | {"auto"}, default="auto"
+        Singular-value cutoff convention. ``"auto"`` uses Pepsy's ``"rsum2"``
+        policy for FIT and preserves Quimb's native method default for native
+        MPO compressors.
+    contraction_opt : object | None, default="auto-hq"
+        Contraction optimizer passed to FIT and explicit native compression
+        paths, matching :class:`MpsOptimizer`.
 
     Attributes
     ----------
@@ -721,7 +385,9 @@ class MpsStabOptimizer:
         gates=None,
         *,
         chi: Optional[int] = None,
-        cutoff: float = 1e-12,
+        cutoff: float | str = "auto",
+        cutoff_mode: str | None = "auto",
+        contraction_opt="auto-hq",
         operator_tol: Optional[float] = None,
         max_pauli_decomposition_qubits: Optional[int] = (
             DEFAULT_MPS_STAB_MAX_PAULI_DECOMPOSITION_QUBITS
@@ -761,9 +427,7 @@ class MpsStabOptimizer:
             )
 
         self.mode = self._normalize_mode(mode)
-        self.chi = None if chi is None else int(chi)
-        if self.mode == "exact":
-            self.chi = None
+        self.chi = self._normalize_chi(chi, mode=self.mode)
         self.fit_init_strategy = self._normalize_fit_init_strategy(
             fit_init_strategy
         )
@@ -796,7 +460,11 @@ class MpsStabOptimizer:
                     "compression_seed must be a non-negative integer or None."
                 )
         self.compression_seed = compression_seed
-        self.cutoff = float(cutoff)
+        self._requested_cutoff = cutoff
+        self._requested_cutoff_mode = cutoff_mode
+        self.contraction_opt = (
+            "auto-hq" if contraction_opt is None else contraction_opt
+        )
         if operator_tol is not None:
             operator_tol = float(operator_tol)
             if not np.isfinite(operator_tol) or operator_tol < 0.0:
@@ -852,6 +520,9 @@ class MpsStabOptimizer:
         self._norm_log_survival = 0.0
         self.dtype = self.state.dtype
         self._rng = np.random.default_rng(seed)
+        self._initial_mps_length = int(self.state.n)
+        self._mps_length_history = [self._initial_mps_length]
+        self.cap_history = []
         self.logical_order = list(range(self.state.n))
         self._logical_to_mps = {q: q for q in self.logical_order}
         self.layout_plan = None
@@ -873,6 +544,25 @@ class MpsStabOptimizer:
             self.state.p.apply_to_arrays(to_backend)
         if self._backend_signature is None:
             self.backend_info()
+        self.cutoff = self._resolve_cutoff(cutoff, dtype=self.backend_dtype)
+        self.cutoff_mode = self._resolve_cutoff_mode(
+            cutoff_mode,
+            preserve_mpo_default=self._is_quimb_mode(self.mode),
+        )
+        # These are per-replay FIT controls, mirroring ``MpsOptimizer.run``.
+        # The constructor keeps them initialized as well so direct helper use
+        # and copied/shot-replayed optimizers have a complete configuration.
+        self._fit_n_iter = 8
+        self._fit_min_iter = 2
+        self._fit_rtol = "auto"
+        self._fit_patience = 2
+        self._fit_block_size = None
+        self._fit_adaptive_sweeps = 2
+        self._fit_sweep_sequence = "RL"
+        self._fit_two_site_transition_sweeps = None
+        self._fit_single_pair_fast_path = False
+        self._fit_finite_check = False
+        self._fit_overlap_diagnostics = False
 
         self._queue: List[object] = []
         self._gate_stream = ()
@@ -921,6 +611,15 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     _DMRG_MODES = frozenset({"dmrg", "dmrg1", "dmrg2", "dmrg3"})
     _CANONICAL_MPO_MODES = frozenset(_MPO_COMPRESSION_METHODS)
+    _FINITE_CHI_MPO_METHODS = frozenset({
+        "src",
+        "src-first",
+        "src-oversample",
+        "srcmps",
+        "srcmps-first",
+        "srcmps-oversample",
+        "fit-oversample",
+    })
     _LEGACY_MODE_NAMES = frozenset({"quimb", "mpo"})
     _LEGACY_MODE_PREFIXES = ("quimb-", "mpo-")
     _ALLOWED_MODES = frozenset(
@@ -947,7 +646,7 @@ class MpsStabOptimizer:
                 "dmrg*, svd, swap, perm, or exact"
             )
             raise ValueError(
-                f"Unknown MpsStabOptimizer mode {mode!r}; choose one of {allowed}."
+                f"Unknown StabilizerMpsSimulator mode {mode!r}; choose one of {allowed}."
             )
         if mode in cls._LEGACY_MODE_NAMES or mode.startswith(cls._LEGACY_MODE_PREFIXES):
             warnings.warn(
@@ -988,7 +687,66 @@ class MpsStabOptimizer:
         if method not in _MPO_COMPRESSION_METHODS:
             allowed = ", ".join(sorted(_MPO_COMPRESSION_METHODS))
             raise ValueError(f"Unknown Quimb compression method {method!r}; choose one of {allowed}.")
+        _require_quimb_compression_method(method)
         return method
+
+    @staticmethod
+    def _resolve_cutoff(value, *, dtype=None):
+        """Resolve and validate a dtype-aware truncation cutoff."""
+        if value == "auto":
+            if dtype is None:
+                dtype = "complex128"
+            return float(dtype_auto_cutoff(dtype))
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cutoff must be 'auto' or a non-negative number."
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError("cutoff must be 'auto' or a non-negative number.")
+        return value
+
+    @staticmethod
+    def _resolve_cutoff_mode(value, *, preserve_mpo_default=False):
+        """Resolve ``cutoff_mode='auto'`` like the ordinary MPS optimizer."""
+        if value is None or (
+            isinstance(value, str) and value.strip().lower() == "auto"
+        ):
+            return None if preserve_mpo_default else "rsum2"
+        return value
+
+    def _resolve_fit_rtol(self, value):
+        """Resolve the ordinary MPS dtype-aware FIT relative tolerance."""
+        dtype = self.backend_dtype if value == "auto" else None
+        return resolve_fit_rtol(value, dtype=dtype)
+
+    @staticmethod
+    def _validate_positive_int(value, name):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, Integral)
+            or value < 1
+        ):
+            raise ValueError(f"{name} must be a positive integer.")
+        return int(value)
+
+    @classmethod
+    def _normalize_chi(cls, chi, *, mode):
+        """Validate a bond cap and its compression-mode requirements."""
+        if chi is not None:
+            chi = cls._validate_positive_int(chi, "chi")
+        if mode == "exact":
+            return None
+        if (
+            chi is None
+            and cls._is_quimb_mode(mode)
+            and cls._mode_quimb_method(mode) in cls._FINITE_CHI_MPO_METHODS
+        ):
+            raise ValueError(
+                f"StabilizerMpsSimulator mode {mode!r} requires a finite chi."
+            )
+        return chi
 
     @classmethod
     def _normalize_fit_init_strategy(cls, strategy):
@@ -1013,20 +771,50 @@ class MpsStabOptimizer:
             return "guess_direct"
         return strategy
 
+    def set_mode(self, mode):
+        """Switch compression mode while preserving the represented state."""
+        new_mode = self._normalize_mode(mode)
+        if new_mode == "exact":
+            new_chi = None
+        elif self.mode == "exact" and self.chi is None:
+            raise ValueError(
+                "cannot leave mode='exact' after its finite chi was discarded; "
+                "create a new optimizer with chi first."
+            )
+        else:
+            new_chi = self._normalize_chi(self.chi, mode=new_mode)
+        self.mode = new_mode
+        self.chi = new_chi
+        requested_cutoff_mode = self._requested_cutoff_mode
+        if requested_cutoff_mode is None or (
+            isinstance(requested_cutoff_mode, str)
+            and requested_cutoff_mode.strip().lower() == "auto"
+        ):
+            requested_cutoff_mode = "auto"
+        else:
+            requested_cutoff_mode = self.cutoff_mode
+        self.cutoff_mode = self._resolve_cutoff_mode(
+            requested_cutoff_mode,
+            preserve_mpo_default=self._is_quimb_mode(new_mode),
+        )
+        self._dmrg1_one_site_locked = False
+        self._last_fit_diagnostics = None
+        return self
+
     @classmethod
-    def from_bits(cls, bits, **kwargs) -> "MpsStabOptimizer":
+    def from_bits(cls, bits, **kwargs) -> "StabilizerMpsSimulator":
         """Start from a computational-basis product state (``bits`` = str or 0/1 seq)."""
         dtype = kwargs.pop("dtype", "complex128")
         return cls(STNState.from_bits(bits, dtype=dtype), **kwargs)
 
     @classmethod
-    def ghz(cls, n: int, **kwargs) -> "MpsStabOptimizer":
+    def ghz(cls, n: int, **kwargs) -> "StabilizerMpsSimulator":
         """Start from the ``n``-qubit GHZ state (a stabilizer state, chi=1)."""
         dtype = kwargs.pop("dtype", "complex128")
         return cls(STNState.ghz(n, dtype=dtype), **kwargs)
 
     @classmethod
-    def from_tableau_and_state(cls, sim, p, **kwargs) -> "MpsStabOptimizer":
+    def from_tableau_and_state(cls, sim, p, **kwargs) -> "StabilizerMpsSimulator":
         """Start from a user stim tableau ``sim`` and coefficient MPS ``p``."""
         dtype = kwargs.pop("dtype", "complex128")
         return cls(STNState.from_tableau_and_state(sim, p, dtype=dtype), **kwargs)
@@ -1035,14 +823,14 @@ class MpsStabOptimizer:
     from_tableau_and_nu = from_tableau_and_state
 
     @classmethod
-    def from_mps(cls, p, **kwargs) -> "MpsStabOptimizer":
+    def from_mps(cls, p, **kwargs) -> "StabilizerMpsSimulator":
         """Start from a qubit MPS in the ordinary computational basis."""
         return cls(p, **kwargs)
 
     @classmethod
     def from_stim(
         cls, circuit, *, seed: Optional[int] = None, stream_transform=None, **kwargs
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Build one STN trajectory directly from a Stim circuit.
 
         The circuit is compiled once by :func:`pepsy.compile_stim_circuit`, then
@@ -1068,7 +856,7 @@ class MpsStabOptimizer:
         """
         if "state" in kwargs or "gates" in kwargs:
             raise TypeError(
-                "MpsStabOptimizer.from_stim derives state and gates from the "
+                "StabilizerMpsSimulator.from_stim derives state and gates from the "
                 "Stim circuit; use stream_transform for stream edits."
             )
         if stream_transform is not None and not callable(stream_transform):
@@ -1105,6 +893,31 @@ class MpsStabOptimizer:
         return self.state.n
 
     @property
+    def L_eff(self) -> int:
+        """Return the current effective coefficient-MPS register length."""
+        return int(self.state.n)
+
+    @property
+    def effective_mps_length(self) -> int:
+        """Descriptive alias for :attr:`L_eff`."""
+        return self.L_eff
+
+    def mps_length_diagnostics(self):
+        """Return the active-register length and dynamic-cap ledger."""
+        history = tuple(int(length) for length in self._mps_length_history)
+        return {
+            "initial_length": int(self._initial_mps_length),
+            "peak_length": int(max(history, default=0)),
+            "minimum_length": int(min(history, default=0)),
+            "L_eff": int(self.L_eff),
+            "effective_length": int(self.L_eff),
+            "removed_sites": int(self._initial_mps_length - self.L_eff),
+            "caps": len(self.cap_history),
+            "length_history": history,
+            "cap_events": deepcopy(self.cap_history),
+        }
+
+    @property
     def p(self):
         """The coefficient MPS (the paper's ``|nu>``), matching ``MpsOptimizer.p``."""
         return self.state.p
@@ -1114,13 +927,13 @@ class MpsStabOptimizer:
         """Alias for :attr:`p`."""
         return self.state.p
 
-    def set_gates(self, gates) -> "MpsStabOptimizer":
+    def set_gates(self, gates) -> "StabilizerMpsSimulator":
         """Replace the queued gate stream."""
         entries = self._as_entries(gates)
         self._install_stream_plan(entries)
         return self
 
-    def add_gates(self, gates) -> "MpsStabOptimizer":
+    def add_gates(self, gates) -> "StabilizerMpsSimulator":
         """Append to the queued gate stream."""
         entries = list(self._queue) + self._as_entries(gates)
         self._install_stream_plan(entries)
@@ -1208,7 +1021,7 @@ class MpsStabOptimizer:
         if len(mismatches) > 8:
             details += f"; ... and {len(mismatches) - 8} more"
         raise TypeError(
-            "MpsStabOptimizer requires every gate and sub-MPO payload to "
+            "StabilizerMpsSimulator requires every gate and sub-MPO payload to "
             f"match the coefficient-MPS backend/device and required dtype "
             f"{target_signature!r} "
             f"before use; {details}. Prepare each payload explicitly with "
@@ -1245,6 +1058,7 @@ class MpsStabOptimizer:
     ):
         """Build a canonical Pauli-measurement event shared with MPS."""
         where = _normalize_sites(where)
+        outcome = _validate_forced_outcome(outcome)
         if absorb_basis is not None or disentangle is not None:
             absorb_basis = _resolve_measurement_disentangle(
                 absorb_basis,
@@ -1254,9 +1068,9 @@ class MpsStabOptimizer:
         entry = ("measure", str(pauli), where)
         if absorb_basis is None:
             if outcome is not None:
-                entry += (int(outcome),)
+                entry += (outcome,)
         else:
-            entry += (None if outcome is None else int(outcome), bool(absorb_basis))
+            entry += (outcome, bool(absorb_basis))
         return entry
 
     @staticmethod
@@ -1491,66 +1305,9 @@ class MpsStabOptimizer:
                     f"are touched by ordinary stream entry {entry!r}."
                 )
 
-    @classmethod
-    def _analysis_matrix_kind(cls, entry) -> str:
-        """Classify a dense matrix entry for stream-level advice."""
-        if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
-            return "opaque"
-        try:
-            where = _normalize_sites(entry[1])
-            gate = _as_gate_matrix(entry[0], len(where))
-        except (TypeError, ValueError, IndexError):
-            return "opaque"
-        if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
-            return "opaque"
-        dim = gate.shape[0]
-        nq = int(round(math.log2(dim))) if dim > 0 else -1
-        if nq < 0 or 2 ** nq != dim or len(where) != nq:
-            return "opaque"
-        if not _is_unitary(gate):
-            return "nonunitary_matrix"
-        try:
-            is_clifford = _tableau_from_exact_unitary(gate) is not None
-        except ImportError:
-            return "nonclifford_matrix"
-        return "clifford_matrix" if is_clifford else "nonclifford_matrix"
+    _analysis_matrix_kind = classmethod(_advice._analysis_matrix_kind)
 
-    @classmethod
-    def _analysis_entry_kind(cls, entry) -> str:
-        """Classify one Pepsy stream entry for whole-stream advice."""
-        if submpo_event_parts(entry, normalize_where=True) is not None:
-            return "submpo"
-        if not (isinstance(entry, (list, tuple)) and entry):
-            return "opaque"
-        head = entry[0]
-        if not isinstance(head, str):
-            return cls._analysis_matrix_kind(entry)
-
-        name = _normalize_event_name(head)
-        if name in _CLIFFORD_NAMES:
-            return "clifford"
-        if name == "disentangle":
-            return "control"
-        try:
-            if cls._injectable_rz(entry) is not None:
-                return "injectable"
-        except (IndexError, TypeError, ValueError):
-            return "opaque"
-        if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name == "rot":
-            try:
-                theta = float(entry[1])
-            except (IndexError, TypeError, ValueError):
-                return "opaque"
-            return "clifford" if cls._is_clifford_angle(theta) else "nonclifford"
-        if name == "measure":
-            return "measure"
-        if name == "reset" or name in _RESET_AXIS_ALIASES:
-            return "reset"
-        if name in _MR_ALIASES or name in _MR_AXIS_ALIASES:
-            return "measure_reset"
-        if name == "cap":
-            return "cap"
-        return "opaque"
+    _analysis_entry_kind = classmethod(_advice._analysis_entry_kind)
 
     @classmethod
     def _progress_entry_part(cls, entry) -> str:
@@ -1565,72 +1322,7 @@ class MpsStabOptimizer:
             "nonunitary_matrix": "nonunitary",
         }.get(kind, kind)
 
-    @classmethod
-    def _analysis_entry_sites(cls, entry, n_qubits: Optional[int]) -> Optional[set[int]]:
-        """Return touched physical sites for a stream entry, if cheaply known."""
-        parts = submpo_event_parts(entry, normalize_where=True)
-        if parts is not None:
-            _mpo, where = parts
-            return set(_normalize_sites(where))
-
-        if not (isinstance(entry, (list, tuple)) and entry):
-            return None
-        head = entry[0]
-        if not isinstance(head, str):
-            if len(entry) != 2:
-                return None
-            return set(_normalize_sites(entry[1]))
-
-        name = _normalize_event_name(head)
-        if name == "disentangle":
-            if len(entry) <= 1:
-                return None if n_qubits is None else set(range(n_qubits))
-            if len(entry) > 2:
-                return None
-            option = entry[1]
-            if isinstance(option, Mapping):
-                bonds = option.get("bonds")
-            elif isinstance(option, Integral):
-                bonds = None
-            else:
-                return None
-            if n_qubits is None:
-                return None
-            sites = set()
-            for bond in cls._disentangle_bonds(bonds, n_qubits):
-                sites.update((int(bond), int(bond) + 1))
-            return sites
-        if name in _CLIFFORD_NAMES:
-            return {int(site) for site in entry[1:]}
-        if name in _ROTATION_AXES:
-            return {int(entry[2])}
-        if name in _ROTATION_AXES_2Q:
-            return {int(entry[2]), int(entry[3])}
-        if name in ("t", "tdg"):
-            return {int(entry[1])}
-        if name == "rot":
-            return set(_normalize_sites(entry[3]))
-        if name == "measure":
-            if len(entry) < 3:
-                return None
-            return set(_normalize_sites(entry[2]))
-        if name == "reset" or name in _RESET_AXIS_ALIASES:
-            _axes, where = _parse_reset_args(
-                entry[1:],
-                default_axis=_RESET_AXIS_ALIASES.get(name),
-            )
-            return set(where)
-        if name in _MR_ALIASES or name in _MR_AXIS_ALIASES:
-            _axes, where, _outcomes, _absorb = _parse_measure_reset_args(
-                entry[1:],
-                default_axis=_MR_AXIS_ALIASES.get(name),
-            )
-            return set(where)
-        if name == "cap":
-            if len(entry) < 3:
-                return None
-            return set(_normalize_sites(entry[1]))
-        return None
+    _analysis_entry_sites = classmethod(_advice._analysis_entry_sites)
 
     @classmethod
     def analyze_stream(cls, gates, *, n_qubits: Optional[int] = None) -> StreamAnalysisRecord:
@@ -1640,219 +1332,9 @@ class MpsStabOptimizer:
         same Pepsy entries as :meth:`apply`, counts the design features that
         affect STN settings, and returns a typed mapping-compatible record.
         """
-        if n_qubits is not None:
-            if isinstance(n_qubits, bool) or not isinstance(n_qubits, Integral):
-                raise TypeError("n_qubits must be a nonnegative integer or None.")
-            n_qubits = int(n_qubits)
-            if n_qubits < 0:
-                raise ValueError("n_qubits must be nonnegative.")
+        return _advice.analyze_stream(cls, gates, n_qubits=n_qubits)
 
-        entries = cls._as_entries(gates)
-        counts = {
-            "clifford": 0,
-            "injectable": 0,
-            "nonclifford": 0,
-            "structural": 0,
-            "control": 0,
-            "opaque": 0,
-            "dense_matrix": 0,
-            "unitary_matrix": 0,
-            "nonunitary_matrix": 0,
-            "submpo": 0,
-            "measure": 0,
-            "reset": 0,
-            "measure_reset": 0,
-            "cap": 0,
-        }
-        touched: set[int] = set()
-        unknown_support = 0
-        invalid_sites: list[int] = []
-
-        for entry in entries:
-            kind = cls._analysis_entry_kind(entry)
-            if kind == "clifford" or kind == "clifford_matrix":
-                counts["clifford"] += 1
-            elif kind == "injectable":
-                counts["injectable"] += 1
-            elif kind == "nonclifford" or kind == "nonclifford_matrix":
-                counts["nonclifford"] += 1
-            elif kind in {"measure", "reset", "measure_reset", "cap"}:
-                counts["structural"] += 1
-            elif kind == "control":
-                counts["control"] += 1
-            else:
-                counts["opaque"] += 1
-
-            if kind in {"clifford_matrix", "nonclifford_matrix", "nonunitary_matrix"}:
-                counts["dense_matrix"] += 1
-            if kind in {"clifford_matrix", "nonclifford_matrix"}:
-                counts["unitary_matrix"] += 1
-            if kind == "nonunitary_matrix":
-                counts["nonunitary_matrix"] += 1
-            if kind == "submpo":
-                counts["submpo"] += 1
-            if kind == "measure":
-                counts["measure"] += 1
-            elif kind == "reset":
-                counts["reset"] += 1
-            elif kind == "measure_reset":
-                counts["measure_reset"] += 1
-            elif kind == "cap":
-                counts["cap"] += 1
-
-            try:
-                sites = cls._analysis_entry_sites(entry, n_qubits)
-            except (IndexError, TypeError, ValueError):
-                sites = None
-            if sites is None:
-                unknown_support += 1
-            else:
-                touched.update(sites)
-                invalid_sites.extend(site for site in sites if site < 0)
-
-        if invalid_sites:
-            raise ValueError(
-                f"stream touches negative qubit index/indices "
-                f"{tuple(sorted(set(invalid_sites)))!r}."
-            )
-        max_qubit = max(touched) if touched else None
-        if n_qubits is not None and max_qubit is not None and max_qubit >= n_qubits:
-            raise ValueError(
-                f"stream touches qubit {max_qubit}, outside n_qubits={n_qubits}."
-            )
-        estimated_qubits = n_qubits if n_qubits is not None else (
-            None if max_qubit is None else max_qubit + 1
-        )
-
-        warnings = []
-        if unknown_support:
-            warnings.append(
-                f"{unknown_support} stream entry/entries have unknown qubit support."
-            )
-        if counts["opaque"]:
-            warnings.append(
-                "Opaque entries cannot be fully priced by the advisor; validate "
-                "them with small exact runs."
-            )
-        if counts["dense_matrix"]:
-            warnings.append(
-                "Dense matrix entries use classification and possibly Pauli "
-                "decomposition; keep them few-qubit or decompose into named gates."
-            )
-        if counts["nonunitary_matrix"] or counts["submpo"]:
-            warnings.append(
-                "Non-unitary matrices and coefficient-frame sub-MPOs can change "
-                "normalization physically and suspend the unitary norm-loss proxy."
-            )
-        if counts["nonclifford"] and counts["injectable"]:
-            warnings.append(
-                "Only the T-family subset is injectable; other non-Clifford work "
-                "stays on the direct STN path."
-            )
-        if counts["cap"]:
-            warnings.append(
-                "A cap changes the qubit/MPS length and disables static "
-                "stream-layout assumptions past the cap."
-            )
-
-        nonmagic_work = counts["nonclifford"] + counts["opaque"]
-        is_clifford_t_like = (
-            counts["injectable"] > 0
-            and counts["nonclifford"] == 0
-            and counts["opaque"] == 0
-        )
-        is_clifford_only = (
-            counts["injectable"] == 0
-            and nonmagic_work == 0
-        )
-
-        return StreamAnalysisRecord(
-            total_entries=int(len(entries)),
-            n_qubits=n_qubits,
-            estimated_qubits=estimated_qubits,
-            touched_qubits=tuple(sorted(touched)),
-            max_qubit=None if max_qubit is None else int(max_qubit),
-            clifford_entries=int(counts["clifford"]),
-            injectable_entries=int(counts["injectable"]),
-            other_nonclifford_entries=int(counts["nonclifford"]),
-            structural_entries=int(counts["structural"]),
-            control_entries=int(counts["control"]),
-            opaque_entries=int(counts["opaque"]),
-            dense_matrix_entries=int(counts["dense_matrix"]),
-            unitary_matrix_entries=int(counts["unitary_matrix"]),
-            nonunitary_matrix_entries=int(counts["nonunitary_matrix"]),
-            submpo_entries=int(counts["submpo"]),
-            measurement_entries=int(counts["measure"]),
-            reset_entries=int(counts["reset"]),
-            measure_reset_entries=int(counts["measure_reset"]),
-            cap_entries=int(counts["cap"]),
-            is_clifford_only=bool(is_clifford_only),
-            is_clifford_t_like=bool(is_clifford_t_like),
-            warnings=tuple(_unique_ordered(warnings)),
-        )
-
-    @classmethod
-    def _magic_strategy_entry_kind(cls, entry) -> str:
-        """Classify one stream entry for :meth:`recommend_magic_strategy`."""
-        if not (isinstance(entry, (list, tuple)) and entry):
-            return "opaque"
-        if not isinstance(entry[0], str):
-            # Stim's compiler emits its ideal Clifford operations as float32
-            # matrices. Recognize small unitary matrices without examining the
-            # large/opaque operator forms that this advisory API cannot price.
-            if len(entry) != 2:
-                return "opaque"
-            try:
-                if cls._injectable_rz(entry) is not None:
-                    return "injectable"
-                where = _normalize_sites(entry[1])
-                gate = _as_gate_matrix(entry[0], len(where))
-                dim = gate.shape[0]
-                nq = int(round(math.log2(dim)))
-                if (
-                    gate.ndim != 2
-                    or gate.shape != (dim, dim)
-                    or len(where) != nq
-                    or 2 ** nq != dim
-                    or nq > 2
-                    or not _is_unitary(gate)
-                ):
-                    return "opaque"
-            except (ImportError, IndexError, TypeError, ValueError, RuntimeError):
-                return "nonclifford"
-            try:
-                is_clifford = _tableau_from_exact_unitary(gate) is not None
-            except ImportError:
-                return "nonclifford"
-            return (
-                "clifford"
-                if is_clifford
-                else "nonclifford"
-            )
-
-        name = _normalize_event_name(entry[0])
-        if name in _CLIFFORD_NAMES:
-            return "clifford"
-        if name == "disentangle":
-            return "control"
-        try:
-            if cls._injectable_rz(entry) is not None:
-                return "injectable"
-        except (IndexError, TypeError, ValueError):
-            return "opaque"
-
-        if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name == "rot":
-            try:
-                theta = float(entry[1])
-            except (IndexError, TypeError, ValueError):
-                return "opaque"
-            return "clifford" if cls._is_clifford_angle(theta) else "nonclifford"
-        if name in {
-            "measure", "reset", "cap", *(_RESET_AXIS_ALIASES),
-            *(_MR_ALIASES), *(_MR_AXIS_ALIASES),
-        }:
-            return "structural"
-        return "opaque"
+    _magic_strategy_entry_kind = classmethod(_advice._magic_strategy_entry_kind)
 
     @classmethod
     def recommend_magic_strategy(
@@ -1882,106 +1364,12 @@ class MpsStabOptimizer:
         :meth:`queued_magic_strategy` before :meth:`run`; it analyzes the queued
         sampled/``stream_transform``-produced Pepsy stream.
         """
-        if ancilla_budget is not None:
-            if isinstance(ancilla_budget, bool) or not isinstance(ancilla_budget, Integral):
-                raise TypeError("ancilla_budget must be a nonnegative integer or None.")
-            ancilla_budget = int(ancilla_budget)
-            if ancilla_budget < 0:
-                raise ValueError("ancilla_budget must be nonnegative.")
-
-        counts = {
-            "clifford": 0,
-            "injectable": 0,
-            "nonclifford": 0,
-            "structural": 0,
-            "control": 0,
-            "opaque": 0,
-        }
-        for entry in cls._as_entries(gates):
-            counts[cls._magic_strategy_entry_kind(entry)] += 1
-
-        injections = counts["injectable"]
-        deferred_feasible = (
-            None if ancilla_budget is None else ancilla_budget >= injections
+        return _advice.recommend_magic_strategy(
+            cls,
+            gates,
+            ancilla_budget=ancilla_budget,
+            prioritize_peak_bond=prioritize_peak_bond,
         )
-        complete_clifford_t = (
-            injections > 0
-            and counts["nonclifford"] == 0
-            and counts["opaque"] == 0
-        )
-        if injections == 0 or ancilla_budget == 0:
-            mode = "direct"
-        elif (
-            prioritize_peak_bond
-            and ancilla_budget is not None
-            and ancilla_budget >= injections
-        ):
-            mode = "deferred"
-        else:
-            mode = "immediate"
-
-        if injections == 0:
-            if counts["nonclifford"]:
-                message = (
-                    f"The stream has {counts['nonclifford']} non-Clifford rotation(s), "
-                    "but none are injectable T-family Rz rotations. Use direct STN "
-                    "execution with exact_cooling=True; schedule greedy cooling only at "
-                    "explicit checkpoints if the coefficient bond grows."
-                )
-            else:
-                message = (
-                    "The stream has no injectable T-family rotations. Use direct STN "
-                    "execution; magic injection is not applicable."
-                )
-        elif ancilla_budget == 0:
-            message = (
-                f"The stream has {injections} injectable T-family rotation(s), but the "
-                "ancilla budget is zero. Use direct STN execution with exact_cooling=True."
-            )
-        elif mode == "deferred":
-            message = (
-                f"The stream has {injections} injectable T-family rotation(s). With "
-                f"{ancilla_budget} available ancilla(s) and peak bond prioritized, use "
-                "deferred MAST: with_deferred_injection(..., "
-                "projection_order='middle_out'). It reserves one ancilla per injected "
-                "gate and moves basis-updating projections to the end."
-            )
-        elif complete_clifford_t:
-            message = (
-                f"The stream is Clifford+T-like with {injections} injectable T-family "
-                "rotation(s). Use immediate injection as the default: "
-                "with_injection(..., n_ancilla=1). It rewrites every eligible rotation, "
-                "measures the ancilla immediately, and reuses it. Deferred MAST is an "
-                f"alternative when {injections} fresh ancillas and lower replay-phase "
-                "peak bond are worth a final projection phase."
-            )
-        else:
-            message = (
-                f"The stream has {injections} injectable T-family rotation(s), "
-                f"{counts['nonclifford']} other non-Clifford rotation(s), and "
-                f"{counts['opaque']} opaque entry/entries. Use immediate injection for "
-                "the eligible subset; the remaining non-Clifford work stays on the "
-                "direct STN path with exact_cooling=True."
-            )
-
-        return {
-            "recommended_mode": mode,
-            "message": message,
-            "total_entries": int(sum(counts.values())),
-            "clifford_entries": int(counts["clifford"]),
-            "injectable_entries": int(injections),
-            "other_nonclifford_entries": int(counts["nonclifford"]),
-            "structural_entries": int(counts["structural"]),
-            "control_entries": int(counts["control"]),
-            "opaque_entries": int(counts["opaque"]),
-            "is_clifford_t_like": bool(complete_clifford_t),
-            "exact_cooling_recommended": True,
-            "immediate_ancillas_required": 1 if injections else 0,
-            "deferred_ancillas_required": int(injections),
-            "ancilla_budget": ancilla_budget,
-            "deferred_feasible": deferred_feasible,
-            "prioritize_peak_bond": bool(prioritize_peak_bond),
-        }
 
     def queued_magic_strategy(self, **kwargs) -> dict:
         """Recommend a mode for the currently queued Pepsy gate stream.
@@ -1990,7 +1378,7 @@ class MpsStabOptimizer:
         optional ``stream_transform``. Call it before :meth:`run`, because that
         method consumes successfully executed queue entries.
         """
-        return type(self).recommend_magic_strategy(self._queue, **kwargs)
+        return _advice.queued_magic_strategy(self, **kwargs)
 
     @classmethod
     def recommend_settings(
@@ -2009,142 +1397,22 @@ class MpsStabOptimizer:
         and calls :meth:`recommend_magic_strategy` for the direct/immediate/
         deferred injection choice.
         """
-        normalized_goal = _normalize_event_name(goal)
-        if normalized_goal not in {"validate", "run", "benchmark"}:
-            raise ValueError(
-                "goal must be one of 'validate', 'run', or 'benchmark', "
-                f"got {goal!r}."
-            )
-
-        analysis = cls.analyze_stream(gates, n_qubits=n_qubits)
-        magic = cls.recommend_magic_strategy(
+        return _advice.recommend_settings(
+            cls,
             gates,
+            n_qubits=n_qubits,
             ancilla_budget=ancilla_budget,
             prioritize_peak_bond=prioritize_peak_bond,
-        )
-        mode = magic["recommended_mode"]
-        execution_method = {
-            "direct": "apply",
-            "immediate": "with_injection",
-            "deferred": "with_deferred_injection",
-        }[mode]
-
-        nonclifford_pressure = (
-            analysis.injectable_entries
-            + analysis.other_nonclifford_entries
-            + analysis.opaque_entries
-        )
-        settings = {
-            "chi": None,
-            "cutoff": 1e-12,
-            "exact_cooling": True,
-            "stabilize_unitary": False,
-        }
-        if normalized_goal != "validate" and nonclifford_pressure:
-            settings["chi"] = 64
-        if (
-            mode in {"direct", "immediate", "deferred"}
-            and normalized_goal != "validate"
-            and nonclifford_pressure
-            and not analysis.cap_entries
-        ):
-            settings["layout"] = "auto"
-            settings["layout_report"] = False
-
-        warnings = list(analysis.warnings)
-        if settings["chi"] is not None:
-            warnings.append(
-                "chi=64 is a starting cap, not a convergence claim; sweep chi "
-                "for production accuracy."
-            )
-        elif (
-            normalized_goal != "validate"
-            and nonclifford_pressure
-            and analysis.estimated_qubits is not None
-            and analysis.estimated_qubits > 16
-        ):
-            warnings.append(
-                "Exact chi=None can become expensive for larger non-Clifford "
-                "streams; use it first as a correctness reference."
-            )
-        if mode == "immediate" and prioritize_peak_bond and not magic["deferred_feasible"]:
-            warnings.append(
-                "Deferred MAST was requested by priority, but it needs one fresh "
-                "ancilla per injectable gate."
-            )
-        if normalized_goal == "benchmark":
-            warnings.append(
-                "Benchmark direct, immediate, and deferred modes separately before "
-                "drawing performance conclusions."
-            )
-
-        disentangle_recommended = (
-            normalized_goal != "validate"
-            and settings["chi"] is not None
-            and (
-                analysis.other_nonclifford_entries
-                + analysis.opaque_entries
-                + analysis.submpo_entries
-            )
-            >= 4
-        )
-        if disentangle_recommended:
-            warnings.append(
-                "Consider explicit disentangle checkpoints after sizeable "
-                "non-Clifford blocks, not after every gate."
-            )
-
-        message_parts = [
-            f"Use {execution_method} for {normalized_goal} mode "
-            f"({mode} execution)."
-        ]
-        if mode == "immediate":
-            message_parts.append(
-                "Immediate injection uses one reusable clean magic ancilla by default."
-            )
-        elif mode == "deferred":
-            message_parts.append(
-                "Deferred MAST reserves one clean ancilla per injectable gate and "
-                "moves projections to the end."
-            )
-        else:
-            message_parts.append(
-                "Direct execution keeps all non-Clifford work on the coefficient "
-                "MPS path."
-            )
-        message_parts.append(
-            "Constructor settings: "
-            + ", ".join(f"{key}={value!r}" for key, value in settings.items())
-            + "."
-        )
-        if warnings:
-            message_parts.append("Warnings: " + " ".join(warnings))
-
-        return StabilizerMpsSettingsAdvice(
-            goal=normalized_goal,
-            recommended_mode=mode,
-            execution_method=execution_method,
-            settings=settings,
-            analysis=analysis,
-            magic_strategy=magic,
-            immediate_ancillas_required=int(magic["immediate_ancillas_required"]),
-            deferred_ancillas_required=int(magic["deferred_ancillas_required"]),
-            ancilla_budget=magic["ancilla_budget"],
-            deferred_feasible=magic["deferred_feasible"],
-            disentangle_checkpoints_recommended=bool(disentangle_recommended),
-            warnings=tuple(_unique_ordered(warnings)),
-            message=" ".join(message_parts),
+            goal=goal,
         )
 
     def queued_stream_analysis(self, **kwargs) -> StreamAnalysisRecord:
         """Analyze the currently queued Pepsy stream without consuming it."""
-        kwargs.setdefault("n_qubits", self.n)
-        return type(self).analyze_stream(self._queue, **kwargs)
+        return _advice.queued_stream_analysis(self, **kwargs)
 
     def queued_recommend_settings(self, **kwargs) -> StabilizerMpsSettingsAdvice:
         """Recommend settings for the currently queued Pepsy stream."""
-        kwargs.setdefault("n_qubits", self.n)
-        return type(self).recommend_settings(self._queue, **kwargs)
+        return _advice.queued_recommend_settings(self, **kwargs)
 
     def run_queued_stream(self, **kwargs) -> StabilizerMpsRunResult:
         """Replay the currently queued Pepsy stream through the public runner.
@@ -2161,8 +1429,8 @@ class MpsStabOptimizer:
         """Run one Pepsy STN gate stream and return a typed result record.
 
         This is the class-level spelling of :func:`run_stabilizer_mps_stream`
-        for new code that already works through :class:`MpsStabOptimizer` /
-        :class:`StabilizerMpsSimulator`.
+        for new code that already works through :class:`StabilizerMpsSimulator` /
+        :class:`MpsStabOptimizer`.
         """
         return run_stabilizer_mps_stream(gates, **kwargs)
 
@@ -2174,37 +1442,15 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Static STN frame auto-layout
     # ------------------------------------------------------------------ #
-    def _refresh_layout_map(self) -> None:
-        """Refresh the logical-coefficient-site -> MPS-position map."""
-        self._logical_to_mps = {
-            int(logical): int(pos)
-            for pos, logical in enumerate(self.logical_order)
-        }
+    _refresh_layout_map = _layout._refresh_layout_map
 
-    def _layout_is_identity(self) -> bool:
-        """Return whether the coefficient MPS is in logical site order."""
-        return tuple(self.logical_order) == tuple(range(self.n))
+    _layout_is_identity = _layout._layout_is_identity
 
-    def _mps_site(self, logical_site: int) -> int:
-        """Map a logical coefficient qubit to its current MPS site position."""
-        try:
-            return self._logical_to_mps[int(logical_site)]
-        except KeyError as exc:
-            raise ValueError(
-                f"coefficient site {logical_site!r} is not present in the "
-                f"current STN layout {self.logical_order!r}."
-            ) from exc
+    _mps_site = _layout._mps_site
 
-    def _mps_sites(self, logical_sites) -> tuple[int, ...]:
-        """Map logical coefficient support sites to MPS positions."""
-        return tuple(self._mps_site(site) for site in logical_sites)
+    _mps_sites = _layout._mps_sites
 
-    def _mps_terms(self, logical_terms) -> dict[int, str]:
-        """Map a logical coefficient-frame Pauli support to MPS positions."""
-        return {
-            self._mps_site(site): axis
-            for site, axis in logical_terms.items()
-        }
+    _mps_terms = _layout._mps_terms
 
     def current_frame_layout(
         self,
@@ -2237,22 +1483,8 @@ class MpsStabOptimizer:
         ``"count"`` for the historical uniform weighting, and ``"angle"`` /
         ``"auto"`` for angle-based weighting.
         """
-        records = self._frame_layout_records(
-            self._queue,
-            weight_mode=weight_mode,
-        )
-        stream = [
-            ("submpo", {"weight": record["weight"]}, record["support"])
-            for record in records
-        ]
-        finder = MpsGateStreamLayoutFinder(stream, L=self.n)
-
-        def weight_fn(payload, _support, _event_type):
-            if isinstance(payload, Mapping):
-                return float(payload.get("weight", 1.0))
-            return 1.0
-
-        plan = finder.run(
+        return _layout.current_frame_layout(
+            self,
             order=order,
             refine_passes=refine_passes,
             refine_numba=refine_numba,
@@ -2263,500 +1495,38 @@ class MpsStabOptimizer:
             nevergrad_optimizer=nevergrad_optimizer,
             kahypar_config_path=kahypar_config_path,
             kahypar_seed=kahypar_seed,
-            weight_fn=weight_fn,
-            weight_mode="count",
+            weight_mode=weight_mode,
         )
-        plan = dict(plan)
-        plan["kind"] = "stn_frame_layout"
-        plan["source"] = "queued_frame_supports"
-        plan["frame_events"] = tuple(records)
-        plan["frame_weight_mode"] = weight_mode
-        return plan
 
     find_frame_layout = current_frame_layout
 
-    def _frame_layout_records(self, entries, *, weight_mode="operator_schmidt"):
-        """Return weighted logical frame-support records for a stream."""
-        mode = str(weight_mode).replace("-", "_").strip().lower()
-        if mode in ("unit", "uniform", "none"):
-            mode = "count"
-        if mode not in ("count", "angle", "auto", "operator_schmidt"):
-            raise ValueError(
-                "STN frame layout weight_mode must be 'operator_schmidt', "
-                "'count', 'angle', or 'auto'."
-            )
-        dry = self.copy()
-        dry._queue = []
-        records = []
-        for entry in self._as_entries(entries):
-            dry._frame_layout_trace_entry(entry, records, weight_mode=mode)
-        return tuple(records)
+    _frame_layout_records = _layout._frame_layout_records
 
-    def _frame_layout_weight(
-        self,
-        *,
-        weight_mode,
-        theta=None,
-        coeff=None,
-        support_size=None,
-        operator_weight=None,
-    ):
-        """Return the scalar weight used for one frame-layout record."""
-        if weight_mode == "operator_schmidt":
-            if operator_weight is not None:
-                amplitude = 1.0
-                if coeff is not None:
-                    try:
-                        amplitude = max(abs(complex(coeff)), 1.0e-12)
-                    except (TypeError, ValueError):
-                        amplitude = 1.0
-                return max(1.0e-12, float(operator_weight) * amplitude)
-            if theta is not None:
-                if support_size is not None and int(support_size) < 2:
-                    return 1.0
-                # Keep a unit locality baseline and add the non-leading
-                # operator-Schmidt weight of the I/P rotation branches.
-                return 1.0 + _operator_schmidt_tail_weight(theta)
-            if coeff is not None:
-                try:
-                    return max(abs(complex(coeff)), 1.0e-12)
-                except (TypeError, ValueError):
-                    return 1.0
-            return 1.0
-        if coeff is not None:
-            try:
-                return float(abs(complex(coeff)))
-            except (TypeError, ValueError):
-                return 1.0
-        if weight_mode in ("angle", "auto") and theta is not None:
-            return _layout_angle_weight(theta)
-        return 1.0
+    _frame_layout_weight = _layout._frame_layout_weight
 
-    def _frame_layout_add_pauli(
-        self,
-        pauli,
-        where,
-        records,
-        *,
-        kind,
-        entry,
-        weight_mode,
-        theta=None,
-        weight=None,
-        absorb_basis=False,
-    ):
-        """Record one current frame image and optionally dry-run its basis update."""
-        m_pauli = self.state.frame_pauli(self._phys_pauli(pauli, where))
-        terms, _sign = hermitian_pauli_terms(m_pauli)
-        support = tuple(sorted(terms))
-        if support:
-            if weight is None:
-                weight = self._frame_layout_weight(
-                    weight_mode=weight_mode,
-                    theta=theta,
-                    support_size=len(support),
-                )
-            records.append({
-                "kind": kind,
-                "entry": entry,
-                "support": support,
-                "weight": float(weight),
-                "operator_weight": float(weight),
-                "absorbs_basis": bool(absorb_basis),
-            })
-        if absorb_basis and support:
-            _ops, v_tableau, _k = _localizing_clifford(
-                terms,
-                self.n,
-                site_position=self._mps_site,
-            )
-            self.state.absorb_basis_clifford(v_tableau)
+    _frame_layout_add_pauli = _layout._frame_layout_add_pauli
 
-    def _frame_layout_trace_rotation(self, name, params, records, *, entry, weight_mode):
-        """Trace a rotation entry for layout without changing ``|p>``."""
-        theta, where, axes = self._rotation_spec(name, params)
-        phys = pauli_string(axes, where, self.n)
-        if self._is_clifford_angle(theta):
-            self._apply_clifford_rotation(theta, where, axes)
-            return
-        m_pauli = self.state.frame_pauli(phys)
-        terms, _sign = hermitian_pauli_terms(m_pauli)
-        support = tuple(sorted(terms))
-        if support:
-            weight = self._frame_layout_weight(
-                weight_mode=weight_mode,
-                theta=theta,
-                support_size=len(support),
-            )
-            records.append({
-                "kind": "rotation",
-                "entry": entry,
-                "support": support,
-                "weight": float(weight),
-                "operator_weight": float(weight),
-                "absorbs_basis": False,
-            })
+    _frame_layout_trace_rotation = _layout._frame_layout_trace_rotation
 
-    def _frame_layout_trace_matrix(self, gate, where, records, *, entry, weight_mode):
-        """Trace an explicit physical matrix entry for layout."""
-        where = _normalize_sites(where)
-        gate = _as_gate_matrix(gate, len(where))
-        dim = gate.shape[0]
-        nq = int(round(math.log2(dim)))
-        if 2 ** nq != dim or gate.shape != (dim, dim):
-            raise ValueError(f"Gate matrix must be square 2^k x 2^k, got {gate.shape}.")
-        if len(where) != nq:
-            raise ValueError(f"Gate on {nq} qubit(s) but where={where!r}.")
+    _frame_layout_trace_matrix = _layout._frame_layout_trace_matrix
 
-        dense_operator_weight = (
-            _dense_operator_schmidt_layout_weight(gate, nq)
-            if weight_mode == "operator_schmidt"
-            else None
-        )
+    _frame_layout_trace_entry = _layout._frame_layout_trace_entry
 
-        tableau = _tableau_from_exact_unitary(gate)
-        gate_is_unitary = _is_unitary(gate)
-        if tableau is not None:
-            self.state.do_tableau(tableau, where)
-            return
+    _validate_layout_plan_for_stn = _layout._validate_layout_plan_for_stn
 
-        if nq == 1 and gate_is_unitary:
-            alpha, theta, beta = _zyz_angles(gate)
-            q = where[0]
-            self._frame_layout_trace_rotation(
-                "rz", (beta, q), records, entry=entry, weight_mode=weight_mode
-            )
-            self._frame_layout_trace_rotation(
-                "ry", (theta, q), records, entry=entry, weight_mode=weight_mode
-            )
-            self._frame_layout_trace_rotation(
-                "rz", (alpha, q), records, entry=entry, weight_mode=weight_mode
-            )
-            return
+    _explicit_layout_plan = _layout._explicit_layout_plan
 
-        limit = self.max_pauli_decomposition_qubits
-        if limit is not None and nq > limit:
-            raise ValueError(
-                f"Pauli decomposition of a {nq}-qubit dense gate would enumerate "
-                f"{4**nq} candidate terms, exceeding "
-                f"max_pauli_decomposition_qubits={limit}."
-            )
-        for term_index, (labels, coeff) in enumerate(
-            pauli_decomposition(gate, nq, tol=self.operator_tol), start=1
-        ):
-            if (
-                self.max_pauli_terms is not None
-                and term_index > self.max_pauli_terms
-            ):
-                raise ValueError(
-                    f"dense gate retained more than max_pauli_terms="
-                    f"{self.max_pauli_terms} during layout analysis."
-                )
-            phys = pauli_string(labels, where, self.n)
-            frame_terms, _sign = hermitian_pauli_terms(self.state.frame_pauli(phys))
-            support = tuple(sorted(frame_terms))
-            if support:
-                weight = self._frame_layout_weight(
-                    weight_mode=weight_mode,
-                    coeff=coeff,
-                    operator_weight=dense_operator_weight,
-                )
-                records.append({
-                    "kind": "matrix_branch",
-                    "entry": entry,
-                    "support": support,
-                    "weight": float(weight),
-                    "operator_weight": (
-                        float(dense_operator_weight)
-                        if dense_operator_weight is not None
-                        else float(weight)
-                    ),
-                    "absorbs_basis": False,
-                })
+    _resolve_layout_plan_argument = _layout._resolve_layout_plan_argument
 
-    def _frame_layout_trace_entry(self, entry, records, *, weight_mode):
-        """Trace one queued entry into weighted frame-support records."""
-        conditional = conditional_event_parts(entry)
-        if conditional is not None:
-            raise ValueError(
-                "static STN frame_layout='auto' cannot safely prepass a "
-                "branch-dependent feed-forward action; provide an explicit "
-                "layout or use the ordinary interaction layout."
-            )
-        parts = submpo_event_parts(entry, normalize_where=True)
-        if parts is not None:
-            mpo, where = parts
-            support = tuple(sorted(_unique_ordered(where)))
-            if support:
-                weight = (
-                    _submpo_operator_layout_weight(mpo)
-                    if weight_mode == "operator_schmidt"
-                    else 1.0
-                )
-                records.append({
-                    "kind": "submpo",
-                    "entry": entry,
-                    "support": support,
-                    "weight": float(weight),
-                    "operator_weight": float(weight),
-                    "absorbs_basis": False,
-                })
-            return
+    _product_site_vector = staticmethod(_layout._product_site_vector)
 
-        if not (isinstance(entry, (list, tuple)) and len(entry) >= 1):
-            raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
+    _relabel_product_mps = _layout._relabel_product_mps
 
-        head = entry[0]
-        if not isinstance(head, str):
-            if len(entry) != 2:
-                raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
-            gate, where = entry
-            self._frame_layout_trace_matrix(
-                self._gate_to_numpy(gate),
-                where,
-                records,
-                entry=entry,
-                weight_mode=weight_mode,
-            )
-            return
+    _format_layout_value = staticmethod(_layout._format_layout_value)
 
-        name = _normalize_event_name(head)
-        if name == "disentangle":
-            return
-        if name in _CLIFFORD_NAMES:
-            self.state.apply_clifford(name, *entry[1:])
-            return
-        if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name in (
-            "rot", "t", "tdg",
-        ):
-            self._frame_layout_trace_rotation(
-                name,
-                entry[1:],
-                records,
-                entry=entry,
-                weight_mode=weight_mode,
-            )
-            return
-        if name == "measure":
-            pauli, where = entry[1], entry[2]
-            absorb = bool(entry[4]) if len(entry) > 4 else False
-            self._frame_layout_add_pauli(
-                pauli,
-                where,
-                records,
-                kind="measure",
-                entry=entry,
-                weight_mode=weight_mode,
-                absorb_basis=absorb,
-            )
-            return
-        if name == "reset" or name in _RESET_AXIS_ALIASES:
-            axes, where = _parse_reset_args(
-                entry[1:],
-                default_axis=_RESET_AXIS_ALIASES.get(name),
-            )
-            for axis, q in zip(axes, where):
-                self._frame_layout_add_pauli(
-                    axis,
-                    q,
-                    records,
-                    kind="reset",
-                    entry=entry,
-                    weight_mode=weight_mode,
-                    absorb_basis=True,
-                )
-            return
-        if name in _MR_ALIASES or name in _MR_AXIS_ALIASES:
-            axes, where, _outcomes, absorb = _parse_measure_reset_args(
-                entry[1:],
-                default_axis=_MR_AXIS_ALIASES.get(name),
-            )
-            for axis, q in zip(axes, where):
-                self._frame_layout_add_pauli(
-                    axis,
-                    q,
-                    records,
-                    kind="measure_reset",
-                    entry=entry,
-                    weight_mode=weight_mode,
-                    absorb_basis=absorb,
-                )
-            return
-        if name == "cap":
-            raise ValueError(
-                "static STN auto-layout is not supported with cap events, "
-                "because cap changes the qubit/MPS length."
-            )
-        raise ValueError(f"Unknown gate name {head!r} in stream entry {entry!r}.")
+    _format_layout_reduction = classmethod(_layout._format_layout_reduction)
 
-    def _validate_layout_plan_for_stn(self, plan) -> None:
-        """Validate that a layout plan is a full permutation of STN qubits."""
-        site_order = tuple(int(site) for site in plan.get("site_order", plan.get("order", ())))
-        if len(site_order) != self.n:
-            raise ValueError(
-                f"layout site_order length must match n={self.n}, got {len(site_order)}."
-            )
-        if sorted(site_order) != list(range(self.n)):
-            raise ValueError(
-                f"layout site_order must be a permutation of range({self.n})."
-            )
-        site_map = plan.get("site_map", plan.get("layout"))
-        if site_map is None:
-            raise ValueError("layout plan must contain a site_map/layout mapping.")
-        expected = {site: pos for pos, site in enumerate(site_order)}
-        if {int(k): int(v) for k, v in dict(site_map).items()} != expected:
-            raise ValueError(
-                "layout site_map must map each logical coefficient site to its "
-                "position in site_order."
-            )
-
-    def _explicit_layout_plan(self, site_order):
-        """Build a minimal STN frame-layout plan from an explicit site order."""
-        site_order = tuple(int(site) for site in site_order)
-        site_map = {site: position for position, site in enumerate(site_order)}
-        return {
-            "kind": "stn_frame_layout",
-            "selected_order": "explicit",
-            "qubit_inds": site_order,
-            "site_order": site_order,
-            "order": site_order,
-            "layout": site_map,
-            "site_map": site_map,
-            "inverse_site_map": {
-                position: site for site, position in site_map.items()
-            },
-            "stats": {},
-            "input_stats": {},
-        }
-
-    def _resolve_layout_plan_argument(self, plan_or_order, layout_kwargs=None):
-        """Resolve a static STN layout request without mutating the simulator."""
-        if isinstance(plan_or_order, Mapping):
-            plan = dict(plan_or_order)
-        elif isinstance(plan_or_order, str):
-            kwargs = {} if layout_kwargs is None else dict(layout_kwargs)
-            plan = self.current_frame_layout(order=plan_or_order, **kwargs)
-        else:
-            try:
-                plan = self._explicit_layout_plan(plan_or_order)
-            except TypeError as exc:
-                raise TypeError(
-                    "plan_or_order must be a layout mapping, an order name, "
-                    "or a permutation of logical coefficient sites."
-                ) from exc
-        self._validate_layout_plan_for_stn(plan)
-        return plan
-
-    @staticmethod
-    def _product_site_vector(p, physical_site):
-        """Extract a local vector from an isolated coefficient-MPS site."""
-        tensor = p[p.site_tag(int(physical_site))]
-        physical_ind = p.site_ind(int(physical_site))
-        try:
-            physical_axis = tensor.inds.index(physical_ind)
-        except ValueError as exc:  # pragma: no cover - defensive quimb guard
-            raise ValueError(
-                "product-state relabeling could not locate a physical site index."
-            ) from exc
-        if any(
-            int(size) != 1
-            for axis, size in enumerate(tensor.shape)
-            if axis != physical_axis
-        ):
-            raise ValueError(
-                "extracting a local product vector requires every virtual dimension "
-                "to be one."
-            )
-        axes = [axis for axis in range(tensor.ndim) if axis != physical_axis]
-        axes.append(physical_axis)
-        data = ar.do("transpose", tensor.data, tuple(axes))
-        return data.reshape(-1)
-
-    def _relabel_product_mps(self, target_order, *, current_order):
-        """Rebuild a bond-one coefficient MPS in a new logical site order."""
-        p = self.state.p
-        if getattr(p, "cyclic", False):
-            raise ValueError(
-                "STN static layout relabeling currently requires an open-boundary MPS."
-            )
-        vectors = {
-            logical_site: self._product_site_vector(p, physical_site)
-            for physical_site, logical_site in enumerate(current_order)
-        }
-        arrays = [vectors[logical_site] for logical_site in target_order]
-        new_p = qtn.MPS_product_state(
-            arrays,
-            site_ind_id=p.site_ind_id,
-            site_tag_id=p.site_tag_id,
-        )
-        if hasattr(p, "exponent") and hasattr(new_p, "exponent"):
-            new_p.exponent = p.exponent
-        self.state.p = new_p
-        self.state.info = {"cur_orthog": None}
-
-    @staticmethod
-    def _format_layout_value(value):
-        """Format one layout diagnostic value compactly."""
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return str(value)
-        if abs(value - round(value)) < 1e-9:
-            return str(int(round(value)))
-        return f"{value:.3g}"
-
-    @classmethod
-    def _format_layout_reduction(cls, before, after):
-        """Format a before/after layout diagnostic compactly."""
-        text = f"{cls._format_layout_value(before)} -> {cls._format_layout_value(after)}"
-        try:
-            before = float(before)
-            after = float(after)
-        except (TypeError, ValueError):
-            return text
-        if before > 0.0:
-            text += f" ({100.0 * (before - after) / before:.1f}% lower)"
-        return text
-
-    @classmethod
-    def _layout_report_text(cls, plan):
-        """Return a concise human-readable STN layout report."""
-        stats = plan.get("stats", {})
-        input_stats = plan.get("input_stats", {})
-        if not input_stats:
-            return None
-        selected = plan.get("selected_order", "<unknown>")
-        site_order = plan.get("site_order", ())
-        lines = [
-            (
-                "MpsStabOptimizer frame layout: "
-                f"order={selected}, sites={len(site_order)}, "
-                f"events={stats.get('num_events', input_stats.get('num_events', 0))}"
-            ),
-            (
-                "  frame event span max/mean: "
-                + cls._format_layout_value(input_stats.get("max_event_span", 0))
-                + "/"
-                + cls._format_layout_value(input_stats.get("weighted_mean_event_span", 0.0))
-                + " -> "
-                + cls._format_layout_value(stats.get("max_event_span", 0))
-                + "/"
-                + cls._format_layout_value(stats.get("weighted_mean_event_span", 0.0))
-            ),
-            (
-                "  score: "
-                + cls._format_layout_reduction(
-                    input_stats.get("loss", input_stats.get("score", 0.0)),
-                    stats.get("loss", stats.get("score", 0.0)),
-                )
-                + " | cut L2: "
-                + cls._format_layout_reduction(
-                    input_stats.get("weighted_cut_congestion_l2", 0.0),
-                    stats.get("weighted_cut_congestion_l2", 0.0),
-                )
-            ),
-        ]
-        return "\n".join(lines)
+    _layout_report_text = classmethod(_layout._layout_report_text)
 
     def apply_layout(
         self,
@@ -2764,7 +1534,7 @@ class MpsStabOptimizer:
         *,
         layout_kwargs=None,
         layout_report: bool = True,
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Install a static STN frame layout while ``|p>`` is still product.
 
         The tableau/physical qubit labels stay unchanged.  Only the coefficient
@@ -2774,59 +1544,14 @@ class MpsStabOptimizer:
         (including Clifford-entangled stabilizer states), and rejects entangled
         coefficient states before mutation.
         """
-        for entry in self._queue:
-            if isinstance(entry, (list, tuple)) and entry:
-                head = entry[0]
-                if isinstance(head, str) and _normalize_event_name(head) == "cap":
-                    raise ValueError(
-                        "static STN layout cannot be installed for streams with "
-                        "cap events, because cap changes the qubit/MPS length."
-                    )
-        plan = self._resolve_layout_plan_argument(plan_or_order, layout_kwargs)
-        target_order = tuple(int(site) for site in plan["site_order"])
-        current_order = tuple(self.logical_order)
-        if target_order != current_order:
-            if int(self.state.max_bond()) != 1:
-                raise ValueError(
-                    "static STN layout requires a product coefficient MPS "
-                    "(state.max_bond() == 1); got max_bond={} . Apply the "
-                "layout before non-Clifford evolution entangles |p>.".format(
-                        self.state.max_bond()
-                    )
-                )
-            self._relabel_product_mps(target_order, current_order=current_order)
-        self.logical_order = list(target_order)
-        self._refresh_layout_map()
-        self._localizer_cache.clear()
-        self.layout_plan = plan
-        self.last_layout_plan = plan
-        if layout_report:
-            report = self._layout_report_text(plan)
-            if report:
-                print(report)
-        return self
+        return _layout.apply_layout(
+            self,
+            plan_or_order,
+            layout_kwargs=layout_kwargs,
+            layout_report=layout_report,
+        )
 
-    def _apply_layout_from_entries(
-        self,
-        entries,
-        layout,
-        *,
-        layout_kwargs=None,
-        layout_report: bool = True,
-    ) -> None:
-        """Install a static layout found from ``entries`` without queuing them."""
-        if layout is None or layout is False:
-            return
-        old_queue = self._queue
-        self._queue = list(entries)
-        try:
-            self.apply_layout(
-                layout,
-                layout_kwargs=layout_kwargs,
-                layout_report=layout_report,
-            )
-        finally:
-            self._queue = old_queue
+    _apply_layout_from_entries = _layout._apply_layout_from_entries
 
     # ------------------------------------------------------------------ #
     # Execution
@@ -2843,6 +1568,8 @@ class MpsStabOptimizer:
                 chi=self.chi,
                 mode=self.mode,
                 cutoff=self.cutoff,
+                cutoff_mode=self.cutoff_mode,
+                contraction_opt=self.contraction_opt,
                 operator_tol=self.operator_tol,
                 max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
                 max_pauli_terms=self.max_pauli_terms,
@@ -2890,7 +1617,7 @@ class MpsStabOptimizer:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
     ):
         """Dispatch noisy replay through the shared MPS/STN runner."""
@@ -2911,7 +1638,7 @@ class MpsStabOptimizer:
             resume
             or checkpoint_keep != 2
             or checkpoint_sync is not True
-            or collect_diagnostics is not True
+            or collect_diagnostics is not False
             or checkpoint_id is not None
         ):
             raise ValueError(
@@ -3128,6 +1855,211 @@ class MpsStabOptimizer:
         self._rng.bit_generator.state = deepcopy(snapshot["rng_state"])
         self.backend_info()
 
+    def _prepare_run_configuration(
+        self,
+        *,
+        n_iter,
+        cutoff,
+        cutoff_mode,
+        mode,
+        contraction_opt,
+        fit_min_iter,
+        fit_rtol,
+        fit_patience,
+        fit_block_size,
+        fit_adaptive_sweeps,
+        fit_sweep_sequence,
+        fit_two_site_transition_sweeps,
+        fit_single_pair_fast_path,
+        finite_check,
+        fit_overlap_diagnostics,
+        fit_init_strategy,
+        fit_init_rand_strength,
+        fit_init_seed,
+    ):
+        """Resolve one MPS-compatible replay configuration.
+
+        ``run`` accepts per-replay overrides without making every FIT control
+        part of the constructor state. Snapshot all mutable settings before
+        resolving them so the caller's configuration can be restored after a
+        successful replay or an exception. An explicitly supplied ``mode`` is
+        the one intentional persistent state transition.
+        """
+        # Keep these overrides isolated from queue execution: FIT and native
+        # Quimb paths read the optimizer attributes directly while replaying.
+        original = {
+            "mode": self.mode,
+            "chi": self.chi,
+            "cutoff": self.cutoff,
+            "cutoff_mode": self.cutoff_mode,
+            "contraction_opt": self.contraction_opt,
+            "fit_n_iter": self._fit_n_iter,
+            "fit_min_iter": self._fit_min_iter,
+            "fit_rtol": self._fit_rtol,
+            "fit_patience": self._fit_patience,
+            "fit_block_size": self._fit_block_size,
+            "fit_adaptive_sweeps": self._fit_adaptive_sweeps,
+            "fit_sweep_sequence": self._fit_sweep_sequence,
+            "fit_two_site_transition_sweeps": self._fit_two_site_transition_sweeps,
+            "fit_single_pair_fast_path": self._fit_single_pair_fast_path,
+            "fit_finite_check": self._fit_finite_check,
+            "fit_overlap_diagnostics": self._fit_overlap_diagnostics,
+            "fit_init_strategy": self.fit_init_strategy,
+            "fit_init_rand_strength": self.fit_init_rand_strength,
+            "fit_init_seed": self.fit_init_seed,
+            "dmrg1_one_site_locked": self._dmrg1_one_site_locked,
+        }
+
+        if mode is not None:
+            # ``mode`` is retained after the replay; the other run controls are
+            # restored in ``_restore_run_configuration`` when the queue ends.
+            new_mode = self._normalize_mode(mode)
+            if (
+                new_mode != "exact"
+                and original["mode"] == "exact"
+                and original["chi"] is None
+            ):
+                raise ValueError(
+                    "run(mode=...) cannot recover a finite chi after an exact "
+                    "optimizer was constructed; create it with chi first."
+                )
+            new_chi = self._normalize_chi(self.chi, mode=new_mode)
+            self.mode = new_mode
+            self.chi = new_chi
+            self._dmrg1_one_site_locked = False
+
+        requested_cutoff = self.cutoff if cutoff is None else cutoff
+        self.cutoff = self._resolve_cutoff(
+            requested_cutoff,
+            dtype=self.backend_dtype,
+        )
+        requested_cutoff_mode = (
+            self.cutoff_mode if cutoff_mode is None else cutoff_mode
+        )
+        self.cutoff_mode = self._resolve_cutoff_mode(
+            requested_cutoff_mode,
+            preserve_mpo_default=self._is_quimb_mode(self.mode),
+        )
+        self.contraction_opt = (
+            original["contraction_opt"]
+            if contraction_opt is None
+            else contraction_opt
+        )
+
+        self._fit_n_iter = self._validate_positive_int(n_iter, "n_iter")
+        self._fit_min_iter = self._validate_positive_int(
+            fit_min_iter,
+            "fit_min_iter",
+        )
+        self._fit_patience = self._validate_positive_int(
+            fit_patience,
+            "fit_patience",
+        )
+        self._fit_rtol = self._resolve_fit_rtol(fit_rtol)
+        if fit_block_size is None:
+            fit_block_size = 3 if self.mode == "dmrg3" else 2
+        if (
+            isinstance(fit_block_size, bool)
+            or not isinstance(fit_block_size, Integral)
+            or int(fit_block_size) not in {1, 2, 3}
+        ):
+            raise ValueError("fit_block_size must be 1, 2, or 3.")
+        fit_block_size = int(fit_block_size)
+        if self.mode == "dmrg3" and fit_block_size not in {1, 3}:
+            raise ValueError("mode='dmrg3' fixes fit_block_size to 3 or its one-site phase.")
+        if self.mode in {"dmrg1", "dmrg2"} and fit_block_size not in {1, 2}:
+            raise ValueError(
+                f"mode={self.mode!r} fixes fit_block_size to 2 or its one-site phase."
+            )
+        self._fit_block_size = fit_block_size
+        self._fit_adaptive_sweeps = self._validate_positive_int(
+            fit_adaptive_sweeps,
+            "fit_adaptive_sweeps",
+        )
+        self._fit_adaptive_sweeps = min(
+            self._fit_adaptive_sweeps,
+            self._fit_n_iter,
+        )
+        self._fit_sweep_sequence = FIT._validate_sweep_sequence(
+            fit_sweep_sequence
+        )
+        if fit_two_site_transition_sweeps is None:
+            fit_two_site_transition_sweeps = 1 if self.mode == "dmrg3" else 0
+        if (
+            isinstance(fit_two_site_transition_sweeps, bool)
+            or not isinstance(fit_two_site_transition_sweeps, Integral)
+            or int(fit_two_site_transition_sweeps) < 0
+        ):
+            raise ValueError(
+                "fit_two_site_transition_sweeps must be a non-negative integer."
+            )
+        self._fit_two_site_transition_sweeps = min(
+            int(fit_two_site_transition_sweeps),
+            self._fit_n_iter,
+        )
+        self._fit_single_pair_fast_path = bool(fit_single_pair_fast_path)
+        self._fit_finite_check = finite_check
+        self._fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
+        if fit_init_strategy is not None:
+            self.fit_init_strategy = self._normalize_fit_init_strategy(
+                fit_init_strategy
+            )
+        if fit_init_rand_strength is not None:
+            try:
+                fit_init_rand_strength = float(fit_init_rand_strength)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "fit_init_rand_strength must be finite and non-negative."
+                ) from exc
+            if (
+                not np.isfinite(fit_init_rand_strength)
+                or fit_init_rand_strength < 0.0
+            ):
+                raise ValueError(
+                    "fit_init_rand_strength must be finite and non-negative."
+                )
+            self.fit_init_rand_strength = fit_init_rand_strength
+        if fit_init_seed is not None:
+            if isinstance(fit_init_seed, bool) or not isinstance(
+                fit_init_seed, Integral
+            ) or int(fit_init_seed) < 0:
+                raise ValueError("fit_init_seed must be a non-negative integer.")
+            self.fit_init_seed = int(fit_init_seed)
+        return original
+
+    def _restore_run_configuration(self, original, *, keep_mode=False):
+        """Restore constructor configuration after a replay override.
+
+        ``keep_mode`` is used only when the caller explicitly requested a
+        mode transition in ``run``. Keeping that transition while restoring
+        cutoff/FIT controls makes mode changes persistent without allowing
+        one-off numerical settings to leak into later replays.
+        """
+        if not keep_mode:
+            self.mode = original["mode"]
+            self.chi = original["chi"]
+        self.cutoff = original["cutoff"]
+        self.cutoff_mode = original["cutoff_mode"]
+        self.contraction_opt = original["contraction_opt"]
+        self._fit_n_iter = original["fit_n_iter"]
+        self._fit_min_iter = original["fit_min_iter"]
+        self._fit_rtol = original["fit_rtol"]
+        self._fit_patience = original["fit_patience"]
+        self._fit_block_size = original["fit_block_size"]
+        self._fit_adaptive_sweeps = original["fit_adaptive_sweeps"]
+        self._fit_sweep_sequence = original["fit_sweep_sequence"]
+        self._fit_two_site_transition_sweeps = original[
+            "fit_two_site_transition_sweeps"
+        ]
+        self._fit_single_pair_fast_path = original["fit_single_pair_fast_path"]
+        self._fit_finite_check = original["fit_finite_check"]
+        self._fit_overlap_diagnostics = original["fit_overlap_diagnostics"]
+        self.fit_init_strategy = original["fit_init_strategy"]
+        self.fit_init_rand_strength = original["fit_init_rand_strength"]
+        self.fit_init_seed = original["fit_init_seed"]
+        if not keep_mode:
+            self._dmrg1_one_site_locked = original["dmrg1_one_site_locked"]
+
     def run(
         self,
         *,
@@ -3153,11 +2085,29 @@ class MpsStabOptimizer:
         resume=False,
         checkpoint_keep=2,
         checkpoint_sync=True,
-        collect_diagnostics=True,
+        collect_diagnostics=False,
         checkpoint_id=None,
         timing: bool = False,
         transactional: bool = False,
         atomic=None,
+        n_iter=8,
+        cutoff=None,
+        cutoff_mode=None,
+        mode=None,
+        contraction_opt=None,
+        fit_min_iter=2,
+        fit_rtol="auto",
+        fit_patience=2,
+        fit_block_size=None,
+        fit_adaptive_sweeps=2,
+        fit_sweep_sequence="RL",
+        fit_two_site_transition_sweeps=None,
+        fit_single_pair_fast_path=False,
+        finite_check=False,
+        fit_overlap_diagnostics=False,
+        fit_init_strategy=None,
+        fit_init_rand_strength=None,
+        fit_init_seed=None,
     ):
         """Apply all queued gates in order, consuming successful entries.
 
@@ -3183,13 +2133,36 @@ class MpsStabOptimizer:
             Show one aggregate rank-zero progress bar for MPI runs.
         timing : bool
             Record a lightweight wall-clock replay record available through
-            :meth:`get_run_timing`.
+            :meth:`get_run_timing`. The default ``False`` performs no replay
+            profiling clock reads and allocates no timing record.
         transactional : bool
             If true, restore the STN state and diagnostics when an entry fails;
             the failed entry and suffix remain queued for retry. This is opt-in
             because a full STN snapshot is intentionally expensive.
         atomic : bool | None
             Alias for ``transactional``.
+        n_iter, cutoff, cutoff_mode, mode, contraction_opt : optional
+            Replay controls matching :meth:`MpsOptimizer.run`. ``cutoff=None``
+            and ``contraction_opt=None`` retain the constructor values;
+            ``cutoff="auto"`` uses the dtype-aware Pepsy policy.
+        fit_min_iter, fit_rtol, fit_patience, fit_block_size, fit_adaptive_sweeps : optional
+            Local FIT/DMRG controls matching the ordinary MPS optimizer.
+            ``fit_rtol="auto"`` selects the dtype-aware stopping tolerance;
+            pass ``None`` to use the fixed iteration budget. The default FIT
+            guess remains ``fit_init_strategy="guess-src"``.
+        fit_sweep_sequence, fit_two_site_transition_sweeps : optional
+            Sweep direction and three-site-to-two-site transition controls for
+            FIT-backed DMRG modes.
+        fit_single_pair_fast_path, finite_check : optional
+            Enable the structural adjacent-pair shortcut or FIT validation
+            checks. Validation is opt-in because it adds tensor-scan cost.
+        fit_overlap_diagnostics : bool, optional
+            If true, compute a diagnostic overlap between the exact FIT target
+            and fitted MPS after each FIT update. This is separate from the
+            norm-based STN compression-loss diagnostic.
+        fit_init_strategy, fit_init_rand_strength, fit_init_seed : optional
+            Select and configure the disposable FIT warm start. The exact
+            target remains independent of this initial guess.
         """
         if atomic is not None:
             transactional = bool(atomic)
@@ -3197,6 +2170,35 @@ class MpsStabOptimizer:
             raise ValueError("shots must be a nonnegative integer.")
         if run_kwargs is not None and not isinstance(run_kwargs, Mapping):
             raise TypeError("run_kwargs must be a mapping or None.")
+        replay_kwargs = dict(run_kwargs or {})
+        for key, value in {
+            "n_iter": n_iter,
+            "fit_min_iter": fit_min_iter,
+            "fit_rtol": fit_rtol,
+            "fit_patience": fit_patience,
+            "fit_block_size": fit_block_size,
+            "fit_adaptive_sweeps": fit_adaptive_sweeps,
+            "fit_sweep_sequence": fit_sweep_sequence,
+            "fit_two_site_transition_sweeps": fit_two_site_transition_sweeps,
+            "fit_single_pair_fast_path": fit_single_pair_fast_path,
+            "finite_check": finite_check,
+            "fit_overlap_diagnostics": fit_overlap_diagnostics,
+        }.items():
+            replay_kwargs.setdefault(key, value)
+        if cutoff is not None:
+            replay_kwargs["cutoff"] = cutoff
+        if cutoff_mode is not None:
+            replay_kwargs["cutoff_mode"] = cutoff_mode
+        if mode is not None:
+            replay_kwargs["mode"] = mode
+        if contraction_opt is not None:
+            replay_kwargs["contraction_opt"] = contraction_opt
+        if fit_init_strategy is not None:
+            replay_kwargs["fit_init_strategy"] = fit_init_strategy
+        if fit_init_rand_strength is not None:
+            replay_kwargs["fit_init_rand_strength"] = fit_init_rand_strength
+        if fit_init_seed is not None:
+            replay_kwargs["fit_init_seed"] = fit_init_seed
         shot_requested = bool(
             self._has_trajectory_events
             or error_model is not None
@@ -3215,12 +2217,12 @@ class MpsStabOptimizer:
             or checkpoint_path is not None
         )
         if shot_requested:
-            started = time.perf_counter()
+            started = time.perf_counter() if timing else None
             result = self._run_shots(
                 shots,
                 error_model=error_model,
                 seed=seed,
-                run_kwargs=run_kwargs,
+                run_kwargs=replay_kwargs,
                 strategy=strategy,
                 max_branches=max_branches,
                 importance_sampling=importance_sampling,
@@ -3241,14 +2243,35 @@ class MpsStabOptimizer:
                 collect_diagnostics=collect_diagnostics,
                 checkpoint_id=checkpoint_id,
             )
-            self._last_run_timing = {
-                "enabled": bool(timing),
-                "mode": "trajectory" if error_model is None else "noisy",
-                "entries": len(self._gate_stream),
-                "elapsed_seconds": float(time.perf_counter() - started),
-            }
+            if timing:
+                self._last_run_timing = {
+                    "enabled": True,
+                    "mode": "trajectory" if error_model is None else "noisy",
+                    "entries": len(self._gate_stream),
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                }
             return result
 
+        run_configuration = self._prepare_run_configuration(
+            n_iter=n_iter,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            mode=mode,
+            contraction_opt=contraction_opt,
+            fit_min_iter=fit_min_iter,
+            fit_rtol=fit_rtol,
+            fit_patience=fit_patience,
+            fit_block_size=fit_block_size,
+            fit_adaptive_sweeps=fit_adaptive_sweeps,
+            fit_sweep_sequence=fit_sweep_sequence,
+            fit_two_site_transition_sweeps=fit_two_site_transition_sweeps,
+            fit_single_pair_fast_path=fit_single_pair_fast_path,
+            finite_check=finite_check,
+            fit_overlap_diagnostics=fit_overlap_diagnostics,
+            fit_init_strategy=fit_init_strategy,
+            fit_init_rand_strength=fit_init_rand_strength,
+            fit_init_seed=fit_init_seed,
+        )
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         queue = tuple(self._queue)
@@ -3256,7 +2279,7 @@ class MpsStabOptimizer:
         pbar = None
         snapshot = self._execution_snapshot() if transactional else None
         rolled_back = False
-        started = time.perf_counter()
+        started = time.perf_counter() if timing else None
         if progbar and queue:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
@@ -3287,16 +2310,21 @@ class MpsStabOptimizer:
                 pbar.close()
             if completed and not rolled_back:
                 del self._queue[:completed]
-            self._last_run_timing = {
-                "enabled": bool(timing),
-                "mode": "direct",
-                "entries": len(queue),
-                "completed": completed,
-                "elapsed_seconds": float(time.perf_counter() - started),
-            }
+            if timing:
+                self._last_run_timing = {
+                    "enabled": True,
+                    "mode": "direct",
+                    "entries": len(queue),
+                    "completed": completed,
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                }
+            self._restore_run_configuration(
+                run_configuration,
+                keep_mode=mode is not None,
+            )
         return self
 
-    def apply(self, gates, *, progbar: bool = False) -> "MpsStabOptimizer":
+    def apply(self, gates, *, progbar: bool = False) -> "StabilizerMpsSimulator":
         """Convenience: queue ``gates`` and run immediately."""
         return self.set_gates(gates).run(progbar=progbar)
 
@@ -3316,6 +2344,9 @@ class MpsStabOptimizer:
 
     def get_infidelities(self):
         """Return the cumulative ``infidelity`` trace like ``MpsOptimizer``."""
+        # Preserve the public list identity while materializing its scalars
+        # only when the caller explicitly requests the trace.
+        self.infidelities[:] = scalar_to_host(self.infidelities)
         return self.infidelities
 
     def get_norm_events(self):
@@ -3333,7 +2364,13 @@ class MpsStabOptimizer:
         here contains both the local ratio for the update and the cumulative
         ratio within the current boundary-aware ledger.
         """
-        return deepcopy(self._compression_norm_events)
+        events = []
+        for event in scalar_to_host(self._compression_norm_events):
+            if event["valid"]:
+                event["valid"] = True
+                event["step"] = len(events) + 1
+                events.append(event)
+        return events
 
     def get_normalizations(self):
         """Return explicit normalization records.
@@ -3402,10 +2439,11 @@ class MpsStabOptimizer:
 
         Parameters
         ----------
-        mode : {"exact", "direct", "zipup", "src", "fit-*", "dmrg"}, default="exact"
+        mode : str, default="exact"
             ``"exact"`` applies the tableau circuit with unlimited bond and
             zero cutoff. Native MPS compression methods use their bare names,
-            matching the ordinary MPS optimizer; ``"dmrg"`` uses its
+            matching the ordinary MPS optimizer, including ``"direct"``,
+            ``"zipup"``, ``"src"``, and ``"fit-*"``; ``"dmrg"`` uses its
             variational replay path. Approximate modes require ``chi``.
             Historical ``"quimb-*"`` and ``"mpo-*"`` forms remain accepted as
             deprecated aliases.
@@ -3675,11 +2713,115 @@ class MpsStabOptimizer:
     def norm(self) -> float:
         """Norm of the coefficient state ``|nu>`` (represented state norm; ~1).
 
-        Computed from :meth:`_norm_squared`, which uses the tracked orthogonality
-        centre when available (no full ``<nu|nu>`` contraction) and never mutates
-        the state.
+        Computed from a log-scaled norm read, using the tracked orthogonality
+        centre when available (no full ``<nu|nu>`` contraction) and never
+        materializing an extreme exponent.
         """
-        return float(self._norm_squared() ** 0.5)
+        return self._float_from_log10(self._norm_log10())
+
+    @staticmethod
+    def _float_from_log10(log10_value: float) -> float:
+        """Materialize a base-10 log value without raising on overflow.
+
+        Norm diagnostics can legitimately span beyond the representable float
+        range. Check the logarithm before exponentiating so reporting an
+        extreme norm produces ``0.0`` or ``inf`` rather than an exception.
+        """
+        log10_value = float(log10_value)
+        if math.isnan(log10_value):
+            return math.nan
+        if log10_value <= _LOG10_FLOAT_MIN_SUBNORMAL:
+            return 0.0
+        if log10_value >= _LOG10_FLOAT_MAX:
+            return math.inf
+        return float(10.0 ** log10_value)
+
+    @staticmethod
+    def _log10_fidelity_from_norms(approx_log10, expected_log10):
+        """Return log fidelity from log-norms, clipped to unit fidelity.
+
+        Fidelity is the squared retained-norm ratio, so the calculation stays
+        stable when either norm carries a very large Quimb exponent.
+        """
+        approx_log10 = float(approx_log10)
+        expected_log10 = float(expected_log10)
+        if math.isnan(approx_log10) or math.isnan(expected_log10):
+            return -math.inf
+        if expected_log10 == -math.inf:
+            return 0.0 if approx_log10 == -math.inf else -math.inf
+        if approx_log10 == -math.inf:
+            return -math.inf
+        if approx_log10 == math.inf and expected_log10 == math.inf:
+            return 0.0
+        if expected_log10 == math.inf:
+            return -math.inf
+        return min(0.0, 2.0 * (approx_log10 - expected_log10) * _LN10)
+
+    def _coefficient_norm_parts(self):
+        """Return ``(norm_mantissa, log10_scale)`` for ``state.p``.
+
+        The tracked canonical centre gives a cheap norm mantissa while keeping
+        Quimb's network exponent separate. For an unknown centre, use Quimb's
+        public ``strip_exponent`` norm API so the full contraction does not
+        materialize an extreme scale.
+        """
+        p = self.state.p
+        cur = self.state.info.get("cur_orthog")
+        if isinstance(cur, tuple) and len(cur) == 2 and cur[0] == cur[1]:
+            center = p[p.site_tag(int(cur[0]))]
+            norm_mantissa = float(abs(self._to_scalar(center.norm())))
+            return norm_mantissa, float(getattr(p, "exponent", 0.0))
+
+        try:
+            result = p.norm(strip_exponent=True)
+            if isinstance(result, tuple) and len(result) == 2:
+                norm_mantissa, exponent = result
+                return (
+                    float(abs(self._to_scalar(norm_mantissa))),
+                    float(exponent),
+                )
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            FloatingPointError,
+            OverflowError,
+        ):
+            pass
+
+        # Compatibility fallback for older Quimb releases without the public
+        # ``strip_exponent`` norm option. Keep the explicit scale separate so
+        # the fallback cannot double-count it.
+        raw = p.copy()
+        exponent = float(getattr(raw, "exponent", 0.0))
+        raw.exponent = 0.0
+        return float(abs(self._to_scalar(raw.norm()))), exponent
+
+    def _norm_log10(self) -> float:
+        """Return ``log10(||p||)`` without materializing the represented norm."""
+        norm_mantissa, exponent = self._coefficient_norm_parts()
+        if math.isnan(norm_mantissa) or math.isnan(exponent):
+            return math.nan
+        if norm_mantissa == 0.0:
+            return -math.inf
+        if norm_mantissa == math.inf or exponent == math.inf:
+            return math.inf
+        if exponent == -math.inf:
+            return -math.inf
+        return math.log10(norm_mantissa) + exponent
+
+    def _norm_snapshot(self):
+        """Return ``(norm, norm_squared, log10_norm)`` from one norm read.
+
+        The materialized values serve compatibility diagnostics; the log value
+        is the authoritative form for ratios and norm restoration.
+        """
+        log10_norm = self._norm_log10()
+        return (
+            self._float_from_log10(log10_norm),
+            self._float_from_log10(2.0 * log10_norm),
+            log10_norm,
+        )
 
     def _norm_squared(self) -> float:
         """Return ``<nu|nu>`` (real) without mutating the state.
@@ -3688,13 +2830,52 @@ class MpsStabOptimizer:
         squared Frobenius norm of that centre tensor; otherwise the full closed
         ``<nu|nu>`` network is contracted.
         """
-        cur = self.state.info.get("cur_orthog")
-        if isinstance(cur, tuple) and len(cur) == 2 and cur[0] == cur[1]:
-            center = self.state.p[self.state.p.site_tag(int(cur[0]))]
-            nrm = float(abs(self._to_scalar(center.norm())))
-            exponent = float(getattr(self.state.p, "exponent", 0.0))
-            return nrm * nrm * (10.0 ** (2.0 * exponent))
-        return float(abs(self._to_scalar(self.state.p.H @ self.state.p)))
+        return self._norm_snapshot()[1]
+
+    def _compression_norm_snapshot(self):
+        """Keep ordinary replay norms on-device; retain explicit scale policy."""
+        p = self.state.p
+        like = self._state_backend_like()
+        if (self.stabilize_unitary or float(getattr(p, "exponent", 0.)) != 0.
+                or ar.infer_backend(like) not in {"torch", "jax", "cupy"}):
+            return self._norm_snapshot()
+        site = self._canonize_p_single()
+        mantissa = diagnostic_scalar(p[p.site_tag(site)].norm())
+        return mantissa, mantissa * mantissa, ar.do("log10", mantissa)
+
+    def _finish_unitary_compression(self, before_sq, before_log, *, kind="unitary_compression"):
+        """Record a unitary update, deferring device scalar readout to getters."""
+        if not self._infidelity_valid:
+            return None
+        backend = ar.infer_backend(before_log)
+        after_log = (
+            self._compression_norm_snapshot()[2]
+            if backend in {"torch", "jax", "cupy"} else None)
+        if after_log is not None and ar.infer_backend(after_log) == backend:
+            previous = self._current_infidelity
+            if not self._norm_segment_open:
+                # Match the absolute-norm observation used before the first
+                # valid event, including a zero/invalid coefficient state.
+                log_absolute = ar.do("clip", 2. * after_log * _LN10, None, 0.)
+                previous = ar.do("where", ar.do("isnan", log_absolute), 1.,
+                                 -ar.do("expm1", log_absolute))
+            segment, current, event = compression_event(
+                before_log, after_log, self._compression_segment_log_survival,
+                self._norm_log_survival, previous,
+                step=len(self._compression_norm_events) + 1, kind=kind,
+            )
+            self._compression_segment_log_survival = segment
+            self._current_infidelity = current
+            self._norm_segment_open = True
+            self._compression_norm_events.append(event)
+            return current
+        # Stabilization and extracted-exponent transitions have host decisions
+        # already. Preserve their existing Python-double range and validation.
+        observed = self._unitary_infidelity()
+        self._record_compression_norm_event(before_sq, observed, kind=kind,
+                                            before_log_norm=before_log)
+        self._stabilize_unitary_norm(before_sq, observed, target_log_norm=before_log)
+        return self._current_infidelity
 
     def _unitary_infidelity(self) -> Optional[float]:
         """Return cumulative unitary norm loss from the canonical centre."""
@@ -3702,7 +2883,10 @@ class MpsStabOptimizer:
             return None
 
         self._canonize_p_single()
-        infidelity = min(1.0, max(0.0, 1.0 - self._norm_squared()))
+        log_fidelity = self._log10_fidelity_from_norms(
+            self._norm_log10(), 0.0
+        )
+        infidelity = float(infidelity_from_log(log_fidelity))
         if not self._norm_segment_open:
             self._current_infidelity = infidelity
         return infidelity
@@ -3713,23 +2897,42 @@ class MpsStabOptimizer:
         after_infidelity: Optional[float],
         *,
         kind: str = "unitary_compression",
+        before_log_norm: Optional[float] = None,
     ) -> None:
         """Record one local retained-norm ratio for a compressed update."""
+        if after_infidelity is None:
+            return
+        if before_log_norm is None:
+            if (
+                before_norm_sq is None
+                or before_norm_sq <= 0.0
+                or math.isnan(float(before_norm_sq))
+            ):
+                return
+            before_log_norm = 0.5 * math.log10(float(before_norm_sq))
+        after_log_norm = self._norm_log10()
         if (
-            before_norm_sq is None
-            or after_infidelity is None
-            or not np.isfinite(before_norm_sq)
-            or before_norm_sq <= 0.0
+            math.isnan(float(before_log_norm))
+            or math.isnan(after_log_norm)
+            or before_log_norm == -math.inf
         ):
             return
-        observed_norm_sq = min(1.0, max(0.0, 1.0 - float(after_infidelity)))
-        raw = float(np.divide(observed_norm_sq, float(before_norm_sq)))
-        local_log_fidelity = log_fidelity_from_norms(
-            observed_norm_sq ** 0.5,
-            float(before_norm_sq) ** 0.5,
-        )
-        local_fidelity = min(1.0, max(0.0, fidelity_from_log(local_log_fidelity)))
+
+        # Measure retention from the pre/post represented norms, not from the
+        # optional ``after_infidelity`` estimate. The latter is only the local
+        # observation used to decide whether this unitary segment is valid;
+        # the log ratio remains finite even when squared norms overflow.
+        raw_log_fidelity = 2.0 * (
+            after_log_norm - float(before_log_norm)
+        ) * _LN10
+        if math.isnan(raw_log_fidelity):
+            return
+        local_log_fidelity = min(0.0, raw_log_fidelity)
+        raw = self._float_from_log10(raw_log_fidelity / _LN10)
+        local_fidelity = float(fidelity_from_log(local_log_fidelity))
         local_infidelity = float(1.0 - local_fidelity)
+        self._compression_segment_log_survival = to_float(
+            self._compression_segment_log_survival, real=True)
         if local_fidelity == 0.0 or self._compression_segment_log_survival == -math.inf:
             self._compression_segment_log_survival = -math.inf
         else:
@@ -3749,8 +2952,8 @@ class MpsStabOptimizer:
             "step": len(self._compression_norm_events) + 1,
             "kind": str(kind),
             "valid": True,
-            "expected_norm": float(max(0.0, before_norm_sq) ** 0.5),
-            "observed_norm": float(observed_norm_sq ** 0.5),
+            "expected_norm": self._float_from_log10(float(before_log_norm)),
+            "observed_norm": self._float_from_log10(after_log_norm),
             "fidelity_raw": float(raw),
             "local_fidelity": local_fidelity,
             "local_infidelity": local_infidelity,
@@ -3767,6 +2970,8 @@ class MpsStabOptimizer:
         self,
         target_norm_sq: Optional[float],
         observed_infidelity: Optional[float],
+        *,
+        target_log_norm: Optional[float] = None,
     ) -> None:
         """Restore the pre-compression working norm without changing fidelity data."""
         if (
@@ -3776,22 +2981,38 @@ class MpsStabOptimizer:
             or not self._infidelity_valid
         ):
             return
-        target_norm = float(max(0.0, target_norm_sq) ** 0.5)
-        observed_norm = float(self._norm_squared() ** 0.5)
+        if target_log_norm is None:
+            if target_norm_sq is None or target_norm_sq <= 0.0:
+                raise FloatingPointError(
+                    "Cannot stabilize a unitary compression with a zero or "
+                    "invalid target norm."
+                )
+            target_log_norm = 0.5 * math.log10(float(target_norm_sq))
+        observed_log_norm = self._norm_log10()
         if (
-            target_norm <= 0.0
-            or observed_norm <= 0.0
-            or not np.isfinite(target_norm)
-            or not np.isfinite(observed_norm)
+            math.isnan(float(target_log_norm))
+            or math.isnan(observed_log_norm)
+            or target_log_norm == -math.inf
+            or observed_log_norm == -math.inf
         ):
             raise FloatingPointError(
                 "Cannot stabilize a unitary compression with a zero or "
                 "non-finite retained norm."
             )
-        if not np.isclose(target_norm, observed_norm, rtol=1e-14, atol=1e-15):
+        # Restore only the working representation's scale. The compression
+        # loss has already been recorded above and must remain visible in the
+        # segment diagnostics after this normalization.
+        log10_scale = float(target_log_norm) - observed_log_norm
+        if abs(log10_scale) > 1.0e-14:
+            scale = self._float_from_log10(log10_scale)
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise FloatingPointError(
+                    "Cannot stabilize a unitary compression with an invalid "
+                    "represented-norm scale."
+                )
             center_site = self._canonize_p_single()
             center = self.state.p[self.state.p.site_tag(int(center_site))]
-            center.modify(data=center.data * (target_norm / observed_norm))
+            center.modify(data=center.data * scale)
         self.state.info["cur_orthog"] = (
             int(self.state.info["cur_orthog"][0]),
             int(self.state.info["cur_orthog"][1]),
@@ -3853,9 +3074,10 @@ class MpsStabOptimizer:
             )
             self._norm_segment_open = True
         segment_fidelity = max(0.0, min(1.0, 1.0 - segment_infidelity))
-        norm_sq = self._norm_squared()
+        norm_log10 = self._norm_log10()
+        norm_sq = self._float_from_log10(2.0 * norm_log10)
         event.update(
-            pre_norm=float(norm_sq ** 0.5),
+            pre_norm=self._float_from_log10(norm_log10),
             pre_norm_sq=float(norm_sq),
             segment_infidelity=segment_infidelity,
             segment_fidelity=segment_fidelity,
@@ -4033,9 +3255,10 @@ class MpsStabOptimizer:
             None if total_survival is None else float(total_survival ** 0.5)
         )
         state_norm = float(self.norm())
+        compression_events = self.get_compression_norm_events()
         latest_compression = (
-            self._compression_norm_events[-1]
-            if self._compression_norm_events
+            compression_events[-1]
+            if compression_events
             else None
         )
         return {
@@ -4063,8 +3286,8 @@ class MpsStabOptimizer:
             "completed_combined_infidelities": [
                 float(1.0 - survival) for survival in completed_survivals
             ],
-            "compression_events": len(self._compression_norm_events),
-            "compression_norm_events": self.get_compression_norm_events(),
+            "compression_events": len(compression_events),
+            "compression_norm_events": compression_events,
             "current_segment_norm": current_norm,
             "current_segment_infidelity": current_loss,
             "current_fidelity": (
@@ -4214,7 +3437,7 @@ class MpsStabOptimizer:
                 f"measured/forced outcome has ~0 probability (centre norm={nrm:.2e})."
             )
         exponent = float(getattr(self.state.p, "exponent", 0.0))
-        represented_norm = float(nrm * (10.0 ** exponent))
+        represented_norm = self._float_from_log10(math.log10(nrm) + exponent)
         center.modify(data=center.data / nrm)
         # Quimb stores an additional base-10 network scale separately from the
         # tensors. The centre is now normalized, so that scale must be cleared.
@@ -4263,13 +3486,15 @@ class MpsStabOptimizer:
             rows.append(row)
         return rows
 
-    def copy(self) -> "MpsStabOptimizer":
+    def copy(self) -> "StabilizerMpsSimulator":
         """Return an independent copy (state deep-copied; queue/history reset)."""
-        copied = MpsStabOptimizer(
+        copied = StabilizerMpsSimulator(
             self.state.copy(),
             chi=self.chi,
             mode=self.mode,
             cutoff=self.cutoff,
+            cutoff_mode=self.cutoff_mode,
+            contraction_opt=self.contraction_opt,
             operator_tol=self.operator_tol,
             max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
             max_pauli_terms=self.max_pauli_terms,
@@ -4300,6 +3525,9 @@ class MpsStabOptimizer:
             for event in self.norm_events
         ]
         copied._localizer_cache = dict(self._localizer_cache)
+        copied._initial_mps_length = self._initial_mps_length
+        copied._mps_length_history = list(self._mps_length_history)
+        copied.cap_history = deepcopy(self.cap_history)
         copied.logical_order = list(self.logical_order)
         copied._refresh_layout_map()
         copied.layout_plan = deepcopy(self.layout_plan)
@@ -4533,6 +3761,100 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Backend helpers (place |nu> gates/MPOs on the configured backend)
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _as_native_gate_matrix(gate, n_qubits):
+        """Normalize dense-gate shape without converting backend arrays.
+
+        The dense validation/classification helpers intentionally operate on
+        NumPy arrays. This shape-only adapter is used at replay time so a
+        differentiable backend tensor can reach the native one-qubit path
+        unchanged. Non-array inputs fall back to the historical validator.
+        """
+        n_qubits = int(n_qubits)
+        shape = getattr(gate, "shape", None)
+        if shape is not None:
+            shape = tuple(int(size) for size in shape)
+            dimension = 2**n_qubits
+            if shape == (dimension, dimension):
+                return gate
+            expected_shape = (2,) * (2 * n_qubits)
+            if shape == expected_shape:
+                return gate.reshape(dimension, dimension)
+        return _as_gate_matrix(gate, n_qubits)
+
+    @staticmethod
+    def _gate_requires_grad(gate) -> bool:
+        """Return whether a backend gate advertises an autodiff history."""
+        return bool(getattr(gate, "requires_grad", False))
+
+    @staticmethod
+    def _backend_scalar_is_exact_zero(value) -> bool:
+        """Test a scalar value for an exact zero without touching its graph."""
+        detached = getattr(value, "detach", None)
+        if callable(detached):
+            value = detached()
+        try:
+            return bool(np.asarray(ar.to_numpy(value)).item() == 0)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _backend_scalar_has_nonzero_grad(value) -> bool:
+        """Return whether a Torch scalar has a locally nonzero derivative.
+
+        This is used only to distinguish structurally zero matrix entries from
+        trainable entries that happen to evaluate to zero at an endpoint. It
+        performs metadata inspection and ``autograd.grad`` queries, never a
+        backward mutation of the caller's leaf gradients.
+        """
+        if not bool(getattr(value, "requires_grad", False)):
+            return False
+        grad_fn = getattr(value, "grad_fn", None)
+        if grad_fn is None:
+            # A leaf scalar is itself a trainable coordinate.
+            return True
+        leaves = []
+        pending = [grad_fn]
+        visited = set()
+        while pending:
+            function = pending.pop()
+            if function in visited:
+                continue
+            visited.add(function)
+            variable = getattr(function, "variable", None)
+            if variable is not None:
+                leaves.append(variable)
+                continue
+            pending.extend(
+                parent
+                for parent, _multiplicity in getattr(function, "next_functions", ())
+                if parent is not None
+            )
+        if not leaves:
+            return True
+        try:
+            import torch
+
+            gradients = []
+            for component in (value.real, value.imag):
+                gradients.extend(
+                    torch.autograd.grad(
+                        component,
+                        leaves,
+                        allow_unused=True,
+                        retain_graph=True,
+                    )
+                )
+            return any(
+                gradient is not None
+                and bool(torch.any(gradient.detach() != 0).item())
+                for gradient in gradients
+            )
+        except (RuntimeError, TypeError):
+            # Be conservative if a backend does not expose a traversable
+            # scalar graph: retaining the term is safer than losing a VJP.
+            return True
+
     def _state_backend_like(self):
         """Return a representative live coefficient-MPS array."""
         for tensor in getattr(self.state.p, "tensors", ()):
@@ -4570,7 +3892,7 @@ class MpsStabOptimizer:
         ):
             self._backend_conversion_warnings.add(warning_key)
             warnings.warn(
-                f"MpsStabOptimizer is converting a {kind} payload from "
+                f"StabilizerMpsSimulator is converting a {kind} payload from "
                 f"backend/dtype/device {source_signature!r} to the live "
                 f"coefficient-MPS state {target_signature!r}; provide matching "
                 f"{kind} payloads to avoid this transfer or cast.",
@@ -4608,16 +3930,47 @@ class MpsStabOptimizer:
 
     def _bk(self, mat):
         """Backend copy of an internally generated gate matrix."""
-        arr = np.asarray(mat, dtype=self.dtype)
+        arr = np.asarray(mat, dtype=self.dtype) if ar.infer_backend(mat) in {"numpy", "builtins"} else mat
         return self._to_state_backend(arr)
 
     def _bk_const(self, tag: str, mat):
         """Backend copy of a *constant* gate matrix, cached by ``tag``."""
+        if infer_backend_signature(self._state_backend_like()) != self._backend_signature:
+            self.backend_info()
         cached = self._bk_cache.get(tag)
         if cached is None:
-            cached = self._to_state_backend(np.asarray(mat, dtype=self.dtype))
+            matrix = np.asarray(mat)
+            if "complex" not in self.dtype and np.iscomplexobj(matrix):
+                if np.any(matrix.imag != 0):
+                    raise ValueError(
+                        "This coefficient operator requires a complex dtype."
+                    )
+                # Pauli I/X/Z can use complex containers with exactly real data.
+                matrix = matrix.real
+            cached = self._to_state_backend(matrix.astype(self.dtype, copy=False))
             self._bk_cache[tag] = cached
         return cached
+
+    def _single_qubit_combo(self, c, coef, axis):
+        """Assemble changing coefficients from cached backend Pauli matrices."""
+        identity = self._bk_const("PI", pauli_matrix("I"))
+        if "complex" not in self.dtype:
+            # -iY is real, so a Y rotation can stay entirely in real storage.
+            # Validate the scalar coefficients before assembly: X/Z rotations
+            # and Y projectors generally require complex coefficient amplitudes.
+            pauli_coef = 1j * coef if axis == "Y" else coef
+            if complex(c).imag != 0 or complex(pauli_coef).imag != 0:
+                raise ValueError(
+                    "This coefficient operator requires a complex dtype."
+                )
+            if axis == "Y":
+                pauli = self._bk_const("minus_iPY", (-1j * pauli_matrix("Y")).real)
+            else:
+                pauli = self._bk_const("P" + axis, pauli_matrix(axis))
+            matrix = complex(c).real * identity + complex(pauli_coef).real * pauli
+        else:
+            matrix = c * identity + coef * self._bk_const("P" + axis, pauli_matrix(axis))
+        return ar.astype(matrix, self.dtype)
 
     def _bk_mpo(self, mpo, *, warn=True):
         """Return a sub-MPO on the live backend without mutating its source."""
@@ -4682,7 +4035,7 @@ class MpsStabOptimizer:
         return np.asarray(to_numpy(gate))
 
     # ------------------------------------------------------------------ #
-    # State primitives used by MpsStabSampler
+    # State primitives used by StabilizerMpsSampler
     # ------------------------------------------------------------------ #
     def _sample_rng(self, seed):
         """Return the RNG used by sampler branch operations.
@@ -4769,15 +4122,15 @@ class MpsStabOptimizer:
 
     # Sampling compatibility delegates
     # ------------------------------------------------------------------ #
-    # Sampling is implemented by MpsStabSampler, next to MpsSampler. Keep
+    # Sampling is implemented by StabilizerMpsSampler, next to MpsSampler. Keep
     # these optimizer methods as thin compatibility shims for existing users
     # and trajectory/noise result objects that expose optimizer sampling.
     @staticmethod
     def pack_bit_samples(samples) -> np.ndarray:
         """Compatibility delegate for packing raw sampler bit arrays."""
-        from ...sampling.stabilizer import MpsStabSampler
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        return MpsStabSampler.pack_bit_samples(samples)
+        return StabilizerMpsSampler.pack_bit_samples(samples)
 
     def sample_bits(
         self,
@@ -4791,10 +4144,10 @@ class MpsStabOptimizer:
         absorb_basis: Optional[bool] = None,
         disentangle: Optional[bool] = None,
     ) -> np.ndarray:
-        """Compatibility delegate to :class:`pepsy.MpsStabSampler`."""
-        from ...sampling.stabilizer import MpsStabSampler
+        """Compatibility delegate to :class:`pepsy.StabilizerMpsSampler`."""
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        return MpsStabSampler(
+        return StabilizerMpsSampler(
             self,
             absorb_basis=absorb_basis,
             disentangle=disentangle,
@@ -4846,9 +4199,9 @@ class MpsStabOptimizer:
         disentangle=None,
     ) -> float:
         """Compatibility delegate for one product-basis probability."""
-        from ...sampling.stabilizer import MpsStabSampler
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        return MpsStabSampler(
+        return StabilizerMpsSampler(
             self,
             absorb_basis=absorb_basis,
             disentangle=disentangle,
@@ -4870,9 +4223,9 @@ class MpsStabOptimizer:
         disentangle=None,
     ) -> np.ndarray:
         """Compatibility delegate for many product-basis probabilities."""
-        from ...sampling.stabilizer import MpsStabSampler
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        return MpsStabSampler(
+        return StabilizerMpsSampler(
             self,
             absorb_basis=absorb_basis,
             disentangle=disentangle,
@@ -4937,9 +4290,9 @@ class MpsStabOptimizer:
         disentangle: Optional[bool] = None,
     ):
         """Compatibility delegate for chunked bit sampling."""
-        from ...sampling.stabilizer import MpsStabSampler
+        from ...sampling.stabilizer import StabilizerMpsSampler
 
-        yield from MpsStabSampler(
+        yield from StabilizerMpsSampler(
             self,
             absorb_basis=absorb_basis,
             disentangle=disentangle,
@@ -4992,7 +4345,42 @@ class MpsStabOptimizer:
             self._apply_entry(payload["action"])
         return self
 
+    @contextmanager
+    def _compatible_torch_linalg(self):
+        """Use a dtype-compatible Torch QR/SVD policy for one replay entry.
+
+        Torch linalg registrations are process-global.  A preceding real-valued
+        autodiff model can therefore leave Pepsy's real stabilized QR rule
+        installed while this optimizer is replaying a complex coefficient MPS.
+        The real rule must reject such inputs; temporarily switching only the
+        policy mode keeps the replay correct and restores the caller's policy
+        immediately afterwards.
+        """
+        sample = self._state_backend_like()
+        is_complex_torch = (
+            self.backend == "torch"
+            and callable(getattr(sample, "is_complex", None))
+            and bool(sample.is_complex())
+        )
+        if not is_complex_torch:
+            yield
+            return
+
+        from ...backends import get_torch_linalg_config
+
+        active = get_torch_linalg_config()
+        if active is None or active.mode == "complex":
+            yield
+            return
+
+        with replace(active, mode="complex").activated():
+            yield
+
     def _apply_entry(self, entry) -> None:
+        with self._compatible_torch_linalg():
+            self._apply_entry_unscoped(entry)
+
+    def _apply_entry_unscoped(self, entry) -> None:
         conditional = conditional_event_parts(entry)
         if conditional is not None:
             self._apply_conditional_entry(entry)
@@ -5062,7 +4450,10 @@ class MpsStabOptimizer:
             # matrix form: (gate_tensor, where)
             gate, where = entry
             where = _normalize_sites(where)
-            self._apply_matrix(_as_gate_matrix(gate, len(where)), where)
+            # Keep a trainable backend matrix native. ``_as_gate_matrix`` is
+            # deliberately a NumPy/classification helper and would detach a
+            # Torch gate before its Pauli coefficients reach ``|nu>``.
+            self._apply_matrix(self._as_native_gate_matrix(gate, len(where)), where)
             return
 
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
@@ -5154,25 +4545,7 @@ class MpsStabOptimizer:
         state. Returning ``(axis, sign)`` means ``sign * axis`` has eigenvalue
         ``+1`` on the vector; otherwise return ``None``.
         """
-        from autoray import to_numpy  # pylint: disable=import-outside-toplevel
-
-        vec = np.array(to_numpy(vector), dtype=complex, copy=True).reshape(-1)
-        if vec.shape != (2,):  # pragma: no cover - guarded by the qubit MPS API
-            return None
-        norm = float(np.linalg.norm(vec))
-        if norm <= tol:
-            return None
-        vec /= norm
-        bloch = {
-            axis: float(np.real(np.vdot(vec, pauli_matrix(axis) @ vec)))
-            for axis in ("X", "Y", "Z")
-        }
-        axis = max(bloch, key=lambda key: abs(bloch[key]))
-        if abs(abs(bloch[axis]) - 1.0) > tol:
-            return None
-        if any(abs(bloch[other]) > tol for other in bloch if other != axis):
-            return None
-        return axis, (1 if bloch[axis] >= 0.0 else -1)
+        return stabilizer_product_eigenstate(vector, tol=tol)
 
     @staticmethod
     def _exact_cooling_basis_tableau(axis: str, sign: int):
@@ -5258,8 +4631,8 @@ class MpsStabOptimizer:
             cascade = self._exact_controlled_pauli_tableau(
                 pivot, pivot_axis, pivot_sign, terms
             )
-            local_rotation = single_qubit_rotation_matrix(
-                theta, rotation_axis, sign, self.dtype
+            local_rotation = self._single_qubit_combo(
+                np.cos(theta / 2), -1j * sign * np.sin(theta / 2), rotation_axis
             )
             p.gate_(self._bk(local_rotation), mps_pivot, contract=True)
             # ``absorb_basis_clifford(V)`` sends C -> C V-dagger. Here V = G-dagger,
@@ -5277,9 +4650,26 @@ class MpsStabOptimizer:
 
     def _quimb_compress_opts(self, method):
         """Return the Quimb options shared by coefficient-MPO updates."""
+        # Some Quimb methods deliberately choose rank from ``max_bond`` and
+        # therefore ignore singular-value cutoffs. Keep that exception aligned
+        # with MpsOptimizer instead of passing an option the method will reject
+        # or silently interpret differently.
         opts = {
             "cutoff": 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else self.cutoff,
         }
+        if (
+            self.cutoff_mode is not None
+            and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE
+        ):
+            opts["cutoff_mode"] = self.cutoff_mode
+        optimize = self.contraction_opt
+        if optimize is not None and not (
+            isinstance(optimize, str)
+            and optimize.strip().lower() in {"auto", "auto-hq"}
+        ):
+            # ``auto``/``auto-hq`` are Pepsy policy names. Only explicit
+            # contraction choices belong in Quimb's low-level kwargs.
+            opts["optimize"] = optimize
         if method == "fit-projector":
             # Match the ordinary MPS path: projector fitting does not need the
             # optional pre-gauge and is safer on exact product-state bonds.
@@ -5289,18 +4679,9 @@ class MpsStabOptimizer:
     def _apply_quimb_submpo(self, p, mpo, where, *, method, max_bond, info):
         """Apply one coefficient-frame sub-MPO with the selected Quimb method."""
         method = self._normalize_quimb_method(method)
-        requires_chi = {
-            "src",
-            "src-first",
-            "src-oversample",
-            "srcmps",
-            "srcmps-first",
-            "srcmps-oversample",
-            "fit-oversample",
-        }
-        if max_bond is None and method in requires_chi:
+        if max_bond is None and method in self._FINITE_CHI_MPO_METHODS:
             raise ValueError(
-                f"MpsStabOptimizer mode {method!r} requires a finite chi."
+                f"StabilizerMpsSimulator mode {method!r} requires a finite chi."
             )
 
         opts = self._quimb_compress_opts(method)
@@ -5318,9 +4699,10 @@ class MpsStabOptimizer:
                 chi=max_bond,
                 method=method,
                 cutoff=self.cutoff,
-                cutoff_mode=None,
+                cutoff_mode=self.cutoff_mode,
                 info=info,
                 inplace_mpo=False,
+                optimize=self._native_contraction_opt(),
                 seed=self.compression_seed,
             )
 
@@ -5342,6 +4724,18 @@ class MpsStabOptimizer:
         )
         return p
 
+    def _native_contraction_opt(self):
+        """Return only explicit contraction options for native Quimb calls."""
+        optimize = self.contraction_opt
+        if optimize is None:
+            return None
+        if isinstance(optimize, str) and optimize.strip().lower() in {
+            "auto",
+            "auto-hq",
+        }:
+            return None
+        return optimize
+
     def _apply_rotation(self, name, params) -> None:
         theta, where, axes = self._rotation_spec(name, params)
         # Validate the complete support before either the tableau or MPS changes.
@@ -5362,7 +4756,7 @@ class MpsStabOptimizer:
         if len(support) == 1:
             q = support[0]
             mps_q = self._mps_site(q)
-            umat = single_qubit_rotation_matrix(theta, terms[q], sign, self.dtype)
+            umat = self._single_qubit_combo(np.cos(theta / 2), -1j * sign * np.sin(theta / 2), terms[q])
             # A single-qubit unitary preserves canonical form and the tracked
             # orthogonality centre, so it is applied without touching the tracker.
             self.state.p.gate_(self._bk(umat), mps_q, contract=True)
@@ -5373,7 +4767,8 @@ class MpsStabOptimizer:
         c = np.cos(theta / 2)
         coef = -1j * sign * np.sin(theta / 2)
         mps_terms = self._mps_terms(terms)
-        mpo, where = pauli_combo_submpo(c, coef, mps_terms, self.n, dtype=self.dtype)
+        mpo, where = pauli_combo_submpo(c, coef, mps_terms, self.n, dtype=self.dtype,
+                                      like=self._state_backend_like())
         self._record(self._evolve_p(self._bk_mpo(mpo, warn=False), where, unitary=True))
 
     def _evolve_p(
@@ -5392,11 +4787,11 @@ class MpsStabOptimizer:
         compressed.  ``max_bond=None`` (exact) is lossless via the cutoff, which
         stops the bond-dim-2 MPO from doubling the bond on every application.
         """
-        before_norm_sq = (
-            self._norm_squared()
-            if unitary and self._infidelity_valid
-            else None
-        )
+        if unitary and self._infidelity_valid:
+            _before_norm, before_norm_sq, before_log_norm = self._compression_norm_snapshot()
+        else:
+            before_norm_sq = None
+            before_log_norm = None
         if self.mode in self._DMRG_MODES:
             self._evolve_p_dmrg(mpo, where)
         else:
@@ -5415,19 +4810,8 @@ class MpsStabOptimizer:
                 max_bond=None if self.mode == "exact" else self.chi,
                 info=self.state.info,
             )
-        observed_infidelity = self._unitary_infidelity() if unitary else None
-        self._record_compression_norm_event(
-            before_norm_sq,
-            observed_infidelity,
-            kind=norm_event_kind,
-        )
-        infidelity = (
-            None
-            if not unitary
-            else self._current_infidelity
-        )
-        if unitary:
-            self._stabilize_unitary_norm(before_norm_sq, observed_infidelity)
+        infidelity = self._finish_unitary_compression(
+            before_norm_sq, before_log_norm, kind=norm_event_kind) if unitary else None
         if renormalize:
             site = self._canonize_p_single()
             projected_norm = self._renorm_p_at(site)
@@ -5438,22 +4822,7 @@ class MpsStabOptimizer:
     @staticmethod
     def _fit_random_data(data, shape, *, strength, rng):
         """Generate backend-compatible random data for a disposable FIT guess."""
-        dtype_name = str(getattr(data, "dtype", "float64"))
-        if "complex64" in dtype_name:
-            random_dtype = np.complex64
-        elif "complex" in dtype_name:
-            random_dtype = np.complex128
-        elif "float32" in dtype_name:
-            random_dtype = np.float32
-        else:
-            random_dtype = np.float64
-        return backend_random_array(
-            shape,
-            like=data,
-            dtype=random_dtype,
-            scale=float(strength),
-            rng=rng,
-        )
+        return fit_random_array(data, shape, strength=strength, rng=rng)
 
     def _fit_randomized_guess(self, p, where, *, block_size, expand):
         """Build a deterministic dense random FIT guess when rank can grow."""
@@ -5480,7 +4849,14 @@ class MpsStabOptimizer:
             return p
 
         guess = p.copy(deep=True)
-        rng = np.random.default_rng(self.fit_init_seed)
+        like = guess.tensors[0].data
+        try:
+            ar.get_lib_fn(ar.infer_backend(like), "random.array")
+            ar.get_lib_fn(ar.infer_backend(like), "random.default_rng")
+        except (AttributeError, ImportError, KeyError, LookupError):
+            rng = np.random.default_rng(self.fit_init_seed)
+        else:
+            rng = ar.do("random.default_rng", self.fit_init_seed, like=like)
         if expand:
             bonds = []
             for site, target_size in zip(range(start, stop), active):
@@ -5728,7 +5104,9 @@ class MpsStabOptimizer:
             target_strategy = (
                 "layered" if self._fit_target_is_layered(target) else "mps"
             )
-        requested_block_size = 3 if self.mode == "dmrg3" else 2
+        requested_block_size = self._fit_block_size or (
+            3 if self.mode == "dmrg3" else 2
+        )
         block_size = min(requested_block_size, span)
         self._maybe_lock_dmrg1_one_site_phase(p)
         if (
@@ -5756,22 +5134,34 @@ class MpsStabOptimizer:
             where,
             block_size=block_size,
         )
+        # The exact operator-applied target and the disposable FIT starting
+        # point have different jobs: ``target`` defines the variational
+        # problem, while ``fit_guess`` only improves convergence.
         fit = FIT(
             target,
             p=fit_guess,
             cutoffs=self.cutoff,
+            contraction_opt=self.contraction_opt,
             retag=False,
             range_int=[start, stop],
             inplace=True,
             copy_target=False,
         )
         adjacent_two_site = span == 2 and block_size == 2
-        growth_sweeps = (
-            0 if block_size == 1 else (1 if adjacent_two_site else 2)
+        single_pair_fast_path = bool(
+            self._fit_single_pair_fast_path
+            or (self.mode == "dmrg2" and adjacent_two_site)
+        )
+        growth_sweeps = 0 if block_size == 1 else min(
+            self._fit_adaptive_sweeps,
+            self._fit_n_iter,
         )
         resolved_fit_init_strategy = self._resolved_fit_init_strategy(
             self.fit_init_strategy
         )
+        transition_sweeps = self._fit_two_site_transition_sweeps
+        if transition_sweeps is None:
+            transition_sweeps = 1 if self.mode == "dmrg3" else 0
         guess_method = (
             resolved_fit_init_strategy[len("guess_") :]
             if resolved_fit_init_strategy.startswith("guess_")
@@ -5789,14 +5179,20 @@ class MpsStabOptimizer:
             # A two-site gate is already the complete local problem. Match
             # MpsOptimizer's structural fast path and spend one FIT update on
             # it; longer windows use two growth sweeps and one-site handoff.
-            n_iter=1 if adjacent_two_site else 3,
+            n_iter=(
+                1
+                if single_pair_fast_path and adjacent_two_site
+                else self._fit_n_iter
+            ),
             block_size=block_size,
-            sweep_sequence="RL",
+            sweep_sequence=self._fit_sweep_sequence,
             max_bond=self.chi,
             cutoff=self.cutoff,
-            min_iter=1,
-            rtol=None,
-            patience=1,
+            cutoff_mode=self.cutoff_mode or "rsum2",
+            min_iter=self._fit_min_iter,
+            rtol=self._fit_rtol,
+            patience=self._fit_patience,
+            finite_check=self._fit_finite_check,
             adaptive_block_sweeps=(
                 None if block_size == 1 else growth_sweeps
             ),
@@ -5805,7 +5201,12 @@ class MpsStabOptimizer:
             # FIT's one-site handoff. Do not add a second explicit refinement
             # sweep on top of that canonical MpsOptimizer schedule.
             final_one_site_sweeps=0,
-            single_pair_fast_path=True,
+            two_site_transition_sweeps=(
+                0
+                if block_size != 3
+                else transition_sweeps
+            ),
+            single_pair_fast_path=single_pair_fast_path,
             collect_split_diagnostics=False,
         )
         self.state.p = fit.p
@@ -5819,17 +5220,74 @@ class MpsStabOptimizer:
                 getattr(fit, "one_site_sweeps_run", 0)
             ),
             "iterations": int(getattr(fit, "iterations_run", 0)),
+            "converged": bool(getattr(fit, "converged", False)),
+            "convergence_reason": getattr(fit, "convergence_reason", None),
+            "relative_change": getattr(fit, "last_relative_change", None),
             "dmrg1_one_site_locked": bool(self._dmrg1_one_site_locked),
             "fit_init_strategy": resolved_fit_init_strategy,
             "fit_init_strategy_requested": self.fit_init_strategy,
             "guess_method": guess_method,
             "guess_used": guess_used,
             "target_strategy": target_strategy,
+            "cutoff": float(self.cutoff),
+            "cutoff_mode": self.cutoff_mode or "rsum2",
+            "contraction_opt": self.contraction_opt,
+            "fit_n_iter": int(self._fit_n_iter),
+            "fit_min_iter": int(self._fit_min_iter),
+            "fit_rtol": self._fit_rtol,
+            "fit_patience": int(self._fit_patience),
+            "fit_adaptive_sweeps": int(self._fit_adaptive_sweeps),
+            "fit_sweep_sequence": self._fit_sweep_sequence,
+            "fit_two_site_transition_sweeps": int(
+                transition_sweeps
+            ),
+            "fit_single_pair_fast_path": bool(single_pair_fast_path),
+            "fit_overlap_diagnostics": bool(self._fit_overlap_diagnostics),
+            "fit_overlap_fidelity": None,
+            "fit_overlap_infidelity": None,
+            "fit_overlap_error": None,
         }
+        if self._fit_overlap_diagnostics:
+            overlap = self._fit_overlap_diagnostics_for_target(target, fit.p)
+            self._last_fit_diagnostics.update(overlap)
         center = fit.final_center_site
         if center is None:
             center = stop
         self.state.info["cur_orthog"] = (int(center), int(center))
+
+    def _fit_overlap_diagnostics_for_target(self, target, fitted):
+        """Return the optional target-overlap diagnostic for a FIT update."""
+        from ...tensors.observables import tn_fidelity
+
+        # Contract copies so this optional diagnostic cannot alter the live
+        # target or FIT center metadata used by the next replay step.
+        contraction_opt = self.contraction_opt
+        if contraction_opt is None or (
+            isinstance(contraction_opt, str)
+            and contraction_opt.strip().lower() in {"auto", "auto-hq"}
+        ):
+            contraction_opt = "greedy"
+        try:
+            overlap = tn_fidelity(
+                target.copy(),
+                fitted.copy(),
+                contraction_opt=contraction_opt,
+            )
+            overlap = float(np.real(self._to_scalar(overlap)))
+            if not np.isfinite(overlap):
+                raise ValueError("FIT target overlap is non-finite")
+        except Exception as exc:  # diagnostic only
+            return {
+                "fit_overlap_fidelity": None,
+                "fit_overlap_infidelity": None,
+                "fit_overlap_error": f"{type(exc).__name__}: {exc}",
+            }
+        overlap = min(1.0, max(0.0, overlap))
+        return {
+            "fit_overlap_fidelity": overlap,
+            "fit_overlap_infidelity": float(1.0 - overlap),
+            "fit_overlap_error": None,
+        }
 
     def _evolve_p_dmrg(self, mpo, where):
         """Build a layered target and compress it with coefficient FIT."""
@@ -5855,14 +5313,7 @@ class MpsStabOptimizer:
     @staticmethod
     def _validate_outcome(outcome):
         """Return a forced Pauli outcome, requiring exactly integer +/-1."""
-        if outcome is None:
-            return None
-        if isinstance(outcome, (bool, np.bool_)) or not isinstance(outcome, Integral):
-            raise ValueError(f"outcome must be exactly +1 or -1, got {outcome!r}.")
-        value = int(outcome)
-        if value not in (-1, 1):
-            raise ValueError(f"outcome must be exactly +1 or -1, got {outcome!r}.")
-        return value
+        return _validate_forced_outcome(outcome)
 
     @staticmethod
     def _outcome_probability(expectation, outcome):
@@ -5989,7 +5440,7 @@ class MpsStabOptimizer:
                 event="measure_many",
             )
             outcome = entry[2] if len(entry) == 3 else None
-            outcome = MpsStabOptimizer._validate_outcome(outcome)
+            outcome = StabilizerMpsSimulator._validate_outcome(outcome)
             operations.append((axis, sites[0], outcome))
             targets.append(sites[0])
 
@@ -6059,72 +5510,87 @@ class MpsStabOptimizer:
         remaining = list(range(len(operations)))
         result = [None] * len(operations)
         schedule = []
+        # A later impossible forced outcome must not leave an earlier collapse,
+        # reset, diagnostic, or RNG draw committed. Only forced multi-operation
+        # batches need this snapshot; sampled-only batches cannot fail due to
+        # impossible postselection.
+        snapshot = (
+            self._execution_snapshot()
+            if len(operations) > 1
+            and any(operation[2] is not None for operation in operations)
+            else None
+        )
 
-        for step in range(len(operations)):
-            if normalized_order == "input":
-                input_index = remaining.pop(0)
-            elif normalized_order == "min_span":
-                candidate_info = {
-                    index: self._measurement_span_info(
-                        operations[index][0],
-                        operations[index][1],
+        try:
+            for step in range(len(operations)):
+                if normalized_order == "input":
+                    input_index = remaining.pop(0)
+                elif normalized_order == "min_span":
+                    candidate_info = {
+                        index: self._measurement_span_info(
+                            operations[index][0],
+                            operations[index][1],
+                            absorb_basis=absorb_basis,
+                        )
+                        for index in remaining
+                    }
+                    input_index = min(
+                        remaining,
+                        key=lambda index: (
+                            candidate_info[index]["span"],
+                            candidate_info[index]["localizer_distance"],
+                            len(candidate_info[index]["frame_support"]),
+                            index,
+                        ),
+                    )
+                    remaining.remove(input_index)
+                else:
+                    rank = {
+                        index: position
+                        for position, index in enumerate(normalized_order)
+                    }
+                    input_index = min(remaining, key=rank.__getitem__)
+                    remaining.remove(input_index)
+
+                axis, qubit, forced = operations[input_index]
+                info = (
+                    candidate_info[input_index]
+                    if normalized_order == "min_span"
+                    else self._measurement_span_info(
+                        axis,
+                        qubit,
                         absorb_basis=absorb_basis,
                     )
-                    for index in remaining
-                }
-                input_index = min(
-                    remaining,
-                    key=lambda index: (
-                        candidate_info[index]["span"],
-                        candidate_info[index]["localizer_distance"],
-                        len(candidate_info[index]["frame_support"]),
-                        index,
-                    ),
                 )
-                remaining.remove(input_index)
-            else:
-                rank = {
-                    index: position
-                    for position, index in enumerate(normalized_order)
-                }
-                input_index = min(remaining, key=rank.__getitem__)
-                remaining.remove(input_index)
-
-            axis, qubit, forced = operations[input_index]
-            info = (
-                candidate_info[input_index]
-                if normalized_order == "min_span"
-                else self._measurement_span_info(
-                    axis,
-                    qubit,
-                    absorb_basis=absorb_basis,
-                )
-            )
-            if reset:
-                m_pauli = self.state.frame_pauli(self._phys_pauli(axis, qubit))
-                outcome = self._absorb_measure(
-                    m_pauli,
-                    None,
-                    norm_event_kind="reset",
-                )
-            else:
-                outcome = self.measure(
-                    axis,
-                    qubit,
-                    outcome=forced,
-                    absorb_basis=absorb_basis,
-                )
-            if (reset or reset_after) and outcome < 0:
-                self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
-                self._record()
-            result[input_index] = int(outcome)
-            schedule.append({
-                "order": int(step),
-                "input_index": int(input_index),
-                "pauli": str(axis),
-                "qubit": int(qubit),
-                **info,
-            })
+                if reset:
+                    m_pauli = self.state.frame_pauli(self._phys_pauli(axis, qubit))
+                    outcome = self._absorb_measure(
+                        m_pauli,
+                        None,
+                        norm_event_kind="reset",
+                    )
+                else:
+                    outcome = self.measure(
+                        axis,
+                        qubit,
+                        outcome=forced,
+                        absorb_basis=absorb_basis,
+                    )
+                if (reset or reset_after) and outcome < 0:
+                    self.state.apply_clifford(_RESET_FLIP_CLIFFORDS[axis], qubit)
+                    self._record()
+                result[input_index] = int(outcome)
+                schedule.append({
+                    "order": int(step),
+                    "input_index": int(input_index),
+                    "pauli": str(axis),
+                    "qubit": int(qubit),
+                    **info,
+                })
+        except BaseException:
+            if snapshot is not None:
+                self._restore_execution_snapshot(snapshot)
+            raise
 
         self.last_measurement_schedule = tuple(schedule)
         return tuple(result)
@@ -6240,7 +5706,7 @@ class MpsStabOptimizer:
         self.measurements.append(MeasurementRecord(pauli, where, int(m)))
         return m
 
-    def reset(self, where, basis="Z", *, order="min_span") -> "MpsStabOptimizer":
+    def reset(self, where, basis="Z", *, order="min_span") -> "StabilizerMpsSimulator":
         """Reset qubit(s) to the ``+1`` eigenstate of ``basis``.
 
         Each target is measured with the basis-updating path (so it
@@ -6269,7 +5735,7 @@ class MpsStabOptimizer:
         )
         return self
 
-    def reset_many(self, where, basis="Z", *, order="min_span") -> "MpsStabOptimizer":
+    def reset_many(self, where, basis="Z", *, order="min_span") -> "StabilizerMpsSimulator":
         """Reset several independent qubits using the metadata-only span scheduler."""
         return self.reset(where, basis=basis, order=order)
 
@@ -6319,21 +5785,20 @@ class MpsStabOptimizer:
         )
         return measured[0] if len(measured) == 1 else measured
 
-    def cap(self, where, vec, *, absorb="left") -> "MpsStabOptimizer":
+    def cap(self, where, vec, *, absorb="left") -> "StabilizerMpsSimulator":
         """Contract one physical qubit with ``vec`` and shorten the simulator.
 
-        This is a correctness-first physical cap: it reconstructs the dense
-        statevector, contracts the selected physical leg, and rebuilds a valid
-        identity-tableau STN on ``n - 1`` qubits.  The operation is therefore
-        guarded by :attr:`max_dense_cap_qubits`; use structured weighted-XOR or
-        coin streams for scalable DEM-style capping.
+        With an identity basis frame, the physical leg is contracted directly
+        into neighboring MPS tensors, preserving backend/autodiff vectors. A
+        non-identity frame is lowered to an ordinary backend-native MPS first,
+        so the cap remains backend-native for both constant and trainable data.
         """
+        absorb = _normalize_absorb(absorb)
         if not self._layout_is_identity():
             raise ValueError(
                 "physical cap is not supported after installing an STN static "
                 "layout, because cap changes the logical qubit set and MPS length."
             )
-        _normalize_absorb(absorb)
         sites = _normalize_sites(where)
         if len(sites) != 1:
             raise ValueError("cap expects exactly one qubit site.")
@@ -6346,38 +5811,142 @@ class MpsStabOptimizer:
         limit = self.max_dense_cap_qubits
         if limit is not None and n > limit:
             raise ValueError(
-                f"physical cap would densely rebuild an {n}-qubit state, exceeding "
+                f"physical cap register has {n} qubits, exceeding "
                 f"max_dense_cap_qubits={limit}. Use a structured capped stream "
                 "or raise the limit explicitly."
             )
-        vec_arr = np.asarray(vec, dtype=self.dtype).ravel()
-        if vec_arr.shape != (2,):
+
+        shape = getattr(vec, "shape", None)
+        if shape is None:
+            vec_arr = np.asarray(vec, dtype=self.dtype).ravel()
+        else:
+            vec_arr = vec.reshape(-1)
+        if tuple(int(size) for size in getattr(vec_arr, "shape", ())) != (2,):
             raise ValueError(
-                f"cap vector must have length 2 for a qubit, got shape {vec_arr.shape}."
+                "cap vector must have length 2 for a qubit, got shape "
+                f"{getattr(vec_arr, 'shape', None)}."
             )
 
-        dense = self.to_statevector().reshape([2] * n)
-        capped = np.tensordot(dense, vec_arr, axes=([q], [0])).reshape(-1)
-        split_opts = {"cutoff": self.cutoff}
-        if self.chi is not None:
-            split_opts["max_bond"] = self.chi
-        p = qtn.MatrixProductState.from_dense(
-            capped,
-            dims=[2] * (n - 1),
-            **split_opts,
+        if self.state.is_identity_frame():
+            p = self.state.p
+            phys_ind = p.site_ind(q)
+            if p.ind_size(phys_ind) != 2:
+                raise ValueError(f"cap site {q} does not have physical dimension 2.")
+            if absorb == "left":
+                neighbour = q - 1 if q > 0 else q + 1
+            else:
+                neighbour = q + 1 if q < n - 1 else q - 1
+
+            self._canonize_p(neighbour)
+            new_center = neighbour if neighbour < q else neighbour - 1
+            cap_tensor = qtn.Tensor(
+                self._to_state_backend(vec_arr),
+                inds=(phys_ind,),
+            )
+            site_tensor = p[p.site_tag(q)]
+            neighbour_tensor = p[p.site_tag(neighbour)]
+            merged = qtn.tensor_contract(site_tensor, cap_tensor, neighbour_tensor)
+
+            site_ind_id = p.site_ind_id
+            site_tag_id = p.site_tag_id
+            p.delete(p.site_tag(q))
+            p.delete(p.site_tag(neighbour))
+            merged.modify(tags=(p.site_tag(neighbour),))
+            p |= merged
+
+            temp_reindex = {
+                site_ind_id.format(old): f"__pepsy_cap_k{old - 1}"
+                for old in range(q + 1, n)
+            }
+            temp_retag = {
+                site_tag_id.format(old): f"__pepsy_cap_I{old - 1}"
+                for old in range(q + 1, n)
+            }
+            if temp_reindex:
+                p.reindex_(temp_reindex)
+                p.retag_(temp_retag)
+            final_reindex = {
+                f"__pepsy_cap_k{i}": site_ind_id.format(i)
+                for i in range(q, n - 1)
+            }
+            final_retag = {
+                f"__pepsy_cap_I{i}": site_tag_id.format(i)
+                for i in range(q, n - 1)
+            }
+            if final_reindex:
+                p.reindex_(final_reindex)
+                p.retag_(final_retag)
+
+            p = p.view_as_(
+                qtn.MatrixProductState,
+                L=n - 1,
+                cyclic=False,
+                site_ind_id=site_ind_id,
+                site_tag_id=site_tag_id,
+            )
+            import stim
+
+            tableau = stim.TableauSimulator()
+            tableau.set_num_qubits(n - 1)
+            self.state = STNState.from_tableau_and_state(
+                tableau,
+                p,
+                dtype=self.dtype,
+            )
+            self.logical_order = list(range(n - 1))
+            self._logical_to_mps = {q: q for q in self.logical_order}
+            self.state.info["cur_orthog"] = (new_center, new_center)
+            self.backend_info()
+            self._localizer_cache.clear()
+            self._invalidate_infidelity()
+            self._mps_length_history.append(int(self.state.n))
+            self.cap_history.append(
+                {
+                    "physical_site": int(q),
+                    "old_length": int(n),
+                    "new_length": int(self.state.n),
+                    "absorb": str(absorb),
+                }
+            )
+            self._record()
+            return self
+
+        # Lower a nontrivial physical frame to an ordinary backend-native MPS
+        # before capping. This avoids any dense statevector reconstruction and
+        # retains the exact physical semantics of the cap.
+        if (
+            self.to_backend is None
+            and self._gate_requires_grad(vec_arr)
+            and self.backend == "numpy"
+        ):
+            raise ValueError(
+                "A trainable physical cap requires a configured native backend "
+                "converter (for example to_backend=backend_torch(...))."
+            )
+        physical = self.to_mps(mode="exact", logical_order=True)
+        lowered = StabilizerMpsSimulator.from_mps(
+            physical,
+            chi=self.chi,
+            cutoff=self.cutoff,
+            max_dense_cap_qubits=self.max_dense_cap_qubits,
+            to_backend=self.to_backend,
         )
-        converter = self.to_backend or self._backend_converter
-        if converter is not None:
-            p.apply_to_arrays(converter)
-
-        import stim
-
-        tableau = stim.TableauSimulator()
-        tableau.set_num_qubits(n - 1)
-        self.state = STNState.from_tableau_and_state(tableau, p, dtype=self.dtype)
+        lowered.cap(q, vec_arr, absorb=absorb)
+        self.state = lowered.state
+        self.logical_order = list(range(self.state.n))
+        self._logical_to_mps = {q: q for q in self.logical_order}
         self.backend_info()
         self._localizer_cache.clear()
         self._invalidate_infidelity()
+        self._mps_length_history.append(int(self.state.n))
+        self.cap_history.append(
+            {
+                "physical_site": int(q),
+                "old_length": int(n),
+                "new_length": int(self.state.n),
+                "absorb": str(absorb),
+            }
+        )
         self._record()
         return self
 
@@ -6491,7 +6060,7 @@ class MpsStabOptimizer:
             (0.5, {target: "X"}),
             (-0.5, {control: "Z", target: "X"}),
         )
-        return pauli_sum_submpo(branches, self.n, dtype=self.dtype)
+        return pauli_sum_submpo(branches, self.n, dtype=self.dtype, like=self._state_backend_like())
 
     def _apply_localizer_to_p(self, ops) -> None:
         """Apply and track the measurement's localizing Clifford on ``|nu>``."""
@@ -6556,7 +6125,7 @@ class MpsStabOptimizer:
         if len(support) == 1:
             q = support[0]
             mps_q = self._mps_site(q)
-            proj = single_qubit_combo_matrix(0.5, coef, terms[q], self.dtype)
+            proj = self._single_qubit_combo(0.5, coef, terms[q])
             self._canonize_p(mps_q)
             self.state.p.gate_(self._bk(proj), mps_q, contract=True, info=self.state.info)
             self.state.info["cur_orthog"] = (int(mps_q), int(mps_q))
@@ -6566,7 +6135,8 @@ class MpsStabOptimizer:
             self._record()
             return
         mps_terms = self._mps_terms(terms)
-        mpo, where = pauli_combo_submpo(0.5, coef, mps_terms, self.n, dtype=self.dtype)
+        mpo, where = pauli_combo_submpo(0.5, coef, mps_terms, self.n, dtype=self.dtype,
+                                      like=self._state_backend_like())
         self._evolve_p(
             self._bk_mpo(mpo, warn=False),
             where,
@@ -6578,7 +6148,7 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Magic-state injection (R1)
     # ------------------------------------------------------------------ #
-    def prepare_magic(self, ancilla, *, angle: float = math.pi / 4) -> "MpsStabOptimizer":
+    def prepare_magic(self, ancilla, *, angle: float = math.pi / 4) -> "StabilizerMpsSimulator":
         """Prepare the magic state ``|M> = Rz(angle)|+>`` on a fresh ``|0>`` ancilla.
 
         The default ``angle = pi/4`` gives the ``T`` resource
@@ -6842,7 +6412,7 @@ class MpsStabOptimizer:
         layout=None,
         layout_kwargs=None,
         layout_report: bool = True,
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Replay ``gates``, teleporting ``Z``-rotations through magic-state injection.
 
         Every injectable gate (``("t", q)`` / ``("tdg", q)`` / ``("rz", phi, q)``
@@ -6962,7 +6532,7 @@ class MpsStabOptimizer:
     @classmethod
     def with_injection(
         cls, n_data: int, gates, *, n_ancilla: int = 1, **kwargs
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Build an ``(n_data + n_ancilla)``-qubit simulator and run ``gates`` with injection.
 
         Data qubits are ``0 .. n_data - 1``; the last ``n_ancilla`` qubits are the
@@ -7009,7 +6579,7 @@ class MpsStabOptimizer:
                 f"outcomes must contain one value per injectable gate ({count}), "
                 f"got {len(values)}."
             )
-        return tuple(MpsStabOptimizer._validate_outcome(value) for value in values)
+        return tuple(StabilizerMpsSimulator._validate_outcome(value) for value in values)
 
     def _deferred_projection_metrics(self, ancilla) -> tuple[int, int]:
         """Return current coefficient-frame support size and MPS span for ``Z_a``."""
@@ -7079,7 +6649,7 @@ class MpsStabOptimizer:
         layout=None,
         layout_kwargs=None,
         layout_report: bool = True,
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Replay a circuit using MAST-style deferred magic-state projections.
 
         Each injectable ``T``/``T-dagger``/non-Clifford ``pi/4``-multiple
@@ -7256,7 +6826,7 @@ class MpsStabOptimizer:
     @classmethod
     def with_deferred_injection(
         cls, n_data: int, gates, *, n_ancilla: Optional[int] = None, **kwargs
-    ) -> "MpsStabOptimizer":
+    ) -> "StabilizerMpsSimulator":
         """Build a simulator and replay ``gates`` with deferred magic projections.
 
         When ``n_ancilla`` is omitted, allocate exactly one trailing ancilla for
@@ -7372,6 +6942,17 @@ class MpsStabOptimizer:
 
     def _apply_matrix(self, gate: np.ndarray, where) -> None:
         where = (int(where),) if isinstance(where, Integral) else tuple(int(w) for w in where)
+        gate = self._as_native_gate_matrix(gate, len(where))
+        if self._gate_requires_grad(gate):
+            if len(where) != 1:
+                raise ValueError(
+                    "Autodiff dense gate matrices currently support one qubit; "
+                    "decompose a trainable multi-qubit gate into native stream "
+                    "events or provide a coefficient-frame sub-MPO."
+                )
+            self._apply_trainable_one_qubit_gate(gate, where[0])
+            return
+
         gate = _as_gate_matrix(gate, len(where))
         dim = gate.shape[0]
         nq = int(round(math.log2(dim)))
@@ -7404,6 +6985,112 @@ class MpsStabOptimizer:
         # General k-qubit gate (any k, unitary or non-unitary): decompose into
         # Paulis and act on the coefficient MPS via the frame map.
         self._apply_dense_gate(gate, where, unitary=gate_is_unitary)
+
+    def _apply_trainable_one_qubit_gate(self, gate, where) -> None:
+        """Apply a trainable one-qubit matrix without leaving the backend.
+
+        For ``G = c_I I + c_X X + c_Y Y + c_Z Z``, the tableau frame maps each
+        Pauli to a signed Pauli string on ``|nu>``. The frame/sign metadata is
+        discrete and remains host-side; the four coefficients stay as backend
+        scalars, so the MPS update retains the caller's autodiff graph.
+        """
+        shape = tuple(int(size) for size in getattr(gate, "shape", ()))
+        if shape != (2, 2):
+            raise ValueError(
+                "A trainable one-qubit dense gate must have shape (2, 2), "
+                f"got {shape}."
+            )
+
+        g00, g01 = gate[0, 0], gate[0, 1]
+        g10, g11 = gate[1, 0], gate[1, 1]
+        coefficients = (
+            (g00 + g11) / 2,
+            (g01 + g10) / 2,
+            (g10 - g01) / (2j),
+            (g00 - g11) / 2,
+        )
+        if (
+            self._backend_scalar_is_exact_zero(g01)
+            and self._backend_scalar_is_exact_zero(g10)
+            and not self._backend_scalar_has_nonzero_grad(g01)
+            and not self._backend_scalar_has_nonzero_grad(g10)
+        ):
+            # Preserve the diagonal I/Z coefficients even when one is zero at
+            # the current parameter value: its derivative may be nonzero.
+            selected = (("I", coefficients[0]), ("Z", coefficients[3]))
+        else:
+            selected = tuple(zip("IXYZ", coefficients))
+        preserve_zero_gradient = any(
+            self._backend_scalar_has_nonzero_grad(coefficient)
+            and self._backend_scalar_is_exact_zero(coefficient)
+            for _axis, coefficient in selected
+        )
+        mapped = []
+        local_site = None
+        local_matrix = None
+        local_candidate = True
+        for axis, coefficient in selected:
+            physical = pauli_string((axis,), (int(where),), self.n)
+            frame_terms, sign = hermitian_pauli_terms(
+                self.state.frame_pauli(physical)
+            )
+            weight = coefficient * sign
+            mapped.append((weight, frame_terms))
+            if not local_candidate:
+                continue
+            if not frame_terms:
+                term_site = local_site
+                term_matrix = self._bk_const("I2", _I2)
+            elif len(frame_terms) == 1:
+                term_site, term_axis = next(iter(frame_terms.items()))
+                term_site = int(term_site)
+                term_matrix = self._bk_const(
+                    "P" + str(term_axis).upper(),
+                    pauli_matrix(term_axis),
+                )
+            else:
+                local_candidate = False
+                continue
+            if local_site is None:
+                local_site = term_site
+            elif term_site != local_site:
+                local_candidate = False
+                continue
+            contribution = weight * term_matrix
+            local_matrix = (
+                contribution
+                if local_matrix is None
+                else local_matrix + contribution
+            )
+
+        if local_candidate:
+            if local_matrix is None:
+                # This is possible only for an exactly-zero matrix. Preserve
+                # the backend state structure while retaining the operation's
+                # scalar graph if one exists.
+                self.state.p = 0.0 * self.state.p
+            elif local_site is None:
+                self.state.p = local_matrix[0, 0] * self.state.p
+            else:
+                self.state.p.gate_(
+                    local_matrix,
+                    self._mps_site(local_site),
+                    contract=True,
+                )
+            self._record()
+            return
+
+        # Do not coalesce here: ``_coalesce_operator_sum`` intentionally casts
+        # weights to Python complex for its constant-gate path. The branch
+        # reducer below accepts backend scalar weights and therefore preserves
+        # Torch/JAX autodiff.
+        self._record(
+            self._apply_operator_sum(
+                mapped,
+                unitary=False,
+                preserve_autodiff_zero=preserve_zero_gradient,
+            )
+        )
 
     def _apply_dense_gate(
         self, gate: np.ndarray, where, *, unitary: bool = False
@@ -7504,7 +7191,7 @@ class MpsStabOptimizer:
             (weight, self._mps_terms(sites))
             for weight, sites in branches
         )
-        mpo, where = pauli_sum_submpo(mapped, self.n, dtype=self.dtype)
+        mpo, where = pauli_sum_submpo(mapped, self.n, dtype=self.dtype, like=self._state_backend_like())
         if unitary:
             return self._evolve_p(self._bk_mpo(mpo, warn=False), where, unitary=True)
         self._evolve_p(self._bk_mpo(mpo, warn=False), where)
@@ -7514,7 +7201,12 @@ class MpsStabOptimizer:
         return self._nonunitary_compression_infidelity(target_norm)
 
     def _apply_operator_sum(
-        self, branches, *, unitary: bool, target_norm: Optional[float] = None
+        self,
+        branches,
+        *,
+        unitary: bool,
+        target_norm: Optional[float] = None,
+        preserve_autodiff_zero: bool = False,
     ) -> Optional[float]:
         """Apply ``M = sum_j w_j (prod_i P_i)`` to the coefficient MPS ``p``.
 
@@ -7526,22 +7218,15 @@ class MpsStabOptimizer:
         """
         p = self.state.p
         branches = tuple(branches)
-        before_norm_sq = (
-            self._norm_squared()
-            if unitary and self._infidelity_valid
-            else None
-        )
+        if unitary and self._infidelity_valid:
+            _before_norm, before_norm_sq, before_log_norm = self._compression_norm_snapshot()
+        else:
+            before_norm_sq = None
+            before_log_norm = None
         if not branches or self._norm_squared() <= 0.0:
             self._set_zero_coefficient_state()
             if unitary:
-                observed_infidelity = self._unitary_infidelity()
-                self._record_compression_norm_event(
-                    before_norm_sq,
-                    observed_infidelity,
-                )
-                infidelity = self._current_infidelity
-                self._stabilize_unitary_norm(before_norm_sq, observed_infidelity)
-                return infidelity
+                return self._finish_unitary_compression(before_norm_sq, before_log_norm)
             if target_norm is not None:
                 return self._nonunitary_compression_infidelity(target_norm)
             self._invalidate_infidelity()
@@ -7549,10 +7234,23 @@ class MpsStabOptimizer:
 
         def combine(left, right, max_bond):
             result = left + right
-            result.compress(max_bond=max_bond, cutoff=self.cutoff)
+            preserve_zero = (
+                preserve_autodiff_zero
+                and (max_bond is None or max_bond >= len(branches))
+            )
+            if not preserve_zero:
+                result.compress(
+                    max_bond=max_bond,
+                    cutoff=self.cutoff,
+                    cutoff_mode=self.cutoff_mode or "rsum2",
+                )
             return result
 
         def build(max_bond):
+            preserve_zero = (
+                preserve_autodiff_zero
+                and (max_bond is None or max_bond >= len(branches))
+            )
             # Binary-carry accumulation produces a balanced addition tree while
             # retaining only one partial sum per level (O(log(branches)) live
             # partials instead of materializing every branch MPS at once).
@@ -7561,11 +7259,19 @@ class MpsStabOptimizer:
                 branch = p.copy()
                 for site, axis in self._mps_terms(sites).items():
                     branch.gate_(self._bk_const("P" + axis, pauli_matrix(axis)), site, contract=True)
-                branch = w * branch
+                # Scale one tensor instead of using MPS scalar multiplication.
+                # The latter routes through Quimb's exponent normalization and
+                # can produce NaNs for an exact zero backend coefficient,
+                # especially at a trainable probability endpoint.
+                first = branch[branch.site_tag(0)]
+                first.modify(data=first.data * w)
 
                 level = 0
                 while level < len(partials) and partials[level] is not None:
-                    branch = combine(partials[level], branch, max_bond)
+                    if preserve_zero:
+                        branch = partials[level] + branch
+                    else:
+                        branch = combine(partials[level], branch, max_bond)
                     partials[level] = None
                     level += 1
                 if level == len(partials):
@@ -7582,7 +7288,12 @@ class MpsStabOptimizer:
                     if result is None
                     else combine(result, partial, max_bond)
                 )
-            result.compress(max_bond=max_bond, cutoff=self.cutoff)
+            if not preserve_zero:
+                result.compress(
+                    max_bond=max_bond,
+                    cutoff=self.cutoff,
+                    cutoff_mode=self.cutoff_mode or "rsum2",
+                )
             return result
 
         if self.mode in self._DMRG_MODES:
@@ -7592,18 +7303,21 @@ class MpsStabOptimizer:
                 self._mps_sites(sorted(logical_support)),
             )
         else:
-            self.state.p = build(None if self.mode == "exact" else self.chi)
-            # compress() leaves the rebuilt MPS canonical with the centre at site 0.
-            self.state.info["cur_orthog"] = (0, 0)
-        if unitary:
-            observed_infidelity = self._unitary_infidelity()
-            self._record_compression_norm_event(
-                before_norm_sq,
-                observed_infidelity,
+            max_bond = None if self.mode == "exact" else self.chi
+            preserve_zero = (
+                preserve_autodiff_zero
+                and (max_bond is None or max_bond >= len(branches))
             )
-            infidelity = self._current_infidelity
-            self._stabilize_unitary_norm(before_norm_sq, observed_infidelity)
-            return infidelity
+            self.state.p = build(max_bond)
+            # A padded direct sum has no canonical centre until a later
+            # operation requests one. The regular compressed path is already
+            # canonical with the centre at site 0.
+            self.state.info["cur_orthog"] = (
+                None if preserve_zero
+                else (0, 0)
+            )
+        if unitary:
+            return self._finish_unitary_compression(before_norm_sq, before_log_norm)
         if target_norm is not None:
             return self._nonunitary_compression_infidelity(target_norm)
         self._invalidate_infidelity()
@@ -7695,13 +7409,16 @@ class MpsStabOptimizer:
         """Record a public update and optionally its bond-history sample."""
         if infidelity is not None:
             self._norm_segment_open = True
-            self.infidelities.append(float(infidelity))
+            self.infidelities.append(
+                diagnostic_scalar(infidelity)
+                if ar.infer_backend(infidelity) in {"torch", "jax", "cupy"}
+                else float(infidelity))
         if record_bond:
             self.bond_history.append(self.state.max_bond())
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return (
-            f"MpsStabOptimizer(n={self.n}, chi={self.chi}, mode={self.mode!r}, "
+            f"StabilizerMpsSimulator(n={self.n}, chi={self.chi}, mode={self.mode!r}, "
             f"fit_init_strategy={self.fit_init_strategy!r}, "
             f"operator_tol={self.operator_tol}, "
             f"max_pauli_decomposition_qubits="
@@ -7776,7 +7493,7 @@ def _runner_bond_value(value) -> int:
 
 
 def _runner_collect_result(
-    sim: MpsStabOptimizer,
+    sim: StabilizerMpsSimulator,
     *,
     mode: str,
     requested_mode: str,
@@ -7837,11 +7554,11 @@ def run_stabilizer_mps_stream(
 
     ``mode`` defaults to ``"direct"``. Use ``mode="recommended"`` only when the
     caller explicitly wants to execute the mode selected by
-    :meth:`MpsStabOptimizer.recommend_settings`.
+    :meth:`StabilizerMpsSimulator.recommend_settings`.
     """
-    entries = MpsStabOptimizer._as_entries(gates)
+    entries = StabilizerMpsSimulator._as_entries(gates)
     if advice is None:
-        advice = MpsStabOptimizer.recommend_settings(
+        advice = StabilizerMpsSimulator.recommend_settings(
             entries,
             n_qubits=n_qubits,
             ancilla_budget=ancilla_budget,
@@ -7870,7 +7587,7 @@ def run_stabilizer_mps_stream(
     if actual_mode == "direct":
         settings_used = {"n_qubits": n_data, **ctor}
         start = time.perf_counter()
-        sim = MpsStabOptimizer(n_data, entries, **ctor)
+        sim = StabilizerMpsSimulator(n_data, entries, **ctor)
         sim.run(**run_opts)
         elapsed = time.perf_counter() - start
         return _runner_collect_result(
@@ -7895,7 +7612,7 @@ def run_stabilizer_mps_stream(
         settings_used = {"n_data": n_data, "n_ancilla": n_ancilla, **ctor}
         kwargs = {**ctor, **run_opts}
         start = time.perf_counter()
-        sim = MpsStabOptimizer.with_injection(
+        sim = StabilizerMpsSimulator.with_injection(
             n_data,
             entries,
             n_ancilla=n_ancilla,
@@ -7926,7 +7643,7 @@ def run_stabilizer_mps_stream(
         settings_used = {"n_data": n_data, "n_ancilla": n_ancilla, **ctor}
         kwargs = {**ctor, **run_opts}
         start = time.perf_counter()
-        sim = MpsStabOptimizer.with_deferred_injection(
+        sim = StabilizerMpsSimulator.with_deferred_injection(
             n_data,
             entries,
             n_ancilla=n_ancilla,
@@ -7954,7 +7671,7 @@ def run_stabilizer_mps_stream(
     raise AssertionError(f"unreachable mode {actual_mode!r}")  # pragma: no cover
 
 
-StabilizerMpsSimulator = MpsStabOptimizer
+MpsStabOptimizer = StabilizerMpsSimulator
 
 
 def _looks_like_stream(gates) -> bool:
@@ -7969,22 +7686,3 @@ def _looks_like_stream(gates) -> bool:
         return False
     # First element is a str/number -> ``gates`` is a single named entry.
     return False
-
-
-def _zyz_angles(gate: np.ndarray):
-    """Return ``(alpha, theta, beta)`` with ``U ~ Rz(alpha) Ry(theta) Rz(beta)``.
-
-    Up to a global phase, using the convention ``Rz(a) = exp(-i a/2 Z)`` and
-    ``Ry(t) = exp(-i t/2 Y)``.
-    """
-    u = np.asarray(ar.to_numpy(gate), dtype=complex)
-    det = u[0, 0] * u[1, 1] - u[0, 1] * u[1, 0]
-    u = u / np.sqrt(det)  # to SU(2) up to a sign (global phase, irrelevant)
-    c = abs(u[0, 0])
-    s = abs(u[1, 0])
-    theta = 2.0 * math.atan2(s, c)
-    apb = -np.angle(u[0, 0]) if c > 1e-12 else 0.0
-    amb = -np.angle(-u[0, 1]) if s > 1e-12 else 0.0
-    alpha = float(apb + amb)
-    beta = float(apb - amb)
-    return alpha, float(theta), beta

@@ -23,16 +23,9 @@ _register(
 )
 _register(
     ".symmetric",
-    "FermionLatticeSetup",
     "SymGateStream",
     "SymHamiltonian",
-    "SymMPS",
-    "SymPEPS",
     "default_physical_sectors",
-    "draw_symmray_blocks",
-    "draw_symmray_mps",
-    "draw_symmray_mpo",
-    "draw_symmray_peps",
     "fermi_hubbard_u1u1_gate_stream",
     "fermi_hubbard_u1u1_hopping_gate_stream",
     "fermi_hubbard_u1u1_interaction_gate_stream",
@@ -40,30 +33,43 @@ _register(
     "fermi_hubbard_u1u1_jw_gate_stream",
     "fermi_hubbard_u1u1_jw_hopping_gate_stream",
     "fermi_hubbard_u1u1_jw_interaction_gate_stream",
-    "fermion_density_param_gen",
-    "fermion_hopping_param_gen",
-    "fermion_interaction_param_gen",
     "sector_index_map",
     "site_charge_alternating",
     "site_charge_from_map",
     "site_charge_from_occupations",
     "site_charge_uniform",
-    "symmray_block_summary",
-    "symmray_mps_summary",
-    "symmray_mpo_summary",
-    "symmray_peps_summary",
     "symm_operator_from_dense",
 )
 _register(
+    ".symmetric_diagnostics",
+    "draw_symmray_blocks",
+    "draw_symmray_mpo",
+    "draw_symmray_mps",
+    "draw_symmray_peps",
+    "symmray_block_summary",
+    "symmray_mpo_summary",
+    "symmray_mps_summary",
+    "symmray_peps_summary",
+)
+_register(
+    ".symmetric_states",
+    "SymMPS",
+    "SymPEPS",
+)
+_register(
     ".symm_fermions",
+    "FermionLatticeSetup",
+    "fermion_density_param_gen",
+    "fermion_hopping_param_gen",
+    "fermion_interaction_param_gen",
     "Fermion",
     "SpinfulFermion",
-    "SpinfulFermionHubbard",
     "SymmFermions",
 )
 _register(
     ".constructors",
     "add_cycle",
+    "bell_to_mps",
     "expec_mpo",
     "haar_random_state",
     "hrs_to_mps",
@@ -71,7 +77,6 @@ _register(
     "hrs_to_ttn",
     "hrps_to_mps",
     "hrps_to_peps",
-    "hrps_to_ttn",
     "id_to_mpo",
     "id_to_pepo",
     "ps_to_3dpeps",
@@ -92,80 +97,41 @@ _register(
     "contract_hypercompressed_tn_batch",
     "tn_norm",
 )
-_register(".observables", "measure_obs", "tn_fidelity")
-_register(".validation", "validate_tensor_network_tags")
 _register(
-    "..backends.config",
-    "backend_cupy",
-    "backend_jax",
-    "backend_numpy",
-    "backend_torch",
-    "build_backend",
-    "get_default_array_backend",
-    "get_default_grad_backend",
-    "get_torch_linalg_config",
-    "register_jax_linalg",
-    "register_torch_linalg",
-    "reset_linalg_registrations",
-    "reset_default_backends",
-    "set_default_array_backend",
-    "set_default_grad_backend",
-    "reg_complex_qr_torch",
-    "reg_native_svd_jax",
-    "reg_native_svd_torch",
-    "reg_complex_svd_jax",
-    "reg_complex_svd_torch",
-    "reg_real_qr_torch",
-    "reg_real_svd_jax",
-    "reg_real_svd_torch",
-    "reg_rel_svd_jax",
-    "reg_rel_svd_torch",
-    "reg_stop_gradient_torch",
-    "stop_grad",
-    "TorchLinalgConfig",
+    ".observables",
+    "measure_obs",
+    "mps_entanglement_entropy",
+    "tn_fidelity",
 )
+_register(".mps_transfer", "MpsTransferSpectrum", "mps_transfer_spectrum", "mps_correlation_length")
+_register(".conversions", "mps_to_ttn", "mps_to_treepeps")
+_register(".validation", "validate_tensor_network_tags")
 
 _SUBMODULES = (
     "constructors",
+    "conversions",
     "contractions",
     "maps",
     "observables",
+    "mps_transfer",
     "symmetric",
     "symm_fermions",
     "validation",
     "core",
 )
 
-_BACKEND_COMPATIBILITY_ALIASES = frozenset(
-    {
-        "backend_cupy",
-        "backend_jax",
-        "backend_numpy",
-        "backend_torch",
-        "build_backend",
-        "get_default_array_backend",
-        "get_default_grad_backend",
-        "get_torch_linalg_config",
-        "register_jax_linalg",
-        "register_torch_linalg",
-        "reset_default_backends",
-        "reset_linalg_registrations",
-        "set_default_array_backend",
-        "set_default_grad_backend",
-        "TorchLinalgConfig",
-    }
-)
-
 _DEPRECATED_ALIASES = {
-    **{name: f"pepsy.backends.{name}" for name in _BACKEND_COMPATIBILITY_ALIASES},
     "build_contraction": "pepsy.tensors.build_optimizer",
-    "SpinfulFermionHubbard": "pepsy.tensors.SpinfulFermion",
     "hrps_to_mps": "pepsy.tensors.hrs_to_mps",
     "hrps_to_peps": "pepsy.tensors.hrs_to_peps",
-    "hrps_to_ttn": "pepsy.tensors.hrs_to_ttn",
 }
 
 __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
+
+
+def __dir__():
+    """List available names without importing their implementations."""
+    return sorted(set(globals()) | set(__all__))
 
 
 def __getattr__(name):

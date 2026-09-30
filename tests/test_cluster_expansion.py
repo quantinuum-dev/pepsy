@@ -913,7 +913,7 @@ def test_pauli_pepo_basis_matches_finite_chain_through_tree_order(order, nsites)
     np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-11)
 
 
-def test_pauli_pepo_basis_order_five_is_exact_on_a_five_site_chain():
+def test_pauli_pepo_basis_order_five_is_exact_on_a_five_site_chain(monkeypatch):
     """The backend-native generic path closes the first five-site tree."""
     basis = PauliPEPOBasis.compile(
         1,
@@ -924,7 +924,17 @@ def test_pauli_pepo_basis_order_five_is_exact_on_a_five_site_chain():
         ],
         order=5,
     )
-    pepo = basis.exp(step=-1j * 0.001, materialize=True)
+    compiled = basis.compile_exp()
+    assert basis.cache_info["generic_cluster_levels"] == 1
+
+    original_plan = basis._cluster_embedding_plan
+
+    def prepared_embedding(nsites, edges):
+        assert (nsites, tuple(edges)) in basis._cluster_embedding_cache
+        return original_plan(nsites, edges)
+
+    monkeypatch.setattr(basis, "_cluster_embedding_plan", prepared_embedding)
+    pepo = compiled.exp(step=-1j * 0.001, materialize=True)
     exact = expm(-1j * 0.001 * _pauli_chain_hamiltonian(5, 0.2, 1.0))
     np.testing.assert_allclose(pepo.to_dense(), exact, atol=1e-11)
     assert basis.cache_info["generic_cluster_levels"] == 1
@@ -947,8 +957,9 @@ def test_pauli_pepo_basis_batches_translated_pbc_shapes():
         materialize=False,
     )
     assert active.active_block_count > 0
-    assert basis.cache_info["generic_cluster_levels"] == 1
-    assert basis.cache_info["generic_translated_clusters"] > 1
+    info = basis.cache_info
+    assert info["localized_cluster_counts"][5] == 6
+    assert info["last_local_targets_evaluated"] < sum(info["localized_cluster_counts"].values())
 
 
 def test_pauli_pepo_basis_order_five_keeps_torch_autodiff():
@@ -1041,6 +1052,16 @@ def test_ordered_pepo_cluster_product_preserves_factor_order():
     )
     compiled = expansion.compile_exp()
     assert isinstance(compiled, CompiledPEPOClusterProduct)
+    assert compiled.cluster_inventory == bases[0].cluster_inventory
+    info = compiled.cache_info
+    assert len(info["factor_cache_info"]) == 3
+    assert all(f["prepared_exp_modes"] == ("homogeneous",)
+               for f in info["factor_cache_info"])
+    info["factor_cache_info"][0]["builds"] = -1
+    assert compiled.cache_info["factor_cache_info"][0]["builds"] == 0
+    inventory = compiled.cluster_inventory
+    inventory[2]["shapes"] = -1
+    assert compiled.cluster_inventory[2]["shapes"] == 2
 
     result = compiled.exp(0.05)
     h_a = np.kron(x, identity) + np.kron(identity, x)
@@ -1122,6 +1143,321 @@ def test_pauli_pepo_basis_keeps_torch_coefficient_and_time_graph():
     )
     assert torch.isfinite(coefficient_gradient).all()
     assert torch.isfinite(time_gradient)
+
+
+def test_pauli_pepo_basis_promotes_channel_maps_for_complex_torch_coefficients():
+    """Complex Torch slots align the static maps without detaching gradients."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        2,
+        [
+            PauliPEPOTerm(
+                "onsite",
+                "X",
+                coefficient=lambda params: -0.5j * params["theta"],
+            )
+        ],
+        order=1,
+    )
+    theta = torch.tensor(0.17, dtype=torch.float64, requires_grad=True)
+
+    dense = basis.exp(
+        1.0,
+        parameters={"theta": theta},
+        materialize=True,
+    ).to_dense()
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.complex128)
+    identity = torch.eye(2, dtype=torch.complex128)
+    hamiltonian = torch.kron(x, identity) + torch.kron(identity, x)
+    expected = torch.matrix_exp(-0.5j * theta * hamiltonian)
+
+    assert torch.allclose(dense, expected, atol=1.0e-12, rtol=1.0e-12)
+    gradient = torch.autograd.grad(dense.real.sum(), theta)[0]
+    assert torch.isfinite(gradient)
+
+
+def test_ordered_pepo_product_promotes_complex_factor_without_value_loss():
+    """A complex product prefactor is promoted, never cast to real zero."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        2,
+        [PauliPEPOTerm("onsite", "X", coefficient=MPOParameter("theta"))],
+        order=1,
+    )
+    product = PEPOClusterProductExpansion.from_bases(
+        (basis,),
+        coefficients=(-0.5j,),
+    ).compile_exp()
+    theta = torch.tensor(0.17, dtype=torch.float64, requires_grad=True)
+
+    dense = product.exp(1.0, parameters={"theta": theta}).to_dense()
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.complex128)
+    identity = torch.eye(2, dtype=torch.complex128)
+    hamiltonian = torch.kron(x, identity) + torch.kron(identity, x)
+    expected = torch.matrix_exp(-0.5j * theta * hamiltonian)
+
+    assert torch.allclose(dense, expected, atol=1.0e-12, rtol=1.0e-12)
+    gradient = torch.autograd.grad(dense.real.sum(), theta)[0]
+    assert torch.isfinite(gradient)
+
+
+def test_inhomogeneous_pauli_pepo_is_exact_on_one_located_edge():
+    """Explicit site/edge slots use their actual finite-lattice coordinates."""
+    basis = PauliPEPOBasis.compile(
+        1,
+        2,
+        [
+            PauliPEPOTerm("onsite", "X", 0.2, where=(0, 0)),
+            PauliPEPOTerm(
+                "edge",
+                "ZY",
+                -0.7,
+                where=((0, 1), (0, 0)),
+            ),
+        ],
+        order=2,
+    )
+    actual = basis.exp(step=-0.03j, materialize=True).to_dense()
+    identity = np.eye(2, dtype=complex)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    hamiltonian = 0.2 * np.kron(x, identity) - 0.7 * np.kron(y, z)
+    expected = expm(-0.03j * hamiltonian)
+
+    np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+    assert basis.cache_info["inhomogeneous"]
+
+
+def test_inhomogeneous_ordered_pepo_keeps_torch_values_and_gradients():
+    """The joint local product preserves local slots, order, and autodiff."""
+    torch = pytest.importorskip("torch")
+    left = PauliPEPOBasis.compile(
+        1,
+        2,
+        [PauliPEPOTerm("onsite", "X", where=(0, 1))],
+        order=2,
+    )
+    right = PauliPEPOBasis.compile(
+        1,
+        2,
+        [PauliPEPOTerm("edge", "ZZ", where=((0, 0), (0, 1)))],
+        order=2,
+    )
+    uniform = PauliPEPOBasis.compile(
+        1,
+        2,
+        [PauliPEPOTerm("onsite", "Y")],
+        order=2,
+    )
+    coefficients = tuple(
+        torch.tensor(value, dtype=torch.float64, requires_grad=True)
+        for value in (0.2, -0.3)
+    )
+    product = PEPOClusterProductExpansion.from_bases(
+        (left, right, uniform),
+        coefficients=(-0.5j, -0.5j, -0.25j),
+    )
+    sparse = product.exp(
+        1.0,
+        coefficients=((coefficients[0],), (coefficients[1],), (0.11,)),
+        materialize=False,
+    )
+    assert isinstance(sparse, ActivePEPOBlocks)
+    assert max(sparse.bond_dimensions.values()) <= sparse.bond_dim
+    actual = product.exp(
+        1.0,
+        coefficients=((coefficients[0],), (coefficients[1],), (0.11,)),
+    )
+    actual = actual.to_dense()
+
+    identity = torch.eye(2, dtype=torch.complex128)
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.complex128)
+    y = torch.tensor([[0.0, -1.0j], [1.0j, 0.0]], dtype=torch.complex128)
+    z = torch.diag(torch.tensor([1.0, -1.0], dtype=torch.complex128))
+    expected = torch.matrix_exp(
+        -0.5j * coefficients[0] * torch.kron(identity, x)
+    ) @ torch.matrix_exp(
+        -0.5j * coefficients[1] * torch.kron(z, z)
+    ) @ torch.matrix_exp(
+        -0.25j * 0.11 * (torch.kron(y, identity) + torch.kron(identity, y))
+    )
+
+    assert torch.allclose(actual, expected, atol=1.0e-12, rtol=1.0e-12)
+    actual_gradient = torch.autograd.grad(actual.real.sum(), coefficients)
+    expected_gradient = torch.autograd.grad(expected.real.sum(), coefficients)
+    assert torch.allclose(
+        torch.stack(actual_gradient),
+        torch.stack(expected_gradient),
+        atol=1.0e-11,
+        rtol=1.0e-11,
+    )
+
+
+def test_inhomogeneous_pauli_pepo_requires_direction_for_parallel_pbc_bonds():
+    """Length-two PBC bond occurrences are never collapsed by endpoints."""
+    ambiguous = PauliPEPOTerm(
+        "edge",
+        "XY",
+        where=((0, 0), (1, 0)),
+    )
+    with pytest.raises(ValueError, match="ambiguous.*direction"):
+        PauliPEPOBasis.compile(2, 2, [ambiguous], order=2, cyclic=True)
+
+    basis = PauliPEPOBasis.compile(
+        2,
+        2,
+        [
+            PauliPEPOTerm(
+                "edge",
+                "XY",
+                0.2,
+                where=((0, 0), (1, 0)),
+                direction="u",
+            ),
+            PauliPEPOTerm(
+                "edge",
+                "YX",
+                -0.3,
+                where=((0, 0), (1, 0)),
+                direction="d",
+            ),
+        ],
+        order=2,
+        cyclic=True,
+    )
+    assert np.count_nonzero(basis._lattice_edge_term_map) == 2
+
+
+def test_inhomogeneous_pauli_pepo_closes_order_three_chain_exactly():
+    """Occurrence-specific three-site residuals close the full chain."""
+    identity = np.eye(2, dtype=complex)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    terms = [
+        PauliPEPOTerm("onsite", "X", 0.2, where=(0, 0)),
+        PauliPEPOTerm("onsite", "Y", -0.1, where=(0, 2)),
+        PauliPEPOTerm("edge", "ZZ", 0.7, where=((0, 0), (0, 1))),
+        PauliPEPOTerm("edge", "XY", -0.3, where=((0, 1), (0, 2))),
+    ]
+    hamiltonian = (
+        0.2 * _kron_all((x, identity, identity))
+        - 0.1 * _kron_all((identity, identity, y))
+        + 0.7 * _kron_all((z, z, identity))
+        - 0.3 * _kron_all((identity, x, y))
+    )
+    basis = PauliPEPOBasis.compile(1, 3, terms, order=3)
+    active = basis.exp(step=-0.017j)
+    actual = active.to_pepo().to_dense()
+    uncompact = active.to_pepo(compact_bonds=False).to_dense()
+
+    np.testing.assert_allclose(actual, expm(-0.017j * hamiltonian), atol=1.0e-12)
+    np.testing.assert_allclose(uncompact, actual, atol=1.0e-12)
+    assert basis.cache_info["localized_cluster_counts"] == {1: 3, 2: 2, 3: 1}
+    assert max(active.bond_dimensions.values()) < active.bond_dim
+
+
+def test_inhomogeneous_pauli_pepo_closes_periodic_order_four_exactly():
+    """PBC clusters include every internal bond occurrence and close exactly."""
+    identity = np.eye(2, dtype=complex)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    terms = [
+        PauliPEPOTerm("onsite", "X", 0.2, where=(0, 0)),
+        PauliPEPOTerm(
+            "edge",
+            "ZZ",
+            0.7,
+            where=((0, 0), (1, 0)),
+            direction="u",
+        ),
+        PauliPEPOTerm(
+            "edge",
+            "XY",
+            -0.3,
+            where=((1, 0), (0, 0)),
+            direction="u",
+        ),
+        PauliPEPOTerm(
+            "edge",
+            "YX",
+            0.4,
+            where=((0, 0), (0, 1)),
+            direction="r",
+        ),
+    ]
+    hamiltonian = (
+        0.2 * _kron_all((x, identity, identity, identity))
+        + 0.7 * _kron_all((z, identity, z, identity))
+        - 0.3 * _kron_all((y, identity, x, identity))
+        + 0.4 * _kron_all((y, x, identity, identity))
+    )
+    basis = PauliPEPOBasis.compile(
+        2,
+        2,
+        terms,
+        order=4,
+        cyclic=True,
+    )
+    actual = basis.exp(step=-0.017j, materialize=True).to_dense()
+
+    np.testing.assert_allclose(actual, expm(-0.017j * hamiltonian), atol=1.0e-12)
+
+
+def test_inhomogeneous_pauli_pepo_reaches_generic_order_five():
+    """The finite-subset route continues through the generic order range."""
+    identity = np.eye(2, dtype=complex)
+    z = np.diag([1.0, -1.0]).astype(complex)
+    basis = PauliPEPOBasis.compile(
+        1,
+        5,
+        [
+            PauliPEPOTerm("onsite", "X", coefficient=0.2),
+            PauliPEPOTerm("edge", "ZZ", coefficient=1.0),
+            PauliPEPOTerm("onsite", "Z", 0.07, where=(0, 2)),
+        ],
+        order=5,
+    )
+    expected_hamiltonian = _pauli_chain_hamiltonian(5, 0.2, 1.0)
+    expected_hamiltonian += 0.07 * _kron_all(
+        (identity, identity, z, identity, identity)
+    )
+    actual = basis.exp(step=-0.001j, materialize=True).to_dense()
+
+    np.testing.assert_allclose(
+        actual,
+        expm(-0.001j * expected_hamiltonian),
+        atol=1.0e-11,
+    )
+
+
+def test_inhomogeneous_pauli_pepo_rank_cap_keeps_torch_gradient():
+    """The explicit truncated-SVD option remains backend differentiable."""
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1,
+        3,
+        [
+            PauliPEPOTerm("onsite", "X"),
+            PauliPEPOTerm("edge", "ZZ"),
+            PauliPEPOTerm("onsite", "Y", where=(0, 1)),
+        ],
+        order=3,
+        max_tree_rank=2,
+    )
+    coefficients = torch.tensor(
+        [0.21, 0.71, -0.13],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    dense = basis.exp(-0.017j, coefficients=coefficients).to_pepo().to_dense()
+    gradient = torch.autograd.grad(dense.real.sum(), coefficients)[0]
+
+    assert torch.isfinite(gradient).all()
 
 
 def test_pauli_pepo_basis_resolves_mpo_parameter_references_with_autodiff():
@@ -1286,10 +1622,15 @@ def test_pauli_pepo_compile_exp_is_the_preferred_cached_interface():
     compiled = basis.compile_exp()
     assert isinstance(compiled, CompiledPEPOExp)
     assert compiled is basis.compile_exp()
+    assert compiled.cache_info["builds"] == 0
+    assert compiled.cluster_inventory == basis.cluster_inventory
+    snapshot = compiled.cache_info
     first = compiled.exp(-1j * 0.01, coefficients=np.array([0.2, 1.0]))
     second = compiled(-1j * 0.02, coefficients=np.array([0.3, 0.7]))
     assert first.bond_dim == second.bond_dim
     assert basis.cache_info["compiled_exp"]
+    assert compiled.cache_info["builds"] == 2
+    assert snapshot["builds"] == 0
 
 
 def test_pauli_pepo_compile_exp_prepares_value_independent_cluster_plans():
@@ -1311,3 +1652,166 @@ def test_pauli_pepo_compile_exp_prepares_value_independent_cluster_plans():
 
     assert basis.cache_info["cluster_embedding_plans"] == first_plan_count
     assert first.blocks is not second.blocks
+
+
+@pytest.mark.parametrize("symmetry", [None, "C4"])
+def test_cluster_inventory_separates_oriented_trees_and_loops(symmetry):
+    twosite, onesite = _itf_terms()
+    plan = ClusterExpansionPlan(5, 6, twosite, onesite, order=4, symmetry=symmetry)
+    basis = PauliPEPOBasis.compile(
+        5, 6, [("onsite", "X"), ("edge", "ZZ")], order=4, symmetry=symmetry,
+    )
+    expected = {
+        "shapes": 19, "trees": 18, "loops": 1,
+        "c4_shapes": 7, "c4_trees": 6, "c4_loops": 1,
+    }
+    assert plan.cluster_inventory[4] == expected
+    assert basis.cluster_inventory == plan.cluster_inventory
+    assert [row["shapes"] for row in plan.cluster_inventory.values()] == [1, 2, 6, 19]
+    snapshot = plan.cluster_inventory
+    snapshot[4]["trees"] = -1
+    assert plan.cluster_inventory[4] == expected
+
+
+def test_shape_cache_reuses_lower_levels_when_cutoff_increases(monkeypatch):
+    from pepsy.operators import pepo_dense
+
+    pepo_dense._connected_cluster_shapes_cached.cache_clear()
+    pepo_dense._connected_cluster_shape_level.cache_clear()
+    generate_connected_cluster_shapes(4)
+    original = pepo_dense._make_cluster_shape
+    constructed_sizes = []
+
+    def record(sites):
+        constructed_sizes.append(len(sites))
+        return original(sites)
+
+    monkeypatch.setattr(pepo_dense, "_make_cluster_shape", record)
+    shapes = generate_connected_cluster_shapes(5)
+    assert len(shapes) == 91
+    assert constructed_sizes == [5] * 63
+    assert pepo_dense._connected_cluster_shape_level.cache_info().maxsize == 18
+
+
+def test_open_square_embeddings_match_independent_connected_subsets():
+    from itertools import combinations
+    from pepsy.operators import pepo_dense
+
+    sites = [(x, y) for x in range(5) for y in range(6)]
+    expected = set()
+    for subset in combinations(sites, 4):
+        remaining = set(subset)
+        frontier = [remaining.pop()]
+        while frontier:
+            x, y = frontier.pop()
+            neighbors = remaining & {(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)}
+            remaining -= neighbors
+            frontier.extend(neighbors)
+        if not remaining:
+            expected.add(frozenset(subset))
+    actual = []
+    loop_count = 0
+    for shape in generate_connected_cluster_shapes(4, min_sites=4):
+        placements = pepo_dense._cluster_shape_embeddings(shape, 5, 6, (False, False))
+        actual.extend(frozenset(sites) for sites in placements)
+        if not shape.is_tree:
+            loop_count += len(placements)
+    assert len(actual) == len(set(actual)) == 295
+    assert set(actual) == expected
+    assert loop_count == 20
+
+
+def test_embedding_cache_distinguishes_boundaries_and_lattice_dimensions():
+    from pepsy.operators import pepo_dense
+
+    shape = next(s for s in generate_connected_cluster_shapes(4, min_sites=4)
+                 if s.sites == ((0, 0), (0, 1), (0, 2), (0, 3)))
+    embed = pepo_dense._cluster_shape_embeddings
+    embed.cache_clear()
+    for lx, ly, cyclic, count in (
+        (5, 6, (False, False), 15),
+        (5, 6, (True, False), 15),
+        (5, 6, (False, True), 30),
+        (5, 6, (True, True), 30),
+        (5, 7, (False, False), 20),
+    ):
+        first = embed(shape, lx, ly, cyclic)
+        assert len(first) == count
+        assert embed(shape, lx, ly, cyclic) is first
+    assert embed.cache_info().misses == 5
+    assert embed.cache_info().hits == 5
+    assert embed.cache_info().maxsize == 256
+
+
+def test_located_compile_shares_maps_and_reuses_them_with_fresh_gradients(monkeypatch):
+    torch = pytest.importorskip("torch")
+    basis = PauliPEPOBasis.compile(
+        1, 3,
+        [PauliPEPOTerm("onsite", "X", where=(0, 0)),
+         PauliPEPOTerm("edge", "XY", where=((0, 0), (0, 1))),
+         PauliPEPOTerm("edge", "ZY", where=((0, 1), (0, 2)))],
+        order=3,
+    )
+    compiled = basis.compile_exp()
+    before = basis.cache_info
+    # Three sites and two edges reuse one local map per cluster size.
+    assert before["localized_cluster_counts"] == {1: 3, 2: 2, 3: 1}
+    assert before["localized_embedding_plans"] == 3
+    assert before["localized_tree_plans"] == 2
+    assert before["prepared_exp_modes"] == ("localized",)
+
+    def unexpected_static_work(*args, **kwargs):
+        pytest.fail("compiled evaluation rebuilt static embeddings or tree topology")
+
+    monkeypatch.setattr(
+        "pepsy.operators.pepo_basis._backend_embed_operator", unexpected_static_work,
+    )
+    monkeypatch.setattr(basis, "_localized_tree_topology", unexpected_static_work)
+    eye = torch.eye(2, dtype=torch.complex128)
+    x = torch.tensor([[0., 1.], [1., 0.]], dtype=torch.complex128)
+    y = torch.tensor([[0., -1j], [1j, 0.]], dtype=torch.complex128)
+    z = torch.diag(torch.tensor([1., -1.], dtype=torch.complex128))
+    terms = (torch.kron(torch.kron(x, eye), eye),
+             torch.kron(torch.kron(x, y), eye),
+             torch.kron(torch.kron(eye, z), y))
+    for values, time in (([0.2, -0.4, 0.3], 0.03), ([-0.1, 0.5, -0.7], 0.05)):
+        coefficients = torch.tensor(values, dtype=torch.float64, requires_grad=True)
+        tau = torch.tensor(time, dtype=torch.float64, requires_grad=True)
+        actual = compiled.exp(-1j * tau, coefficients=coefficients,
+                              materialize=True).to_dense()
+        hamiltonian = sum(c * term for c, term in zip(coefficients, terms))
+        expected = torch.matrix_exp(-1j * tau * hamiltonian)
+        assert torch.allclose(actual, expected, atol=1e-11, rtol=1e-11)
+        actual_grad = torch.autograd.grad(actual.real.sum(), (coefficients, tau))
+        expected_grad = torch.autograd.grad(expected.real.sum(), (coefficients, tau))
+        for actual_value, expected_value in zip(actual_grad, expected_grad):
+            assert torch.allclose(actual_value, expected_value, atol=1e-10, rtol=1e-10)
+    after = basis.cache_info
+    assert after["localized_embedding_plans"] == before["localized_embedding_plans"]
+    assert after["localized_tree_plans"] == before["localized_tree_plans"]
+
+
+def test_mixed_product_compile_prepares_uniform_factor_for_located_route(monkeypatch):
+    uniform = PauliPEPOBasis.compile(1, 2, [("onsite", "X")], order=2)
+    located = PauliPEPOBasis.compile(
+        1, 2, [PauliPEPOTerm("edge", "YZ", where=((0, 0), (0, 1)))], order=2,
+    )
+    compiled = PEPOClusterProductExpansion.from_bases((uniform, located)).compile_exp()
+    for basis in (uniform, located):
+        assert basis.cache_info["prepared_exp_modes"] == ("localized",)
+
+    def unexpected_embedding(*args, **kwargs):
+        pytest.fail("mixed compiled product rebuilt a static embedding")
+
+    monkeypatch.setattr(
+        "pepsy.operators.pepo_basis._backend_embed_operator", unexpected_embedding,
+    )
+    actual = compiled.exp(-0.04j, coefficients=([0.2], [-0.3])).to_dense()
+    eye = np.eye(2)
+    x = np.array([[0., 1.], [1., 0.]])
+    y = np.array([[0., -1j], [1j, 0.]])
+    z = np.diag([1., -1.])
+    expected = expm(-0.04j * 0.2 * (np.kron(x, eye) + np.kron(eye, x))) @ expm(
+        -0.04j * -0.3 * np.kron(y, z)
+    )
+    np.testing.assert_allclose(actual, expected, atol=1e-12)

@@ -14,6 +14,65 @@ Phys. Rev. Research 7, 023193 (2025).
 
 ## Upstream audit and current opportunities
 
+### 2026-09-26: symmetric MPO builder extraction
+
+The installed versions remain Symmray `0.4.1.dev8+gc45f91457`, Quimb
+`1.15.1.dev66+ge927f06e1`, Autoray `0.11.1.dev3+g1b476b305`, and Cotengra
+`0.8.3.dev7+g1d7fd333f`. Reused the same-task upstream review below and
+rechecked installed `symmray.utils.from_dense`, `MatrixProductOperator`, and
+`MatrixProductOperator.compress` signatures. Array construction still accepts
+the existing index maps, duals, fermionic flag, and operator charge; compression
+continues to receive the existing cutoff and maximum-bond options.
+
+- **Compatibility shim:** lazy historical builder attributes in
+  `tensors.symmetric` resolve to `operators._symmetric_mpo`. Both import orders
+  and old pickle globals are checked with Symmray unavailable.
+- **Defer:** dependency upgrades and new upstream algorithms. Native grading,
+  Jordan-Wigner strings, compression policy, and backend conversion order are
+  unchanged. Shared charge/basis/mapping helpers remain in `tensors.symmetric`.
+
+### 2026-09-25: model, diagnostic, and MPS helper extraction
+
+Rechecked the installed versions below: all four remain unchanged. Reused
+the same-task Symmray audit and inspected the installed local-element builder,
+`tensor_network_1d_compress`, `gate_nonlocal_`, and `gate_with_submpo_`
+signatures. Reviewed the [Quimb changelog](https://quimb.readthedocs.io/en/latest/changelog.html),
+[Cotengra changelog](https://cotengra.readthedocs.io/en/latest/changelog.html),
+and [Autoray repository](https://github.com/jcmgray/autoray).
+
+- **Compatibility shim:** lazy historical model and diagnostic attributes in
+  `symmetric.py`; direct aliases for the relocated MPS helpers. Old serialized
+  model and stream-plan class paths still resolve to the same classes.
+- **Defer:** new upstream behavior and dependency upgrades. Existing Quimb
+  cutoff/seed/interior-compression policies and native fermion conventions are
+  retained. AST comparison confirms all 196 non-facade symmetry definitions,
+  all 20 MPS top-level definitions (including the entire optimizer class), and
+  all three previously extracted state classes are unchanged.
+
+### 2026-09-25: state implementation extraction
+
+Installed versions checked for this refactor: Symmray
+`0.4.1.dev8+gc45f91457`, Quimb `1.15.1.dev66+ge927f06e1`, Autoray
+`0.11.1.dev3+g1b476b305`, and Cotengra `0.8.3.dev7+g1d7fd333f`.
+Inspected the installed edge-based and PEPS random-constructor signatures and
+the native local-operator builders/charge-index maps. The state wrappers retain
+their existing backend callbacks, physical sectors, charge patterns, and
+constructor options; their class bodies are unchanged by AST comparison.
+
+Reviewed the official Quimb and Cotengra changelogs, Cotengra documentation,
+Autoray repository, and Symmray repository/metadata. Symmray's Read the Docs
+index, array guide, and changelog were unavailable through the web reader;
+installed source and the official repository supplied the capability boundary.
+No upstream package or numerical policy was changed.
+
+- **Compatibility shim:** historical `symmetric.SymMPS`, `SymPEPS`, and
+  `_SymState` attributes resolve lazily to the extracted state classes. This
+  preserves imports and loading old pickle class paths without an eager cycle.
+- **Defer:** adoption of new upstream constructor, contraction, and conversion
+  behavior. This is an ownership refactor, not a numerical upgrade.
+
+### Earlier capability audit
+
 This note is the human-readable companion to the native fermion skill. Before
 changing native Symmray code, check the [latest
 documentation](https://symmray.readthedocs.io/en/latest/index.html), the
@@ -21,8 +80,8 @@ documentation](https://symmray.readthedocs.io/en/latest/index.html), the
 and the installed package. Record what was checked here so a future agent can
 tell verified behavior from a proposed design.
 
-Audit date: **2026-08-24**. The shared Python 3.12 environment reports
-`symmray 0.2.2.dev36+g7d1aa0c69`. This is a development build, so a documented
+Audit date: **2026-08-31**. The shared Python 3.12 environment reports
+`symmray 0.3.2.dev6+ga17699db6`. This is a development build, so a documented
 feature still needs an installed-API probe and a focused regression before it
 becomes a Pepsy dependency or changes a native execution path.
 
@@ -78,8 +137,42 @@ At the beginning of future Symmray-native work:
 5. Re-check MPS, PEPS/PEPO, and SymDMRG2 separately when the change touches
    contraction ordering, QR/SVD, backend conversion, or debosonization.
 
+The 2026-08-31 MPO audit also confirmed that native Quimb contraction fuses
+Symmray physical legs into packed charge sectors. Pepsy's MPO boundary now
+passes explicit physical `index_maps` to Symmray when converting the fused
+result to dense, restoring computational-basis order without changing the
+native block representation. This adopts the installed public API and is
+covered by an interior-support MPO regression.
+
 This gives the agent a repeatable upgrade path while keeping design intent
 readable for a human maintainer.
+
+## 2026-09-01 paper and GPU VMC audit
+
+The paper identifies static tensor shapes as the key requirement for GPU VMC.
+Its flat finite-cyclic representation, branchless fermionic phase tables,
+export-vmap-compile pipeline, and cached boundary-MPS reuse are implemented
+in the authors' vmc_torch repository. General variable-sector U1 arrays are
+explicitly outside the same flat GPU path.
+
+Pepsy already uses flat Symmray Z2 arrays for the JAX-jitted NetKet fermionic
+path, while U1, Z2Z2, and U1U1 retain sparse non-jitted fallbacks. Pepsy's
+Torch path now adopts the compatible execution design through the opt-in
+TorchPEPSAmplitude.export_and_compile method. It compiles exact amplitudes
+and stable log amplitudes for a fixed walker batch, and pads changing
+Metropolis proposal subsets to that batch before discarding auxiliary rows.
+
+The intentional boundaries are: fixed-shape compilation is adopted for exact
+dense and flat-Z2 Torch amplitudes; compiled boundary-MPS environment and
+one-/two-row or one-/two-column geometry-class reuse is now an opt-in dense
+Torch prototype; ordinary eager/vmap/serial paths remain the default; and
+general U1/U1U1 flattening is deferred. The compiled boundary path uses
+Quimb's `full-bond` environment mode because the current MPS compression
+route exposes data-dependent SVD shape guards to `torch.export`; it therefore
+needs numerical benchmarks before becoming a default.
+The Python 3.12 audit environment reports Torch 2.6.0, Symmray 0.3.1, and
+NetKet 3.22.3. Upstream APIs were probed and the design was adapted to
+Pepsy's basis ordering, parameter pytree, and contraction fallbacks.
 
 ## Core objects
 

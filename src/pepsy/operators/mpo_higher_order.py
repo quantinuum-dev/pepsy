@@ -16,17 +16,21 @@ compatibility facade.
 
 from .mpo_semantic import (
     FirstDegreeMPO,
+    MPOAdaptiveCompressionReport,
     MPODifferentiableCompressionReport,
     MPOLocalOperatorTerm,
     MPONumericalCompressionReport,
+    MPOChargeValidationReport,
     MPOCompressionReport,
     MPOLevel,
     MPOLevelToken,
     MPOParameter,
     MPOProductTerm,
 )
+from .mpo_block_plan import MPOBlock, MPOBlockPlan
 from .mpo_basis import CompiledMPOExp, MPOBasis, exp_mpo
 from .mpo_space import MPOBraiding, MPOPhysicalSpace
+from .mpo_trotter import TrotterMPOReport, exp_trotter
 
 __all__ = [
     "MPOParameter",
@@ -39,8 +43,14 @@ __all__ = [
     "MPOCompressionReport",
     "MPONumericalCompressionReport",
     "MPODifferentiableCompressionReport",
+    "MPOAdaptiveCompressionReport",
+    "MPOChargeValidationReport",
+    "MPOBlock",
+    "MPOBlockPlan",
     "FirstDegreeMPO",
     "CompiledMPOExp",
     "MPOBasis",
     "exp_mpo",
+    "TrotterMPOReport",
+    "exp_trotter",
 ]

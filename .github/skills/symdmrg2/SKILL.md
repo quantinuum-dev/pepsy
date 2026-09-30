@@ -9,8 +9,9 @@ description: "Run, debug, tune, extend, or validate Pepsy SymDMRG2, the symmetri
 block-sparse arrays** (native symmetry: `U1`, `U1U1`, `Z2`), driven by a symmetric
 MPO from `SymHamiltonian.to_mpo`. It is the symmetric analog of `quimb`'s `DMRG2`.
 
-Use the **Python 3.12 env** (`~/envs/py312/bin/python`); the system python has an
-old `symmray` that crashes `to_mpo` (`build_local_fermionic_dense` missing).
+Use the environment selected by `AGENTS.md` and any local override. Inspect
+the installed Symmray capabilities before diagnosing a compatibility failure;
+do not assume another interpreter has the same dependencies.
 
 ## When to use
 - Ground state of a lattice model with a conserved charge, as an MPS, in pepsy.
@@ -135,7 +136,7 @@ assert opt.backend == "symmray"
   swap phases during contraction). Build a **Jordan-Wigner** dense ED (Z-strings) and
   restrict to the fixed particle-number sector. See `_dense_jw_fermi_hubbard` /
   the retained fermionic regression in `tests/test_symmetric_tensors.py`.
-- **vs TeNPy** (py312 has TeNPy 1.1.0): `SpinChain` (Heisenberg, `conserve="Sz"`),
+- **vs TeNPy** (optional; inspect the installed version): `SpinChain` (Heisenberg, `conserve="Sz"`),
   `FermionChain` (spinless, `H=Σ -J(c†c+h.c.)+V n n − μ n`, `conserve="N"`),
   `hubbard`, `tf_ising`. Drive:
   `dmrg.TwoSiteDMRGEngine(psi, model, {"trunc_params":{"chi_max":,"svd_min":}, "mixer":True, "combine":True}).run() -> (E, psi)`;
@@ -205,7 +206,7 @@ type name starts with the symmetry (`U1…`/`Z2…`) **and carry >1 charge block
    must reuse the cache and retain the same blocks at `1e-12`.
 3. Retain the native-fermion dummy-mode/lazy-phase regression, then run
    `pytest -q -o addopts='' tests/test_symmetric_tensors.py tests/test_optimize_mps.py`.
-   Set `NUMBA_CACHE_DIR=/tmp/pepsy-numba-cache` in the shared py312 environment
+   Set `NUMBA_CACHE_DIR=/tmp/pepsy-numba-cache` in the selected development environment
    when import-time Numba caching lacks a writable package locator.
 4. For a performance claim, use the same warmed 6x6 PBC chi=64 benchmark
    runner/options for A/B runs. Require solver-tolerance energy agreement and

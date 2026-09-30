@@ -69,6 +69,28 @@ def test_tree_pepo_application_matches_dense_operator_and_preserves_tree():
     )
 
 
+def test_tree_sub_pepo_full_readout_preserves_declared_physical_dimensions():
+    plan = TreePepsPlan.from_shape((1, 4), topology="path")
+    subop = TreeSubPepo.from_operator(
+        plan,
+        np.eye(4),
+        support=(0, 2),
+        dims={0: 2, 1: 3, 2: 2, 3: 4},
+    )
+
+    assert len(subop.operator.tensors) == len(subop.span)
+    assert subop.validate(full=True) is subop
+    assert subop.full_operator.node_tensor(1).ind_size(
+        subop.full_operator.output_ind(1)
+    ) == 3
+
+    compact = subop.operator.copy()
+    compact._physical_dims = None
+    without_dimensions = TreeSubPepo(compact, support=(0, 2))
+    with pytest.raises(ValueError, match="physical_dims"):
+        without_dimensions.full_operator
+
+
 def test_tree_pepo_operator_canonicalization_and_compression_track_metadata():
     plan = TreePepsPlan.from_shape((2, 3))
     operator = TreePepo.from_operator(plan, _cnot(), support=(0, 4))
@@ -103,6 +125,8 @@ def test_tree_sub_pepo_can_wrap_an_existing_operator_and_guard_dense_size():
     wrapped = TreeSubPepo.from_operator(operator, support=(0, 3))
     assert wrapped.plan_signature == operator.plan_signature
     assert wrapped.support == (0, 3)
+    wrapped_copy = wrapped.copy()
+    assert len(wrapped_copy._full_operator.tensors) == plan.size
 
     with pytest.raises(ValueError, match="limited"):
         TreePepo.from_operator(plan, np.eye(2**4), support=range(4), max_operator_sites=3)

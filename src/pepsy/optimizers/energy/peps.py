@@ -12,6 +12,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...boundary._measurements import compute_peps_local_expectation
 from ...backends import (
     backend_cupy,
     backend_jax,
@@ -20,7 +21,8 @@ from ...backends import (
     infer_backend_converter_from_sample,
     TorchLinalgConfig,
 )
-from ...tensors import build_optimizer, reg_rel_svd_jax
+from ...backends import reg_rel_svd_jax
+from ...tensors import build_optimizer
 from ..global_opt import GlobalOptimizer
 
 __all__ = ["EnergyEstimate", "MpsEnergyOptimizer", "PepsEnergyOptimizer"]
@@ -939,7 +941,8 @@ class PepsEnergyOptimizer:
                     **kwargs,
                 )
         else:
-            value = state.compute_local_expectation(
+            value = compute_peps_local_expectation(
+                state,
                 terms,
                 max_bond=chi,
                 cutoff=cutoff,
