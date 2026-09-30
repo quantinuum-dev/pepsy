@@ -67,9 +67,10 @@ open bond support; one-node refinement retains that support. Explicit
 `TreePepsOptimizer` retains its own block-size default of two.
 Selecting `TreeOptimizer`'s legacy `dmrg1` in the constructor or explicitly
 in `run(mode=...)` emits a visible `FutureWarning` recommending `dmrg` for
-one-site refinement. Its existing warm-up schedule is retained; the warning
-is not repeated by a plain `run()` that keeps the selected mode.
-`dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
+one-site refinement. It now uses exactly the same FIT settings and schedule
+as `dmrg`, including explicit overrides, with no automatic two-node warm-up.
+The warning is not repeated by a plain `run()` that keeps the selected mode.
+`dmrg2` uses two-node warm-up blocks, while `dmrg3` uses
 three-node warm-up blocks followed by a two-node transition and one-node
 refinement. The default `fit_n_iter=4` permits eight directional passes and
 reaches refinement: `(2, 2, 1, 1)` for `dmrg2`, `(3, 3, 2, 1)` for `dmrg3`.

@@ -221,7 +221,7 @@ def test_successive_oversample_modes_round_with_direct_tree_sweep(
 
 @pytest.mark.parametrize(
     ("mode", "fit_n_iter", "expected_block_size"),
-    (("dmrg1", 3, 2), ("dmrg2", 1, 2), ("dmrg3", 1, 3)),
+    (("dmrg1", 3, 1), ("dmrg2", 1, 2), ("dmrg3", 1, 3)),
 )
 def test_tree_optimizer_dmrg_uses_tree_fit_engine(
     mode, fit_n_iter, expected_block_size
@@ -258,9 +258,9 @@ def test_tree_optimizer_dmrg_uses_tree_fit_engine(
     assert diagnostics["block_size"] == expected_block_size
     assert diagnostics["requested_block_size"] == expected_block_size
     if mode == "dmrg1":
-        assert diagnostics["block_size_trace"] == (2, 2, 1)
-        assert diagnostics["adaptive_sweeps"] == 2
-        assert diagnostics["one_site_refinement_sweeps"] == 1
+        assert diagnostics["block_size_trace"] == (1, 1, 1)
+        assert diagnostics["adaptive_sweeps"] == 0
+        assert diagnostics["one_site_refinement_sweeps"] == 3
     assert diagnostics["guess_backend"] == "tree_mpo"
     assert diagnostics["target_layout"] == "layered"
     assert diagnostics["cache"]["hits"] > 0

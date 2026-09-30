@@ -466,8 +466,8 @@ class TreeOptimizer:
         tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg`` defaults
         to one-node refinement of the initialized guess, without a multi-node
         FIT warm-up. Selecting ``dmrg1`` emits a ``FutureWarning`` recommending
-        ``dmrg``; its existing warm-up behavior is retained. ``dmrg1`` can use
-        two-node warm-up blocks to grow missing ranks; ``dmrg2`` starts with
+        ``dmrg`` and uses exactly the same FIT settings and schedule.
+        ``dmrg2`` starts with
         two-node blocks and ``dmrg3`` with three-node blocks. Their schedules
         transition to one-node refinement within the iteration budget.
         Hyphenated spellings such as ``"tree-mpo-dm"`` are accepted, as are
@@ -578,8 +578,8 @@ class TreeOptimizer:
         time, retaining initialized bond support without multi-node FIT updates.
         Guess construction may still split tensors and open bond support.
         Explicit larger values opt into adaptive block updates.
-        Named aliases select their own
-        warm-up size; ``dmrg1`` uses two-node growth before one-node DMRG.
+        ``dmrg1`` is an alias of ``dmrg`` and honors the same settings.
+        ``dmrg2`` and ``dmrg3`` select their own warm-up size.
         ``mix`` always uses one-node refinement, without a growth warm-up.
     fit_n_iter : int, default=4
         Maximum TreeFIT iterations per fitted gate window. Each iteration
@@ -616,8 +616,7 @@ class TreeOptimizer:
     fit_adaptive_sweeps : int, default=2
         Number of larger-block warm-up iterations when ``fit_block_size``
         is explicitly greater than one, or for named ``dmrg2``/``dmrg3``.
-        Inactive for default one-node ``dmrg``. Named ``dmrg1`` uses two
-        warm-up iterations.
+        Inactive for default one-node ``dmrg`` and its ``dmrg1`` alias.
     fit_two_site_transition_sweeps : int, default=1
         Two-node iterations between three-node warm-up and one-node refinement
         in named ``dmrg3``, within ``fit_n_iter``. Zero skips this transition.
@@ -685,9 +684,9 @@ class TreeOptimizer:
         """Explain the one-node replacement when callers select legacy DMRG1."""
         if alias == "dmrg1":
             warnings.warn(
-                "TreeOptimizer mode='dmrg1' is a legacy preset; use "
-                "mode='dmrg' for one-site refinement. 'dmrg1' retains its "
-                "two-node growth warm-up.",
+                "TreeOptimizer mode='dmrg1' is a deprecated alias; use "
+                "mode='dmrg' for one-site refinement. Both names now use "
+                "the same FIT settings and schedule.",
                 FutureWarning,
                 stacklevel=3,
             )
@@ -3037,12 +3036,10 @@ class TreeOptimizer:
     def _fit_block_size(self):
         """Resolve a named FIT preset to its requested initial block size."""
 
-        if self._dmrg_mode_alias is not None:
-            # The legacy Tree DMRG1 preset has a bounded two-node growth
-            # warm-up. DMRG2/3 retain their requested larger
-            # local blocks before the common one-site refinement phase.
-            # MIX refines a direct guess with one-node blocks from the start.
-            return {"dmrg1": 2, "dmrg2": 2, "dmrg3": 3, "mix": 1}[self._dmrg_mode_alias]
+        if self._dmrg_mode_alias not in {None, "dmrg1"}:
+            # DMRG1 is a compatibility spelling of generic DMRG. Only the
+            # larger named schedules and MIX override the caller's block size.
+            return {"dmrg2": 2, "dmrg3": 3, "mix": 1}[self._dmrg_mode_alias]
         return self.fit_block_size
 
     def _fit_guess_strategy(self):
@@ -3303,27 +3300,6 @@ class TreeOptimizer:
         )
         active_block_size = min(block_size, len(region))
         fit._finite_check_warning_handled = self._finite_check_warning_handled
-        if (
-            self._dmrg_mode_alias == "dmrg1"
-            and block_size == 2
-            and fit._active_bonds_at_rank_targets(region, state=self.tn)
-        ):
-            active_block_size = 1
-        if (
-            self._dmrg_mode_alias == "dmrg1"
-            and active_block_size == 2
-            and len(region) > 2
-            and not fit._active_bonds_at_rank_targets(region, state=self.tn)
-            and self.fit_n_iter < 3
-        ):
-            raise ValueError(
-                "mode='dmrg1' requires fit_n_iter >= 3 for an under-capacity "
-                "tree window: two block-growth sweeps and one-site refinement."
-            )
-        adaptive_sweeps = (
-            2 if self._dmrg_mode_alias == "dmrg1"
-            else self.fit_adaptive_sweeps
-        )
         fit_rtol = (
             None if self._fit_rtol_requested == "auto" and (
                 target_norm is None or not self._norm_tracking_enabled
@@ -3339,13 +3315,13 @@ class TreeOptimizer:
             patience=self.fit_patience,
             single_node_fast_path=self.fit_single_node_fast_path,
             _path_order=path,
-            adaptive_block_sweeps=adaptive_sweeps,
+            adaptive_block_sweeps=self.fit_adaptive_sweeps,
             two_site_transition_sweeps=(
                 self.fit_two_site_transition_sweeps
                 if self._dmrg_mode_alias == "dmrg3" else 0
             ),
             adaptive_until_rank=(
-                self._dmrg_mode_alias is None
+                self._dmrg_mode_alias in {None, "dmrg1"}
                 and not (
                     active_block_size in {2, 3}
                     and len(region) > active_block_size
@@ -3735,8 +3711,9 @@ class TreeOptimizer:
             ``*-oversample`` variants add a direct final round after a larger
             intermediate sketch. ``"dmrg"`` selects TreeFIT with
             one-node refinement by default; explicit larger ``fit_block_size``
-            values select an adaptive block schedule. ``"dmrg1"`` and ``"dmrg2"``
-            use two-node warm-up blocks, while ``"dmrg3"`` uses three-node
+            values select an adaptive block schedule. ``"dmrg1"`` is a
+            deprecated alias of ``"dmrg"``. ``"dmrg2"`` uses two-node warm-up
+            blocks, while ``"dmrg3"`` uses three-node
             warm-up blocks followed by its configured two-node transition;
             each named schedule then performs one-node refinement.
             ``"zipup-oversample"`` (alias ``"zipup-first"``) performs larger
