@@ -72,7 +72,10 @@ than hiding policy in a mode-specific helper.
   bond ceilings are reached. `dmrg2` uses its required two-site warm-up (two
   sweeps by default) followed by one-site refinement, and `dmrg3` uses the
   same fixed warm-up policy with three-site updates, then one two-site
-  transition sweep before one-site refinement. Generic `dmrg` remains
+  transition sweep before one-site refinement. Generic `dmrg`/`fit` defaults
+  to fixed-rank one-site FIT without block SVD updates; target preparation and
+  guess construction may still use SVD. With explicit block size two or three,
+  generic `dmrg` remains
   rank-adaptive until its active-bond ceilings are reached; rank stagnation is
   not an early exit there. A `dmrg1` window already at its attainable ceilings
   starts directly with one-site FIT. An under-capacity non-adjacent `dmrg1`

@@ -1396,7 +1396,7 @@ def test_mps_optimizer_dmrg_stops_fit_adaptively():
         fit_patience=1,
     )
 
-    assert opt._last_dmrg_fit_diagnostics["iterations"] == 4
+    assert opt._last_dmrg_fit_diagnostics["iterations"] == 2
 
 
 def test_mps_optimizer_mix_can_keep_fixed_fit_iterations():

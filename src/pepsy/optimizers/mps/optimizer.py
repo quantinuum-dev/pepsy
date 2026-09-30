@@ -272,7 +272,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Other Quimb methods accept their bare or ``"quimb-<method>"`` names;
         legacy ``"mpo-<method>"`` spellings also remain accepted.
         ``"fit"`` is the clear alias of the historical
-        ``"dmrg"`` spelling. ``"dmrg1"`` uses at most two two-site growth
+        ``"dmrg"`` spelling; both default to one-site FIT updates.
+        ``"dmrg1"`` uses at most two two-site growth
         sweeps, then one-site refinement; once every bond reaches its
         attainable physical/``chi`` ceiling, it latches one-site updates
         for the rest of the replay. An already-capped window starts
@@ -1956,8 +1957,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         bond in a long MPS would waste ``O(L * chi**2)`` memory, so only the
         active internal indices are padded. Mixed mode deliberately bypasses
         this helper because its disposable direct-compressed guess owns rank
-        growth. Native Symmray callers use two- or three-site FIT instead of
-        this dense-style expansion path.
+        growth. Native Symmray preparation bypasses this dense-style expansion
+        path and preserves charge sectors for native guess construction.
         """
         if self.chi <= 1 or getattr(self.p, "L", 0) <= 1:
             return
@@ -2000,10 +2001,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Native two- and three-site FIT updates receive the current MPS bond
         dimensions unchanged. Their direction-aware SVD splits grow only the
         visited bonds, up to ``chi``. Ordinary one-site compatibility FIT may
-        pre-size active bonds. Mixed one-site FIT instead receives its bond
-        support from the disposable ``guess-direct`` state.
+        pre-size active dense bonds. Native one-site FIT preserves the current
+        sectors here and leaves enrichment to its native guess preparation.
+        Mixed one-site FIT instead receives its bond support from the
+        disposable ``guess-direct`` state.
         """
-        if int(block_size) == 1 and self.mode != "mix":
+        if (
+            int(block_size) == 1
+            and self.mode != "mix"
+            and not self._replay_has_symmray_data(self.p)
+        ):
             self._prepare_one_site_dmrg_state(where)
 
     def _dmrg_fit_block_size(self, p, where, requested_block_size):
@@ -3347,16 +3354,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             adaptive warm-up before this criterion can stop a run.
         fit_block_size : {1, 2, 3} | None, default=None
             Number of neighboring MPS tensors optimized by each FIT update.
-            ``None`` selects two-site FIT for ordinary DMRG and one-site FIT
-            for ``mode="mix"``. Mixed mode fixes this value at one: a
+            ``None`` selects one-site FIT for ordinary DMRG and ``mode="mix"``.
+            Named ``dmrg1``/``dmrg2``/``dmrg3`` retain their block schedules.
+            Mixed mode fixes this value at one: a
             chi-capped direct-compressed guess opens the active bond support
             before every eligible multi-site gate is refined with one-site
             FIT. Use ordinary ``mode="dmrg"`` to select block sizes two or
             three.
-            Two-site FIT is recommended: it forms both physical legs and the
+            Explicit two-site FIT forms both physical legs and the
             two outer virtual legs, then uses a native SVD on the middle bond,
-            allowing active bonds to grow up to ``chi``. One-site FIT is kept
-            for compatibility with the original fixed-rank update. Three-site
+            allowing active bonds to grow up to ``chi``. Default one-site FIT
+            refines the guess at fixed rank without block SVD updates; target
+            preparation and guess construction may still use SVD. Three-site
             FIT forms a three-site wavefunction and performs two native,
             direction-aware SVD splits. If the active gate span contains only
             two sites, it automatically falls back to the two-site update.
@@ -3456,6 +3465,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Stop an adjacent two-site FIT after its single exact variational
             update. This structural convergence is independent of ``rtol``;
             enable it when deliberately choosing the one-update fast path.
+            Requires a two-site FIT block; generic one-site DMRG ignores it.
         fit_single_pair_n_iter : int | None, default=None
             Separate DMRG sweep cap for windows spanning exactly two MPS
             sites. Longer windows retain ``n_iter``, including non-adjacent
@@ -3642,10 +3652,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         quality_check_repair = bool(quality_check_repair)
         self.quality_checks = []
         # Mixed mode is a fixed one-site FIT algorithm initialized from a
-        # disposable direct-compressed guess. Ordinary DMRG retains its
-        # two-site and ``guess-src`` defaults.
+        # disposable direct-compressed guess. Ordinary DMRG also defaults to
+        # one-site updates, retaining its ``guess-src`` initialization.
+        # Named DMRG schedules resolve their block sizes below.
         if fit_block_size is None:
-            fit_block_size = 1 if self.mode == "mix" else 2
+            fit_block_size = 1
         if fit_init_strategy is None:
             fit_init_strategy = (
                 "guess_direct"
@@ -7799,7 +7810,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_rtol=None,
         fit_patience=1,
         fit_finite_check=None,
-        fit_block_size=2,
+        fit_block_size=1,
         fit_adaptive_sweeps=2,
         fit_sweep_sequence="RL",
         fit_max_span=None,

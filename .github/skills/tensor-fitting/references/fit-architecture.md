@@ -15,8 +15,9 @@
 
 ## Public controls
 
-- `fit_block_size=2`: recommended two-site local wavefunction and native SVD.
-- `fit_block_size=1`: fixed-rank compatibility update.
+- `fit_block_size=1`: default fixed-rank update in generic MpsOptimizer
+  `dmrg`/`fit`; target preparation and guesses may still use SVD.
+- `fit_block_size=2`: explicit two-site local wavefunction and native SVD.
 - `fit_sweep_sequence="RL"`: alternating left-to-right/right-to-left sweeps.
 - `fit_min_iter`, `fit_rtol`, `fit_patience`: mode-neutral adaptive stopping
   controls for DMRG and mixed DMRG. Patience counts same-phase norm samples,
@@ -32,8 +33,8 @@
   `fit_init_seed` makes random policies reproducible without a global backend
   RNG.
 - `fit_init_rand_strength`: scale of deterministic random initialization.
-- `fit_single_pair_fast_path=True`: opt-in one update for an adjacent active pair;
-  named `dmrg2` enables this automatically.
+- `fit_single_pair_fast_path=True`: opt-in one update for an adjacent active pair
+  when the selected FIT block size is two.
 - `cutoff`, `cutoff_mode`, `chi`: output split/truncation controls.
 - Quimb guess methods follow the native 1D registry, including `direct`, `dm`,
   `zipup`, SDC/SRC/SRCMPS and their oversampling variants, `fit`,
@@ -126,8 +127,8 @@ replay. Named `dmrg2` and `dmrg3` are fixed warm-up schedules: they perform
 exactly `fit_adaptive_sweeps` two- or three-site sweeps (two by default).
 `dmrg3` then performs one two-site transition sweep. Both spend the remaining
 `n_iter` budget on one-site refinement subject to
-`fit_rtol`. Generic `dmrg` remains available for rank-adaptive block
-scheduling.
+`fit_rtol`. Generic `dmrg` defaults to one-site FIT; explicit block sizes two
+or three select rank-adaptive block scheduling.
 
 Physical ceilings are replay-scoped geometry metadata; changing bond ranks
 remain live. A sufficient `n_iter >= 3` needs no additional rank scan just to

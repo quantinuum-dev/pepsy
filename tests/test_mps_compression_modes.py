@@ -20,6 +20,28 @@ from _mps_test_helpers import (
 pytestmark = [pytest.mark.core, pytest.mark.mps]
 
 
+@pytest.mark.parametrize("mode", ["dmrg", "fit"])
+@pytest.mark.parametrize("block_options", [{}, {"fit_block_size": None}, {"fit_block_size": 2}])
+def test_generic_dmrg_default_one_site_sweeps(mode, block_options):
+    """Default refinement avoids block splits while preserving an exact gate target."""
+    state = qtn.MPS_computational_state("+00", dtype="complex128")
+    gates = [(qu.CNOT(), (0, 2))]
+    exact = py.MpsOptimizer(state, gates, chi=4, mode="exact")
+    exact.run(progbar=False)
+    optimizer = py.MpsOptimizer(state, gates, chi=4, mode=mode)
+    optimizer.run(
+        progbar=False, n_iter=4, fit_rtol=None, fit_init_seed=13,
+        cutoff=0.0, timing=True, **block_options,
+    )
+    records = optimizer.get_run_timing()["fit_steps"]
+    expected = [2, 2, 1, 1] if block_options.get("fit_block_size") == 2 else [1] * 4
+    assert [record["block_size"] for record in records] == expected
+    assert optimizer.get_fit_diagnostics()["fallback"] is False
+    np.testing.assert_allclose(
+        optimizer.to_dense().ravel(), exact.to_dense().ravel(), atol=1e-10,
+    )
+
+
 @pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
 def test_mps_optimizer_long_range_dmrg_seeds_disposable_fit_guess(mode):
     """DMRG keeps the target exact and seeds only the disposable FIT guess."""
@@ -40,7 +62,7 @@ def test_mps_optimizer_long_range_dmrg_seeds_disposable_fit_guess(mode):
         chi=4,
         mode=mode,
     )
-    out = optimizer.run(progbar=False, n_iter=4, fit_rtol=None)
+    out = optimizer.run(progbar=False, n_iter=4, fit_rtol=None, fit_block_size=2)
 
     assert float(
         np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
@@ -927,7 +949,7 @@ def test_mps_optimizer_timing_reports_fit_sweeps_and_sites():
         mode="dmrg",
     )
 
-    opt.run(progbar=False, n_iter=3, timing=True)
+    opt.run(progbar=False, n_iter=3, timing=True, fit_block_size=2)
 
     timing = opt.get_run_timing()
     fit_steps = timing["fit_steps"]
@@ -960,7 +982,7 @@ def test_mps_optimizer_timing_distinguishes_fit_calls_from_sweeps():
         mode="fit",
     )
 
-    optimizer.run(progbar=False, n_iter=3, timing=True)
+    optimizer.run(progbar=False, n_iter=3, timing=True, fit_rtol=None)
 
     records = optimizer.get_run_timing()["fit_steps"]
     assert [record["fit_index"] for record in records] == [0, 0, 0, 1, 1, 1]

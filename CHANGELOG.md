@@ -175,6 +175,13 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Changed
 
+- Generic `MpsOptimizer` modes `dmrg` and `fit` now default to one-site FIT
+  (`fit_block_size=1`), avoiding two-site SVD updates during refinement.
+  Explicit block sizes two/three and named DMRG schedules remain available;
+  target preparation and guess construction may still use SVD.
+  Native one-site preparation preserves charge sectors without attempting
+  dense bond padding.
+
 - Branched tree direct/DM compression keeps the canonical center at the final
   visited tensor, skipping the final QR return to the hub. Cut order and
   required returns between branches are preserved. Later finite-bond sweeps

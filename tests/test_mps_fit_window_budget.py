@@ -74,7 +74,10 @@ def test_explicit_fast_path_still_selects_one_update(mode):
         qtn.MPS_computational_state("+0", dtype="complex128"),
         [(qu.CNOT(), (0, 1))], chi=2, mode=mode,
     )
-    opt.run(fit_single_pair_n_iter=5, fit_single_pair_fast_path=True, fit_rtol=None)
+    opt.run(
+        fit_single_pair_n_iter=5, fit_single_pair_fast_path=True,
+        fit_rtol=None, fit_block_size=2,
+    )
     assert opt.get_fit_diagnostics()["iterations"] == 1
 
 

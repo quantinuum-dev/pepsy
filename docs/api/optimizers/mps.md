@@ -646,8 +646,11 @@ default named-mode guess. Both the target and the guess remain separate from
 the live MPS. The fixed expansion handoff remains two two-site sweeps followed
 by one one-site sweep; a window already at its attainable `chi` ceiling uses
 one-site FIT directly.
-`mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
-schedule for local windows. For a long-range window that is wider than the
+`mode="dmrg"` (also `"fit"`) defaults to `fit_block_size=1`: one-site FIT
+refines the initialized guess at fixed rank without two-site SVD updates.
+Target preparation and guess construction may still use SVD. Explicit
+`fit_block_size=2` or `3` enables block updates and their adaptive schedule
+for local windows. For a long-range window that is wider than the
 selected FIT block, it uses the corresponding fixed block handoff so the
 terminal canonical center remains authoritative for unitary norm tracking;
 the randomized FIT initialization is unchanged. `mode="mix"` is the
@@ -682,7 +685,7 @@ For ordinary DMRG, `auto` selects `guess-src` in both phases;
 the current MPS is used directly only when the caller explicitly requests
 `direct` (or a native Symmray/fermionic route requires its native warm-start).
 Native Symmray and fermionic paths use their graded sector-growth route without
-dense random padding. `fit_block_size=1` selects the fixed-rank compatibility
+dense random padding. `fit_block_size=1` selects the default fixed-rank
 algorithm in ordinary DMRG. Mixed mode fixes `fit_block_size=1` and
 `fit_init_strategy="guess-direct"`; pass another block size or initialization
 only with `mode="dmrg"`. On native Symmray states, the mixed direct guess uses
@@ -690,8 +693,9 @@ Pepsy's native chi-capped auto-swap/SVD route and does not densify charge
 sectors.
 Standalone one-site gates use the exact direct/MPO
 path; ordinary DMRG target blocks can absorb intervening one-site gates before
-the block's shared compression. Generic `mode="dmrg"` remains rank-adaptive
-on local windows and uses the fixed canonical handoff for long-range windows,
+the block's shared compression. Generic `mode="dmrg"` with an explicit block
+size of two or three remains rank-adaptive on local windows and uses the fixed
+canonical handoff for long-range windows,
 while named `"dmrg1"` bounds its two-site warm-up at two sweeps and then uses
 one-site FIT for the remaining requested sweeps. The named mode does not
 extend the two-site phase because of rank stagnation. Once all full-chain
@@ -781,6 +785,9 @@ a structural special case whose only pair is
 the complete variational problem. The default
 `fit_single_pair_fast_path=False` honors the window's budget and `fit_rtol`; set it to
 `True` to stop after one effective-tensor SVD, even when `fit_rtol=None`.
+This shortcut requires a two-site FIT block, such as explicit
+`fit_block_size=2` in generic DMRG; it does not change one-site FIT into a
+two-site update.
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
 non-finite sweep. Non-unitary MPS DMRG keeps the dtype-aware automatic
 tolerance because convergence uses relative norm change; use `fit_rtol=None`
@@ -856,7 +863,7 @@ it does not enable per-sweep `finite_check` scans.
 The DMRG/FIT update follows the variational update described in
 the [Ayral *et al.* PRX Quantum paper](https://doi.org/10.1103/PRXQuantum.4.020304):
 the effective tensor is built from cached contractions on the left and right,
-then the MPS is swept repeatedly. Recommended `fit_block_size=2` forms a
+then the MPS is swept repeatedly. Explicit `fit_block_size=2` forms a
 local wavefunction with the two outer virtual legs and both sites' physical
 groups, then splits its middle bond with `Tensor.split`. `fit_block_size=3`
 forms the analogous three-site tensor and splits it twice, absorbing singular

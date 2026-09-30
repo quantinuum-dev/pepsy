@@ -1007,7 +1007,13 @@ def test_mps_optimizer_spinful_fermion_symmetry_mode_matrix_matches_mpo(
         n_iter=3,
         fit_rtol=None,
         stabilize_unitary=False,
+        timing=mode == "dmrg",
     )
+
+    if mode == "dmrg":
+        assert [
+            record["block_size"] for record in optimizer.get_run_timing()["fit_steps"]
+        ] == [1, 1, 1]
 
     if mode == "perm":
         optimizer.restore_qubit_order()

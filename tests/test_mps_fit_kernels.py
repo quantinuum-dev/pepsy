@@ -1696,6 +1696,7 @@ def test_dmrg_modes_advance_after_one_update_per_two_site_window(mode):
         n_iter=8,
         fit_rtol=None,
         fit_single_pair_fast_path=True,
+        fit_block_size=2,
         timing=True,
     )
 
