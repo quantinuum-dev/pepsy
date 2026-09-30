@@ -463,7 +463,10 @@ class TreeOptimizer:
         the effective guess/block policy, without overwriting stored FIT
         options. Failed FIT raises without installing the guess.
         ``"dmrg"`` and ``"dmrg1"``/``"dmrg2"``/``"dmrg3"`` select the
-        tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg1`` can use
+        tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg`` defaults
+        to one-node refinement of the initialized guess, without a multi-node
+        FIT warm-up. Selecting ``dmrg1`` emits a ``FutureWarning`` recommending
+        ``dmrg``; its existing warm-up behavior is retained. ``dmrg1`` can use
         two-node warm-up blocks to grow missing ranks; ``dmrg2`` starts with
         two-node blocks and ``dmrg3`` with three-node blocks. Their schedules
         transition to one-node refinement within the iteration budget.
@@ -570,8 +573,12 @@ class TreeOptimizer:
     cutoff_mode_oversample : str or {"auto"}, optional
         Cutoff convention for the intermediate SDC or zipup pass. The
         default is ``"rel"``, matching Quimb's oversampling default.
-    fit_block_size : {1, 2, 3}, default=2
-        Generic ``dmrg`` local block size. Named aliases select their own
+    fit_block_size : {1, 2, 3}, default=1
+        Generic ``dmrg`` local block size. The default refines one node at a
+        time, retaining initialized bond support without multi-node FIT updates.
+        Guess construction may still split tensors and open bond support.
+        Explicit larger values opt into adaptive block updates.
+        Named aliases select their own
         warm-up size; ``dmrg1`` uses two-node growth before one-node DMRG.
         ``mix`` always uses one-node refinement, without a growth warm-up.
     fit_n_iter : int, default=4
@@ -607,8 +614,10 @@ class TreeOptimizer:
         Routine fitting uses the terminal canonical-centre norm for convergence
         and does not scan tensor entries or revalidate every tree isometry.
     fit_adaptive_sweeps : int, default=2
-        Number of larger-block warm-up sweeps for generic ``dmrg``. Named
-        ``dmrg1`` uses two warm-up sweeps, matching MpsOptimizer.
+        Number of larger-block warm-up iterations when ``fit_block_size``
+        is explicitly greater than one, or for named ``dmrg2``/``dmrg3``.
+        Inactive for default one-node ``dmrg``. Named ``dmrg1`` uses two
+        warm-up iterations.
     fit_two_site_transition_sweeps : int, default=1
         Two-node iterations between three-node warm-up and one-node refinement
         in named ``dmrg3``, within ``fit_n_iter``. Zero skips this transition.
@@ -670,6 +679,18 @@ class TreeOptimizer:
     """
 
     _normalize_mode = staticmethod(normalize_mode)
+
+    @staticmethod
+    def _warn_legacy_dmrg1(alias):
+        """Explain the one-node replacement when callers select legacy DMRG1."""
+        if alias == "dmrg1":
+            warnings.warn(
+                "TreeOptimizer mode='dmrg1' is a legacy preset; use "
+                "mode='dmrg' for one-site refinement. 'dmrg1' retains its "
+                "two-node growth warm-up.",
+                FutureWarning,
+                stacklevel=3,
+            )
 
     _PROGBAR_COLORS = {
         # Keep the two primary colors aligned with MpsOptimizer. The tree
@@ -792,7 +813,7 @@ class TreeOptimizer:
                  compression_seed=None,
                  max_bond_oversample=None, cutoff_oversample=0.0,
                  cutoff_mode_oversample="rel",
-                 fit_block_size=2, fit_n_iter=4, fit_adaptive_sweeps=2,
+                 fit_block_size=1, fit_n_iter=4, fit_adaptive_sweeps=2,
                  fit_two_site_transition_sweeps=1,
                  fit_min_iter=2, fit_rtol="auto", fit_patience=1,
                  fit_init_strategy="auto",
@@ -985,6 +1006,7 @@ class TreeOptimizer:
         self.mode, self.compression_mode, self._dmrg_mode_alias = self._resolve_replay_mode(
             raw_mode, compression_mode
         )
+        self._warn_legacy_dmrg1(self._dmrg_mode_alias)
 
         self.chi = self._normalize_max_bond(chi)
         self.cutoff = cutoff
@@ -3016,8 +3038,8 @@ class TreeOptimizer:
         """Resolve a named FIT preset to its requested initial block size."""
 
         if self._dmrg_mode_alias is not None:
-            # DMRG1 is the MPS-compatible one-site algorithm with a bounded
-            # two-site growth warm-up. DMRG2/3 retain their requested larger
+            # The legacy Tree DMRG1 preset has a bounded two-node growth
+            # warm-up. DMRG2/3 retain their requested larger
             # local blocks before the common one-site refinement phase.
             # MIX refines a direct guess with one-node blocks from the start.
             return {"dmrg1": 2, "dmrg2": 2, "dmrg3": 3, "mix": 1}[self._dmrg_mode_alias]
@@ -3711,8 +3733,9 @@ class TreeOptimizer:
             with successive deterministic, randomized-SVD, or product-noise
             complementary-environment compression, respectively; the
             ``*-oversample`` variants add a direct final round after a larger
-            intermediate sketch. ``"dmrg"`` selects TreeFIT with the
-            configured adaptive block schedule. ``"dmrg1"`` and ``"dmrg2"``
+            intermediate sketch. ``"dmrg"`` selects TreeFIT with
+            one-node refinement by default; explicit larger ``fit_block_size``
+            values select an adaptive block schedule. ``"dmrg1"`` and ``"dmrg2"``
             use two-node warm-up blocks, while ``"dmrg3"`` uses three-node
             warm-up blocks followed by its configured two-node transition;
             each named schedule then performs one-node refinement.
@@ -3795,6 +3818,8 @@ class TreeOptimizer:
             current_compression=self.compression_mode,
             current_alias=self._dmrg_mode_alias,
         )
+        if mode is not None:
+            self._warn_legacy_dmrg1(next_alias)
         if compression_seed is not None:
             if isinstance(compression_seed, bool) or not isinstance(
                 compression_seed, Integral

@@ -269,8 +269,85 @@ def test_tree_optimizer_dmrg_uses_tree_fit_engine(
     assert optimizer.tn.validate(check_canonical=True) is optimizer.tn
 
 
-def test_tree_optimizer_generic_dmrg_warmup_then_refinement():
-    """Generic tree DMRG uses the MPS-style two-site handoff."""
+@pytest.mark.parametrize("entry", ("constructor", "run_override", "copy", "fit_alias"))
+@pytest.mark.parametrize("backend", ("numpy", "torch"))
+def test_tree_dmrg_default_only_refines_one_node(entry, backend, monkeypatch):
+    """Default guesses open support; every subsequent FIT update stays one-node."""
+    plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
+    hadamard = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2)
+    cnot = np.array([[1, 0, 0, 0], [0, 1, 0, 0],
+                     [0, 0, 0, 1], [0, 0, 1, 0]], dtype=complex)
+    stream = [(hadamard, 0), (cnot, (0, 4)), (cnot, (0, 2))]
+    expected = _exact_state(stream, 5)
+    state = TreeTensorNetwork.from_plan(plan)
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        convert = lambda x: torch.as_tensor(x, dtype=torch.complex128)
+        state.apply_to_arrays(convert)
+        stream = [(convert(gate), where) for gate, where in stream]
+    mode = "auto" if entry == "run_override" else "fit" if entry == "fit_alias" else "dmrg"
+    optimizer = TreeOptimizer(stream, state=state, mode=mode, chi=4, run=False)
+    if entry == "copy":
+        optimizer = optimizer.copy()
+    original = TreeFIT.fit_block
+    visited = []
+
+    def one_node_only(self, block, **kwargs):
+        assert len(block) == 1, "default dmrg performed a multi-node FIT update"
+        visited.append(tuple(block))
+        return original(self, block, **kwargs)
+
+    monkeypatch.setattr(TreeFIT, "fit_block", one_node_only)
+    optimizer.run(**({"mode": "dmrg"} if entry == "run_override" else {}))
+    assert visited
+    assert optimizer.fit_block_size == 1
+    assert optimizer.fit_n_iter == 4
+    for diagnostic in optimizer.fit_diagnostics:
+        assert set(diagnostic["block_size_trace"]) == {1}
+        assert diagnostic["adaptive_sweeps"] == 0
+    diagnostic = optimizer.get_fit_diagnostics()
+    assert diagnostic["fit_init_strategy"] == "guess_src"
+    assert diagnostic["guess_used"] is True
+    np.testing.assert_allclose(optimizer.to_dense().reshape(-1), expected.reshape(-1),
+                               atol=1e-11)
+    assert optimizer.tn.max_bond() > 1
+    assert optimizer.tn.max_bond() <= optimizer.chi
+    optimizer.tn.validate(check_canonical=True)
+    if backend == "torch":
+        assert all(isinstance(t.data, torch.Tensor) and t.data.dtype == torch.complex128
+                   for t in optimizer.tn.tensors)
+
+
+@pytest.mark.parametrize("symmetry", ("U1", "U1U1"))
+@pytest.mark.parametrize("dtype", ("complex64", "complex128"))
+def test_tree_dmrg_default_preserves_native_guess(symmetry, dtype):
+    """One-node refinement preserves the exact graded guess and its sectors."""
+    pytest.importorskip("symmray")
+    fermion = pepsy.Fermion(spinful=True, symmetry=symmetry, dtype=dtype)
+    plan = TreePlan.from_order(range(4), structure="balanced")
+    state = pepsy.ps_to_ttn(
+        4, tree=plan, fermion=fermion, dtype=dtype,
+        occupations=((1, 1), (0, 0), (1, 1), (0, 0)),
+    )
+    stream = [(fermion.hopping_gate(.1, t=1., imaginary=False), (0, 3))]
+    reference = TreeOptimizer(stream, state=state, chi=16, mode="direct")
+    refined = TreeOptimizer(stream, state=state, chi=16, mode="dmrg")
+    diagnostic = refined.get_fit_diagnostics()
+    assert diagnostic["fit_init_strategy"] == "guess_direct"
+    assert set(diagnostic["block_size_trace"]) == {1}
+    assert diagnostic["adaptive_sweeps"] == 0
+    assert all(type(t.data).__module__.startswith("symmray") for t in refined.tn.tensors)
+    assert refined.tn.max_bond() <= 16
+    assert refined.tn.fermionic
+    assert refined.tn.symmetry == reference.tn.symmetry
+    tolerance = 2e-5 if dtype == "complex64" else 1e-10
+    assert float(pepsy.tensors.tn_fidelity(refined.tn, reference.tn)) == pytest.approx(
+        1., abs=tolerance,
+    )
+
+
+def test_tree_optimizer_explicit_dmrg_warmup_then_refinement():
+    """An explicit larger Tree DMRG block retains its adaptive handoff."""
 
     plan = TreePlan.from_order(range(5), structure="balanced", top_arity=2)
     optimizer = TreeOptimizer(
@@ -281,6 +358,7 @@ def test_tree_optimizer_generic_dmrg_warmup_then_refinement():
         chi=2,
         cutoff=0.0,
         fit_n_iter=4,
+        fit_block_size=2,
         fit_adaptive_sweeps=2,
         fit_init_strategy="guess-src",
         track_infidelity=False,

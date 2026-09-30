@@ -3963,7 +3963,7 @@ def test_u1u1_fermionic_mps_optimizer_two_site_fit_stays_native():
         state.tn.copy(),
         gates,
         chi=16,
-        mode="dmrg",
+        mode="dmrg2",
     )
     out = optimizer.run(
         progbar=False,
@@ -4258,7 +4258,7 @@ def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
         state.tn.copy(),
         nearest_gates,
         chi=4,
-        mode="dmrg",
+        mode="dmrg2",
     ).run(progbar=False, fit_block_size=2)
     assert _all_tensor_data_symmray(grown)
     assert grown.max_bond() <= 4
@@ -4272,13 +4272,20 @@ def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
             mode="dmrg",
         ).run(progbar=False, fit_target_strategy="layered")
 
-    with pytest.raises(ValueError, match="fit_block_size=2"):
-        pepsy.MpsOptimizer(
-            state.tn.copy(),
-            nonlocal_gates,
-            chi=4,
-            mode="dmrg",
-        ).run(progbar=False, fit_block_size=1)
+    # Native one-site FIT uses its sector-preserving guess without dense padding.
+    one_site = pepsy.MpsOptimizer(
+        state.tn.copy(), nonlocal_gates, chi=4, mode="dmrg",
+    )
+    refined = one_site.run(progbar=False, fit_block_size=1)
+    reference = pepsy.MpsOptimizer(
+        state.tn.copy(), nonlocal_gates, chi=4, mode="mpo",
+    ).run(progbar=False)
+    assert one_site.get_fit_diagnostics()["block_size"] == 1
+    assert _all_tensor_data_symmray(refined)
+    assert refined.max_bond() <= 4
+    assert float(np.real(pepsy.tn_fidelity(
+        refined, reference, contraction_opt="greedy",
+    ))) == pytest.approx(1.0, abs=1e-10)
 
 
 @pytest.mark.parametrize(
@@ -4301,12 +4308,12 @@ def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
 @pytest.mark.parametrize(
     ("mode", "expected_blocks"),
     [
-        ("dmrg1", [1, 1, 1]),
+        ("dmrg", [1, 1, 1]),
         ("dmrg2", [2, 2, 1]),
         ("dmrg3", [3, 3, 2]),
     ],
 )
-def test_symmps_mps_optimizer_dmrg_aliases_preserve_native_rank_schedule(
+def test_symmps_mps_optimizer_dmrg_modes_preserve_native_rank_schedule(
     model,
     symmetry,
     site_charge,
@@ -4314,7 +4321,7 @@ def test_symmps_mps_optimizer_dmrg_aliases_preserve_native_rank_schedule(
     mode,
     expected_blocks,
 ):
-    """Native U1/U1U1 aliases follow their schedules without densifying."""
+    """Native U1/U1U1 modes follow their schedules without densifying."""
     state = SymMPS.random_unitary_for_model(
         model,
         3,

@@ -1,6 +1,7 @@
 """Consistent TreeOptimizer options at construction, replay and operator calls."""
 
 from copy import deepcopy
+import warnings
 
 import numpy as np
 import pytest
@@ -19,6 +20,42 @@ def _gate(theta=0.6):
 def _configuration(opt):
     return (opt.mode, opt.compression_mode, opt._dmrg_mode_alias,
             opt.compression_seed, opt.track_infidelity, opt.chi, opt.cutoff)
+
+
+@pytest.mark.parametrize("entry", ("constructor", "run", "two_site_mode"))
+def test_dmrg1_warns_to_use_dmrg_without_changing_legacy_schedule(entry):
+    stream = [(_gate(), (0, 3))]
+    options = dict(n=4, chi=4, fit_rtol=None, structure="balanced")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if entry == "constructor":
+            optimizer = TreeOptimizer(stream, mode=" DMRG1 ", **options)
+        elif entry == "two_site_mode":
+            optimizer = TreeOptimizer(stream, two_site_mode="dmrg1", **options)
+        else:
+            optimizer = TreeOptimizer(None, run=False, **options)
+            optimizer.run(stream, mode="dmrg1")
+        optimizer.copy()
+        optimizer.run([])  # Retaining the selected mode must not warn again.
+    notices = [notice for notice in caught if notice.category is FutureWarning]
+    assert len(notices) == 1
+    assert "use mode='dmrg' for one-site refinement" in str(notices[0].message)
+    assert "two-node growth warm-up" in str(notices[0].message)
+    assert notices[0].filename == __file__
+    assert optimizer._dmrg_mode_alias == "dmrg1"
+    assert optimizer.fit_diagnostics[-1]["block_size_trace"] == (2, 2, 1, 1)
+    expected = np.zeros(16, dtype=complex)
+    expected[[0, 9]] = np.cos(0.6), np.sin(0.6)
+    np.testing.assert_allclose(optimizer.to_dense().reshape(-1), expected, atol=1e-11)
+
+
+@pytest.mark.parametrize("mode", ("dmrg", "fit", "dmrg2", "dmrg3"))
+def test_current_dmrg_selectors_do_not_emit_legacy_warning(mode):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        optimizer = TreeOptimizer(None, n=3, mode=mode)
+        optimizer.run(mode=mode)
+    assert not [notice for notice in caught if notice.category is FutureWarning]
 
 
 def test_constructor_propagates_map_mode_to_automatic_layout():

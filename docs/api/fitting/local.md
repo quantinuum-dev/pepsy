@@ -231,12 +231,9 @@ exit. Remaining requested sweeps use one-site FIT. One-site refinement
 preserves the bond dimensions opened by the larger block and is cheaper than
 repeating the larger SVD block.
 
-The MPS optimizer passes `adaptive_block_sweeps=fit_adaptive_sweeps` and enables
-`adaptive_until_rank` only for eligible generic `dmrg` windows.
-Before constructing a `dmrg1` fit, the optimizer checks the active
-attainable bond ceilings: an already-capped window starts with one-site FIT,
-while an under-capacity non-adjacent window requires `n_iter >= 3` for two
-two-site growth sweeps and at least one one-site refinement sweep. `dmrg2`
+The MPS optimizer's `dmrg` mode uses only one-site refinement from the
+initialized guess and rejects larger `fit_block_size` values. The removed
+`dmrg1` spelling raises a migration error. `dmrg2`
 and `dmrg3` use exactly the configured two- or three-site block warm-up (two
 sweeps by default); `dmrg3` adds one two-site transition sweep. Both then
 refine with one-site FIT. The direct FIT
@@ -336,13 +333,13 @@ sweep only rebuilds the same environments. That terminal update constructs no
 active-window environments; native fermionic outside-window environments stay
 intact. The default is `False` on direct
 `FIT.run_gate` calls and in `MpsOptimizer`, preserving fixed-sweep
-compatibility. Set it to `True` to make named `dmrg1`, `dmrg2`, and `dmrg3`
-windows of two sites perform one two-site update and advance to the next gate
+compatibility. With a two-site FIT block selected, set it to `True` to make
+DMRG windows of two sites perform one two-site update and advance to the next gate
 without one-site refinement; `n_iter` and tolerance controls cannot add a
 second sweep while the fast path is enabled. `collect_split_diagnostics=False`
 omits per-SVD truncation dictionaries when only the fitted state and retained
-norm are needed. `MpsOptimizer` additionally keeps the named `dmrg2`
-nearest-neighbor schedule at one update by default.
+norm are needed. Named `dmrg2` also requires an explicit fast-path request;
+its default respects the sweep budget and convergence controls.
 
 `sweep_sequence` uses Quimb direction names: `"R"` is left-to-right, `"L"` is
 right-to-left, and `"RL"` alternates. Native fermionic `run_gate` executes the

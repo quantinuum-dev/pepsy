@@ -66,7 +66,7 @@ opt.run()
 ```
 
 The previous constructor default was `"dmrg"`. Specify `mode="dmrg"` (or a
-named `dmrg1`/`dmrg2`/`dmrg3` schedule) to retain variational FIT replay.
+named `dmrg2`/`dmrg3` schedule) to retain variational FIT replay.
 
 For a normalized base-2 entropy diagnostic, use the middle MPS bond by
 default or pass an explicit bipartition index:
@@ -573,7 +573,7 @@ The practical shot-mode matrix is:
 | `direct` (default) | Quimb direct compression; `mpo` and `quimb` are compatibility aliases |
 | bare `<method>` / `quimb-<method>` | explicitly selected Quimb 1D compressor |
 | `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
-| `dmrg`, `dmrg1/2/3` | opt-in variational compressed replay with the selected FIT schedule |
+| `dmrg`, `dmrg2`, `dmrg3` | opt-in variational compressed replay with the selected FIT schedule |
 | `mix` | unitary FIT plus an explicit MPO fallback for Kraus gates; no controls/leakage |
 | `exact`, `exact-batch` (`batch-exact` alias) | exact unitary, mixture, control, and state-dependent Kraus replay |
 | `perm` | fresh identity-order shots only; persistent layouts use the normal MPS modes |
@@ -620,116 +620,68 @@ SRC replay requires a newer backend-native compressor. For ordinary dense
 MPS FIT warm starts, Pepsy warns and uses direct compression on those builds;
 the exact FIT target and final accuracy settings are preserved.
 
-`mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
-convenience modes share the DMRG backend but have distinct schedules:
-`"dmrg1"` uses at most two two-site growth sweeps and then fixed-rank one-site
-FIT. If every active bond is already at its attainable ceiling before the fit,
-`"dmrg1"` starts directly with one-site FIT. Once every full-chain bond
-reaches its physical/`chi` ceiling, the optimizer latches one-site updates for
-later windows in the same replay. `"dmrg2"` uses two-site FIT for the required
-warm-up (two sweeps by default) and then one-site FIT; `"dmrg3"` follows the
-same fixed warm-up schedule with three-site FIT, then one two-site transition
-sweep, then one-site FIT. All phases share the `n_iter` budget: with eight
-fixed sweeps the schedules are `2,2,1,1,1,1,1,1` and `3,3,2,1,1,1,1,1`.
-Tolerance comparisons reset whenever the block size changes. The adjacent
-two-site `dmrg2` exact-update exception remains active.
-For dense DMRG windows, FIT starts from a disposable compressed guess. The
-default is `fit_init_strategy="guess-src"`; the exact FIT target and named
-schedules are unchanged. The strategy can be `direct`, `random`,
-`random_expand`, or `guess-<method>`, where `<method>` is one of the Quimb
-compression methods listed below. The underscore spelling remains accepted for
-compatibility. `auto` selects `guess-src` in both the rank-expansion and
-reached-chi phases. Native Symmray and fermionic states use the native
-sector-preserving randomized guess by default as well. The legacy
-`fit_mpo_guess=False` switch still disables the
-default named-mode guess. Both the target and the guess remain separate from
-the live MPS. The fixed expansion handoff remains two two-site sweeps followed
-by one one-site sweep; a window already at its attainable `chi` ceiling uses
-one-site FIT directly.
-`mode="dmrg"` (also `"fit"`) defaults to `fit_block_size=1`: one-site FIT
-refines the initialized guess at fixed rank without two-site SVD updates.
-Target preparation and guess construction may still use SVD. Explicit
-`fit_block_size=2` or `3` enables block updates and their adaptive schedule
-for local windows. For a long-range window that is wider than the
-selected FIT block, it uses the corresponding fixed block handoff so the
-terminal canonical center remains authoritative for unitary norm tracking;
-the randomized FIT initialization is unchanged. `mode="mix"` is the
-transactional unitary variant: every eligible multi-site gate first builds a
-disposable, chi-capped `guess-direct` state and then runs one-site DMRG/FIT
-against a separately constructed exact target. This path is unchanged between
-the bond-growing and fixed-`chi` phases; the direct guess is never committed
-without the FIT refinement.
-For ordinary DMRG, `fit_block_size=2` grows only bonds visited by the gate
-interval, up
-to `chi`, through the middle-bond SVD; it does not pad the whole MPS and does
-not need an MPO rank warm-up. `fit_block_size=3` uses a three-site effective
-wavefunction and two direction-aware native SVD splits, and is useful when a
-larger local window is worth the extra decomposition cost. An adjacent
-two-site gate span automatically falls back to `fit_block_size=2`. Both block
-sizes preserve native dense and Symmray backends. For block sizes 2 and 3, the
-optimizer's `fit_init_strategy` chooses whether a disposable FIT guess is
-direct, randomly perturbed at fixed rank, randomly expanded on active bonds,
-or `guess-<method>` compressed by Quimb. For native Symmray/fermionic states,
-`guess-src` is implemented by native randomized SVD while the other
-Quimb-specific guess methods retain their native direct fallback. The available methods are
-`direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `src`,
-`src-first`, `src-oversample`, `srcmps`,
-`srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
-`fit-projector`, `fit-oversample`, `sdc`, `sdc-oversample`, `sdcr`, and
-`sdcr-oversample`. The successive modes require a Quimb build containing the
-corresponding compressor. They are also valid FIT warm-start policies as
-`fit_init_strategy="guess-sdc"`, `fit_init_strategy="guess-sdc-oversample"`,
-`fit_init_strategy="guess-sdcr"`, and
-`fit_init_strategy="guess-sdcr-oversample"`.
-For ordinary DMRG, `auto` selects `guess-src` in both phases;
-the current MPS is used directly only when the caller explicitly requests
-`direct` (or a native Symmray/fermionic route requires its native warm-start).
-Native Symmray and fermionic paths use their graded sector-growth route without
-dense random padding. `fit_block_size=1` selects the default fixed-rank
-algorithm in ordinary DMRG. Mixed mode fixes `fit_block_size=1` and
-`fit_init_strategy="guess-direct"`; pass another block size or initialization
-only with `mode="dmrg"`. On native Symmray states, the mixed direct guess uses
-Pepsy's native chi-capped auto-swap/SVD route and does not densify charge
-sectors.
-Standalone one-site gates use the exact direct/MPO
-path; ordinary DMRG target blocks can absorb intervening one-site gates before
-the block's shared compression. Generic `mode="dmrg"` with an explicit block
-size of two or three remains rank-adaptive on local windows and uses the fixed
-canonical handoff for long-range windows,
-while named `"dmrg1"` bounds its two-site warm-up at two sweeps and then uses
-one-site FIT for the remaining requested sweeps. The named mode does not
-extend the two-site phase because of rank stagnation. Once all full-chain
-ceilings are reached, it latches one-site updates for later gate windows.
-This keeps the bond spaces opened by the SVD warm-up while avoiding repeated
-GPU SVD truncations. The dense open-chain ceilings are
-`2, 4, 8, ..., chi, ..., 8, 4, 2` (also limited by the current outside-window
-bonds); FIT never pads a bond merely to make it equal to `chi`. Set
-`fit_adaptive_sweeps` to configure the named `dmrg2`/`dmrg3` warm-up; `dmrg1`
-keeps its two-sweep policy. A generic `mode="dmrg"` with `fit_block_size=1`
-remains the fixed-rank one-site compatibility path. `fit_layer_size` is the
-clear name for
-`k_2q_batch`; it counts two-site gates in a contiguous paper-style target
-block. For `fit_block_size=2`, an active window spanning at least three sites
-uses the generic adaptive schedule for local windows and the fixed canonical
-handoff described above for long-range windows; an ordinary two-site gate window
-has a complete local variational problem, but by default it honors the
-requested FIT sweeps and convergence controls. With
-`fit_single_pair_fast_path=True`, `dmrg1`, `dmrg2`, and `dmrg3` immediately
-advance to the next gate after one exact update instead of repeating their
-warm-up or entering one-site refinement.
-Named `dmrg2` also honors the two-site sweep budget and convergence controls.
-Explicit `fit_single_pair_fast_path=True` requests one exact update in every
-DMRG mode.
-`fit_three_site_sweeps` remains a deprecated alias for
-`fit_adaptive_sweeps`.
-`fit_max_span="auto"` also limits the spatial width of a batched
-target, splitting disjoint gates before they create an unnecessarily wide FIT
-window. Set `fit_max_span=None` to restore unrestricted gate-count batching.
-If a DMRG/FIT batch
-raises, produces non-finite data, or exceeds `chi`, the optimizer restores the
-complete pre-batch state (including canonical metadata) and
-replays the batch through MPO. Interrupts restore the trial state and are
-re-raised.
+The MPS variational modes have three schedules:
+
+| Mode | FIT updates |
+| --- | --- |
+| `dmrg` | One-site refinement from the initialized guess, throughout every sweep. |
+| `dmrg2` | Two-site warm-up (two sweeps by default), then one-site refinement. |
+| `dmrg3` | Three-site warm-up (two sweeps by default), one two-site transition sweep, then one-site refinement. |
+
+`dmrg1` has been removed; use `dmrg`. The historical `fit` spelling remains
+an alias of `dmrg`. `dmrg` fixes `fit_block_size=1` and rejects values two or
+three; select `dmrg2` or `dmrg3` for block updates. The one-site FIT refinement
+has no two-site or three-site SVD updates. Target preparation and initial-guess
+construction may still use SVD and may open bond support up to `chi`.
+
+All phases share the `n_iter` budget. With eight fixed sweeps, the schedules
+are `1,1,1,1,1,1,1,1`, `2,2,1,1,1,1,1,1`, and `3,3,2,1,1,1,1,1`.
+`fit_adaptive_sweeps` sets the `dmrg2`/`dmrg3` warm-up length and has no effect
+on one-site `dmrg`. Tolerance comparisons reset whenever the block size changes.
+Three-site updates shorten to two-site updates for an adjacent two-site window.
+
+FIT holds the exact target separate from its disposable initial guess. The
+default initialization is `guess-src` (`fit_init_strategy=None` or `auto`).
+Supported strategies include `direct` (current MPS), `random` (fixed-rank
+perturbation), `random_expand` (active bond expansion), and `guess-<method>`
+(compressed guess). Explicit guess methods apply even at the bond ceiling.
+The underscore spelling remains accepted for compatibility. `fit_init_seed=0`
+seeds randomized guesses; `fit_init_rand_strength=0.0` applies only when an
+explicit dense random strategy is selected.
+
+Guess methods include `direct`, `dm`, `zipup`, `zipup-first`,
+`zipup-oversample`, `src`, `src-first`, `src-oversample`, `srcmps`,
+`srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, `fit-projector`,
+`fit-oversample`, `sdc`, `sdc-oversample`, `sdcr`, and `sdcr-oversample`.
+The successive methods require a Quimb build with the corresponding compressor.
+Native Symmray/fermionic `guess-src` uses a sector-preserving randomized SVD;
+other Quimb-specific guess methods retain their native direct fallback.
+The legacy `fit_mpo_guess=False` switch disables the default `dmrg3` guess;
+use `fit_init_strategy` to select an explicit policy.
+
+Two-site FIT grows only visited bonds through its middle-bond SVD, up to
+`chi`; three-site FIT uses two direction-aware splits. These block updates
+preserve native backends and do not pad the whole MPS. Dense open-chain
+ceilings are `2, 4, 8, ..., chi, ..., 8, 4, 2`, also limited by the current
+outside-window bonds.
+
+`mode="mix"` uses a disposable `guess-direct` state followed by one-site FIT
+against the exact target. Its block size and guess policy are fixed, both
+before and after reaching `chi`. Failed transactions roll back before the
+direct/MPO fallback. Native guesses preserve charge sectors and grading.
+
+`fit_layer_size` aliases `k_2q_batch` and counts two-site circuit gates in a
+target block. This is independent of how many MPS tensors FIT updates at once.
+Standalone one-site gates are applied directly; intervening one-site gates can
+be absorbed into a batched target. `fit_max_span="auto"` also limits spatial
+width; `None` restores unrestricted gate-count batching. If a batch fails,
+becomes non-finite or exceeds `chi`, rollback restores the pre-batch state and
+canonical metadata before MPO fallback. Interrupts restore and re-raise.
+
+All modes respect the sweep budget and convergence controls for adjacent
+windows. Explicit `fit_single_pair_fast_path=True` enables a single exact
+two-site update in `dmrg2`/`dmrg3`. It never converts `dmrg` to a block update.
+`fit_three_site_sweeps` remains a deprecated alias of `fit_adaptive_sweeps`.
 
 For ordinary DMRG and mixed DMRG, `n_iter` is a maximum rather than an
 unconditional sweep count. `fit_min_iter`, `fit_rtol`, and `fit_patience`
@@ -774,19 +726,16 @@ norm once per sweep. Its native finite checks reduce active tensor blocks and
 transfer those flags together with the optional tolerance norm as one compact
 vector. Adaptive rank-growing windows require `n_iter >= 2`; a
 shorter request raises before fitting, except for the adjacent two-site exact
-fast path. An under-capacity, non-adjacent `mode="dmrg1"` window requires
-`n_iter >= 3`, reserving its first two sweeps for two-site rank growth and at
-least one later sweep for one-site refinement. An already-capped `dmrg1`
-window has no growth reservation and uses all requested sweeps as one-site
-updates.
+fast path. One-site `dmrg` accepts any positive `n_iter`; it has no
+reserved growth phase.
 At least two adaptive block sweeps are required whenever the active window
 needs rank growth, regardless of `fit_rtol`; an adjacent two-site interval is
 a structural special case whose only pair is
 the complete variational problem. The default
 `fit_single_pair_fast_path=False` honors the window's budget and `fit_rtol`; set it to
 `True` to stop after one effective-tensor SVD, even when `fit_rtol=None`.
-This shortcut requires a two-site FIT block, such as explicit
-`fit_block_size=2` in generic DMRG; it does not change one-site FIT into a
+This shortcut requires a two-site FIT block, as selected by
+`dmrg2` or an adjacent `dmrg3` window; it does not change one-site FIT into a
 two-site update.
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
 non-finite sweep. Non-unitary MPS DMRG keeps the dtype-aware automatic
@@ -801,7 +750,7 @@ checks are needed. Transactional MPO fallbacks are norm-checked only when
 scalar results on the device, and transfer one Boolean to the host.
 
 `run(finite_check=False)` disables runtime non-finite detection by default
-in every MpsOptimizer mode, including DMRG1/2/3, mixed, MPO/direct/SRC/SDC,
+in every MpsOptimizer mode, including DMRG/DMRG2/DMRG3, mixed, MPO/direct/SRC/SDC,
 swap/permutation/SVD, and exact replay. This is an optional diagnostic
 feature, not a requirement for normal optimization. Leave it off to avoid
 extra validation work and possible accelerator synchronization.
@@ -839,8 +788,7 @@ layout changes, mode changes, and explicit canonical resynchronization clear
 cached metadata, and a changed `chi` or chain length forces new ceilings.
 Mixed replay prepares each FIT window once and reuses its validated final
 maximum bond for history and the next transaction. Quality checks invalidate
-that maximum because repair may change dimensions. DMRG1 skips rank checks
-used solely to validate a sweep budget when `n_iter >= 3` already suffices.
+that maximum because repair may change dimensions.
 
 Backend/symmetry classification uses weak references to actual networks,
 propagated only through owned backend-preserving copies. It does not retain
@@ -853,7 +801,7 @@ The expensive direct FIT-target overlap contraction is opt-in through
 `fit_overlap_infidelity`; the default `False` leaves those fields as `None`
 while retaining the ordinary FIT convergence metadata. If enabled, the
 contraction is performed after each successful DMRG FIT update, including
-DMRG1/2/3 schedules. Mixed-mode transactions retain the existing behavior of
+DMRG/DMRG2/DMRG3 schedules. Mixed-mode transactions retain the existing behavior of
 omitting this target-overlap calculation.
 If the optional contraction fails or returns NaN/infinity, both overlap values
 remain `None` and `fit_overlap_error` explains the failure. This does not reject
@@ -863,9 +811,9 @@ it does not enable per-sweep `finite_check` scans.
 The DMRG/FIT update follows the variational update described in
 the [Ayral *et al.* PRX Quantum paper](https://doi.org/10.1103/PRXQuantum.4.020304):
 the effective tensor is built from cached contractions on the left and right,
-then the MPS is swept repeatedly. Explicit `fit_block_size=2` forms a
+then the MPS is swept repeatedly. `dmrg2` forms a
 local wavefunction with the two outer virtual legs and both sites' physical
-groups, then splits its middle bond with `Tensor.split`. `fit_block_size=3`
+groups, then splits its middle bond with `Tensor.split`. `dmrg3`
 forms the analogous three-site tensor and splits it twice, absorbing singular
 values toward the sweep direction. Both dispatch to configured dense SVD
 drivers and, crucially, Symmray's native block SVD for U1, U1xU1, and fermionic
@@ -877,10 +825,9 @@ before each split, and restores the physical ket afterward. Thus `R`, `L`, and
 `RL` are honored exactly without dense conversion or Jordan-Wigner
 bosonization.
 
-The named `dmrg1`, `dmrg2`, and `dmrg3` schedules are backend-independent:
-native U1, U1xU1, and Z2 fermionic states use the same schedules as ordinary
-arrays. `dmrg1` uses its bounded two-sweep warm-up and sticky one-site phase,
-while `dmrg2` and `dmrg3` perform their fixed block warm-up before one-site
+The `dmrg`, `dmrg2`, and `dmrg3` schedules apply to native U1, U1xU1,
+and Z2 fermionic states as well as ordinary arrays. `dmrg` uses one-site FIT, while `dmrg2` and `dmrg3` perform their fixed
+block warm-up before one-site
 refinement, with one intervening two-site sweep for `dmrg3`.
 Ordinary dense MPS replay keeps the exact gate target `p_g` separate
 from FIT's initial state. For a two- or three-site growth window,
@@ -1007,7 +954,7 @@ including `branch_probability`, `physical_boundary`, and `renormalized`. Their
 expected norm includes the Born probability, so a normal physical branch has
 zero compression infidelity. Renormalization closes the current raw-norm
 baseline but does not erase the cumulative compression ledger. The same norm
-contract is used by DMRG1/2/3 and the MPO, SVD, swap/perm, and mixed backends.
+contract is used by DMRG/DMRG2/DMRG3 and the MPO, SVD, swap/perm, and mixed backends.
 
 Unitary compression also validates that the retained canonical-center norm
 does not materially exceed its pre-compression norm. The raw overshoot remains
@@ -1046,7 +993,7 @@ accumulation remains logarithmic and numerically stable.
 The progress-bar descriptor shows only the active mode: `src`, `zipup`, and
 other Quimb compression modes are displayed without the internal `quimb-` or
 legacy `mpo-` prefix, while the `quimb` and `mpo` aliases display as `direct`.
-Named DMRG schedules display as `dmrg1`, `dmrg2`, or `dmrg3`; generic `dmrg`
+Named DMRG schedules display as `dmrg2` or `dmrg3`; generic `dmrg`
 and its `fit` alias display as `dmrg`.
 
 Replay timing is opt-in and does not print by itself:
@@ -1106,8 +1053,7 @@ optimizer-owned state. `get_fit_diagnostics()` returns a copy of the last
 DMRG/FIT record or `None` before a FIT update and for modes that do not use
 FIT. The record
 includes the iteration count, convergence reason, relative change, active block
-size, adaptive and one-site sweep counts, and the DMRG1 one-site lock state
-when applicable. The record also includes `fit_overlap_diagnostics` so callers
+size, and adaptive and one-site sweep counts. The record also includes `fit_overlap_diagnostics` so callers
 can distinguish a disabled overlap calculation from a backend failure.
 
 Ordinary runs retain no per-gate timer or timing-record overhead. Enabled

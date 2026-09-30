@@ -601,18 +601,18 @@ def test_fit_adaptive_rank_targets_follow_open_chain_capacity():
         16,
     ) == (2, 4, 8, 16, 8, 4, 2)
 
-    optimizer = py.MpsOptimizer(state, gates=[], chi=16, mode="dmrg1")
+    optimizer = py.MpsOptimizer(state, gates=[], chi=16, mode="dmrg")
     assert optimizer._mix_target_bond_dimensions() == [2, 4, 8, 16, 8, 4, 2]
 
 
-def test_dmrg1_leaves_adaptive_phase_after_two_sweeps_on_rank_stagnation():
-    """DMRG1 does not extend its two-site phase when rank growth stalls."""
+def test_dmrg_default_ignores_block_warmup_length():
+    """DMRG1 uses only one-site sweeps, even with a longer warm-up option."""
     state = qtn.MPS_computational_state("000", dtype="complex128")
     optimizer = py.MpsOptimizer(
         state,
         gates=[(np.eye(4), (0, 2))],
         chi=2,
-        mode="dmrg1",
+        mode="dmrg",
     )
 
     optimizer.run(
@@ -627,28 +627,28 @@ def test_dmrg1_leaves_adaptive_phase_after_two_sweeps_on_rank_stagnation():
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [2, 2, 1, 1, 1, 1]
-    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
-    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 4
-    assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is False
+    ] == [1, 1, 1, 1, 1, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 0
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 6
 
 
 @pytest.mark.parametrize("n_iter", [1, 2])
-def test_dmrg1_growth_requires_room_for_one_site_refinement(n_iter):
-    """DMRG1 growth needs two block sweeps plus one refinement sweep."""
+def test_dmrg_accepts_short_one_site_budgets(n_iter):
+    """The one-site alias accepts one or two sweeps without reserving growth."""
     optimizer = py.MpsOptimizer(
         qtn.MPS_computational_state("000", dtype="complex128"),
         gates=[(np.eye(4), (0, 2))],
         chi=2,
-        mode="dmrg1",
+        mode="dmrg",
     )
 
-    with pytest.raises(ValueError, match="n_iter >= 3"):
-        optimizer.run(progbar=False, n_iter=n_iter, fit_rtol=None)
+    optimizer.run(n_iter=n_iter, fit_rtol=None, timing=True)
+    assert [r["block_size"] for r in optimizer.get_run_timing()["fit_steps"]] == [1] * n_iter
+    np.testing.assert_allclose(optimizer.to_dense().ravel(), [1, 0, 0, 0, 0, 0, 0, 0], atol=1e-12)
 
 
-def test_dmrg1_under_capacity_grows_twice_then_refines():
-    """DMRG1 grows an under-capacity window twice before refinement."""
+def test_dmrg_guess_opens_bonds_before_one_site_refinement():
+    """The default guess represents new entanglement before one-site FIT."""
     hadamard = np.array([[1.0, 1.0], [1.0, -1.0]]) / np.sqrt(2.0)
     cnot = np.array(
         [
@@ -663,7 +663,7 @@ def test_dmrg1_under_capacity_grows_twice_then_refines():
         qtn.MPS_computational_state("000", dtype="complex128"),
         gates=[(bell_gate, (0, 2))],
         chi=2,
-        mode="dmrg1",
+        mode="dmrg",
     )
 
     optimizer.run(
@@ -677,14 +677,17 @@ def test_dmrg1_under_capacity_grows_twice_then_refines():
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [2, 2, 1]
-    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
-    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
+    ] == [1, 1, 1]
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 0
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 3
+    np.testing.assert_allclose(
+        optimizer.to_dense().ravel(), np.array([1, 0, 0, 0, 0, 1, 0, 0]) / np.sqrt(2), atol=1e-12,
+    )
 
 
 @pytest.mark.parametrize("fit_mpo_guess", [True, False])
-def test_dmrg1_optional_svd_guess(fit_mpo_guess):
-    """DMRG1 can toggle the legacy switch for the direct-SVD guess."""
+def test_dmrg_legacy_guess_switch_matches_generic_dmrg(fit_mpo_guess):
+    """The legacy named-mode switch does not override the generic default guess."""
     hadamard = np.array([[1.0, 1.0], [1.0, -1.0]]) / np.sqrt(2.0)
     cnot = np.array(
         [
@@ -707,7 +710,7 @@ def test_dmrg1_optional_svd_guess(fit_mpo_guess):
         state.copy(deep=True),
         stream,
         chi=2,
-        mode="dmrg1",
+        mode="dmrg",
     )
 
     out = optimizer.run(
@@ -725,12 +728,12 @@ def test_dmrg1_optional_svd_guess(fit_mpo_guess):
     ) == pytest.approx(1.0, abs=1.0e-12)
     assert (
         optimizer.get_fit_diagnostics()["mpo_fit_guess_used"]
-        is fit_mpo_guess
+        is True
     )
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [2, 2, 1]
+    ] == [1, 1, 1]
 
 
 @pytest.mark.parametrize("fit_mpo_guess", [True, False])
@@ -784,8 +787,8 @@ def test_dmrg3_optional_svd_guess(fit_mpo_guess):
     ] == [3, 3, 2]
 
 
-def test_dmrg1_latches_one_site_phase_after_full_chain_saturation():
-    """After filling all bonds, later DMRG1 windows stay one-site."""
+def test_dmrg_uses_one_site_updates_for_successive_windows():
+    """Both initial and later DMRG1 windows use one-site refinement."""
     hadamard = np.array([[1.0, 1.0], [1.0, -1.0]]) / np.sqrt(2.0)
     cnot = np.array(
         [
@@ -803,7 +806,7 @@ def test_dmrg1_latches_one_site_phase_after_full_chain_saturation():
             (np.eye(4), (0, 2)),
         ],
         chi=2,
-        mode="dmrg1",
+        mode="dmrg",
     )
 
     optimizer.run(
@@ -815,12 +818,11 @@ def test_dmrg1_latches_one_site_phase_after_full_chain_saturation():
     )
 
     records = optimizer.get_run_timing()["fit_steps"]
-    assert [record["block_size"] for record in records] == [2, 2, 1, 1, 1, 1]
+    assert [record["block_size"] for record in records] == [1, 1, 1, 1, 1, 1]
     assert [record["fit_index"] for record in records] == [0, 0, 0, 1, 1, 1]
-    assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is True
 
 
-def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
+def test_dmrg_already_at_ceiling_starts_with_one_site_sweeps():
     """A full-rank DMRG1 window should not repeat two-site warm-up."""
     state = qtn.MPS_rand_state(
         3,
@@ -833,7 +835,7 @@ def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
         state,
         gates=[(np.eye(4, dtype=np.complex128), (0, 2))],
         chi=2,
-        mode="dmrg1",
+        mode="dmrg",
     )
 
     optimizer.run(
@@ -853,10 +855,9 @@ def test_dmrg1_already_at_ceiling_starts_with_one_site_sweeps():
     assert diagnostics["one_site_refinement_sweeps"] == 3
     assert diagnostics["guess_method"] == "src"
     assert diagnostics["guess_used"] is True
-    assert optimizer._last_dmrg_fit_diagnostics["dmrg1_one_site_locked"] is True
 
 
-def test_dmrg1_reopens_block_warmup_for_rank_preserving_nonlocal_target():
+def test_dmrg_refines_guess_for_rank_preserving_nonlocal_target():
     """DMRG1 must rotate saturated subspaces for a nonlocal gate."""
     state = (
         qtn.MPS_computational_state("00000000", dtype="complex128")
@@ -874,7 +875,7 @@ def test_dmrg1_reopens_block_warmup_for_rank_preserving_nonlocal_target():
         state.copy(deep=True),
         stream,
         chi=2,
-        mode="dmrg1",
+        mode="dmrg",
     )
 
     out = optimizer.run(
@@ -898,7 +899,7 @@ def test_dmrg1_reopens_block_warmup_for_rank_preserving_nonlocal_target():
     ] == [1, 1, 1, 1, 1, 1]
 
 
-def test_dmrg1_default_ftol_window_uses_two_one_site_samples():
+def test_dmrg_default_ftol_window_uses_two_one_site_samples():
     """The default window of two stops after two stable one-site norms."""
     state = qtn.MPS_rand_state(
         3,
@@ -911,7 +912,7 @@ def test_dmrg1_default_ftol_window_uses_two_one_site_samples():
         state,
         gates=[(np.eye(4, dtype=np.complex128), (0, 2))],
         chi=2,
-        mode="dmrg1",
+        mode="dmrg",
     )
 
     optimizer.run(
@@ -1677,7 +1678,7 @@ def test_fit_two_site_single_pair_fast_path_is_structurally_converged():
     assert fit.final_direction == "R"
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
+@pytest.mark.parametrize("mode", ["dmrg2", "dmrg3"])
 def test_dmrg_modes_advance_after_one_update_per_two_site_window(mode):
     """A two-site window gets one exact update, independent of n_iter."""
     optimizer = py.MpsOptimizer(

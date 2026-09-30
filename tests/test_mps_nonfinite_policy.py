@@ -9,7 +9,7 @@ import pepsy as py
 
 
 @pytest.mark.parametrize("mode", [
-    "dmrg", "dmrg1", "dmrg2", "dmrg3", "mix", "mpo", "direct",
+    "dmrg", "dmrg2", "dmrg3", "mix", "mpo", "direct",
     "src", "sdc", "swap", "perm", "svd", "exact",
 ])
 def test_runtime_nonfinite_detection_is_opt_in(monkeypatch, mode, quimb_compressor):

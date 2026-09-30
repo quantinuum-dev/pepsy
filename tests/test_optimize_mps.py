@@ -603,7 +603,7 @@ def test_mps_optimizer_fit_overlap_nonfinite_is_reported(monkeypatch, overlap):
     assert "non-finite" in result["fit_overlap_error"]
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3", "mix"])
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2", "dmrg3", "mix"])
 @pytest.mark.parametrize("timing", [False, True])
 def test_mps_optimizer_fit_overlap_diagnostics_are_opt_in(monkeypatch, mode, timing):
     """The expensive FIT-target overlap contraction is disabled by default."""
@@ -766,9 +766,9 @@ def test_mps_optimizer_mix_uses_dmrg_during_growth_and_fixed_chi(monkeypatch):
         "dmrg",
     ]
     assert [event["reason"] for event in opt.mix_history[1:]] == [
-        "guess_direct_dmrg1",
-        "guess_direct_dmrg1",
-        "guess_direct_dmrg1",
+        "guess_direct_dmrg",
+        "guess_direct_dmrg",
+        "guess_direct_dmrg",
     ]
     assert opt.mix_history[1]["start_bond"] == 1
     assert opt.mix_history[1]["end_bond"] == 2
@@ -779,7 +779,7 @@ def test_mps_optimizer_mix_uses_dmrg_during_growth_and_fixed_chi(monkeypatch):
     assert opt.last_mix_summary["fallback_steps"] == 0
 
 
-def test_mps_optimizer_mix_defaults_to_guess_direct_dmrg1():
+def test_mps_optimizer_mix_defaults_to_guess_direct_dmrg():
     """Mixed multi-site gates use the fixed guess-direct/DMRG1 contract."""
     p0 = qtn.MPS_computational_state("000", dtype="complex128")
     gates = [
@@ -876,7 +876,7 @@ def test_mps_optimizer_mix_guess_direct_opens_short_active_bonds():
         "dmrg",
     ]
     assert all(
-        entry["reason"] == "guess_direct_dmrg1"
+        entry["reason"] == "guess_direct_dmrg"
         for entry in opt.mix_history[1:]
     )
 
@@ -950,7 +950,7 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
         qtn.MPS_computational_state("0000", dtype="complex128"),
         gates=[(qu.hadamard(), (0,)), (qu.CNOT(), (0, 3))],
         chi=2,
-        mode="dmrg",
+        mode="dmrg3",
     )
     optimizer.run(
         progbar=False,
@@ -960,22 +960,22 @@ def test_mps_optimizer_three_site_fit_uses_window_and_falls_back_short():
         timing=True,
     )
     assert optimizer._last_dmrg_fit_diagnostics["block_size"] == 3
-    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 2
-    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 1
+    assert optimizer._last_dmrg_fit_diagnostics["adaptive_sweeps"] == 3
+    assert optimizer._last_dmrg_fit_diagnostics["one_site_refinement_sweeps"] == 0
     assert [
         record["block_size"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [3, 3, 1]
+    ] == [3, 3, 2]
     assert [
         record["site_count"]
         for record in optimizer.get_run_timing()["fit_steps"]
-    ] == [2, 2, 4]
+    ] == [2, 2, 3]
 
     adjacent = py.MpsOptimizer(
         qtn.MPS_computational_state("00", dtype="complex128"),
         gates=[(qu.CNOT(), (0, 1))],
         chi=2,
-        mode="dmrg",
+        mode="dmrg3",
     )
     adjacent.run(
         progbar=False,
@@ -1017,7 +1017,7 @@ def test_mps_optimizer_boundary_long_range_uses_fixed_handoff(
         ),
         gates=[(qu.CNOT(), where)],
         chi=2,
-        mode="dmrg",
+        mode=f"dmrg{block_size}",
     )
 
     optimizer.run(
@@ -1046,7 +1046,7 @@ def test_mps_optimizer_batched_boundary_long_range_uses_fixed_handoff(
         qtn.MPS_computational_state("000", dtype="complex128"),
         gates=[(qu.CNOT(), (0, 1)), (qu.CNOT(), (1, 2))],
         chi=2,
-        mode="dmrg",
+        mode="dmrg2",
     )
 
     optimizer.run(
@@ -1071,7 +1071,7 @@ def test_mps_optimizer_adaptive_blocks_do_not_preexpand_bonds(
         qtn.MPS_computational_state("0" * length, dtype="complex128"),
         gates=[(qu.hadamard(), (0,)), (qu.CNOT(), (0, 4))],
         chi=2,
-        mode="dmrg",
+        mode=f"dmrg{block_size}",
     )
 
     def fail_rank_warmup(*args, **kwargs):
@@ -1253,7 +1253,7 @@ def test_mps_optimizer_fit_mode_is_clear_dmrg_alias():
 @pytest.mark.parametrize(
     ("mode", "expected_blocks"),
     [
-        ("dmrg1", [2, 2, 1]),
+        ("dmrg", [1, 1, 1]),
         ("dmrg2", [2, 2, 1]),
         ("dmrg3", [3, 3, 2]),
     ],
@@ -1459,7 +1459,7 @@ def test_mps_optimizer_rejects_conflicting_legacy_fit_controls():
             )
 
 
-def test_mix_unitary_stabilization_covers_guess_direct_dmrg1():
+def test_mix_unitary_stabilization_covers_guess_direct_dmrg():
     """Mixed guess-direct/DMRG1 should retain the unitary working norm."""
     gates = []
     for depth in range(4):
@@ -1576,7 +1576,7 @@ def test_mps_optimizer_mix_inplace_guess_direct_opens_short_bond():
     assert out is p0
     assert opt.p is p0
     assert opt.mix_history[1]["backend"] == "dmrg"
-    assert opt.mix_history[1]["reason"] == "guess_direct_dmrg1"
+    assert opt.mix_history[1]["reason"] == "guess_direct_dmrg"
     assert p0.bond_size(2, 3) == 2
 
 
@@ -1711,7 +1711,7 @@ def test_mps_optimizer_mix_batches_two_site_transactions():
 
     assert out.max_bond() <= 2
     assert [entry["backend"] for entry in opt.mix_history] == ["dmrg", "dmrg"]
-    assert opt.mix_history[0]["reason"] == "guess_direct_dmrg1"
+    assert opt.mix_history[0]["reason"] == "guess_direct_dmrg"
     assert opt.mix_history[1]["reason"] == "dmrg_batch"
 
 

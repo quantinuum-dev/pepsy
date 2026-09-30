@@ -13,7 +13,7 @@ import pepsy as py
 pytestmark = [pytest.mark.core, pytest.mark.mps]
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2", "dmrg3"])
 @pytest.mark.parametrize("target", ["layered", "mps"])
 @pytest.mark.parametrize("supports,budget", [
     ([(0, 1)], 5),
@@ -40,7 +40,7 @@ def test_explicit_budget_uses_full_single_or_batched_window(mode, target, suppor
     np.testing.assert_allclose(opt.to_dense().ravel(), exact.to_dense().ravel(), atol=1e-10)
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2", "dmrg3"])
 @pytest.mark.parametrize("n_iter", [3, 8])
 @pytest.mark.parametrize("pair_options", [{}, {"fit_single_pair_n_iter": None}])
 def test_default_or_none_pair_budget_inherits_n_iter(mode, n_iter, pair_options):
@@ -68,7 +68,7 @@ def test_pair_cap_is_configurable_and_respects_general_limit(n_iter, pair_cap, e
     assert opt.get_fit_diagnostics()["iterations"] == expected
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "dmrg2"])
+@pytest.mark.parametrize("mode", ["dmrg2", "dmrg3"])
 def test_explicit_fast_path_still_selects_one_update(mode):
     opt = py.MpsOptimizer(
         qtn.MPS_computational_state("+0", dtype="complex128"),

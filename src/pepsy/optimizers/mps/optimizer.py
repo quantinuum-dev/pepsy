@@ -271,13 +271,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         not a separate algorithm; explicit sub-MPO inputs work in direct mode.
         Other Quimb methods accept their bare or ``"quimb-<method>"`` names;
         legacy ``"mpo-<method>"`` spellings also remain accepted.
-        ``"fit"`` is the clear alias of the historical
-        ``"dmrg"`` spelling; both default to one-site FIT updates.
-        ``"dmrg1"`` uses at most two two-site growth
-        sweeps, then one-site refinement; once every bond reaches its
-        attainable physical/``chi`` ceiling, it latches one-site updates
-        for the rest of the replay. An already-capped window starts
-        directly with one-site sweeps. ``"dmrg2"`` uses two-site updates
+        ``"dmrg"`` (also ``"fit"``) performs only one-site FIT refinement
+        from the initialized guess. ``"dmrg2"`` uses two-site updates
         for the required warm-up (two sweeps by default), then one-site
         refinement. ``"dmrg3"`` follows the same fixed warm-up policy with
         three-site updates before one-site refinement. ``"mix"`` uses a
@@ -352,11 +347,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mapping installed by :meth:`apply_layout` otherwise.
     """
 
-    _DMRG_MODE_ALIASES = {"dmrg1": 1, "dmrg2": 2, "dmrg3": 3}
+    _DMRG_MODE_ALIASES = {"dmrg2": 2, "dmrg3": 3}
     _ALLOWED_MODES = frozenset(
         {
             "dmrg",
-            "dmrg1",
             "dmrg2",
             "dmrg3",
             "quimb",
@@ -390,6 +384,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _normalize_mode(cls, mode):
         """Validate and normalize execution mode."""
         mode_norm = str(mode).strip().lower()
+        if mode_norm == "dmrg1":
+            raise ValueError(
+                "mode='dmrg1' has been removed; use mode='dmrg' for one-site FIT."
+            )
         if mode_norm == "batch-exact":
             mode_norm = "exact-batch"
         # Public ``direct`` names the compression algorithm. Historical
@@ -398,10 +396,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if mode_norm in {"mpo", "quimb"}:
             mode_norm = "direct"
         # ``fit`` names the algorithm while ``dmrg`` preserves the historical
-        # mode spelling. DMRG1/2/3 are readable block-size aliases that share
-        # the same implementation and are normalized to ``dmrg``. The alias
-        # is recorded by the constructor before this function runs, so the
-        # shared implementation can still select the requested schedule.
+        # mode spelling. DMRG is one-site refinement; only DMRG2/3 retain
+        # distinct block schedules, recorded before normalization.
         if mode_norm == "fit" or mode_norm in cls._DMRG_MODE_ALIASES:
             mode_norm = "dmrg"
         elif mode_norm in _MPO_COMPRESSION_METHODS:
@@ -1074,15 +1070,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._mix_dmrg_disabled_reason = None
         self._mix_dmrg_failed_sweep = None
         self._last_dmrg_fit_diagnostics = None
-        self._dmrg1_one_site_locked = False
-        # Native Symmray one-site writeback can retain duplicate fermionic
-        # dummy modes when a product-state DMRG1 warm-up has just saturated
-        # its bonds. Keep that narrow initialization case on two-site FIT;
-        # non-product native states retain the documented DMRG1 schedule.
-        self._dmrg1_native_product_two_site = (
-            self._dmrg_mode_alias == "dmrg1"
-            and self._is_native_fermionic_product_state(self.p)
-        )
         self.measurements = []
         self._control_operator_cache = None
         self._rng = np.random.default_rng()
@@ -1207,19 +1194,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ):
             if cache is not None:
                 cache.clear()
-
-    @classmethod
-    def _is_native_fermionic_product_state(cls, p):
-        """Return whether ``p`` is a native Symmray fermionic product MPS."""
-        if not cls._has_symmray_data(p):
-            return False
-        is_fermionic = getattr(p, "isfermionic", None)
-        if not callable(is_fermionic) or not is_fermionic():
-            return False
-        try:
-            return cls._effective_max_bond(p) <= 1
-        except (AttributeError, TypeError, ValueError):
-            return False
 
     @staticmethod
     def _mps_data_is_finite(p):
@@ -1976,7 +1950,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if self._replay_has_symmray_data(self.p):
                 raise ValueError(
                     "One-site FIT cannot pad native Symmray bonds safely; use "
-                    "fit_block_size=2 or 3 so the native block SVD grows only "
+                    "mode='dmrg2' or 'dmrg3' so the native block SVD grows only "
                     "charge sectors present in the effective target."
                 )
             by_target = {}
@@ -2014,79 +1988,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._prepare_one_site_dmrg_state(where)
 
     def _dmrg_fit_block_size(self, p, where, requested_block_size):
-        """Resolve the live DMRG block size for an active window.
-
-        DMRG1 uses two-site updates only during its bounded warm-up. Once the
-        optimizer has latched the full-chain one-site phase, or the active
-        bonds already have no attainable rank growth left, fixed-rank one-site
-        sweeps are the correct and cheaper update.
-        """
+        """Limit the requested FIT block to the active window width."""
         xmin, xmax = self._normalize_span(where)
-        active_block_size = min(
-            int(requested_block_size),
-            xmax - xmin + 1,
-        )
-        if self._dmrg_mode_alias == "dmrg1" and active_block_size == 2:
-            if self._dmrg1_native_product_two_site:
-                return active_block_size
-            if self._dmrg1_one_site_locked:
-                return 1
-            if (
-                xmax - xmin >= 2
-                and FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
-                    p,
-                    xmin,
-                    xmax,
-                    self.chi,
-                )
-            ):
-                return 1
-        return active_block_size
-
-    def _dmrg1_all_bonds_at_rank_targets(self):
-        """Return whether every MPS bond has reached its physical ceiling."""
-        if self._dmrg_mode_alias != "dmrg1":
-            return False
-        target_sizes = self._mix_target_bond_dimensions()
-        if not target_sizes:
-            return True
-        return all(
-            int(self.p.bond_size(site, site + 1)) >= int(target)
-            for site, target in enumerate(target_sizes)
-        )
-
-    def _maybe_lock_dmrg1_one_site_phase(self):
-        """Latch DMRG1 into one-site updates after full-chain saturation."""
-        if self._dmrg_mode_alias != "dmrg1":
-            return False
-        if not self._dmrg1_one_site_locked and self._dmrg1_all_bonds_at_rank_targets():
-            self._dmrg1_one_site_locked = True
-        return self._dmrg1_one_site_locked
-
-    def _validate_dmrg1_iteration_budget(self, p, where, *, n_iter, block_size):
-        """Require two growth sweeps plus refinement for uncapped DMRG1."""
-        if self._dmrg_mode_alias != "dmrg1" or int(block_size) != 2:
-            return
-        # Three sweeps suffice at every rank. The default budget of eight
-        # needs no tensor metadata inspection just to validate this minimum.
-        if int(n_iter) >= 3:
-            return
-        xmin, xmax = self._normalize_span(where)
-        if xmax - xmin < 2:
-            return
-        if FIT._active_bonds_at_rank_targets(  # pylint: disable=protected-access
-            p,
-            xmin,
-            xmax,
-            self.chi,
-        ):
-            return
-        if int(n_iter) < 3:
-            raise ValueError(
-                "mode='dmrg1' requires n_iter >= 3 for an under-capacity "
-                "window: two two-site growth sweeps and at least one "
-                "one-site refinement sweep."
-            )
+        return min(int(requested_block_size), xmax - xmin + 1)
 
     def set_p(self, p):
         """Assign a new state and reset state-dependent optimizer metadata.
@@ -2121,11 +2025,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._norm_summary_cache = None
         self._norm_log_survival = 0.0
         self._pending_zero_norm = None
-        self._dmrg1_one_site_locked = False
-        self._dmrg1_native_product_two_site = (
-            self._dmrg_mode_alias == "dmrg1"
-            and self._is_native_fermionic_product_state(self.p)
-        )
         self._set_site_order(range(int(getattr(self.p, "L", 0))))
         self._persistent_layout_plan = None
         self.layout_plan = None
@@ -2247,9 +2146,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         copied._dmrg_mode_block_size = self._dmrg_mode_block_size
         copied._dmrg_mode_alias = self._dmrg_mode_alias
-        copied._dmrg1_native_product_two_site = (
-            self._dmrg1_native_product_two_site
-        )
         # ``MatrixProductState.copy()`` does not promise to preserve the
         # physical orthogonality centre. The constructor canonicalizes the
         # copied state, so its freshly initialized ``info_c`` is authoritative
@@ -2304,7 +2200,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied._norm_summary_cache = None
         copied._mix_dmrg_disabled_reason = self._mix_dmrg_disabled_reason
         copied._mix_dmrg_failed_sweep = self._mix_dmrg_failed_sweep
-        copied._dmrg1_one_site_locked = self._dmrg1_one_site_locked
         copied._last_dmrg_fit_diagnostics = deepcopy(
             self._last_dmrg_fit_diagnostics
         )
@@ -2392,12 +2287,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._last_dmrg_fit_diagnostics = None
         self._dmrg_mode_alias = new_dmrg_alias
         self._dmrg_mode_block_size = new_dmrg_block_size
-        self._dmrg1_native_product_two_site = (
-            self._dmrg_mode_alias == "dmrg1"
-            and self._is_native_fermionic_product_state(self.p)
-        )
-        if old_mode != new_mode or old_dmrg_alias != new_dmrg_alias:
-            self._dmrg1_one_site_locked = False
         if old_mode in _EXACT_MODES and self.mode not in _EXACT_MODES:
             # Exact mode stores a fully contracted TensorNetwork, so rebuild an
             # MPS before recreating canonical metadata for an MPS mode.
@@ -3222,10 +3111,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             modes this is the maximum number of sweeps when adaptive FIT
             stopping is enabled; pass ``fit_rtol=None`` for fixed
             iterations. Adaptive rank-growing windows require at least two
-            sweeps. An under-capacity non-adjacent ``dmrg1`` window requires
-            ``n_iter >= 3`` so its two fixed growth sweeps leave room for
-            one-site refinement. Once all attainable full-chain bond ceilings
-            are reached, ``dmrg1`` stays in the one-site phase. The adjacent
+            sweeps. Default one-site ``dmrg`` accepts any positive
+            sweep budget. The adjacent
             two-site exact fast path is exempt.
             Ignored by ``mpo``/``swap``/``svd``/``exact``.
         progbar : bool, default=False
@@ -3354,13 +3241,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             adaptive warm-up before this criterion can stop a run.
         fit_block_size : {1, 2, 3} | None, default=None
             Number of neighboring MPS tensors optimized by each FIT update.
-            ``None`` selects one-site FIT for ordinary DMRG and ``mode="mix"``.
-            Named ``dmrg1``/``dmrg2``/``dmrg3`` retain their block schedules.
+            ``None`` selects the mode's schedule. ``dmrg`` and ``mix`` fix
+            this value at one; explicit values two or three are rejected.
+            Use ``dmrg2``/``dmrg3`` for their block warm-up schedules.
             Mixed mode fixes this value at one: a
             chi-capped direct-compressed guess opens the active bond support
             before every eligible multi-site gate is refined with one-site
-            FIT. Use ordinary ``mode="dmrg"`` to select block sizes two or
-            three.
+            FIT. Use ``mode="dmrg2"`` or ``mode="dmrg3"`` for block updates.
             Explicit two-site FIT forms both physical legs and the
             two outer virtual legs, then uses a native SVD on the middle bond,
             allowing active bonds to grow up to ``chi``. Default one-site FIT
@@ -3372,18 +3259,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Two- and three-site FIT never pre-expand the MPS; only bonds
             visited by their native splits can grow.
         fit_adaptive_sweeps : int, default=2
-            Generic ``mode="dmrg"``: minimum number of initial two- or
-            three-site sweeps used to adapt the active bond spaces. Generic
-            rank-adaptive DMRG continues block sweeps until every active bond
-            reaches its physical ceiling; rank stagnation never triggers the
-            transition. Long-range windows use the corresponding fixed block
-            handoff so their terminal canonical center remains authoritative
-            for unitary norm tracking. Otherwise, if a ceiling is not reached,
-            the block phase uses all requested sweeps, and remaining sweeps use
-            fixed-rank one-site FIT. For named ``mode="dmrg1"``, the two-site phase is fixed at
-            two sweeps and this value does not extend it; after that, remaining
-            sweeps use one-site FIT and the phase latches once all full-chain
-            attainable ceilings are reached. For ``mode="dmrg2"`` and
+            For ``mode="dmrg2"`` and
             ``mode="dmrg3"``, this sets the required two- or three-site
             warm-up length. The value is clipped to ``n_iter`` and ignored
             for ``fit_block_size=1``; the default is two sweeps. Mixed mode's
@@ -3418,7 +3294,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Explicit multi-site sub-MPO events in DMRG use the same layered
             representation when the backend supports lazy FIT targets.
         fit_mpo_guess : bool, default=True
-            Legacy compatibility switch for the named DMRG1/DMRG3 default
+            Legacy compatibility switch for the named DMRG3 default
             ``"guess-src"`` policy. New code should use
             ``fit_init_strategy`` explicitly. Dense DMRG uses the disposable
             SRC guess in both the expansion and one-site/reached-chi phases.
@@ -3919,13 +3795,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 raise ValueError("compression_seed must be non-negative.")
         if self.mode in {"dmrg", "mix"}:
             if self._dmrg_mode_block_size is not None:
-                # A named DMRG mode is an explicit block-size choice. Use the
-                # generic ``mode='dmrg'`` spelling when custom per-run block
-                # sizes are needed.
-                alias_block_size = (
-                    2 if self._dmrg_mode_block_size == 1
-                    else self._dmrg_mode_block_size
-                )
+                # Named modes select their block warm-up explicitly.
+                alias_block_size = self._dmrg_mode_block_size
                 if (
                     isinstance(fit_block_size, Integral)
                     and int(fit_block_size)
@@ -3933,7 +3804,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 ):
                     raise ValueError(
                         f"mode='dmrg{self._dmrg_mode_block_size}' fixes "
-                        "fit_block_size; use mode='dmrg' for a custom value."
+                        "fit_block_size; select mode='dmrg', 'dmrg2', or 'dmrg3'."
                     )
                 fit_block_size = alias_block_size
             if self.mode == "mix" and non_unitary and not _trajectory_non_unitary:
@@ -3964,10 +3835,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ):
                 raise ValueError("fit_block_size must be 1, 2, or 3.")
             fit_block_size = int(fit_block_size)
-            if self.mode == "mix" and fit_block_size != 1:
+            if self._dmrg_mode_alias is None and fit_block_size != 1:
                 raise ValueError(
-                    "mode='mix' fixes fit_block_size=1; use mode='dmrg' "
-                    "for two- or three-site FIT."
+                    f"mode='{self.mode}' fixes fit_block_size=1; use mode='dmrg2' "
+                    "or mode='dmrg3' for block updates."
                 )
             fit_adaptive_sweeps = self._resolve_legacy_fit_option(
                 canonical_name="fit_adaptive_sweeps",
@@ -5008,7 +4879,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return False
         if (
             not fit_mpo_guess
-            and self._dmrg_mode_alias in {"dmrg1", "dmrg3"}
+            and self._dmrg_mode_alias == "dmrg3"
             and str(strategy).strip().lower() in {"auto", _DEFAULT_FIT_INIT_STRATEGY}
         ):
             return False
@@ -5372,10 +5243,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         needs_growth = requested_strategy in {"random", "random_expand"} and not (
             FIT._active_bonds_at_rank_targets(p, start, stop, self.chi)  # pylint: disable=protected-access
         )
-        is_named_svd_window = len(gates) == 1 and self._dmrg_mode_alias in {
-            "dmrg1",
-            "dmrg3",
-        }
+        is_named_svd_window = (
+            len(gates) == 1 and self._dmrg_mode_alias == "dmrg3"
+        )
         if requested_strategy == "auto":
             selected_strategy = _DEFAULT_FIT_INIT_STRATEGY
         else:
@@ -5717,7 +5587,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError("mixed DMRG requires fit_block_size=1.")
         old_dmrg_alias = self._dmrg_mode_alias
         old_dmrg_block_size = self._dmrg_mode_block_size
-        self._dmrg_mode_alias = "dmrg1"
+        self._dmrg_mode_alias = None
         self._dmrg_mode_block_size = 1
         kwargs["fit_block_size"] = 1
         try:
@@ -6344,7 +6214,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         quality_check_every=None,
         quality_check_repair=True,
     ):
-        """Apply phase-independent guess-direct/DMRG1 with an MPO fallback.
+        """Apply phase-independent guess-direct/one-site FIT with an MPO fallback.
 
         Every eligible multi-site gate builds a disposable chi-capped direct
         guess, then runs one-site FIT against a separately constructed exact
@@ -6698,7 +6568,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "target_bond": int(target_bond),
                             "backend": "dmrg",
                             "reason": (
-                                "guess_direct_dmrg1"
+                                "guess_direct_dmrg"
                                 if offset == 0
                                 else "dmrg_batch"
                             ),
@@ -6823,16 +6693,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         span = (min(where_sites), max(where_sites))
         if fit_single_pair_n_iter is not None and span[1] == span[0] + 1:
             n_iter = min(n_iter, fit_single_pair_n_iter)
-        requested_block_size = min(
-            int(fit_block_size),
-            span[1] - span[0] + 1,
-        )
-        self._validate_dmrg1_iteration_budget(
-            p,
-            span,
-            n_iter=n_iter,
-            block_size=requested_block_size,
-        )
         self._prepare_fit_window(span, block_size=fit_block_size)
         self.canonize_mps(p, span)
         state_snapshot = self._fit_rollback_snapshot(p, span)
@@ -6856,11 +6716,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             span,
             fit_block_size,
         )
-        adaptive_sweeps = (
-            2 if self._dmrg_mode_alias == "dmrg1" else int(fit_adaptive_sweeps)
-        )
+        adaptive_sweeps = int(fit_adaptive_sweeps)
         adaptive_rank_schedule = self._dmrg_mode_alias not in {
-            "dmrg1",
             "dmrg2",
             "dmrg3",
         } and not (
@@ -7054,7 +6911,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "backend": "fit",
             "fallback": False,
         }
-        self._maybe_lock_dmrg1_one_site_phase()
         return projected_norm, center
 
     def _run_dmrg_single_window(
@@ -7108,12 +6964,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             xmin,
             xmax,
             active_fit_block_size,
-        )
-        self._validate_dmrg1_iteration_budget(
-            p,
-            (xmin, xmax),
-            n_iter=n_iter,
-            block_size=active_fit_block_size,
         )
         self._prepare_fit_window(
             (xmin, xmax),
@@ -7450,10 +7300,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     **fit_overlap,
                 }
             )
-        self._maybe_lock_dmrg1_one_site_phase()
-        self._last_dmrg_fit_diagnostics[
-            "dmrg1_one_site_locked"
-        ] = bool(self._dmrg1_one_site_locked)
         return p, xmin, xmax
 
     def _run_dmrg_batch_window(
@@ -7501,12 +7347,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         active_fit_block_size = min(
             fit_block_size,
             xmax - xmin + 1,
-        )
-        self._validate_dmrg1_iteration_budget(
-            p,
-            (xmin, xmax),
-            n_iter=n_iter,
-            block_size=active_fit_block_size,
         )
         self._prepare_fit_window(
             (xmin, xmax),
@@ -7786,10 +7626,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     **fit_overlap,
                 }
             )
-        self._maybe_lock_dmrg1_one_site_phase()
-        self._last_dmrg_fit_diagnostics[
-            "dmrg1_one_site_locked"
-        ] = bool(self._dmrg1_one_site_locked)
         return p, xmin, xmax
 
     def _run_dmrg(
@@ -7855,24 +7691,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 else "layered"
             )
 
-        # ``dmrg1`` has a bounded two-site warm-up: exactly two sweeps for an
-        # under-capacity window, then one-site refinement. It latches into the
-        # one-site phase once every full-chain bond reaches its attainable
-        # physical/chi ceiling. ``dmrg2`` and ``dmrg3`` retain their configured
-        # fixed warm-ups. Generic ``dmrg`` remains rank-adaptive for local
-        # windows and uses the fixed canonical handoff for long-range windows.
+        # DMRG2/3 have fixed block warm-ups. DMRG only refines one site
+        # at a time and needs no block warm-up.
         adaptive_rank_schedule = self._dmrg_mode_alias not in {
-            "dmrg1",
             "dmrg2",
             "dmrg3",
         }
-        adaptive_sweeps = (
-            2 if self._dmrg_mode_alias == "dmrg1" else int(fit_adaptive_sweeps)
-        )
+        adaptive_sweeps = int(fit_adaptive_sweeps)
 
         self._last_dmrg_fit_diagnostics = None
         p = self.p
-        self._maybe_lock_dmrg1_one_site_phase()
         two_qubit_count = 0
         submpo_count = 0
         last_where = self._current_orthog(p)

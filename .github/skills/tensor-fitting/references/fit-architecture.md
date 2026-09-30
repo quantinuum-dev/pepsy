@@ -15,9 +15,9 @@
 
 ## Public controls
 
-- `fit_block_size=1`: default fixed-rank update in generic MpsOptimizer
-  `dmrg`/`fit`; target preparation and guesses may still use SVD.
-- `fit_block_size=2`: explicit two-site local wavefunction and native SVD.
+- `fit_block_size=1`: fixed-rank update required by MpsOptimizer `dmrg`/`fit`;
+  target preparation and guesses may still use SVD. `dmrg1` is removed.
+- `dmrg2`/`dmrg3`: select the two-/three-site block warm-up and native SVD.
 - `fit_sweep_sequence="RL"`: alternating left-to-right/right-to-left sweeps.
 - `fit_min_iter`, `fit_rtol`, `fit_patience`: mode-neutral adaptive stopping
   controls for DMRG and mixed DMRG. Patience counts same-phase norm samples,
@@ -116,23 +116,17 @@ redundant. Non-unitary scale control likewise normalizes that singleton center
 in place when it remains inside the active interval; it must not move a valid
 left endpoint to the right endpoint merely to extract the same norm.
 
-For `dmrg1`, inspect the active and full-chain attainable rank targets before
-starting FIT. An already-capped window starts with one-site updates. An
-under-capacity non-adjacent window requires at least three requested sweeps:
-two two-site growth sweeps followed by at least one one-site refinement sweep.
-The two-site phase is bounded at two sweeps; it does not extend because of
-rank stagnation. Once every full-chain bond reaches its physical/``chi``
-ceiling, the optimizer latches one-site updates for later windows in the same
-replay. Named `dmrg2` and `dmrg3` are fixed warm-up schedules: they perform
+`dmrg` performs only one-site FIT from the initialized guess. Reject explicit
+block sizes two or three; `dmrg1` is no longer accepted.
+Named `dmrg2` and `dmrg3` are fixed warm-up schedules: they perform
 exactly `fit_adaptive_sweeps` two- or three-site sweeps (two by default).
 `dmrg3` then performs one two-site transition sweep. Both spend the remaining
 `n_iter` budget on one-site refinement subject to
-`fit_rtol`. Generic `dmrg` defaults to one-site FIT; explicit block sizes two
-or three select rank-adaptive block scheduling.
+`fit_rtol`. Standalone `FIT.run_gate` retains its explicit block and adaptive
+rank controls; MpsOptimizer selects its schedule by mode.
 
 Physical ceilings are replay-scoped geometry metadata; changing bond ranks
-remain live. A sufficient `n_iter >= 3` needs no additional rank scan just to
-validate DMRG1's minimum budget. Mixed replay owns one window preparation and
+remain live. Mixed replay owns one window preparation and
 can reuse its checked final maximum while the state is unchanged. Dense owned
 SRC/random guesses retain the untouched source as rollback; a direct guess
 that aliases the source still requires an isolated snapshot before fitting.

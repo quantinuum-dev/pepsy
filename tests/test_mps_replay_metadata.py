@@ -119,15 +119,6 @@ def test_array_classification_uses_actual_networks_and_weak_ownership():
     assert opt._replay_has_symmray_data(dense)
 
 
-def test_dmrg1_sufficient_budget_needs_no_rank_check(monkeypatch):
-    opt = py.MpsOptimizer(_state(4, 2), [], chi=4, mode="dmrg1")
-
-    def unexpected(*args, **kwargs):
-        raise AssertionError("sufficient sweep budgets need no rank check")
-
-    monkeypatch.setattr(py.FIT, "_active_bonds_at_rank_targets", unexpected)
-    opt._validate_dmrg1_iteration_budget(opt.p, (0, 3), n_iter=8, block_size=2)
-
 
 def test_mixed_maximum_is_refreshed_after_quality_repair(monkeypatch):
     gates = [(qu.CNOT(), (2, 5))] * 2

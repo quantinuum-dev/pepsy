@@ -37,8 +37,8 @@ Make decisions in this order; each choice owns a different invariant:
 2. **Compression route.** `direct` is the constructor default and preferred
    public name for Quimb direct compression. `mpo` is a silent compatibility
    alias, not a separate algorithm. Use `dmrg2` for explicit variational
-   replay, `dmrg1` when the fixed two-site-growth/one-site-refinement schedule is
-   required, and `dmrg3` when a three-site warm-up is useful. Use
+   replay, `dmrg` (also `fit`) for one-site FIT from the initialized
+   guess by default, and `dmrg3` when a three-site warm-up is useful. Use
    `quimb-<method>` (or its bare method alias) when benchmarking a specific
    Quimb compressor, `svd` for a transparent local split reference, and
    `swap`/`perm` when endpoint movement is the intended representation.
@@ -66,27 +66,22 @@ than hiding policy in a mode-specific helper.
 
 ## Execution modes
 
-- `fit` / `dmrg` / `dmrg1` / `dmrg2` / `dmrg3`: local variational compression;
-  `dmrg1` uses at most two two-site growth sweeps followed by one-site
-  refinement, then latches one-site updates after all full-chain attainable
-  bond ceilings are reached. `dmrg2` uses its required two-site warm-up (two
+- `fit` / `dmrg` / `dmrg2` / `dmrg3`: local variational compression;
+  `dmrg1` is removed. `dmrg` fixes one-site FIT; reject larger block overrides.
+  `dmrg2` uses its required two-site warm-up (two
   sweeps by default) followed by one-site refinement, and `dmrg3` uses the
   same fixed warm-up policy with three-site updates, then one two-site
-  transition sweep before one-site refinement. Generic `dmrg`/`fit` defaults
-  to fixed-rank one-site FIT without block SVD updates; target preparation and
-  guess construction may still use SVD. With explicit block size two or three,
-  generic `dmrg` remains
-  rank-adaptive until its active-bond ceilings are reached; rank stagnation is
-  not an early exit there. A `dmrg1` window already at its attainable ceilings
-  starts directly with one-site FIT. An under-capacity non-adjacent `dmrg1`
-  window requires `n_iter >= 3`: two block sweeps plus at least one refinement
-  sweep. Its default `fit_patience=2` is a two-sample same-phase norm window,
+  transition sweep before one-site refinement. `dmrg`/`fit` performs fixed-rank one-site FIT without block SVD updates;
+  target preparation and guess construction may still use SVD. Select `dmrg2`
+  or `dmrg3` for multi-site updates. One-site FIT accepts any positive `n_iter`.
+  Its default `fit_patience=2` is a two-sample same-phase norm window,
   i.e. one stable comparison. Adjacent two-site windows inherit `n_iter` when
   `fit_single_pair_n_iter` is omitted or None; a positive cap selects
   `min(n_iter, fit_single_pair_n_iter)`. Every DMRG mode, including `dmrg2`,
   honors that budget and its convergence controls by default.
   `fit_single_pair_fast_path=True` explicitly requests one exact two-site
-  update, without warm-up repetition or one-site refinement, before advancing
+  update when a two-site FIT block is selected, without warm-up repetition
+  or one-site refinement, before advancing
   to the next gate. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
@@ -109,7 +104,7 @@ than hiding policy in a mode-specific helper.
   after reaching `chi`. One-site gates remain exact/direct, and failed FIT
   transactions restore the committed state before direct/MPO fallback.
   `fit_block_size` is fixed at `1` and `fit_init_strategy` at `guess-direct`;
-  use ordinary `dmrg` for other block sizes or initialization policies.
+  use `dmrg` for other initialization policies and `dmrg2`/`dmrg3` for block updates.
 - `exact`: fully contracted TensorNetwork replay, without MPS canonical metadata.
   Exact replay preserves operator scale directly; `non_unitary=True` is only
   needed for compressed MPS scale bookkeeping and is accepted in exact
@@ -351,8 +346,9 @@ loss.
 
 Before changing `optimizer.py`, verify the following ownership boundaries:
 
-- `_normalize_mode` may canonicalize public aliases, but the DMRG alias must
-  remain available to select its schedule.
+- `_normalize_mode` rejects removed `dmrg1` and canonicalizes `fit` to
+  one-site `dmrg`. Preserve named DMRG2/3 schedule metadata; prevent a run
+  option from turning `dmrg` into a multi-site FIT schedule.
 - `_execute_mode` receives backend-prepared payloads and dispatches only gate
   or sub-MPO events. `_run_segmented` owns control-event boundaries.
 - Conditional actions reuse the full validated segment settings. Never replace

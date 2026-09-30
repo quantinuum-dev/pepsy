@@ -26,9 +26,10 @@ shared Torch/CTMRG safeguards previously embedded in the root guide.
 
 ## Core workflows
 
-- [MPS optimizer](mps-optimizer/SKILL.md)
+- [MPS optimizer](mps-optimizer/SKILL.md): gate replay, `dmrg`
+  one-site refinement, and named `dmrg2`/`dmrg3` schedules.
 - [Tensor fitting](tensor-fitting/SKILL.md)
-- [Tree optimizer](tree-optimizer/SKILL.md): tree replay, unitary stabilization,
+- [Tree optimizer](tree-optimizer/SKILL.md): tree replay, default one-node DMRG, unitary stabilization,
   device-aware FIT environments, opt-in CPU thread limits, and bounded histories.
 - [qMERA energy optimizer](qmera-energy-optimizer/SKILL.md)
 

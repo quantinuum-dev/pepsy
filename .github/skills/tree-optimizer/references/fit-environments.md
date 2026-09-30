@@ -57,6 +57,11 @@ Read this reference before changing `pepsy.fitting.TreeFIT` or its
   The latest FIT getter returns an independent record, clears after completed
   non-FIT updates, and returns `None` outside FIT. State replacement clears
   both the latest record and historical FIT list.
+- TreeOptimizer generic `dmrg` (and `fit`) defaults to `fit_block_size=1`:
+  refine only one node at a time from the disposable initialized guess, with
+  no multi-node FIT warm-up. Guess construction can open bond support.
+  Explicit larger block sizes and named schedules retain their existing
+  behavior; TreePepsOptimizer and standalone TreeFIT own separate defaults.
 - TreeOptimizer defaults to automatic cutoff, `rsum2` cutoff mode,
   `fit_rtol="auto"`, and `fit_min_iter=2`. FIT tolerance is `1e-3` for
   16-bit data, `1e-5` for float32/complex64, and `1e-9` otherwise. Explicit

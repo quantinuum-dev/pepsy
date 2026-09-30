@@ -227,12 +227,12 @@ shape. Passing `fit_block_size` does not override a named mode; the mode's
 block size is authoritative. `fit_single_pair_fast_path=False` is the default,
 matching `MpsOptimizer`; `dmrg2` still enables the automatic shortcut for an
 adjacent two-site window, while setting the option to `True` enables it for
-every DMRG schedule. The generic `mode="dmrg"` path now follows the MPS
-schedule as well: two- or three-site FIT uses `fit_adaptive_sweeps` as an
-adaptive block warm-up and hands the remaining `n_iter` budget to one-site
-refinement. For a long-range window, the generic schedule uses the fixed
-canonical handoff after the block phase, matching the MPS behavior. As in
-`MpsOptimizer`, an under-capacity `dmrg1` window spanning at least three sites
+every DMRG schedule. The generic MPO `mode="dmrg"` path supports two- or
+three-site FIT with `fit_adaptive_sweeps` as an adaptive block warm-up, handing
+the remaining `n_iter` budget to one-site refinement. For a long-range window,
+it uses a fixed canonical handoff after the block phase. This is separate from
+`MpsOptimizer`, whose `mode="dmrg"` is strictly one-site refinement.
+For `MpoOptimizer`, an under-capacity `dmrg1` window spanning at least three sites
 requires `n_iter >= 3` so its two growth sweeps have room for one-site
 refinement.
 

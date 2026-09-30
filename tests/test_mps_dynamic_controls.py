@@ -196,7 +196,7 @@ def test_kraus_probabilities_use_tracked_center_without_global_norms(backend, mo
     np.testing.assert_allclose(opt.to_dense().ravel(), vector, atol=2e-7)
 
 
-@pytest.mark.parametrize("mode", ["dmrg1", "dmrg2", "dmrg3"])
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2", "dmrg3"])
 def test_conditional_gate_preserves_fit_policy_and_state(mode):
     gate = (qu.rand_uni(4, seed=17), (1, 6))
     measure = ("measure", "Z", 0, 1)
@@ -212,7 +212,7 @@ def test_conditional_gate_preserves_fit_policy_and_state(mode):
     assert not diagnostics.get("fallback", False)
     assert diagnostics["iterations"] == 8
     assert diagnostics["guess_method"] == "direct"
-    assert diagnostics["block_size"] == (3 if mode == "dmrg3" else 2)
+    assert diagnostics["block_size"] == {"dmrg": 1, "dmrg2": 2, "dmrg3": 3}[mode]
     assert diagnostics == direct.get_fit_diagnostics()
     assert conditional.info_c == direct.info_c
     np.testing.assert_allclose(conditional.to_dense(), direct.to_dense(), atol=1e-12)
@@ -223,7 +223,7 @@ def test_conditional_shots_preserve_dmrg_policy(strategy):
     gate = (qu.rand_uni(4, seed=17), (1, 6))
     opt = py.MpsOptimizer(
         _product("0000000"), [("measure", "Z", 0, 1), ("if", -1, 0, gate)],
-        chi=8, mode="dmrg1",
+        chi=8, mode="dmrg",
     )
     result = opt.run(shots=2, strategy=strategy, seed=714, run_kwargs={
         "n_iter": 8, "fit_rtol": None, "fit_init_strategy": "guess-direct",

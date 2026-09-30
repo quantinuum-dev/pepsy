@@ -246,7 +246,7 @@ projection is unsupported; use native `direct` or `zipup` for those states.
   each outgoing message immediately. Do not add a full-target materialization
   or canonical precompression. Its intermediate cuts have noncanonical
   unvisited environments, so discarded weights are not global error bounds.
-- TreeFIT uses incremental neighboring messages and `inward-outward` passes.
+- Generic `dmrg` defaults to one-node TreeFIT refinement with inward/outward passes.
   Unchanged non-differentiable Torch exteriors can use shared-array identity
   proofs; combine the device target norm with the first convergence read.
   TreeOptimizer's `fit_rtol="auto"` follows the state dtype; `None` disables

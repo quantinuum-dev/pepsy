@@ -58,9 +58,18 @@ Raw external edits are not automatically tracked by the FIT message cache.
 Construct a new TreeFIT when changing target geometry or connectivity.
 
 `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
-engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names. Generic
-`dmrg` uses `fit_block_size` (two by default) and its configured adaptive
-warm-up. `dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
+engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names.
+`TreeOptimizer(mode="dmrg")` defaults to `fit_block_size=1`: one-node refinement
+from the initialized guess, with no two-/three-node FIT warm-up. The `fit`
+alias follows this default. Guess construction can still split tensors and
+open bond support; one-node refinement retains that support. Explicit
+`fit_block_size=2` or `3` opts into an adaptive block schedule. The separate
+`TreePepsOptimizer` retains its own block-size default of two.
+Selecting `TreeOptimizer`'s legacy `dmrg1` in the constructor or explicitly
+in `run(mode=...)` emits a visible `FutureWarning` recommending `dmrg` for
+one-site refinement. Its existing warm-up schedule is retained; the warning
+is not repeated by a plain `run()` that keeps the selected mode.
+`dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
 three-node warm-up blocks followed by a two-node transition and one-node
 refinement. The default `fit_n_iter=4` permits eight directional passes and
 reaches refinement: `(2, 2, 1, 1)` for `dmrg2`, `(3, 3, 2, 1)` for `dmrg3`.
@@ -229,7 +238,33 @@ SRC/SDC/SDCR settings map to direct local SVD because complementary-environment
 compression is a separate whole-subtree algorithm. `fit_init_strategy`
 independently determines the disposable guess method.
 
-TreeOptimizer defaults to `fit_rtol="auto"` and `fit_min_iter=2`:
+For `TreeOptimizer(mode="dmrg")`, the main defaults are:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `fit_block_size` | `1` | One-node refinement, no block-growth warm-up |
+| `fit_n_iter` | `4` | Up to four inward/outward iterations (eight directional passes) |
+| `fit_min_iter` | `2` | Minimum iterations before tolerance stopping |
+| `fit_rtol` | `"auto"` | Dtype-dependent retained-norm tolerance below |
+| `fit_patience` | `1` | One stable comparison between two same-phase norm samples |
+| `fit_init_strategy` | `"auto"` | Dense SRC guess; native fermionic direct-compression guess |
+| `fit_init_seed` | `0` | Seed for guess construction |
+| `fit_init_rand_strength` | `0.0` | No extra random perturbation; SRC itself remains randomized |
+| `fit_sweep_sequence` | `"inward-outward"` | Both directions per iteration |
+| `fit_traversal` | `"auto"` | Endpoint traversal for paths; depth-first for branches |
+| `fit_single_node_fast_path` | `True` | Exact projection when the entire active region is one node |
+| `chi` | `64` | Bond cap used during guess/compression construction |
+| `cutoff`, `cutoff_mode` | `"auto"`, `"auto"` | Dtype-dependent cutoff and `"rsum2"` |
+
+These FIT options are constructor settings, inherited by copies and replay;
+`run()` does not accept `fit_*` overrides. Constructor `mode="auto"` remains
+the general replay default: request `mode="dmrg"` to select this refinement.
+`fit_adaptive_sweeps=2` and `fit_two_site_transition_sweeps=1` remain available
+for larger-block schedules and do not introduce block updates into default DMRG.
+Finite scans, overlap diagnostics, profiling, and unitary stabilization remain
+off by default. The separate standalone `TreeFIT` defaults are unchanged.
+
+Automatic tolerances are:
 
 | State precision | `cutoff="auto"` | `fit_rtol="auto"` |
 | --- | --- | --- |

@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.core, pytest.mark.optional, pytest.mark.mps]
 # The fit spelling aliases dmrg and has separate mapping/replay regressions.
 # Named DMRG schedules are distinct algorithms and remain in every matrix.
 _NATIVE_REPLAY_MODES = (
-    "dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "svd", "swap", "perm", "mix", "exact",
+    "dmrg", "dmrg2", "dmrg3", "mpo", "svd", "swap", "perm", "mix", "exact",
 )
 
 
@@ -718,7 +718,7 @@ def test_mps_optimizer_mix_native_guess_direct_uses_auto_swap(monkeypatch):
     )
 
     diagnostics = optimizer.get_fit_diagnostics()
-    assert optimizer.mix_history[0]["reason"] == "guess_direct_dmrg1"
+    assert optimizer.mix_history[0]["reason"] == "guess_direct_dmrg"
     assert diagnostics["block_size"] == 1
     assert diagnostics["fit_init_strategy"] == "guess_direct"
     assert diagnostics["guess_method"] == "direct"
@@ -844,7 +844,7 @@ def test_fit_fermionic_partial_window_reports_disconnected_target_sectors():
     ],
 )
 @pytest.mark.parametrize("fit_sweep_sequence", ["R", "RL"])
-@pytest.mark.parametrize("mode", ["dmrg1", "dmrg2", "dmrg3"])
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2", "dmrg3"])
 def test_mps_optimizer_named_dmrg_long_range_fermions_stay_native_and_exact(
     spinful,
     symmetry,
@@ -935,9 +935,9 @@ def test_mps_optimizer_named_dmrg_long_range_fermions_stay_native_and_exact(
         "native_fermionic_warm_start"
     ] is True
     diagnostics = optimizer._last_dmrg_fit_diagnostics
-    if mode == "dmrg1" and diagnostics["block_size"] == 1:
-        # The native warm start can already fill every active rank ceiling.
-        # DMRG1 then correctly spends the complete budget on one-site FIT.
+    if mode == "dmrg":
+        # DMRG1 is the generic one-site FIT alias on native arrays as well.
+        assert diagnostics["block_size"] == 1
         assert diagnostics["adaptive_sweeps"] == 0
         assert diagnostics["one_site_refinement_sweeps"] == 3
     else:

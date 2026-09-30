@@ -21,7 +21,7 @@ pytestmark = [pytest.mark.core, pytest.mark.mps]
 
 
 @pytest.mark.parametrize("mode", ["dmrg", "fit"])
-@pytest.mark.parametrize("block_options", [{}, {"fit_block_size": None}, {"fit_block_size": 2}])
+@pytest.mark.parametrize("block_options", [{}, {"fit_block_size": None}, {"fit_block_size": 1}])
 def test_generic_dmrg_default_one_site_sweeps(mode, block_options):
     """Default refinement avoids block splits while preserving an exact gate target."""
     state = qtn.MPS_computational_state("+00", dtype="complex128")
@@ -34,7 +34,7 @@ def test_generic_dmrg_default_one_site_sweeps(mode, block_options):
         cutoff=0.0, timing=True, **block_options,
     )
     records = optimizer.get_run_timing()["fit_steps"]
-    expected = [2, 2, 1, 1] if block_options.get("fit_block_size") == 2 else [1] * 4
+    expected = [1] * 4
     assert [record["block_size"] for record in records] == expected
     assert optimizer.get_fit_diagnostics()["fallback"] is False
     np.testing.assert_allclose(
@@ -42,7 +42,7 @@ def test_generic_dmrg_default_one_site_sweeps(mode, block_options):
     )
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3"])
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2", "dmrg3"])
 def test_mps_optimizer_long_range_dmrg_seeds_disposable_fit_guess(mode):
     """DMRG keeps the target exact and seeds only the disposable FIT guess."""
     stream = [
@@ -62,12 +62,13 @@ def test_mps_optimizer_long_range_dmrg_seeds_disposable_fit_guess(mode):
         chi=4,
         mode=mode,
     )
-    out = optimizer.run(progbar=False, n_iter=4, fit_rtol=None, fit_block_size=2)
+    out = optimizer.run(progbar=False, n_iter=4, fit_rtol=None)
 
     assert float(
         np.real(py.tn_fidelity(out, reference, contraction_opt="greedy"))
     ) == pytest.approx(1.0, abs=1.0e-12)
-    assert out.max_bond() == 2
+    # One-site refinement retains the SRC guess rank; block modes can reduce it.
+    assert out.max_bond() == (4 if mode == "dmrg" else 2)
     assert optimizer.norm_diagnostics()["infidelity"] == pytest.approx(
         0.0, abs=1.0e-12
     )
@@ -535,7 +536,6 @@ def test_mps_optimizer_progress_bar_uses_mode_name(
     [
         ("fit", "dmrg"),
         ("dmrg", "dmrg"),
-        ("dmrg1", "dmrg1"),
         ("dmrg2", "dmrg2"),
         ("dmrg3", "dmrg3"),
     ],
@@ -946,7 +946,7 @@ def test_mps_optimizer_timing_reports_fit_sweeps_and_sites():
         qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=31),
         gates=[(qu.CNOT(), (0, 2))],
         chi=2,
-        mode="dmrg",
+        mode="dmrg2",
     )
 
     opt.run(progbar=False, n_iter=3, timing=True, fit_block_size=2)
@@ -1054,3 +1054,60 @@ def test_mps_optimizer_timing_transfers_records_without_internal_copies(
     assert timing["fit_steps"]
     timing["fit_steps"].clear()
     assert optimizer.last_run_timing["fit_steps"]
+
+
+@pytest.mark.parametrize("entry", ["constructor", "set_mode", "run", "shots"])
+def test_removed_dmrg1_is_rejected(entry):
+    state = qtn.MPS_computational_state("+00", dtype="complex128")
+    gates = [(qu.CNOT(), (0, 2))]
+    opt = py.MpsOptimizer(state, gates, chi=4, mode="dmrg2")
+    before = opt.to_dense().copy()
+    with pytest.raises(ValueError, match="dmrg1.*removed.*dmrg"):
+        if entry == "constructor":
+            py.MpsOptimizer(state, gates, chi=4, mode="dmrg1")
+        elif entry == "set_mode":
+            opt.set_mode("dmrg1")
+        elif entry == "run":
+            opt.run(mode="dmrg1")
+        else:
+            opt.run(shots=2, run_kwargs={"mode": "dmrg1"})
+    np.testing.assert_array_equal(opt.to_dense(), before)
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "fit"])
+@pytest.mark.parametrize("block_size", [2, 3])
+def test_one_site_dmrg_rejects_block_updates(mode, block_size):
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("+00", dtype="complex128"),
+        [(qu.CNOT(), (0, 2))], chi=4, mode=mode,
+    )
+    before = opt.to_dense().copy()
+    with pytest.raises(ValueError, match="fixes fit_block_size=1.*dmrg2.*dmrg3"):
+        opt.run(fit_block_size=block_size)
+    np.testing.assert_array_equal(opt.to_dense(), before)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("fast_path", [False, True])
+def test_dmrg_never_runs_block_sweeps(monkeypatch, batch_size, fast_path):
+    """Even batching and fast-path requests leave DMRG strictly one-site."""
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dmrg must not perform a block FIT sweep")
+
+    monkeypatch.setattr(py.FIT, "_run_gate_two_site_sweep", forbidden)
+    monkeypatch.setattr(py.FIT, "_run_gate_three_site_sweep", forbidden)
+    state = qtn.MPS_computational_state("+000", dtype="complex128")
+    gates = [(qu.CNOT(), (0, 1)), (qu.CNOT(), (1, 3))]
+    exact = py.MpsOptimizer(state, gates, chi=4, mode="exact")
+    exact.run()
+    opt = py.MpsOptimizer(state, gates, chi=4, mode="dmrg")
+    opt.run(
+        n_iter=4, fit_rtol=None, k_2q_batch=batch_size, fit_max_span=None,
+        fit_single_pair_fast_path=fast_path, cutoff=0.0, timing=True,
+    )
+    records = opt.get_run_timing()["fit_steps"]
+    assert records and {r["block_size"] for r in records} == {1}
+    assert len(records) == 8 // batch_size
+    assert not opt.get_fit_diagnostics()["fallback"]
+    assert "dmrg1_one_site_locked" not in opt.get_fit_diagnostics()
+    np.testing.assert_allclose(opt.to_dense().ravel(), exact.to_dense().ravel(), atol=1e-12)

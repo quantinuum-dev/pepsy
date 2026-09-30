@@ -14,6 +14,14 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Selecting TreeOptimizer's legacy `dmrg1` mode now warns to use `dmrg` for
+  one-site refinement, while preserving the legacy growth schedule.
+
+- `TreeOptimizer(mode="dmrg")` now defaults to `fit_block_size=1`, refining
+  only one tree node at a time from its initialized guess without multi-node
+  FIT warm-up. The four-iteration budget still allows eight directional passes;
+  explicit larger block sizes and named DMRG schedules remain available.
+
 - Cluster-MPO facades now accept `preparation="frontier"` or `"automaton"`
   with fixed uncapped construction, plus `delinearize=True` for integrated
   NumPy QR dependency removal. Single and ordered-product calls preserve the
@@ -175,9 +183,15 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Changed
 
+- Removed `MpsOptimizer(mode="dmrg1")`; use `mode="dmrg"` for one-site
+  FIT refinement from the initialized guess. `dmrg` rejects block sizes two
+  and three; select `dmrg2` or `dmrg3` for multi-site updates. DMRG2/3 schedules
+  are unchanged. Removed the old DMRG1 growth reservation and latch diagnostic;
+  mixed-mode reasons now use `guess_direct_dmrg`.
+
 - Generic `MpsOptimizer` modes `dmrg` and `fit` now default to one-site FIT
   (`fit_block_size=1`), avoiding two-site SVD updates during refinement.
-  Explicit block sizes two/three and named DMRG schedules remain available;
+  Use the named `dmrg2`/`dmrg3` schedules for multi-site updates;
   target preparation and guess construction may still use SVD.
   Native one-site preparation preserves charge sectors without attempting
   dense bond padding.
