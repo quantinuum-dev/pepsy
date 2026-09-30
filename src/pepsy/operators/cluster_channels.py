@@ -394,12 +394,12 @@ class ClusterChannelPlan:
         """Trace the constructed compact operator with explicit contraction controls."""
         from .pepo_trace import _trace_options, trace_pepo
 
+        if self._layout.kind == "mpo" and contract_opts is not None:
+            raise ValueError("contract_opts requires a graph or square PEPO channel plan.")
         trace_options = _trace_options(state_budget, contract_opts, materialized=True)
         result = self.exp(step, parameters, coefficients=coefficients,
                           delinearize=delinearize, delinearize_opts=delinearize_opts)
         if self._layout.kind == 'mpo':
-            if contract_opts is not None:
-                raise ValueError("contract_opts requires a graph or square PEPO channel plan.")
             value = result.trace()
             return value / self._layout.dimension**len(self._layout.sites) if normalized else value
         return trace_pepo(result, normalized=normalized, **trace_options)

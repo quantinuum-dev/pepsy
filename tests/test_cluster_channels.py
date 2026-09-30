@@ -307,5 +307,6 @@ def test_channel_trace_options_are_explicit():
     with pytest.raises(TypeError, match="contract_opts must be a mapping"):
         square.trace_exp(**arguments(values), contract_opts=[])
     mpo = prepare_cluster_channels(source("mpo"), **arguments(values))
-    with pytest.raises(ValueError, match="contract_opts requires"):
-        mpo.trace_exp(**arguments(values), contract_opts={})
+    with patch.object(mpo, "exp", side_effect=AssertionError("unexpected construction")):
+        with pytest.raises(ValueError, match="contract_opts requires"):
+            mpo.trace_exp(**arguments(values), contract_opts={})
