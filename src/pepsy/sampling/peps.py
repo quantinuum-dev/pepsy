@@ -85,12 +85,14 @@ class PepsSampler:
     amplitude_max_cost : float, optional
         Optional maximum Cotengra estimated exact contraction cost. Exceeding
         it raises before execution; no approximate amplitude is substituted.
-    amplitude_mode : {"boundary", "none", "exact"}, default="boundary"
+    amplitude_mode : {"proposal", "boundary", "exact", "none"}, default="proposal"
         Evaluate amplitudes with a full exact contraction or a truncated
         single-layer boundary-MPS sweep. Boundary amplitudes and the resulting
         importance weights are approximate; proposal probabilities remain those
-        of the actual sampling procedure. "none" skips amplitude evaluation
+        of the actual sampling procedure. "proposal" skips amplitude evaluation
         and returns proposal probabilities with equal averaging weights.
+        "none" is a compatibility alias; result metadata retains the supplied
+        spelling. The default is "proposal"; amplitude corrections are opt-in.
     amplitude_chi : int, optional
         Boundary amplitude bond cap. Defaults to chi_prime in boundary mode.
         If both are None, the boundary sweep has no bond cap; cutoff still applies.
@@ -137,7 +139,7 @@ class PepsSampler:
         row_contraction_opt="auto-hq",
         amplitude_max_intermediate_bytes=None,
         amplitude_max_cost=None,
-        amplitude_mode="boundary",
+        amplitude_mode="proposal",
         amplitude_chi=None,
         row_cache_max_bytes=64 * 2**20,
         row_cache_mode="factored",
@@ -163,8 +165,9 @@ class PepsSampler:
             has_cap = self.sample_chi is not None or self.marginal_chi not in (None, 0)
             self.boundary_engine = "dmrg" if has_cap else "exact"
         self.ket_compression = self._normalize_ket_compression(ket_compression)
-        if amplitude_mode not in {"exact", "boundary", "none"}:
-            raise ValueError("amplitude_mode must be 'boundary', 'none', or 'exact'.")
+        if amplitude_mode not in {"exact", "boundary", "proposal", "none"}:
+            raise ValueError("amplitude_mode must be 'boundary', 'proposal', or 'exact' "
+                             "('none' is an alias for 'proposal').")
         self.amplitude_mode = amplitude_mode
         self.amplitude_chi = self._validate_optional_chi(amplitude_chi, "amplitude_chi")
         if amplitude_mode == "boundary":
@@ -1724,7 +1727,7 @@ class PepsSampler:
 
     def _sampled_amplitude(self, config):
         """Keep proposal-only draws independent of every amplitude evaluator."""
-        if self.amplitude_mode == "none":
+        if self.amplitude_mode in {"proposal", "none"}:
             return None
         return self._projected_amplitude_scaled(config)
 
@@ -1780,9 +1783,13 @@ class PepsSampler:
             draws, logs = self._draw_grouped_choices(rng, rhos, groups, site=site)
             ket_ind = self._site_inds[site]
             for gi, (group, values) in enumerate(zip(groups, draws)):
-                for value in np.unique(values):
+                outcomes = np.unique(values)
+                for value in outcomes:
                     shot_indices = group["indices"][values == value]
-                    working = group["working"].copy()
+                    # A group owns its network. If it does not split, move
+                    # that network forward instead of copying it at every site.
+                    working = (group.pop("working") if len(outcomes) == 1
+                               else group["working"].copy())
                     working.isel_({ket_ind: int(value)})
                     next_groups.append(
                         {
@@ -1795,6 +1802,9 @@ class PepsSampler:
             groups = next_groups
             max_groups = max(max_groups, len(groups))
 
+        # Completed conditionals are not needed by amplitude contractions.
+        for group in groups:
+            group.pop("working")
         return groups, max_groups
 
     def _sample_batch_boundary(self, rng, samples):
@@ -1881,6 +1891,8 @@ class PepsSampler:
             self._last_boundary_mps = (
                 None if last_phi is None else last_phi.copy()
             )
+        for group in groups:
+            group["phi"] = None
         self._last_row_cache_stats = {
             "rows": self.Ly,
             "suffix_cache_builds": cache_builds,
@@ -1918,9 +1930,11 @@ class PepsSampler:
                 draws, logs = self._draw_grouped_choices(rng, rhos, groups, site=site)
                 ket_ind = self._site_inds[site]
                 for gi, (group, values) in enumerate(zip(groups, draws)):
-                    for value in np.unique(values):
+                    outcomes = np.unique(values)
+                    for value in outcomes:
                         shot_indices = group["indices"][values == value]
-                        center = group["center"].copy()
+                        center = (group.pop("center") if len(outcomes) == 1
+                                  else group["center"].copy())
                         center.isel_({ket_ind: int(value)})
                         next_groups.append(
                             {
@@ -1950,6 +1964,8 @@ class PepsSampler:
             self._last_boundary_mps = (
                 None if last_phi is None else last_phi.copy()
             )
+        for group in groups:
+            group["phi"] = None
         self._last_row_cache_stats = {
             "rows": self.Ly,
             "suffix_cache_builds": 0,
@@ -2021,7 +2037,7 @@ class PepsSampler:
                 [value[0] for value in omegas],
                 [value[1] for value in omegas],
             ),
-            ps=None if self.amplitude_mode == "none" else (
+            ps=None if self.amplitude_mode in {"proposal", "none"} else (
                 [value[0] for value in amplitudes],
                 [value[1] for value in amplitudes],
             ),
@@ -2033,8 +2049,25 @@ class PepsSampler:
             raise ValueError(f"{name} must be a positive integer.")
         return int(value)
 
+    def _resolve_chunk_size(self, chunk_size, samples):
+        """Bound automatic prefix groups while retaining useful row caches."""
+        if not isinstance(chunk_size, str) or chunk_size != "auto":
+            return self._positive_sample_count(chunk_size, "chunk_size")
+        # Exact groups hold full conditioned networks. Without a usable row
+        # cache, prefer one history at a time over many independent centers.
+        if self.boundary_engine == "exact" or not self.row_cache_max_bytes:
+            return 1
+        per_group = self._estimate_row_cache_bytes()
+        available = self.row_cache_max_bytes - self._initial_row_cache_estimate_bytes
+        count = max(1, min(samples, 32, available // max(1, per_group)))
+        if self.row_cache_mode == "dense":
+            count = min(count, 32 if self.Lx * self.Ly <= 9 else 4)
+            if self.marginal_chi not in (None, 0) and self.Lx * self.Ly > 9:
+                return 1
+        return int(count)
+
     def iter_samples(
-        self, samples: int, *, chunk_size: int = 128, seed: int | None = None,
+        self, samples: int, *, chunk_size: int | str = 128, seed: int | None = None,
     ) -> Iterator[PEPSSampleResult]:
         """Yield bounded prefix batches with one continuous backend RNG.
 
@@ -2042,30 +2075,42 @@ class PepsSampler:
         change draw order. Each yielded result and diagnostics describe that
         chunk. Consume/discard results to bound memory; retained results still
         require output storage. Boundary caches are reused until refresh().
+        ``"auto"`` selects at most 32 shots using the row-cache estimate, or
+        one shot for exact proposals or disabled caches. It is not a total
+        memory limit. The resolved size is reported in ``batch_stats``.
         """
         samples = self._positive_sample_count(samples, "samples")
-        chunk_size = self._positive_sample_count(chunk_size, "chunk_size")
+        requested_chunk_size = chunk_size
+        chunk_size = self._resolve_chunk_size(chunk_size, samples)
         rng = self._make_rng(seed)
         for start in range(0, samples, chunk_size):
-            yield self._sample_batch(rng, min(chunk_size, samples - start))
+            batch = self._sample_batch(rng, min(chunk_size, samples - start))
+            self._last_batch_stats.update(
+                requested_chunk_size=requested_chunk_size, chunk_size=chunk_size,
+            )
+            yield batch
+            del batch  # Do not retain discarded output while building the next chunk.
 
     def sample_batch(
-        self, samples: int = 1, seed: int | None = None, *, chunk_size: int | None = None,
+        self, samples: int = 1, seed: int | None = None, *, chunk_size: int | str | None = None,
     ) -> PEPSSampleResult:
         """Sample with shared prefixes and optional bounded working batches.
 
         ``chunk_size`` bounds live prefix states, not the returned output or
         exact-contraction workspace. Omit it to preserve the original single
         batch draw order. Use :meth:`iter_samples` to stream the output too.
+        ``"auto"`` uses the cache-aware bounded policy of :meth:`iter_samples`.
         """
         samples = self._positive_sample_count(samples, "samples")
         if chunk_size is None:
             return self._sample_batch(self._make_rng(seed), samples)
-        chunk_size = self._positive_sample_count(chunk_size, "chunk_size")
+        requested_chunk_size = chunk_size
+        chunk_size = self._resolve_chunk_size(chunk_size, samples)
         result = PEPSSampleResult([], ([], []),
-                                  None if self.amplitude_mode == "none" else ([], []),
+                                  None if self.amplitude_mode in {"proposal", "none"} else ([], []),
                                   amplitude_mode=self.amplitude_mode)
         stats = {"samples": samples, "chunks": 0, "chunk_size": chunk_size,
+                 "requested_chunk_size": requested_chunk_size,
                  "max_prefix_groups": 0, "conditional_batches": 0,
                  "final_prefix_groups": 0, "boundary_engine": self.boundary_engine}
         diagnostics = {}
@@ -2159,5 +2204,5 @@ class PepsSampler:
             configs=configs,
             amplitude_mode=self.amplitude_mode,
             omegas=(omegas_mantissa, omegas_exponent),
-            ps=None if self.amplitude_mode == "none" else (ps_mantissa, ps_exponent),
+            ps=None if self.amplitude_mode in {"proposal", "none"} else (ps_mantissa, ps_exponent),
         )

@@ -71,11 +71,13 @@ class PEPSSampleResult:
         Pair ``(mantissas, exponents)`` for sampled PEPS amplitude estimates,
         or None when amplitude evaluation was disabled.
     amplitude_mode
-        ``"boundary"``, ``"none"``, or ``"exact"``. Boundary-mode amplitudes and
-        importance weights include finite-bond contraction error. "none" gives
+        ``"boundary"``, ``"proposal"``, ``"exact"``, or the compatibility alias
+        ``"none"``. Boundary-mode amplitudes and importance weights include
+        finite-bond contraction error. "proposal" (also "none") gives
         equal weights for proposal averages, not an importance correction.
+        The supplied spelling is retained for compatibility with saved records.
         The record's legacy default "exact" supports existing BP/manual records;
-        PepsSampler explicitly supplies its selected mode (default "boundary").
+        PepsSampler explicitly supplies its selected mode (default "proposal").
     log_probabilities, log_abs_amplitudes, log_weights
         Natural-log NumPy arrays computed from the scaled pairs without
         materializing their powers of ten. Access copies any backend scalars
@@ -107,6 +109,10 @@ class PEPSSampleResult:
         ], dtype=float)
         if absolute:
             values = np.abs(values)
+        elif (np.iscomplexobj(values) or np.any(~np.isfinite(values))
+              or np.any(values < 0) or np.any(~np.isfinite(powers))):
+            raise ValueError("Proposal probabilities need finite nonnegative real mantissas "
+                             "and finite exponents.")
         with np.errstate(divide="ignore"):
             return np.log(values) + powers * math.log(10.0)
 
@@ -119,15 +125,19 @@ class PEPSSampleResult:
     def log_abs_amplitudes(self):
         """Natural logs of the absolute PEPS amplitudes, as a NumPy array."""
         if self.ps is None:
-            raise ValueError("Amplitudes were not evaluated (amplitude_mode='none').")
+            raise ValueError(f"Amplitudes were not evaluated (amplitude_mode={self.amplitude_mode!r}).")
         return self._scaled_logs(self.ps, absolute=True)
 
     @property
     def log_weights(self):
         """Log importance weights, or zeros for uncorrected proposal averages."""
-        if self.amplitude_mode == "none":
-            return np.zeros(len(self), dtype=float)
-        return 2.0 * self.log_abs_amplitudes - self.log_probabilities
+        target_logs = (None if self.amplitude_mode in {"proposal", "none"}
+                       else 2.0 * self.log_abs_amplitudes)
+        proposal_logs = self.log_probabilities
+        if np.any(~np.isfinite(proposal_logs)):
+            raise ValueError("Sampled configurations must have positive finite proposal probabilities.")
+        # Even equal-weight averages must not conceal malformed saved q data.
+        return np.zeros(len(self), dtype=float) if target_logs is None else target_logs - proposal_logs
 
     @property
     def normalized_weights(self):
@@ -169,13 +179,13 @@ class PEPSSampleResult:
         return {
             "samples": len(weights),
             "amplitude_mode": self.amplitude_mode,
-            "weight_kind": "proposal" if self.amplitude_mode == "none" else "importance",
+            "weight_kind": "proposal" if self.amplitude_mode in {"proposal", "none"} else "importance",
             "weights_are_approximate": self.amplitude_mode != "exact",
             "effective_sample_size": ess,
             "ess_fraction": ess / len(weights),
             "max_normalized_weight": float(np.max(weights)),
             "zero_weights": int(np.count_nonzero(np.isneginf(logs))),
-            "log_mean_weight": (None if self.amplitude_mode == "none" else
+            "log_mean_weight": (None if self.amplitude_mode in {"proposal", "none"} else
                                 float(largest + np.log(np.exp(logs - largest).mean()))),
         }
 

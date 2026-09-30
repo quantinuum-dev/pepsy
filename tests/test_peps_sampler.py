@@ -59,7 +59,7 @@ def test_peps_sampler_seed_and_source_network_are_stable():
         dtype="complex128",
     )
     original_tags = set(peps.tags)
-    sampler = pepsy.PepsSampler(peps)
+    sampler = pepsy.PepsSampler(peps, amplitude_mode="boundary")
 
     first = sampler.sample(samples=3, seed=17)
     second = sampler.sample(samples=3, seed=17)
@@ -281,14 +281,14 @@ def test_peps_sampler_infers_array_backend(array_backend, kwargs, monkeypatch):
 
     backend, convert = array_backend
     source = qtn.PEPS.rand(2, 3, bond_dim=2, dtype="complex64", seed=83)
-    reference = pepsy.PepsSampler(source, contraction_opt="greedy", **kwargs)
+    reference = pepsy.PepsSampler(source, amplitude_mode="boundary", contraction_opt="greedy", **kwargs)
     dense = source.to_dense(
         [source.site_ind(*site) for site in reference.site_order]
     ).reshape(-1)
     state = source.copy()
     state.apply_to_arrays(convert)
     before = [ar.to_numpy(t.data).copy() for t in state.tensors]
-    sampler = pepsy.PepsSampler(state, contraction_opt="greedy", **kwargs)
+    sampler = pepsy.PepsSampler(state, amplitude_mode="boundary", contraction_opt="greedy", **kwargs)
     assert sampler.backend == backend
     assert callable(sampler.to_backend)
     signature = infer_backend_signature(state.tensors[0].data)
@@ -430,7 +430,7 @@ def test_peps_sampler_reference_batch_and_duplicate_amplitudes(array_backend, mo
         [[np.array([1.0, 0.0], dtype="complex64")] * 2] * 2
     )
     sampler = pepsy.PepsSampler(
-        state, to_backend=convert, sample_chi=2, marginal_chi=0,
+        state, amplitude_mode="boundary", to_backend=convert, sample_chi=2, marginal_chi=0,
         boundary_engine="quimb-mps", contraction_opt="greedy",
         row_cache_max_bytes=0,
     )
@@ -505,8 +505,8 @@ def test_peps_sampler_large_cache_uses_reference_before_allocation(monkeypatch):
     state = qtn.PEPS.rand(3, 3, bond_dim=4, dtype="complex128", seed=101)
     options = dict(sample_chi=16, marginal_chi=32, boundary_engine="quimb-mps",
                    contraction_opt="greedy")
-    sampler = pepsy.PepsSampler(state, row_cache_max_bytes=64 * 2**20, row_cache_mode="dense", **options)
-    reference = pepsy.PepsSampler(state, row_cache_max_bytes=0, **options)
+    sampler = pepsy.PepsSampler(state, amplitude_mode="boundary", row_cache_max_bytes=64 * 2**20, row_cache_mode="dense", **options)
+    reference = pepsy.PepsSampler(state, amplitude_mode="boundary", row_cache_max_bytes=0, **options)
 
     def forbidden_cache(*args, **kwargs):
         pytest.fail("Oversized dense row cache must not be constructed")
@@ -810,8 +810,8 @@ def test_peps_sampler_cutoff_aliases_preserve_sampled_distribution(engine):
     """New cutoff names select the same proposal and original amplitudes."""
     state = qtn.PEPS.rand(2, 3, bond_dim=2, dtype="complex128", seed=149)
     options = dict(boundary_engine=engine, contraction_opt="greedy")
-    canonical = pepsy.PepsSampler(state, chi=4, chi_prime=2, **options)
-    legacy = pepsy.PepsSampler(state, marginal_chi=4, sample_chi=2, **options)
+    canonical = pepsy.PepsSampler(state, amplitude_mode="boundary", chi=4, chi_prime=2, **options)
+    legacy = pepsy.PepsSampler(state, amplitude_mode="boundary", marginal_chi=4, sample_chi=2, **options)
     assert canonical.chi == legacy.marginal_chi == 4
     assert canonical.chi_prime == legacy.sample_chi == 2
     first = canonical.sample_batch(samples=8, seed=17)
@@ -870,9 +870,9 @@ def test_peps_sampler_validates_canonical_cutoffs_and_conflicts(options, message
 def test_peps_sampler_uncompressed_ket_needs_no_cap(engine):
     """Explicitly uncompressed boundaries recover the exact small-state Born law."""
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=163)
-    sampler = pepsy.PepsSampler(state, chi=16, ket_compression=None,
+    sampler = pepsy.PepsSampler(state, amplitude_mode="boundary", chi=16, ket_compression=None,
                                boundary_engine=engine, cutoff=0.0)
-    reference = pepsy.PepsSampler(state)
+    reference = pepsy.PepsSampler(state, amplitude_mode="boundary")
     assert sampler.chi_prime is None
     configs = list(product(range(2), repeat=4))
     np.testing.assert_allclose([sampler.probability(c) for c in configs],
@@ -939,7 +939,7 @@ def test_peps_sampler_auto_cutoffs_match_born_by_precision(
         originals = [ar.to_numpy(t.data).copy() for t in state]
         kwargs = {} if engine == "exact" else dict(chi=8, chi_prime=4)
         sampler = pepsy.PepsSampler(
-            state, boundary_engine=engine, ket_compression=compression,
+            state, amplitude_mode="boundary", boundary_engine=engine, ket_compression=compression,
             cutoff="auto", cutoff_mode="auto", contraction_opt="greedy", **kwargs,
         )
         assert sampler.cutoff == expected_cutoff
@@ -1082,7 +1082,7 @@ def test_peps_sampler_future_relative_cutoff_is_scale_invariant(array_backend, d
                 tensor.modify(data=convert(data * (scale if y == 2 else 1.0)))
             originals = [ar.to_numpy(t.data).copy() for t in state]
             sampler = pepsy.PepsSampler(
-                state, chi=16, chi_prime=4, boundary_engine="quimb-mps",
+                state, amplitude_mode="boundary", chi=16, chi_prime=4, boundary_engine="quimb-mps",
                 cutoff="auto", cutoff_mode="auto", contraction_opt="greedy",
             )
             tolerance = 3e-5 if dtype == "complex64" else 1e-11
@@ -1333,7 +1333,7 @@ def test_peps_sampler_repaired_draws_queries_and_weights_agree(policy, options, 
     """All routes use the repaired conditional in the actual sampled log q."""
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=239)
     sampler = pepsy.PepsSampler(
-        state, rho_positivity=policy, contraction_opt="greedy", **options,
+        state, amplitude_mode="boundary", rho_positivity=policy, contraction_opt="greedy", **options,
     )
     conditional = sampler._conditional_probabilities_batch
 
@@ -1452,7 +1452,7 @@ def test_peps_sampler_row_cache_sharing_and_refresh(engine, monkeypatch):
     """Only the initial row persists; later rows depend on complete prefixes."""
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=251)
     sampler = pepsy.PepsSampler(
-        state, chi=8, chi_prime=4, boundary_engine=engine,
+        state, amplitude_mode="boundary", chi=8, chi_prime=4, boundary_engine=engine,
         row_cache_max_bytes=64 * 2**20, contraction_opt="greedy",
         row_cache_mode="dense",
     )

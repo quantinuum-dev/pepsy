@@ -42,7 +42,7 @@ sampler = PepsSampler(
     ket_compression="quimb",    # or "fit", or None
     cutoff="auto",              # Resolve from the working tensor dtype
     cutoff_mode="auto",         # Relative discarded squared weight (rsum2)
-    amplitude_mode="boundary",  # Default: boundary-MPS amplitude correction
+    amplitude_mode="boundary",  # Opt in to boundary-MPS amplitude correction
 )
 ```
 
@@ -162,10 +162,18 @@ the full-contraction exact mode can handle them.
 ### Array backend and conversion
 
 By default, the sampler infers the backend, dtype, and device from the PEPS
-arrays. NumPy, Torch (CPU or CUDA), and JAX arrays use their own contractions,
+arrays. NumPy, Torch (CPU or CUDA), CuPy, and JAX arrays use their own contractions,
 identity caps, local density matrices, conditional probabilities, and random
 draws. The public `sampler.backend` reports the inferred array backend;
 `boundary_engine` independently selects the contraction algorithm.
+
+The numerical core uses Autoray namespaces inferred from the actual arrays,
+including their dtype/device (`ar.get_namespace(template)` and its real-valued
+counterpart). This follows the [Autoray namespace API](https://autoray.readthedocs.io/en/latest/automatic_dispatch.html#namespace-api).
+The same rule covers cached environment tensors, local rho construction,
+conditional probabilities, RNG, and physical-slice scaling for amplitudes.
+Backend support does not imply identical sequences, precision policy, or
+identical solver convergence across libraries/devices.
 
 Supply a callable `to_backend` to convert a private copy explicitly:
 
@@ -214,6 +222,10 @@ separately. The existing result lists contain host scalars. `rho_diagnostics`
 converts its cached scalar diagnostics when accessed. This is an eager sampler;
 it does not provide a fully compiled JAX or Torch sampling loop, and contractions
 and boundary compression still run separately for distinct prefix groups.
+Result log arrays, normalized weights, and summary statistics are explicitly
+NumPy host postprocessing. This does not move the PEPS, rho, boundary MPS, or
+cached tensor environments to NumPy, and is not a claim that the entire Python
+sampling loop or result analysis is device-resident.
 
 ### Hermitian and positive local proposals
 
@@ -284,12 +296,14 @@ rank does not by itself establish exact sampling; check convergence against an
 independent reference and account for the cutoff as well.
 
 `result.configs` contains row-major physical-index configurations, while
-`result.omegas` and `result.ps` contain proposal probabilities and projected
-PEPS amplitudes as `(mantissas, exponents)`, representing `m * 10**e`. For multiple shots,
+`result.omegas` contains proposal probabilities as `(mantissas, exponents)`,
+representing `m * 10**e`. `result.ps` is `None` by default; explicit boundary
+or exact amplitude modes populate it with scaled PEPS amplitudes. For multiple shots,
 `sample_batch(...)` shares a local Quimb conditional network until shot
 prefixes diverge:
 
 ```python
+sampler = PepsSampler(peps, chi=64, chi_prime=32, amplitude_mode="boundary")
 batch = sampler.sample_batch(samples=256, seed=0)
 log_q = batch.log_probabilities        # natural log of proposal q(S)
 log_abs_psi = batch.log_abs_amplitudes # natural log of |Psi(S)|
@@ -304,8 +318,8 @@ the host when accessed and preserve the existing `configs`, `omegas`, and
 `ps` fields. Weights are unnormalized and use the original PEPS amplitudes.
 A zero amplitude has `log_abs_amplitudes = -inf` and, for positive proposal
 probability, `log_weights = -inf`. Sampling produces positive-probability
-configurations; manually constructed zero-probability results retain ordinary
-logarithmic division semantics (infinity or undefined `0/0`).
+configurations; weight access rejects manually constructed zero-probability
+draws instead of returning infinity or an undefined `0/0`.
 
 This uses prefix groups rather than adding a shared batch index to PEPS
 tensors, because a repeated Quimb index would be contracted as an ordinary
@@ -383,6 +397,7 @@ from pepsy.sampling import PepsSampler
 optimizer = build_optimizer(parallel=False, directory="/tmp/peps-paths")
 sampler = PepsSampler(
     peps, chi=16, chi_prime=8,
+    amplitude_mode="exact",  # Opt in to amplitudes and the exact-plan limits below.
     contraction_opt=optimizer, row_contraction_opt="auto-hq",
     row_cache_mode="factored", row_cache_max_bytes=64 * 2**20,
     amplitude_max_intermediate_bytes=512 * 2**20,
@@ -421,7 +436,7 @@ Amplitude evaluation is a separate choice for importance correction:
 ```python
 sampler = PepsSampler(
     peps, chi=64, chi_prime=32,
-    amplitude_mode="boundary",  # default; full exact amplitudes are opt-in
+    amplitude_mode="boundary",  # opt-in correction; default is "proposal"
     amplitude_chi=32,           # defaults to chi_prime
 )
 ```
@@ -443,12 +458,18 @@ amplitude mode. Neither cap controls total memory.
 To skip amplitude evaluation entirely and average the proposal draws directly:
 
 ```python
-sampler = PepsSampler(peps, chi=64, chi_prime=32, amplitude_mode="none")
-batch = sampler.sample_batch(4096, seed=17, chunk_size=32)
+sampler = PepsSampler(peps, chi=64, chi_prime=32, amplitude_mode="proposal")
+batch = sampler.sample_batch(4096, seed=17, chunk_size="auto")
 q_logs = batch.log_probabilities  # sum of the selected site log conditionals
 assert batch.ps is None
 weights = batch.normalized_weights  # equal weights: 1 / number of samples
 ```
+
+`amplitude_mode="none"` remains a compatibility alias for `"proposal"`.
+Both spellings use the same algorithm; result and diagnostic metadata retain
+the supplied spelling so existing saved-record consumers keep working.
+The default is `"proposal"`: no separate amplitude contractions. Select
+`"boundary"` or `"exact"` explicitly to obtain amplitudes and correction weights.
 
 This mode never evaluates amplitudes, including in serial and streamed calls.
 `log_weights` is zero, `weight_kind` is `"proposal"`, and `log_mean_weight` is
@@ -457,6 +478,14 @@ raises instead of inventing amplitudes or phases from q. ESS equals the number
 of draws by construction; it does not diagnose proposal accuracy. Ordinary
 averages use equal weights, **not q again**, because the configurations were
 already drawn from q.
+
+The product of selected conditional probabilities is q, not an importance
+weight or a complex PEPS amplitude. `0.5 * batch.log_probabilities` gives
+`log(sqrt(q))`, the log magnitude of a normalized positive proposal wavefunction.
+The magnitude sqrt(q) approximates the normalized PEPS amplitude magnitude
+only when the proposal converges, and contains neither the PEPS phase nor
+its physical norm. Keep `ps=None` for this mode; use `amplitude_mode="boundary"` or
+`"exact"` when separate amplitude estimates and correction weights are wanted.
 
 Increasing χ and χ′ can recover exact Born probabilities as boundary
 compression and solver errors vanish. A fixed nonzero cutoff or unconverged
@@ -491,6 +520,31 @@ single-batch proposal/draw order. Prefix groups never exceed the current chunk
 size. Caches and exact-contraction workspace are additional memory; this is
 not a hard process/GPU memory limit.
 
+The `sample_batch` default is `chunk_size=None` (one group batch containing
+all requested shots); `iter_samples` defaults to 128 shots per chunk.
+`"auto"` is opt-in and does not change either default.
+
+Use `chunk_size="auto"` to select at most 32 shots, reduced to fit the
+estimated row-cache budget after accounting for the retained initial row.
+This avoids disabling useful suffix caches merely because a fixed chunk is
+too large. Exact proposals, disabled caches, or a budget too small for one
+cached history select one shot at a time; the usual reference fallback still
+applies when a single cached row cannot fit. The estimate is conservative,
+not a measured peak-memory or speed guarantee. `batch_stats["chunk_size"]`
+records the resolved size and `requested_chunk_size` records `"auto"`.
+The policy does not change χ, χ′, cutoff, or amplitude mode. Fix an integer
+chunk size when reproducing a draw sequence across different cache budgets.
+
+For boundary proposals, the original PEPS and future boundaries remain shared.
+Each distinct sampled history owns a conditioned boundary MPS, with at most
+one group per shot in the current chunk. Within a row, sibling groups share their incoming boundary
+and right suffixes, carrying separate left contractions. Unsplit reference
+groups move their owned network forward without copying it. Completed group
+networks are released before optional amplitude contractions; one last
+boundary snapshot remains available for diagnostics. Larger chunks can still
+retain more boundaries after histories diverge. Use `chunk_size=1` for a
+single history at a time, while retaining row-cache reuse.
+
 `sample_batch(..., chunk_size=...)` aggregates conditional counts and maximum
 rho defects/repairs across chunks. `iter_samples` exposes statistics and rho
 diagnostics for the most recently yielded chunk. `row_cache_stats` describes
@@ -502,9 +556,14 @@ A subsequent likelihood query replaces the rho diagnostics but leaves the last
 batch counts intact. Serial `sample` rho diagnostics describe its last draw.
 Each scaled result field must contain one mantissa and exponent per configuration;
 log and weight accessors reject mismatched lengths instead of broadcasting them.
+Proposal mantissas must be finite, real, and nonnegative, with finite
+exponents. Weight access also rejects zero proposal probability for a saved
+draw, including in proposal-only mode; equal weights must not conceal
+malformed probability records. Very small positive probabilities remain
+usable through their log/scaled representation without underflow.
 
 `normalized_weights` computes `exp(log_w - max(log_w))` and normalizes the sum
-(uniform weights in `amplitude_mode="none"`).
+(uniform weights in `amplitude_mode="proposal"`, also spelled `"none"`).
 `effective_sample_size` is `1 / sum(normalized_weights**2)`.
 `weight_diagnostics` adds ESS/N, maximum normalized weight, zero-weight count,
 and the log mean unnormalized weight. With exact amplitudes and full proposal support, the latter

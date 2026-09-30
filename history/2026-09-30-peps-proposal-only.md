@@ -50,7 +50,13 @@ large exponent metadata.
 The amplitude-focused selection passed 68 checks. The downstream PEPS,
 observable, and sweep selection passed 91 checks; both saved-schema regressions
 passed again after the stability fix. Changed-file and full Pepsy Ruff passed.
-The broader CPU suite result is recorded below after completion.
+The broader CPU sampler/amplitude/API/layout selection completed with
+**367 passed, 2 skipped, 2 failures** in 449 seconds. One failure was the
+already-corrected legacy exact-amplitude test (the process had collected its
+old definition); its focused rerun passed. The other was the existing installed
+version metadata mismatch. Smoke gave 92 passes and that same version failure;
+an earlier selected public-API/layout smoke run gave 54 passes. No full-suite
+success is claimed.
 
 A JAX GPU probe failed in existing future-environment/conditional construction,
 before amplitude evaluation (cuBLAS autotuning failure in Quimb-MPS; a DMRG
@@ -60,3 +66,43 @@ was interrupted after 202 passes; its two failures were tests assuming exact
 amplitudes by default and have been made explicit reference tests. Both passed
 in their focused rerun. The installed/project version metadata mismatch remains
 an independent environment failure, not addressed by changing installations.
+
+## Follow-up cache verification
+
+The user asked to verify fixed future boundaries and DMRG-style site environment
+reuse. Both are already implemented: `_prepare_future_environments` constructs
+the future MPSs once per refresh; `_build_factored_row_cache` selects `X{x}` and
+site/BRA tags, builds suffixes once per conditioned slice, `_row_local_rho`
+combines left/local/right, and `_advance_row_prefix` projects both ket/bra and
+updates the left side. Prefix groups share suffixes until they move to a new
+slice; different histories must not share their conditioned numerical values.
+
+An instrumented 3×3 D=2 probe with default DMRG futures, factored cache, two
+12-shot batches (chunk size 4), and a likelihood query observed one future
+preparation and one initial-row cache build. Future tensors were unchanged.
+Later conditioned rows rebuilt as required by distinct histories; the final
+query reused the initial-row cache and advanced six site prefixes. None mode
+performed zero amplitude contractions. Memory budget fallback remains explicit
+in `row_cache_stats`; caches are not unconditionally enabled for oversized rows.
+
+## Autoray audit requested by the user
+
+Read the linked [Autoray index](https://autoray.readthedocs.io/en/latest/index.html)
+and [dispatch/namespace guide](https://autoray.readthedocs.io/en/latest/automatic_dispatch.html).
+Checked the installed 0.11.1.dev3+g1b476b305 `get_namespace(like,device,dtype,submodule)`
+and `do` signatures. Tensor arithmetic and creation use inferred Autoray
+namespaces; Quimb/Cotengra dispatch contractions to the native arrays. Python/
+NumPy usage in the sampler is dtype metadata, integer grouping, and explicit
+public scalar/diagnostic output. Result weight/log postprocessing is documented
+as host NumPy; the implementation is not an entirely device-resident Python loop.
+
+Added `tests/test_peps_sampler_backend_audit.py` covering boundary/none modes
+and complex64/complex128 on NumPy, Torch CPU/CUDA, JAX CPU, and CuPy CUDA. It
+forbids floating tensor host transfers and checks rho, private PEPS, future
+boundaries, conditioned MPS, suffix caches, and amplitude slices retain their
+backend/dtype/device. The local versions were NumPy 2.5.2, Torch 2.6.0+cu124,
+JAX 0.10.2, and CuPy 14.1.1. All 20 backend/dtype/mode audit cases passed
+(74.84 seconds). The two JAX GPU factored/reference proposal comparisons also
+passed with `JAX_DEFAULT_MATMUL_PRECISION=highest` (115.65 seconds). Default GPU
+matmul precision had produced approximately 1e-4 differences against tight
+reference tolerances; this precision setting is required for that comparison.

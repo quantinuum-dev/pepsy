@@ -24,8 +24,8 @@ def test_factored_proposal_matches_reference_and_preserves_source(backend, engin
     original_values = [ar.to_numpy(t.data).copy() for t in state]
     kwargs = dict(chi=16, chi_prime=4, cutoff=0, boundary_engine=engine,
                   contraction_opt="greedy")
-    reference = PepsSampler(state, row_cache_max_bytes=0, **kwargs)
-    factored = PepsSampler(state, row_cache_mode="factored",
+    reference = PepsSampler(state, amplitude_mode="boundary", row_cache_max_bytes=0, **kwargs)
+    factored = PepsSampler(state, amplitude_mode="boundary", row_cache_mode="factored",
                            row_cache_max_bytes=128 * 2**20, **kwargs)
     configs = list(product(range(2), repeat=6))
     expected = np.array([reference.probability(c) for c in configs])
@@ -204,8 +204,8 @@ def test_factored_truncated_repaired_proposal_matches_reference():
     state = qtn.PEPS.rand(3, 3, bond_dim=3, dtype="complex128", seed=452)
     kwargs = dict(chi=4, chi_prime=2, cutoff="auto", boundary_engine="quimb-mps",
                   rho_positivity="absolute", contraction_opt="greedy")
-    reference = PepsSampler(state, row_cache_max_bytes=0, **kwargs)
-    cached = PepsSampler(state, row_cache_mode="factored", row_cache_max_bytes=64 * 2**20, **kwargs)
+    reference = PepsSampler(state, amplitude_mode="boundary", row_cache_max_bytes=0, **kwargs)
+    cached = PepsSampler(state, amplitude_mode="boundary", row_cache_mode="factored", row_cache_max_bytes=64 * 2**20, **kwargs)
     a = reference.sample_batch(24, seed=5, chunk_size=6)
     b = cached.sample_batch(24, seed=5, chunk_size=6)
     assert a.configs == b.configs
@@ -288,7 +288,7 @@ def test_default_reusable_builder_and_cached_row_optimizer(monkeypatch):
 
     monkeypatch.setattr(tensors, "build_optimizer", build)
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=829)
-    sampler = PepsSampler(state, chi=16, chi_prime=4,
+    sampler = PepsSampler(state, amplitude_mode="boundary", chi=16, chi_prime=4,
                           row_cache_mode="factored", row_cache_max_bytes=2**20)
     assert sampler.contraction_opt is built[0]
     assert sampler.row_contraction_opt == "auto-hq"
@@ -301,9 +301,9 @@ def test_default_reusable_builder_and_cached_row_optimizer(monkeypatch):
     assert sampler.contraction_opt is built[0]
     assert len(built) == 1
     assert sampler.amplitude_plan_info is None
-    explicit = PepsSampler(state, contraction_opt="greedy")
+    explicit = PepsSampler(state, amplitude_mode="boundary", contraction_opt="greedy")
     assert explicit.row_contraction_opt == "auto-hq"
-    override = PepsSampler(state, contraction_opt="greedy", row_contraction_opt="auto-hq")
+    override = PepsSampler(state, amplitude_mode="boundary", contraction_opt="greedy", row_contraction_opt="auto-hq")
     assert override.row_contraction_opt == "auto-hq"
 
 

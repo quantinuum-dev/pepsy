@@ -51,9 +51,9 @@ def test_boundary_amplitude_cap_changes_estimate():
     assert abs(estimates[0] - exact) > 1e-5 * abs(exact)
 
 
-def test_default_amplitudes_are_boundary_with_optional_cap():
+def test_explicit_boundary_amplitudes_with_optional_cap():
     state = qtn.PEPS.rand(2, 2, 2, seed=19, dtype="complex128")
-    sampler = PepsSampler(state, cutoff=0, contraction_opt="greedy")
+    sampler = PepsSampler(state, cutoff=0, contraction_opt="greedy", amplitude_mode="boundary")
     assert sampler.amplitude_mode == "boundary"
     assert sampler.amplitude_chi is None
     result = sampler.sample_batch(3, seed=2)
@@ -63,9 +63,37 @@ def test_default_amplitudes_are_boundary_with_optional_cap():
     assert sampler.amplitude_stats["plan_builds"] == 0
 
 
+@pytest.mark.parametrize("engine", ["exact", "quimb-mps", "dmrg"])
+@pytest.mark.parametrize("method", ["sample", "sample_batch", "stream"])
+def test_default_is_proposal_without_amplitude_work(engine, method, monkeypatch):
+    state = qtn.PEPS.rand(2, 2, 2, seed=20, dtype="complex128")
+    caps = {} if engine == "exact" else dict(chi=8, chi_prime=4)
+    sampler = PepsSampler(state, boundary_engine=engine, contraction_opt="greedy", **caps)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Default proposal sampling must not evaluate amplitudes")
+
+    monkeypatch.setattr(sampler, "_projected_amplitude", forbidden)
+    monkeypatch.setattr(sampler, "_projected_amplitude_scaled", forbidden)
+    if method == "stream":
+        batches = list(sampler.iter_samples(3, seed=2, chunk_size="auto"))
+    elif method == "sample_batch":
+        batches = [sampler.sample_batch(3, seed=2, chunk_size="auto")]
+    else:
+        batches = [sampler.sample(3, seed=2)]
+    for batch in batches:
+        assert batch.amplitude_mode == "proposal"
+        assert batch.ps is None
+        np.testing.assert_allclose(batch.normalized_weights, 1 / len(batch))
+        np.testing.assert_allclose(batch.log_probabilities,
+                                   [sampler.log_probability(c) for c in batch.configs])
+    assert sampler.amplitude_stats == {"plan_builds": 0, "contractions": 0}
+
+
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
 @pytest.mark.parametrize("method", ["sample", "sample_batch", "chunked", "stream"])
-def test_proposal_only_skips_amplitudes_and_preserves_draws(backend, method, monkeypatch):
+@pytest.mark.parametrize("mode", ["proposal", "none"])
+def test_proposal_only_skips_amplitudes_and_preserves_draws(backend, method, mode, monkeypatch):
     state = qtn.PEPS.rand(2, 3, 2, seed=21, dtype="complex128")
     if backend == "torch":
         torch = pytest.importorskip("torch")
@@ -73,8 +101,8 @@ def test_proposal_only_skips_amplitudes_and_preserves_draws(backend, method, mon
     options = dict(chi=4, chi_prime=2, boundary_engine="quimb-mps",
                    contraction_opt="greedy", row_contraction_opt="greedy",
                    rho_positivity="absolute")
-    proposal = PepsSampler(state, amplitude_mode="none", **options)
-    corrected = PepsSampler(state, **options)
+    proposal = PepsSampler(state, amplitude_mode=mode, **options)
+    corrected = PepsSampler(state, amplitude_mode="boundary", **options)
 
     def forbid_amplitude(*args, **kwargs):
         raise AssertionError("proposal-only mode must not evaluate any amplitude")
@@ -91,7 +119,7 @@ def test_proposal_only_skips_amplitudes_and_preserves_draws(backend, method, mon
 
     for raw, weighted in zip(draw(proposal), draw(corrected)):
         assert raw.ps is None
-        assert raw.amplitude_mode == "none"
+        assert raw.amplitude_mode == mode
         assert raw.configs == weighted.configs
         np.testing.assert_allclose(raw.log_probabilities, weighted.log_probabilities)
         np.testing.assert_array_equal(raw.log_weights, np.zeros(len(raw)))
@@ -106,7 +134,7 @@ def test_proposal_only_skips_amplitudes_and_preserves_draws(backend, method, mon
 def test_larger_proposal_caps_recover_born_probabilities():
     state = qtn.PEPS.rand(2, 3, 2, seed=22, dtype="complex128")
     samplers = [PepsSampler(state, chi=cap, chi_prime=cap, cutoff=0,
-                            amplitude_mode="none", boundary_engine="quimb-mps",
+                            amplitude_mode="proposal", boundary_engine="quimb-mps",
                             contraction_opt="greedy", row_contraction_opt="greedy",
                             rho_positivity="absolute") for cap in (1, 16)]
     order = samplers[0].site_order

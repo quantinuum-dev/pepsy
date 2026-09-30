@@ -14,6 +14,12 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- `PepsSampler(amplitude_mode="proposal")` names sampling without separate
+  amplitude evaluation. `"none"` remains a compatible alias, including its
+  existing result metadata. Both return q, `ps=None`, and equal averaging
+  weights. `"proposal"` is now the default; amplitude corrections require
+  explicit `"boundary"` or `"exact"`. Chunk-size defaults are unchanged.
+
 - Optional `TreeSampler(chunk_size=...)` bounds dense shot batches and tiles
   first-child density environments to avoid quartic bond allocations.
   The default remains unchunked, with native outputs and seeded draw ordering
@@ -22,11 +28,21 @@ releases remain backwards-compatible. From 1.0 onward:
   buffers; single-chunk requests reuse their outputs. CuPy sampling and scoring
   honor the captured tree device independently of the current CUDA device.
 
+- `PepsSampler.sample_batch` and `iter_samples` accept `chunk_size="auto"`
+  to bound shared-prefix groups using the row-cache estimate (at most 32).
+  Exact proposals and disabled/insufficient caches use one history at a time.
+  Explicit integer sizes and the existing defaults retain their draw order.
+  Unsplit reference groups avoid network copies, and completed conditional
+  networks are released before optional amplitude contractions. Streams release
+  discarded results before constructing the next chunk. Saved PEPS
+  proposal records now reject malformed probabilities even when equal-weight
+  proposal-only averages are requested.
+
 - `PepsSampler(amplitude_mode="boundary", amplitude_chi=...)` evaluates
   projected amplitudes with a capped boundary-MPS sweep, preserving scaled
   values and phase without a full-network exact amplitude plan. Results and
-  weight diagnostics identify approximate weights. Boundary amplitudes are now
-  the library default; full exact amplitudes require `amplitude_mode="exact"`.
+  weight diagnostics identify approximate weights. Both amplitude methods are
+  opt-in; full exact amplitudes require `amplitude_mode="exact"`.
   `amplitude_mode="none"` skips amplitude contractions, returns `ps=None`, and
   uses equal weights for ordinary proposal averages with explicit diagnostics.
 

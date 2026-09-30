@@ -90,7 +90,7 @@ def test_peps_4x4_end_to_end(backend, dtype, engine, chi, chip, cutoff, repair, 
     with context:
         start = time.perf_counter()
         sampler = PepsSampler(
-            state, chi=chi, chi_prime=chip, boundary_engine=engine, to_backend=convert,
+            state, amplitude_mode="boundary", chi=chi, chi_prime=chip, boundary_engine=engine, to_backend=convert,
             cutoff=cutoff, cutoff_mode="auto", rho_positivity=repair,
             contraction_opt="greedy", row_cache_max_bytes=64 * 2**20,
         )
@@ -204,8 +204,8 @@ def test_peps_4x4_actual_row_cache_and_refresh(monkeypatch):
         contraction_opt="greedy",
         row_cache_mode="dense",
     )
-    cached = PepsSampler(state, row_cache_max_bytes=64 * 2**20, **options)
-    reference = PepsSampler(state, **options)
+    cached = PepsSampler(state, amplitude_mode="boundary", row_cache_max_bytes=64 * 2**20, **options)
+    reference = PepsSampler(state, amplitude_mode="boundary", **options)
     builds, build = [], cached._build_row_transfer_cache
 
     def counted_build(y, phi):
@@ -226,7 +226,7 @@ def test_peps_4x4_actual_row_cache_and_refresh(monkeypatch):
     state.gate_(np.diag([1.0, 2.0]), where=(0, 0), contract=True)
     cached.refresh()
     assert cached._initial_row_cache is None
-    refreshed = PepsSampler(state, **options)
+    refreshed = PepsSampler(state, amplitude_mode="boundary", **options)
     new_q = cached.log_probability(batch.configs[0])
     assert abs(old_q - new_q) > 1e-3
     np.testing.assert_allclose(new_q, refreshed.log_probability(batch.configs[0]), atol=1e-11)
@@ -251,9 +251,9 @@ def test_peps_4x4_backend_parity(backend, dtype):
             from jax.experimental import enable_x64
         context = enable_x64()
     options = dict(chi=32, chi_prime=16, boundary_engine="quimb-mps", contraction_opt="greedy")
-    reference = PepsSampler(state, **options)
+    reference = PepsSampler(state, amplitude_mode="boundary", **options)
     with context:
-        sampler = PepsSampler(state, to_backend=convert, **options)
+        sampler = PepsSampler(state, amplitude_mode="boundary", to_backend=convert, **options)
         batch = sampler.sample_batch(8, seed=313)
         ids = np.asarray(batch.configs) @ _BITS
         tolerance = 2e-4 if dtype == "complex64" else 1e-10
@@ -292,7 +292,7 @@ def test_peps_4x4_future_refresh():
     state, psi, _, _ = _oracle("complex128")
     state = state.copy()
     options = dict(chi=32, chi_prime=16, boundary_engine="quimb-mps", contraction_opt="greedy")
-    sampler = PepsSampler(state, **options)
+    sampler = PepsSampler(state, amplitude_mode="boundary", **options)
     old_future = dict(sampler._future_environments)
     snapshots = {y: _snapshot(env) for y, env in old_future.items()}
     batch = sampler.sample_batch(8, seed=331)
@@ -300,7 +300,7 @@ def test_peps_4x4_future_refresh():
     state.gate_(np.diag([1.0, 2.0]), where=(0, 3), contract=True)
     sampler.refresh()
     assert all(sampler._future_environments[y] is not env for y, env in old_future.items())
-    fresh = PepsSampler(state, **options)
+    fresh = PepsSampler(state, amplitude_mode="boundary", **options)
     new_q = np.array([sampler.log_probability(c) for c in batch.configs])
     assert np.max(abs(new_q-old_q)) > 1e-3
     np.testing.assert_allclose(new_q, [fresh.log_probability(c) for c in batch.configs], atol=1e-11)
