@@ -7,6 +7,18 @@ exact Born samples from a `TreeTensorNetwork` (or the live state of a
 CPU threads are not capped by default (`threads=None`), matching TreeOptimizer.
 Pass a positive `threads` value to explicitly limit BLAS/OpenMP around sampling.
 
+Dense sampling can optionally use `TreeSampler(..., chunk_size=1000)` to
+process at most 1,000 shots per contraction batch while returning the requested
+total sample count. The default `chunk_size=None` keeps unchunked sampling.
+Chunking also tiles the first-child density environment, avoiding the complete
+quartic bond tensor and its transpose copy. Its internal environment target is
+1 GiB per tile (or one child-index slice when larger); this is not a bound on
+total memory, which also includes state tensors and per-shot intermediates.
+Arrays remain on the selected backend/device. Uniform draws retain the same
+seed ordering across chunk sizes; floating-point rounding can still change
+outcomes exactly at a probability threshold. Native Symmray already draws one
+shot at a time and accepts this option without changing that algorithm.
+
 ```python
 from pepsy.optimizers import TreeOptimizer
 from pepsy.sampling import TreeSampler

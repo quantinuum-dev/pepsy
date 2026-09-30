@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+from numbers import Integral
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -58,6 +59,9 @@ __all__ = [
     "TreeSampleResult",
     "TreeSampler",
 ]
+
+# Bound the optional dense sampling environment tile, not total device memory.
+_SAMPLE_ENV_BYTES = 1024 ** 3
 
 try:  # threadpoolctl is a NumPy/SciPy transitive dependency; treat as optional.
     from threadpoolctl import ThreadpoolController as _ThreadpoolController
@@ -261,6 +265,11 @@ class TreeSampler:
     threads : int or None, default=None
         Leave ambient CPU thread settings unchanged. A positive integer
         explicitly caps BLAS/OpenMP around batched contractions.
+    chunk_size : int or None, default=None
+        Optional maximum shots per dense contraction batch. Also tile the
+        first-child density transfer to avoid a full quartic bond tensor.
+        None preserves the unchunked path. Native Symmray already samples
+        one shot at a time. The returned sample count is unchanged.
     backend : {"auto", "native", "numpy", "torch", "cupy", "symmray"}, default="auto"
         Backend used for cached node arrays and batched contractions. ``auto``
         preserves the existing dense compatibility path for Symmray trees;
@@ -287,9 +296,17 @@ class TreeSampler:
         *,
         seed=None,
         threads: int | None = None,
+        chunk_size: int | None = None,
         backend="auto",
         fermion=None,
     ):
+        if chunk_size is not None and (
+            isinstance(chunk_size, bool)
+            or not isinstance(chunk_size, Integral)
+            or chunk_size < 1
+        ):
+            raise ValueError("chunk_size must be a positive integer or None.")
+        self.chunk_size = None if chunk_size is None else int(chunk_size)
         self._rng = np.random.default_rng(seed)
         self.threads = None if threads is None else int(threads)
         self.backend = _normalize_tree_sampler_backend(backend)
@@ -1161,7 +1178,23 @@ class TreeSampler:
 
     # -- sampling ------------------------------------------------------------
 
-    def _sample_arrays(self, n_samples, rng):
+    def _sample_first_child_density(self, rho, ur):
+        """Contract an exact density transfer with bounded environment tiles."""
+        par, child, _ = ur.shape
+        itemsize = ur.element_size() if self.resolved_backend == "torch" else ur.dtype.itemsize
+        width = max(1, min(child, _SAMPLE_ENV_BYTES // (par * par * child * itemsize)))
+        result = self._zeros((rho.shape[0], child, child), dtype=ur.dtype)
+        conjugate = ur.conj()
+        for start in range(0, child, width):
+            stop = min(start + width, child)
+            # Group the contracted parent legs together. acAd would require
+            # a second quartic transpose/reshape allocation in CuPy einsum.
+            env = self._einsum("acF,AdF->aAcd", ur[:, start:stop, :], conjugate)
+            result[:, start:stop, :] = self._einsum("BaA,aAcd->Bcd", rho, env)
+            del env
+        return result
+
+    def _sample_arrays(self, n_samples, rng, *, physical_draws=None):
         """Batched perfect sampling; returns backend-native arrays."""
         B = int(n_samples)
         arrays = self._arrays
@@ -1186,9 +1219,10 @@ class TreeSampler:
         # Draw all uniforms in one host call and, for accelerator backends,
         # one host-to-device transfer. The previous per-site transfer made a
         # large tree perform one small synchronization/copy per physical site.
-        physical_draws = self._as_backend(
-            rng.random((len(qubit_of_node), B)), dtype=prob_dtype
-        )
+        if physical_draws is None:
+            physical_draws = self._as_backend(
+                rng.random((len(qubit_of_node), B)), dtype=prob_dtype
+            )
         draw_index = 0
 
         def visit(nid, rho):
@@ -1237,8 +1271,12 @@ class TreeSampler:
                 d0 = arr.shape[1]
                 F0 = int(np.prod(arr.shape[2:])) if len(ch) > 1 else 1
                 ur = arr.reshape(par, d0, F0)
-                env = self._einsum("acF,AdF->acAd", ur, ur.conj())
-                rho0 = self._einsum("BaA,acAd->Bcd", rho, env)
+                if self.chunk_size is None:
+                    env = self._einsum("acF,AdF->acAd", ur, ur.conj())
+                    rho0 = self._einsum("BaA,acAd->Bcd", rho, env)
+                    del env
+                else:
+                    rho0 = self._sample_first_child_density(rho, ur)
                 phi0 = visit(ch[0], rho0)
                 # Collapse child 0 into the node tensor -> batched remainder.
                 K = self._tensordot(phi0, arr, axes=([1], [1]))
@@ -1265,6 +1303,10 @@ class TreeSampler:
         ``configs`` has shape ``(n_samples, nqubits)`` and ``probs`` has shape
         ``(n_samples,)``. By default arrays use the resolved sampler backend;
         pass ``to_numpy=True`` for an explicit host copy.
+        A constructor ``chunk_size`` bounds dense contraction batches while
+        retaining the full output. Uniform draws keep the unchunked ordering,
+        so chunking does not intentionally change the seeded sample stream
+        (floating-point contraction rounding can affect boundary draws).
         """
         if int(n_samples) < 1:
             raise ValueError("n_samples must be a positive integer.")
@@ -1294,6 +1336,19 @@ class TreeSampler:
                             probs,
                             dtype=self._symmray_state["template"].real.dtype,
                         )
+            elif self.chunk_size is not None:
+                # Keep RNG order independent of chunk boundaries. The only
+                # full-shot device arrays are small uniforms and final results.
+                draws = self._as_backend(rng.random((len(self._qubit_of_node), int(n_samples))))
+                chunks = [
+                    self._sample_arrays(
+                        min(self.chunk_size, int(n_samples) - start), rng,
+                        physical_draws=draws[:, start:start + self.chunk_size],
+                    )
+                    for start in range(0, int(n_samples), self.chunk_size)
+                ]
+                configs = ar.do("concatenate", [chunk[0] for chunk in chunks], axis=0)
+                probs = ar.do("concatenate", [chunk[1] for chunk in chunks], axis=0)
             else:
                 configs, probs = self._sample_arrays(int(n_samples), rng)
         if to_numpy:

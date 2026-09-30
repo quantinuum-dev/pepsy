@@ -14,6 +14,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Optional `TreeSampler(chunk_size=...)` bounds dense shot batches and tiles
+  first-child density environments to avoid quartic bond allocations.
+  The default remains unchunked, with native outputs and seeded draw ordering
+  preserved. Total requested sample counts are unchanged.
+
 - `PepsSampler(amplitude_mode="boundary", amplitude_chi=...)` evaluates
   projected amplitudes with a capped boundary-MPS sweep, preserving scaled
   values and phase without a full-network exact amplitude plan. Results and

@@ -161,6 +161,81 @@ def test_physical_root_probabilities_and_amplitudes_match_statevector():
 # -- empirical sampling -------------------------------------------------------
 
 
+@pytest.mark.parametrize("chunk_size", [1, 7, 1000])
+@pytest.mark.parametrize("root_qubit", [None, 2])
+def test_optional_chunks_preserve_seeded_born_samples(chunk_size, root_qubit):
+    n = 5
+    plan = TreePlan.from_order(
+        [q for q in range(n) if q != root_qubit],
+        structure="balanced", root_qubit=root_qubit,
+    )
+    opt = TreeOptimizer(_random_stream(n, 30, np.random.default_rng(91)), tree=plan, chi=32)
+    reference = TreeSampler(opt, seed=17)
+    sampler = TreeSampler(opt, seed=17, chunk_size=chunk_size)
+    before = opt.to_dense().copy()
+    for seed in (9, None, None):
+        expected = reference.sample_batch(31, seed=seed)
+        actual = sampler.sample_batch(31, seed=seed)
+        np.testing.assert_array_equal(actual.configs, expected.configs)
+        np.testing.assert_allclose(actual.probs, expected.probs, atol=1e-12)
+        _, exact = _exact_probs(opt, n)
+        indices = actual.configs @ (2 ** np.arange(n - 1, -1, -1))
+        np.testing.assert_allclose(actual.probs, exact[indices], atol=1e-12)
+    np.testing.assert_allclose(opt.to_dense(), before, atol=1e-12)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1, 1.5, True])
+def test_invalid_tree_sample_chunk_size(chunk_size):
+    with pytest.raises(ValueError, match="chunk_size"):
+        TreeSampler(None, chunk_size=chunk_size)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch", "cupy"])
+def test_chunked_density_transfer_matches_dense_without_full_environment(monkeypatch, backend):
+    import pepsy.sampling.tree as module
+
+    state = TreeOptimizer([], n=2).tn
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        state.apply_to_arrays(lambda x: torch.as_tensor(x, dtype=torch.complex128))
+    elif backend == "cupy":
+        cp = pytest.importorskip("cupy")
+        try:
+            if cp.cuda.runtime.getDeviceCount() < 1:
+                pytest.skip("CUDA unavailable")
+        except cp.cuda.runtime.CUDARuntimeError:
+            pytest.skip("CUDA unavailable")
+        state.apply_to_arrays(lambda x: cp.asarray(x, dtype=cp.complex128))
+    sampler = TreeSampler(state, chunk_size=3)
+    rng = np.random.default_rng(27)
+    ur = rng.normal(size=(5, 7, 3)) + 1j * rng.normal(size=(5, 7, 3))
+    x = rng.normal(size=(3, 5, 5)) + 1j * rng.normal(size=(3, 5, 5))
+    rho = x @ x.conj().transpose(0, 2, 1)
+    expected = np.einsum("BaA,acF,AdF->Bcd", rho, ur, ur.conj())
+    monkeypatch.setattr(module, "_SAMPLE_ENV_BYTES", 5 * 5 * 7 * 16 * 2)
+    original = sampler._einsum
+    widths = []
+
+    def checked_einsum(equation, *operands):
+        assert equation != "acF,AdF->acAd"
+        result = original(equation, *operands)
+        if equation == "acF,AdF->aAcd":
+            widths.append(result.shape[2])
+            assert np.prod(result.shape) * 16 <= module._SAMPLE_ENV_BYTES
+        return result
+
+    monkeypatch.setattr(sampler, "_einsum", checked_einsum)
+    actual = sampler._sample_first_child_density(sampler._as_backend(rho), sampler._as_backend(ur))
+    if backend == "torch":
+        assert torch.is_tensor(actual)
+        actual = actual.numpy()
+    elif backend == "cupy":
+        assert isinstance(actual, cp.ndarray)
+        actual = actual.get()
+    np.testing.assert_allclose(actual, expected, atol=1e-11)
+    assert widths == [2, 2, 2, 1]
+
+
 def test_sample_frequencies_converge_to_born():
     n = 4
     rng = np.random.default_rng(3)
@@ -269,7 +344,8 @@ def test_batch_result_helpers():
     assert np.array_equal(np_copy.probs, res.probs)
 
 
-def test_tree_sampler_preserves_torch_backend_and_supports_host_copy():
+@pytest.mark.parametrize("chunk_size", [None, 7])
+def test_tree_sampler_preserves_torch_backend_and_supports_host_copy(chunk_size):
     torch = pytest.importorskip("torch")
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     state = TreeOptimizer(None, n=3).tn
@@ -279,7 +355,7 @@ def test_tree_sampler_preserves_torch_backend_and_supports_host_copy():
     )
     opt = TreeOptimizer([(h, 0)], state=state, run=True, mode="direct")
 
-    sampler = TreeSampler(opt, backend="native", seed=0)
+    sampler = TreeSampler(opt, backend="native", seed=0, chunk_size=chunk_size)
     assert sampler.resolved_backend == "torch"
     configs = _all_configs(3)
     probs = sampler.probabilities(configs, to_numpy=False)
@@ -309,7 +385,8 @@ def test_tree_sampler_rejects_explicit_backend_mismatch():
         TreeSampler(opt, backend="torch")
 
 
-def test_tree_sampler_preserves_cupy_backend_when_available():
+@pytest.mark.parametrize("chunk_size", [None, 7])
+def test_tree_sampler_preserves_cupy_backend_when_available(chunk_size):
     cupy = pytest.importorskip("cupy")
     try:
         if cupy.cuda.runtime.getDeviceCount() < 1:
@@ -321,7 +398,7 @@ def test_tree_sampler_preserves_cupy_backend_when_available():
     state = TreeOptimizer(None, n=2).tn
     state.apply_to_arrays(to_backend)
     opt = TreeOptimizer([(to_backend(pepsy.h()), 0)], state=state, mode="direct")
-    sampler = TreeSampler(opt, backend="native")
+    sampler = TreeSampler(opt, backend="native", chunk_size=chunk_size)
 
     result = sampler.sample_batch(16, seed=2)
     assert sampler.resolved_backend == "cupy"
@@ -329,6 +406,7 @@ def test_tree_sampler_preserves_cupy_backend_when_available():
     assert isinstance(result.probs, cupy.ndarray)
     assert isinstance(sampler.probabilities(result.configs, to_numpy=False), cupy.ndarray)
     assert isinstance(result.to_numpy().configs, np.ndarray)
+    np.testing.assert_allclose(result.to_numpy().probs, sampler.probabilities(result.configs))
 
 
 def test_sample_returns_list_result():
