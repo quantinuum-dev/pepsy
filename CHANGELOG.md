@@ -12,6 +12,16 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Fixed
+
+- TreeSampler rescales dense conditional messages to prevent long-tree
+  complex64 sampling bias and scores probabilities with float64 scale
+  bookkeeping. Dense root normalization handles extreme finite scales,
+  retains Torch gradients, and rejects invalid norms. Scoring rejects invalid
+  physical codes before indexing; native Symmray flip ratios return one
+  independently flipped column per site. Zero uniform draws skip zero-weight
+  branches.
+
 ### Added
 
 - Experimental exact `TreeSampler(strategy="factor")` retains compact mixed

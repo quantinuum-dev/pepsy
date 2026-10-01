@@ -298,8 +298,8 @@ class TreeSampler:
     Notes
     -----
     The node arrays are extracted once (in canonical, normalized form) and
-    cached.  Call :meth:`refresh` after the source state changes; otherwise the
-    sampler keeps representing its previously captured tensor data.
+    cached. Call :meth:`refresh` after the source state changes. Off-root
+    arrays can share source storage, so raw in-place edits can affect a capture.
     """
 
     def __init__(
@@ -557,6 +557,38 @@ class TreeSampler:
 
             return torch.broadcast_to(value, tuple(shape))
         return self._xp().broadcast_to(value, tuple(shape))
+
+    def _scale_magnitude(self, value):
+        """Bound complex values without squaring subnormal/large components."""
+        complex_value = (value.is_complex() if self.resolved_backend == "torch"
+                         else self._xp().iscomplexobj(value))
+        if complex_value:
+            return self._xp().maximum(self._xp().abs(value.real), self._xp().abs(value.imag))
+        return self._xp().abs(value)
+
+    def _rescale_batch(self, value):
+        """Remove a positive row scale without changing conditional ratios."""
+        axes = tuple(range(1, value.ndim))
+        magnitude = self._scale_magnitude(value)
+        scale = (
+            magnitude.amax(dim=axes, keepdim=True)
+            if self.resolved_backend == "torch"
+            else magnitude.max(axis=axes, keepdims=True)
+        )
+        # Binary scaling is exact in the working dtype, avoiding a fresh
+        # reciprocal-rounding error at every node of a long complex64 tree.
+        _, exponent = self._xp().frexp(self._where(scale > 0, scale, 1.0))
+        # Complex division forms a reciprocal on these backends. Clamp the
+        # divisor to the smallest normal value so subnormal inputs also stay
+        # finite; they still gain enough scale to survive the next square.
+        floating = (magnitude.is_floating_point() if self.resolved_backend == "torch"
+                    else magnitude.dtype.kind == "f")
+        dtype = magnitude.dtype if floating else self._xp().float64
+        minimum_exponent = math.frexp(self._xp().finfo(dtype).tiny)[1] - 1
+        exponent = self._where(exponent - 1 < minimum_exponent, minimum_exponent, exponent - 1)
+        scale = self._xp().ldexp(self._xp().ones_like(scale), exponent)
+        # The reciprocal remains finite even for subnormal input rows.
+        return value * (1.0 / scale), scale.reshape(value.shape[0])
 
     @staticmethod
     def _resolve_ttn(state):
@@ -829,13 +861,23 @@ class TreeSampler:
                 arr = arr.reshape((1,) + arr.shape)
             arrays[nid] = arr
 
-        # Normalize via the root array (state is canonical with centre = root).
+        # Scale before squaring, and keep both divisors in the native graph.
+        # The canonical root contains the whole norm, but a finite root can
+        # have a squared norm outside its dtype's representable range.
         root_arr = arrays[root]
-        nrm = math.sqrt(
-            float(ar.to_numpy(self._sum(self._xp().abs(root_arr) ** 2)))
-        )
-        if nrm > 0:
-            arrays[root] = root_arr / nrm
+        magnitude = self._scale_magnitude(root_arr)
+        scale = magnitude.max()
+        host_scale = float(ar.to_numpy(scale))
+        if not np.isfinite(host_scale) or host_scale <= 0:
+            raise ValueError("Dense tree state has a zero or non-finite norm.")
+        floating = (magnitude.is_floating_point() if self.resolved_backend == "torch"
+                    else magnitude.dtype.kind == "f")
+        dtype = magnitude.dtype if floating else self._xp().float64
+        minimum = self._xp().finfo(dtype).tiny
+        scale = self._where(scale < minimum, minimum, scale)
+        scaled = root_arr * (1.0 / scale)
+        nrm = self._sum(self._xp().abs(scaled) ** 2) ** 0.5
+        arrays[root] = scaled * (1.0 / nrm)
 
         self._nqubits = int(plan.n)
         self._root = root
@@ -973,33 +1015,27 @@ class TreeSampler:
         constructing a separate full-tree amplitude contraction for every
         site, which is the fallback used by generic samplers.
         """
-        configs = self._check_configs(configs)
+        with self._thread_ctx(), self._array_device_context():
+            configs = self._check_configs(configs)
+            return self._single_site_flip_amplitude_ratios(configs, to_numpy=to_numpy)
+
+    def _single_site_flip_amplitude_ratios(self, configs, *, to_numpy):
         if self.resolved_backend == "symmray":
             state = self._symmray_state
             if any(
-                len(state["local_to_source"][qubit]) != 2
+                len(state["physical_code_maps"][qubit]) != 2
                 for qubit in range(self._nqubits)
             ):
                 raise NotImplementedError(
                     "single-site flip ratios require binary physical dimensions."
                 )
-            flipped = np.asarray(configs, dtype=np.int64).copy()
+            denominator = self._symmray_amplitudes(configs)
+            columns = []
             for qubit in range(self._nqubits):
-                source_to_local = state["source_to_local"][qubit]
-                local_to_source = state["local_to_source"][qubit]
-                try:
-                    flipped[:, qubit] = np.asarray([
-                        local_to_source[1 - source_to_local[int(code)]]
-                        for code in flipped[:, qubit]
-                    ])
-                except (KeyError, IndexError, TypeError) as exc:
-                    raise ValueError(
-                        f"configs contain invalid physical index for site {qubit}."
-                    ) from exc
-            ratios = (
-                self._symmray_amplitudes(flipped)
-                / self._symmray_amplitudes(configs)
-            )
+                flipped = configs.copy()
+                flipped[:, qubit] = 1 - configs[:, qubit]
+                columns.append(self._symmray_amplitudes(flipped) / denominator)
+            ratios = ar.do("stack", columns, axis=1, like=denominator)
             return _backend_array_to_numpy(ratios) if to_numpy else ratios
         if any(
             int(self._arrays[node].shape[1]) != 2
@@ -1269,6 +1305,7 @@ class TreeSampler:
             )
         draw_index = 0
         context = _factor_context
+        valid_conditionals = self._ones((), dtype=prob_dtype) > 0
 
         def select(value, indices, mapping=None):
             if value.shape[0] == 1:
@@ -1278,7 +1315,7 @@ class TreeSampler:
             return value if indices is None else value[indices]
 
         def visit(nid, rho=None, vector=None, factor=None, factor_inverse=None, rho_inverse=None):
-            nonlocal draw_index
+            nonlocal draw_index, valid_conditionals
             # rho: (1 or B, d_par, d_par) density on nid's parent bond.
             # vector: (1 or B, d_par), only when purity follows from the
             # traversal: the root is pure, and a remaining sibling bond space
@@ -1288,6 +1325,12 @@ class TreeSampler:
             ch = children[nid]
             arr = arrays[nid]
             q = qubit_of_node.get(nid)
+            if vector is not None:
+                vector, _ = self._rescale_batch(vector)
+            elif factor is not None:
+                factor, _ = self._rescale_batch(factor)
+            else:
+                rho, _ = self._rescale_batch(rho)
             if q is not None:
                 # p[B, x] = Re sum_{a,a'} rho[a,a'] T[a,x] conj(T[a',x]).
                 flat = arr.reshape(arr.shape[0], arr.shape[1], -1)
@@ -1309,15 +1352,20 @@ class TreeSampler:
                         p = p[rho_inverse]
                 p = self._clip_nonnegative(p)
                 total = self._sum(p, axis=1, keepdims=True)
+                valid_conditionals = valid_conditionals & (
+                    self._xp().isfinite(total) & (total > 0)
+                ).all()
                 safe_total = self._where(total > 0.0, total, 1.0)
                 probs = self._broadcast_to(p / safe_total, (B, p.shape[1]))
                 draws = physical_draws[draw_index]
                 draw_index += 1
                 cdf = self._cumsum(probs, axis=1)
-                x = self._sum(draws[:, None] > cdf, axis=1)
+                x = self._sum(draws[:, None] >= cdf, axis=1)
                 x = self._as_int64(self._clip_max(x, probs.shape[1] - 1))
                 configs[:, q] = x
-                prob[:] *= probs[batch, x]
+                chosen = probs[batch, x]
+                valid_conditionals = valid_conditionals & (chosen > 0).all()
+                prob[:] *= chosen
                 # Selecting one physical value leaves a batched tensor over
                 # the parent and child bonds. A physical leaf has no remaining
                 # child axes and can return immediately.
@@ -1329,7 +1377,7 @@ class TreeSampler:
                     selection = x[representatives]
                 selected = self._moveaxis(arr[:, selection, ...], 1, 0)
                 if not ch:
-                    return selected.reshape(B, arr.shape[0])
+                    return self._rescale_batch(selected.reshape(B, arr.shape[0]))[0]
 
                 par = arr.shape[0]
                 K = selected
@@ -1458,7 +1506,9 @@ class TreeSampler:
                     k_inverse = new_inverse
                 else:
                     Knew = self._einsum("BpcF,Bc->BpF", Kf, phi_i)
-                K = Knew.reshape((Knew.shape[0], par) + K.shape[3:])
+                K = self._rescale_batch(
+                    Knew.reshape((Knew.shape[0], par) + K.shape[3:])
+                )[0]
             result = K.reshape(K.shape[0], par)
             return result if k_inverse is None else result[k_inverse]
 
@@ -1469,6 +1519,8 @@ class TreeSampler:
             # Break the recursive closure's self-reference so completed chunk
             # buffers are released without waiting for cyclic GC.
             visit = None
+        if not bool(ar.to_numpy(valid_conditionals)):
+            raise ValueError("Tree sampling encountered a zero or non-finite conditional norm.")
         return configs, prob
 
     def _sample_dense_arrays(self, count, rng):
@@ -1601,31 +1653,59 @@ class TreeSampler:
 
     def _check_configs(self, configs):
         if self.resolved_backend == "symmray":
-            configs = np.asarray(_backend_array_to_numpy(configs), dtype=np.int64)
-        elif self.resolved_backend == "torch":
-            import torch
-
-            configs = torch.as_tensor(
-                configs, dtype=torch.int64, device=self._device
-            )
-        elif self.resolved_backend == "cupy":
-            import cupy as cp
-
-            configs = cp.asarray(configs, dtype=cp.int64)
+            configs = np.asarray(_backend_array_to_numpy(configs))
+            xp = np
         else:
-            configs = np.asarray(configs, dtype=np.int64)
+            try:
+                configs = self._as_backend(configs)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("configs must contain integral physical codes.") from exc
+            xp = self._xp()
         if configs.ndim != 2 or configs.shape[1] != self._nqubits:
             raise ValueError(
                 f"configs must have shape (batch, nqubits={self._nqubits}); "
                 f"got {tuple(configs.shape)}."
             )
-        return configs
+        if self.resolved_backend == "torch":
+            if configs.is_complex():
+                raise ValueError("configs must contain real integral physical codes.")
+            # Wide unsigned Torch tensors lack comparison kernels. Validation
+            # precedes int64 coercion so overflow cannot become a valid code.
+            values = configs.to(dtype=xp.float64)
+        else:
+            if configs.dtype.kind not in "biuf":
+                raise ValueError("configs must contain real integral physical codes.")
+            values = configs
+        dims = (
+            [len(codes) for codes in self._physical_code_maps]
+            if self._physical_code_maps is not None
+            else [self._arrays[self._node_of_qubit[q]].shape[1] for q in range(self._nqubits)]
+        )
+        limits = (xp.asarray(dims) if self.resolved_backend == "symmray"
+                  else self._as_backend(dims))
+        valid = xp.isfinite(values) & (values >= 0) & (values < limits)
+        if self.resolved_backend == "torch" or values.dtype.kind == "f":
+            valid = valid & (values == xp.floor(values))
+        if not bool(ar.to_numpy(valid.all())):
+            raise ValueError("configs contain invalid physical codes for the source sites.")
+        return (configs.astype(np.int64, copy=False) if self.resolved_backend == "symmray"
+                else self._as_int64(configs))
 
-    def _amplitudes(self, configs):
+    def _amplitudes(self, configs, *, probabilities=False):
         arrays = self._arrays
         children = self._children
         qubit_of_node = self._qubit_of_node
         B = configs.shape[0]
+        real_dtype = self._xp().float64
+        log_scale = self._zeros(B, dtype=real_dtype) if probabilities else None
+
+        def rescale(value):
+            nonlocal log_scale
+            if not probabilities:
+                return value
+            value, scale = self._rescale_batch(value)
+            log_scale = log_scale + self._xp().log(self._as_backend(scale, dtype=real_dtype))
+            return value
 
         def visit(nid):
             ch = children[nid]
@@ -1635,7 +1715,8 @@ class TreeSampler:
                 x = configs[:, q]
                 K = self._moveaxis(arr[:, x, ...], 1, 0)
                 if not ch:
-                    return K.reshape(B, arr.shape[0])
+                    return rescale(K.reshape(B, arr.shape[0]))
+                K = rescale(K)
                 start = 0
             else:
                 if not ch:
@@ -1656,10 +1737,15 @@ class TreeSampler:
                     Kf = K.reshape(B, par, di, Fi)
                     Knew = self._einsum("BpcF,Bc->BpF", Kf, phi_c)
                     K = Knew.reshape((B, par) + K.shape[3:])
+                K = rescale(K)
             return K.reshape(B, par)
 
         try:
-            return visit(self._root)[:, 0]
+            result = visit(self._root)[:, 0]
+            if probabilities:
+                magnitude = self._as_backend(self._xp().abs(result), dtype=real_dtype)
+                return magnitude**2 * self._xp().exp(2 * log_scale)
+            return result
         finally:
             # As in sampling, release the recursive closure and its captured
             # snapshot/configurations without waiting for cyclic collection.
@@ -1687,13 +1773,13 @@ class TreeSampler:
         """Return Born probabilities ``|<config|psi>|**2`` for ``configs``.
 
         For the normalized state captured by the sampler this is the exact
-        probability of each supplied configuration.
+        probability of each supplied configuration. Dense scores use float64
+        scale bookkeeping while contractions retain the source tensor dtype.
         """
         with self._thread_ctx(), self._array_device_context():
             configs = self._check_configs(configs)
             if self.resolved_backend == "symmray":
                 out = self._symmray_probabilities(configs)
             else:
-                amps = self._amplitudes(configs)
-                out = self._xp().abs(amps) ** 2
+                out = self._amplitudes(configs, probabilities=True)
         return _backend_array_to_numpy(out) if to_numpy else out

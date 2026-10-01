@@ -55,9 +55,9 @@ Torch autograd graphs require additional memory, and a minimum one-shot or
 one-slice tile can exceed the target. Signed 64-bit key overflow falls back to
 exact row grouping without cross-chunk caching.
 
-Torch source gradients, dtype/device preservation and native result conversion
-are supported. Sharing thresholds are performance heuristics, so speedups
-depend on bond dimensions and repeated configurations. Native Symmray trees
+Torch source gradients, tensor dtype/device preservation and native result
+conversion are supported. Sharing thresholds are performance heuristics, so
+speedups depend on bond dimensions and repeated configurations. Native Symmray trees
 retain their existing block-sparse sampling algorithm with either strategy.
 
 ```python
@@ -110,7 +110,8 @@ do not move the canonical center. Live tensor `left_inds` identify each proven
 isometry's direction, allowing redundant lossless QR moves to be skipped.
 After the source state changes, call
 `sampler.refresh()` before sampling again. An immediate refresh after constructing
-the sampler is unnecessary.
+the sampler is unnecessary. The tree copy can share off-root array storage;
+raw in-place source edits can therefore affect a capture before refresh.
 
 `sample_arrays(...)` returns the raw `(configs, probs)` tuple, and `sample(...)`
 returns the list-based `TreeSampleResult`. To score existing configurations:
@@ -119,6 +120,33 @@ returns the list-based `TreeSampleResult`. To score existing configurations:
 amps = sampler.amplitudes(configs)        # <config|psi>
 probs = sampler.probabilities(configs)    # |<config|psi>|**2
 ```
+
+Configurations must be real integral physical codes in each source site's
+basis range; integral floating values are accepted. Negative, fractional,
+non-finite and out-of-range codes raise `ValueError` before indexing on every
+backend. A valid Symmray code whose charge sector is absent from the canonical
+tensor still has zero amplitude. For binary sites,
+`single_site_flip_amplitude_ratios(configs)` returns `(batch, nqubits)` ratios,
+with each column flipping only that source physical code.
+
+Dense root normalization scales before squaring and keeps its divisors in the
+Torch gradient graph. Zero and non-finite norms raise `ValueError`; finite
+large or small root scales preserve the normalized distribution. Sampling
+rescales conditional environments and collapsed messages by positive powers
+of two, preserving their ratios and tensor dtype without accumulating a long
+prefix's probability in those messages. A zero or non-finite conditional norm
+raises `ValueError`; zero-weight branches are skipped even for a zero uniform
+draw. Dense `probabilities()` uses the same tensor dtype for contractions,
+tracks removed scales in float64 logarithms and returns float64 scores on the
+captured backend/device. Thus small representable probabilities survive even
+when their amplitude square would underflow in float32. `amplitudes()` retains
+the source amplitude dtype and its representable range. Probabilities below
+float64's range still underflow.
+
+CuPy's float32 arithmetic flushes subnormal source components to zero; rescaling
+does not recover those components. Use source components in the normal dtype
+range for that backend. The long-tree rescaling checks keep their individual
+tensor components in that range.
 
 The sampler canonicalizes once with the centre on the root, so every non-root
 node is isometric toward its parent bond. Sampling then walks the tree
