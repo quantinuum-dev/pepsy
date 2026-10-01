@@ -24,6 +24,16 @@ from .._internal.validation import normalize_integer_tuple
 __all__ = ["MPOChannel", "MPOTransition", "MPOAutomaton"]
 
 
+class _DefaultDelinearize:
+    """Signature-friendly automatic default for dense backend delinearization."""
+
+    def __repr__(self):
+        return "auto"
+
+
+_DEFAULT_DELINEARIZE = _DefaultDelinearize()
+
+
 def _check_state(state, *, name="state"):
     """Check and return a virtual state identifier."""
     if not isinstance(state, Hashable):
@@ -1676,21 +1686,43 @@ class MPOAutomaton:
         lower_ind_id="b{}",
         site_tag_id="I{}",
         compress=False,
+        delinearize=_DEFAULT_DELINEARIZE,
     ):
         """Build a Quimb MPO from the explicit automaton tensors.
 
         ``compress`` is accepted as a guard against accidentally changing the
         exact structural path.  Set it only to ``False``; call Quimb's
         ``mpo.compress(...)`` separately when approximation is intended.
+        By default, NumPy, Torch, CuPy, and JAX arrays receive two
+        roundoff-safe structural sweeps before constructing the Quimb MPO.
+        Set ``delinearize=False`` to skip them or ``True`` to require them;
+        they do not truncate singular values.
         """
         if compress:
             raise ValueError(
                 "MPOAutomaton.to_mpo never compresses; call mpo.compress(...) explicitly."
             )
+        delinearize_was_default = delinearize is _DEFAULT_DELINEARIZE
+        if not delinearize_was_default and not isinstance(
+            delinearize, (bool, np.bool_)
+        ):
+            raise TypeError("delinearize must be a boolean.")
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
+        arrays = self.to_arrays()
+        if delinearize_was_default:
+            from ._structural_compression import _is_supported_dense_array
+
+            delinearize = all(
+                _is_supported_dense_array(array) for array in arrays
+            )
+        report = None
+        if delinearize:
+            from ._structural_compression import _delinearize_mpo_arrays
+
+            arrays, report = _delinearize_mpo_arrays(arrays)
         mpo = qtn.MatrixProductOperator(
-            self.to_arrays(),
+            arrays,
             shape="lrud",
             upper_ind_id=upper_ind_id,
             lower_ind_id=lower_ind_id,
@@ -1701,4 +1733,6 @@ class MPOAutomaton:
         # higher-order builders and diagnostics without changing contraction
         # behavior or making compression implicit.
         mpo.pepsy_automaton = self.copy()
+        if report is not None:
+            mpo.pepsy_delinearization = report
         return mpo

@@ -652,6 +652,7 @@ def test_ham_builder_converts_generic_mpo_to_configured_backend():
 
     assert all(isinstance(tensor.data, torch.Tensor) for tensor in mpo)
     assert mpo.max_bond() <= 2
+    assert mpo.pepsy_delinearization["method"] == "delinearize"
 
 
 def test_ham_builder_automaton_preserves_shared_structure_on_backend():

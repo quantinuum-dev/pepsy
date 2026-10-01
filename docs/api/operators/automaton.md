@@ -58,17 +58,26 @@ mpo = identity.to_mpo()
 These operations only assemble structural paths. They do not compress the
 resulting channel space. `trim()` is the one exact structural cleanup: it
 removes channels that are unreachable from either boundary without changing
-any accepted operator path. Numerical bond compression remains an explicit
-follow-up on the returned Quimb MPO.
+any accepted operator path. `to_mpo()` rank-reveals NumPy, Torch, CuPy, or JAX
+layered arrays in two directional passes before Quimb MPO materialization by
+default; pass `delinearize=False` to skip it. Numerical bond compression
+remains an explicit follow-up.
 
-The model-facing `ham_tn.to_mpo(...)` builder adds one dense-only structural
-pass after its automaton or term assembly. It removes exact proportional and
-roundoff-safe linearly dependent boundary channels before the optional Quimb
-SVD, then keeps the existing public `compress`, `max_bond`, and backend
-behavior. This is the deparallelization/delinearization stage; the explicit
-`MPOAutomaton.to_mpo()` method above remains a raw, inspection-friendly
-materialization. Non-NumPy tensors, including Torch and native Symmray data,
-continue through their existing backend-aware paths.
+The model-facing `ham_tn.to_mpo(...)` builder keeps its existing structural
+cleanup. For supported dense inputs, `delinearize` defaults to `True` on
+`ham_tn.to_mpo` and `MPOAutomaton.to_mpo`; pass `False` to skip the two
+rank-revealing passes before the optional Quimb SVD. On the automaton builder
+path these run on the layered arrays before Quimb MPO materialization. The
+returned MPO exposes pass counts
+and bond reductions in `.pepsy_delinearization`. With a builder-level
+`to_backend`, the automaton builder runs the sweep on converted tensors before
+the final numerical compression. NumPy, Torch, CuPy, and JAX dense arrays are
+supported; the rank decision is discrete and reads scalar diagnostics on the
+host. When JAX is tracing a function, the data-dependent rank reductions are
+skipped so gradients flow through the unreduced MPO. Structured Symmray arrays
+keep their backend-specific compression path. NumPy rank-
+revealing QR uses optional SciPy; without it, exactly proportional channels
+are still removed.
 
 The existing channel/transition tuple representation can be wrapped with
 `MPOAutomaton.from_legacy(...)` and emitted with `to_legacy()`. This allows the

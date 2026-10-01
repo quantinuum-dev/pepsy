@@ -80,6 +80,34 @@ terms acting on the same site, and removes identity factors from two-site
 terms. These are exact algebraic simplifications; `chi` and `cutoff` control
 the numerical compression sweep(s) selected by the construction strategy.
 
+For the automaton route, delinearization is enabled by default and runs before
+the optional SVD cap:
+
+```python
+mpo = builder.to_mpo(
+    terms,
+    compress="automaton",
+)
+report = mpo.pepsy_delinearization
+```
+
+For `compress="automaton"`, Pepsy applies a right-to-left suffix pass and a
+left-to-right prefix pass directly to the automaton arrays, before building
+the Quimb MPO. It does not apply an SVD cutoff itself. With a builder-level
+`to_backend` converter, the sweep runs on the converted dense tensors before
+the final automaton compression. NumPy, Torch, CuPy, and JAX arrays are
+supported. Use `max_bond=None` to
+disable the later numerical cap when you want only structural reduction.
+Rank-revealing QR uses the optional SciPy dependency for NumPy arrays; the
+other dense backends use their native SVD. `delinearize` defaults to enabled
+for dense builds; pass `False` to skip it. On the term route, the two passes
+run after accumulation, so sequential SVDs still happen during accumulation.
+The automaton route applies them directly to its arrays before Quimb
+materializes the MPO, except when a backend converter is configured. This can
+reduce bonds for generic long-range terms, though it does not certify globally
+minimal bonds for every MPO. Under JAX tracing, data-dependent rank reduction
+is skipped so gradients can pass through the unreduced build.
+
 For a 2D builder, locations can be lattice coordinates and are mapped through
 `OneDMap`; a one-site coordinate can be written as `((x, y),)`:
 

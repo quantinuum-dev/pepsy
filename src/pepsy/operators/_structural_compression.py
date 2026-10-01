@@ -8,7 +8,7 @@ before a numerical SVD is attempted.
 
 The implementation is deliberately private and conservative:
 
-* only NumPy-backed tensors are touched;
+* NumPy, Torch, CuPy, and JAX dense tensors are supported;
 * proportional columns are detected exactly;
 * the optional linear-dependence pass only accepts a reconstruction whose
   residual is at floating-point roundoff;
@@ -16,22 +16,162 @@ The implementation is deliberately private and conservative:
   the represented operator without introducing a public compression API.
 
 This is the dense/operator-network part of the deparallelization and
-delinearization ideas from arXiv:1611.02498.  Symmray, Torch, and other
-backends continue through their existing metadata-preserving SVD paths.
+delinearization ideas from arXiv:1611.02498. Structured Symmray tensors
+continue through their existing metadata-preserving compression paths.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping
 
 import numpy as np
 import quimb.tensor as qtn
+import autoray as ar
 
 
 def _is_dense_numpy(data):
     """Whether ``data`` is safe to mutate with NumPy-only operations."""
 
     return isinstance(data, np.ndarray) and np.issubdtype(data.dtype, np.number)
+
+
+def _backend_name(data):
+    """Return a dense array backend without materializing device data."""
+    try:
+        backend = ar.infer_backend(data)
+    except Exception:  # pragma: no cover - defensive for structured arrays
+        return None
+    return backend if backend in {"numpy", "torch", "cupy", "jax"} else None
+
+
+def _is_supported_dense_array(data):
+    """Whether ``data`` is a numeric array on a supported dense backend."""
+    backend = _backend_name(data)
+    if backend is None:
+        return False
+    try:
+        dtype = np.dtype(ar.get_dtype_name(data))
+    except (TypeError, ValueError):
+        return False
+    return np.issubdtype(dtype, np.number)
+
+
+def _transpose(data, axes):
+    """Transpose using the common dense-array backend interfaces."""
+    return ar.do("transpose", data, axes)
+
+
+def _reshape(data, shape):
+    """Reshape using Autoray's backend dispatch."""
+    return ar.do("reshape", data, shape)
+
+
+def _moveaxis(data, source, destination):
+    """Move an axis without coercing device arrays to NumPy."""
+    return ar.do("moveaxis", data, source, destination)
+
+
+def _host_scalar(value):
+    """Read a scalar used for a discrete rank decision through Autoray."""
+    return np.asarray(ar.to_numpy(value)).item()
+
+
+def _array_epsilon(data):
+    dtype = np.dtype(ar.get_dtype_name(data))
+    real_dtype = np.empty((), dtype=dtype).real.dtype
+    if not np.issubdtype(real_dtype, np.inexact):
+        return None
+    return np.finfo(real_dtype).eps
+
+
+def _backend_linear_factor(matrix):
+    """Find a roundoff-safe low-rank factorization on a dense backend."""
+    backend = _backend_name(matrix)
+    if backend == "jax":
+        import jax  # pylint: disable=import-outside-toplevel
+
+        if isinstance(matrix, jax.core.Tracer):
+            # A data-dependent rank changes static tensor shapes and cannot be
+            # selected while JAX is tracing. Keep the exact unreduced edge;
+            # its surrounding MPO construction remains differentiable.
+            return matrix, None, False
+    if matrix.shape[1] <= 1:
+        return matrix, None, False
+    eps = _array_epsilon(matrix)
+    if eps is None:
+        return matrix, None, False
+
+    scale = float(_host_scalar(ar.do("max", ar.do("abs", matrix))))
+    if not math.isfinite(scale):
+        return matrix, None, False
+    if scale == 0.0:
+        return (
+            matrix[:, :1],
+            ar.do("zeros", (1, matrix.shape[1]), like=matrix, dtype=matrix.dtype),
+            matrix.shape[1] > 1,
+        )
+
+    try:
+        _left, singular_values, right = ar.do("linalg.svd", matrix, full_matrices=False)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"delinearization requires SVD support on the {backend} backend.") from exc
+
+    tolerance = 64.0 * eps * max(matrix.shape) * scale
+    rank = max(
+        1,
+        min(
+            int(_host_scalar(ar.do("sum", singular_values > tolerance))),
+            matrix.shape[1],
+        ),
+    )
+    if rank >= matrix.shape[1]:
+        return matrix, None, False
+
+    # Greedy pivoted modified Gram-Schmidt picks a stable independent set of
+    # columns. Its array arithmetic stays on the selected backend; only each
+    # argmax index and norm crosses to the host because those values control
+    # Python's loop and the resulting static output shape.
+    residual_columns = right[:rank, :]
+    pivots = []
+    for _ in range(rank):
+        norms = ar.do(
+            "sqrt",
+            ar.do("sum", ar.do("abs", residual_columns) ** 2, axis=0),
+        )
+        pivot = int(_host_scalar(ar.do("argmax", norms)))
+        norm = float(_host_scalar(norms[pivot]))
+        if not math.isfinite(norm) or norm <= 64.0 * eps:
+            break
+        pivots.append(pivot)
+        vector = residual_columns[:, pivot] / norm
+        projections = ar.do(
+            "reshape",
+            ar.do(
+                "matmul",
+                ar.do("reshape", ar.do("conj", vector), (1, -1)),
+                residual_columns,
+            ),
+            (-1,),
+        )
+        residual_columns = residual_columns - ar.do("outer", vector, projections)
+    if len(pivots) < rank:
+        return matrix, None, False
+
+    basis = ar.do("stack", [matrix[:, pivot] for pivot in pivots], axis=1)
+    q, r = ar.do("linalg.qr", basis, mode="reduced")
+    basis_transfer = ar.do(
+        "matmul",
+        _transpose(ar.do("conj", q), (1, 0)),
+        matrix,
+    )
+    transfer = ar.do("linalg.solve", r, basis_transfer)
+    reconstructed = ar.do("matmul", basis, transfer)
+    residual = float(_host_scalar(ar.do("max", ar.do("abs", reconstructed - matrix))))
+    allowed = 256.0 * eps * max(matrix.shape) * scale
+    if not math.isfinite(residual) or residual > allowed:
+        return matrix, None, False
+    return basis, transfer, True
 
 
 def _parallel_factor(matrix):
@@ -111,17 +251,28 @@ def _linear_factor(matrix):
 
     try:
         from scipy.linalg import qr as scipy_qr
+        from scipy.linalg import solve_triangular
     except ImportError:
         return matrix, np.eye(matrix.shape[1], dtype=matrix.dtype), False
 
     scale = float(np.max(np.abs(matrix), initial=0.0))
     if scale == 0.0:
-        return matrix[:, :1], np.zeros((1, matrix.shape[1]), dtype=matrix.dtype), (
-            matrix.shape[1] > 1
+        return (
+            matrix[:, :1],
+            np.zeros((1, matrix.shape[1]), dtype=matrix.dtype),
+            (matrix.shape[1] > 1),
         )
 
     try:
-        _q, r, piv = scipy_qr(matrix, mode="economic", pivoting=True)
+        # Only R and the pivot order are needed below. Avoid forming Q and
+        # recomputing the same coefficients with a separate least-squares
+        # solve: in pivot order, A = Q R and the selected basis is Q R11.
+        r, piv = scipy_qr(
+            matrix,
+            mode="r",
+            pivoting=True,
+            check_finite=False,
+        )
     except (TypeError, ValueError, np.linalg.LinAlgError):
         return matrix, np.eye(matrix.shape[1], dtype=matrix.dtype), False
     diagonal = np.abs(np.diag(r))
@@ -135,11 +286,19 @@ def _linear_factor(matrix):
     if rank >= matrix.shape[1]:
         return matrix, np.eye(matrix.shape[1], dtype=matrix.dtype), False
 
-    basis = matrix[:, np.asarray(piv[:rank], dtype=int)]
+    piv = np.asarray(piv, dtype=int)
+    basis = matrix[:, piv[:rank]]
     try:
-        transfer, *_ = np.linalg.lstsq(basis, matrix, rcond=None)
+        transfer_pivoted = solve_triangular(
+            r[:rank, :rank],
+            r[:rank, :],
+            lower=False,
+            check_finite=False,
+        )
     except (TypeError, ValueError, np.linalg.LinAlgError):
         return matrix, np.eye(matrix.shape[1], dtype=matrix.dtype), False
+    transfer = np.empty_like(transfer_pivoted)
+    transfer[:, piv] = transfer_pivoted
     reconstructed = basis @ transfer
     eps = np.finfo(matrix.real.dtype).eps
     residual = float(np.max(np.abs(reconstructed - matrix), initial=0.0))
@@ -152,14 +311,16 @@ def _linear_factor(matrix):
 def _factor_columns(matrix, *, method="auto"):
     """Return a conservative low-rank column factorization."""
 
+    if method not in {"auto", "delinearize", "linear", "deparallelize", "parallel", "sparse"}:
+        raise ValueError(
+            "structural compression method must be 'auto', 'deparallelize', or 'delinearize'."
+        )
+    if _backend_name(matrix) not in {None, "numpy"}:
+        return _backend_linear_factor(matrix)
+
     basis, transfer, changed = _parallel_factor(matrix)
     if method in {"deparallelize", "parallel", "sparse"}:
         return basis, transfer, changed
-    if method not in {"auto", "delinearize", "linear"}:
-        raise ValueError(
-            "structural compression method must be 'auto', "
-            "'deparallelize', or 'delinearize'."
-        )
 
     linear_basis, linear_transfer, linear_changed = _linear_factor(basis)
     if linear_changed:
@@ -189,9 +350,9 @@ def _replace_bond(tensor, old_bond, new_bond, data):
 def _transform_axis(data, matrix, axis):
     """Apply ``matrix`` to one tensor axis, preserving the axis position."""
 
-    moved = np.moveaxis(data, axis, 0)
-    transformed = np.tensordot(matrix, moved, axes=(1, 0))
-    return np.moveaxis(transformed, 0, axis)
+    moved = _moveaxis(data, axis, 0)
+    transformed = ar.do("tensordot", matrix, moved, axes=((1,), (0,)))
+    return _moveaxis(transformed, 0, axis)
 
 
 def _factor_edge_from_child(
@@ -205,35 +366,35 @@ def _factor_edge_from_child(
     """Reduce one edge and absorb its exact transfer into the parent tensor."""
 
     if not (
-        _is_dense_numpy(child_tensor.data)
-        and _is_dense_numpy(parent_tensor.data)
+        _is_supported_dense_array(child_tensor.data)
+        and _is_supported_dense_array(parent_tensor.data)
     ):
         return False, None
 
     child_axis = child_tensor.inds.index(bond)
-    child_data = np.moveaxis(child_tensor.data, child_axis, -1)
+    child_data = _moveaxis(child_tensor.data, child_axis, -1)
     old_dim = child_data.shape[-1]
-    matrix = child_data.reshape(-1, old_dim)
+    matrix = _reshape(child_data, (-1, old_dim))
     if reduce_rows:
-        basis, transfer, changed = _factor_columns(matrix.T, method=method)
+        basis, transfer, _changed = _factor_columns(_transpose(matrix, (1, 0)), method=method)
         # ``matrix.T`` has one column per non-bond configuration, so its
-        # column rank can be smaller without reducing the actual virtual
-        # bond. Do not perform a pointless gauge change in that case.
-        if not changed or basis.shape[1] >= old_dim:
+        # column rank can equal its full column count while still being
+        # smaller than the virtual bond dimension. ``changed`` only reports
+        # whether columns were dependent on each other; compare the resulting
+        # rank directly with the old bond size.
+        if basis.shape[1] >= old_dim:
             return False, None
-        parent_transform = basis.T
-        child_data = transfer.reshape(
-            basis.shape[1], *child_data.shape[:-1]
-        )
-        child_data = np.moveaxis(child_data, 0, -1)
-        child_data = np.moveaxis(child_data, -1, child_axis)
+        parent_transform = _transpose(basis, (1, 0))
+        child_data = _reshape(transfer, (basis.shape[1], *child_data.shape[:-1]))
+        child_data = _moveaxis(child_data, 0, -1)
+        child_data = _moveaxis(child_data, -1, child_axis)
     else:
         basis, transfer, changed = _factor_columns(matrix, method=method)
         if not changed:
             return False, None
         parent_transform = transfer
-        child_data = basis.reshape(*child_data.shape[:-1], basis.shape[1])
-        child_data = np.moveaxis(child_data, -1, child_axis)
+        child_data = _reshape(basis, (*child_data.shape[:-1], basis.shape[1]))
+        child_data = _moveaxis(child_data, -1, child_axis)
 
     parent_axis = parent_tensor.inds.index(bond)
     parent_data = _transform_axis(parent_tensor.data, parent_transform, parent_axis)
@@ -265,9 +426,7 @@ def _structural_compress_mpo(mpo, *, method="auto"):
 
     reductions = []
     for _direction in range(2):
-        indices = range(len(tensors) - 1) if _direction == 0 else range(
-            len(tensors) - 2, -1, -1
-        )
+        indices = range(len(tensors) - 1) if _direction == 0 else range(len(tensors) - 2, -1, -1)
         for index in indices:
             left = tensors[index]
             right = tensors[index + 1]
@@ -294,6 +453,158 @@ def _structural_compress_mpo(mpo, *, method="auto"):
         "changed": bool(reductions),
         "reductions": tuple(reductions),
         "method": method,
+    }
+
+
+def _delinearize_mpo(mpo):
+    """Rank-reveal a dense MPO with one right and one left sweep.
+
+    The right-to-left sweep first propagates independent suffix channels;
+    the left-to-right sweep then removes dependent prefix channels. Unlike
+    numerical SVD compression, this only removes dependencies that reconstruct
+    within the conservative floating-point residual bound in
+    :func:`_linear_factor`.
+    """
+
+    tensors = tuple(mpo)
+    if not tensors or any(not _is_supported_dense_array(tensor.data) for tensor in tensors):
+        raise TypeError("delinearize=True requires dense NumPy, Torch, CuPy, or JAX MPO tensors.")
+
+    reductions = []
+    for direction, indices in (
+        (1, range(len(tensors) - 2, -1, -1)),
+        (0, range(len(tensors) - 1)),
+    ):
+        for index in indices:
+            left = tensors[index]
+            right = tensors[index + 1]
+            bond = next(iter(qtn.bonds(left, right)))
+            child, parent = (right, left) if direction else (left, right)
+            changed, detail = _factor_edge_from_child(
+                child,
+                parent,
+                bond,
+                method="delinearize",
+                reduce_rows=bool(direction),
+            )
+            if changed:
+                reductions.append((index, detail[0], detail[1], direction))
+
+    return {
+        "changed": bool(reductions),
+        "sweeps": 2 if len(tensors) > 1 else 0,
+        "reductions": tuple(reductions),
+        "method": "delinearize",
+    }
+
+
+def _delinearize_mpo_arrays(arrays):
+    """Delinearize dense MPO arrays before Quimb tensor construction.
+
+    The arrays use Quimb's ``lrud`` convention, with absent boundary bonds
+    omitted. Internally they are converted to ``(left, physical, right)``
+    matrices. A right-to-left row-rank sweep followed by a left-to-right
+    column-rank sweep propagates each exact transfer once along the chain.
+    """
+
+    arrays = tuple(arrays)
+    if not arrays or any(not _is_supported_dense_array(array) for array in arrays):
+        raise TypeError(
+            "automaton delinearization requires dense NumPy, Torch, CuPy, or JAX arrays."
+        )
+    if len(arrays) == 1:
+        shape = arrays[0].shape
+        if len(shape) != 2 or shape[0] != shape[1]:
+            raise ValueError("a one-site MPO array must be square.")
+        return arrays, {
+            "changed": False,
+            "sweeps": 0,
+            "reductions": (),
+            "method": "delinearize",
+        }
+
+    phys_dim = arrays[0].shape[-1]
+    standard = []
+    standard.append(
+        _reshape(
+            _transpose(arrays[0], (1, 2, 0)),
+            (1, phys_dim * phys_dim, -1),
+        )
+    )
+    for array in arrays[1:-1]:
+        standard.append(
+            _reshape(
+                _transpose(array, (0, 2, 3, 1)),
+                (array.shape[0], phys_dim * phys_dim, array.shape[1]),
+            )
+        )
+    standard.append(_reshape(arrays[-1], (arrays[-1].shape[0], phys_dim * phys_dim, 1)))
+
+    reductions = []
+    # Right-canonicalize suffix channels. The basis is stored on the current
+    # site and its transfer is absorbed into the preceding site.
+    for site in range(len(standard) - 1, 0, -1):
+        left = standard[site - 1]
+        right = standard[site]
+        old_dim = right.shape[0]
+        matrix = _reshape(right, (old_dim, -1))
+        basis, transfer, _changed = _factor_columns(
+            _transpose(matrix, (1, 0)), method="delinearize"
+        )
+        new_dim = basis.shape[1]
+        if new_dim >= old_dim:
+            continue
+        standard[site] = _reshape(
+            _transpose(basis, (1, 0)),
+            (new_dim, right.shape[1], right.shape[2]),
+        )
+        standard[site - 1] = ar.do(
+            "tensordot",
+            left,
+            _transpose(transfer, (1, 0)),
+            axes=((2,), (0,)),
+        )
+        reductions.append((site - 1, old_dim, new_dim, 1))
+
+    # Left-canonicalize prefix channels against the independent suffix bases.
+    for site in range(len(standard) - 1):
+        left = standard[site]
+        right = standard[site + 1]
+        old_dim = left.shape[2]
+        matrix = _reshape(left, (-1, old_dim))
+        basis, transfer, _changed = _factor_columns(
+            matrix,
+            method="delinearize",
+        )
+        new_dim = basis.shape[1]
+        if new_dim >= old_dim:
+            continue
+        standard[site] = _reshape(basis, (left.shape[0], left.shape[1], new_dim))
+        standard[site + 1] = ar.do(
+            "tensordot",
+            transfer,
+            right,
+            axes=((1,), (0,)),
+        )
+        reductions.append((site, old_dim, new_dim, 0))
+
+    output = [_transpose(_reshape(standard[0], (phys_dim, phys_dim, -1)), (2, 0, 1))]
+    for array in standard[1:-1]:
+        output.append(
+            _transpose(
+                _reshape(
+                    array,
+                    (array.shape[0], phys_dim, phys_dim, array.shape[2]),
+                ),
+                (0, 3, 1, 2),
+            )
+        )
+    output.append(_reshape(standard[-1][:, :, 0], (-1, phys_dim, phys_dim)))
+    return tuple(output), {
+        "changed": bool(reductions),
+        "sweeps": 2,
+        "reductions": tuple(reductions),
+        "method": "delinearize",
     }
 
 
@@ -359,16 +670,12 @@ def _structural_compress_tree(
         metadata_network = stored_networks[0]
     try:
         final_bond = max(
-            (metadata_network.ind_size(index)
-             for index in metadata_network.inner_inds()),
+            (metadata_network.ind_size(index) for index in metadata_network.inner_inds()),
             default=1,
         )
     except AttributeError:
         final_bond = None
-    if (
-        final_bond is not None
-        and hasattr(metadata_network, "pepsy_tree_operator_bond")
-    ):
+    if final_bond is not None and hasattr(metadata_network, "pepsy_tree_operator_bond"):
         metadata_network.pepsy_tree_operator_bond = final_bond
 
     return {

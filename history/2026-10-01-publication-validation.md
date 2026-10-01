@@ -25,3 +25,10 @@ unchanged MPS/PEPS tests, as recorded in the
 [factor integration handoff](2026-10-01-tree-factor-sampling-integration.md#finalization--2026-10-01).
 The full suite is not repeated solely for publication. Commit and push status
 is reported after remote integration and final branch verification.
+
+Remote integration completed without conflicts. The local PEPS fixes and
+sampler/solver commit `3bfaaa9` are preserved alongside upstream `c796530`.
+Fresh structural-compression/MPO/Hamiltonian/gate/public-API/package checks
+on the merged tree: **287 passed**; Ruff and whitespace checks also passed.
+Examples `main` was pushed at `857145c`, including notebook commit `80b05e2`
+and the independently added upstream Helix analysis notebooks.

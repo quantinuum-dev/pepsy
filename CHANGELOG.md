@@ -237,6 +237,10 @@ releases remain backwards-compatible. From 1.0 onward:
   `materialize=True` on reusable evaluators for direct Quimb MPO output. Their
   cached vector-binding plans preserve independent coefficient gradients.
 
+- `ham_tn.to_mpo(..., delinearize=True)` rank-reveals automaton channels in
+  two directional passes on dense NumPy, Torch, CuPy, or JAX arrays before
+  optional SVD compression. The result includes a bond reduction report.
+
 - Compiled connected-cluster MPO and Pauli PEPO products now expose
   `trace_exp(..., normalized=False, state_budget=100000)`. It evaluates
   complete chosen-order ordered-product traces from scalar connected
@@ -286,6 +290,10 @@ releases remain backwards-compatible. From 1.0 onward:
   target preparation and guess construction may still use SVD.
   Native one-site preparation preserves charge sectors without attempting
   dense bond padding.
+
+- Enabled `delinearize` by default for NumPy-backed MPO builds. Builder-level
+  backend conversion now supports the dense backend sweep instead of skipping
+  it.
 
 - Branched tree direct/DM compression keeps the canonical center at the final
   visited tensor, skipping the final QR return to the hub. Cut order and
