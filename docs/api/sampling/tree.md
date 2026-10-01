@@ -68,7 +68,11 @@ method continues to return host Python lists.
 
 The source object is never mutated: the sampler copies the tree, moves the
 orthogonality centre onto the root, normalizes, and caches the per-node arrays.
-After the source state changes, call `sampler.refresh()` before sampling again.
+Existing canonical-region metadata limits this move to the required region/path;
+a source already centered at the root requires no new gauging. Sampling batches
+do not move the canonical center. After the source state changes, call
+`sampler.refresh()` before sampling again. An immediate refresh after constructing
+the sampler is unnecessary.
 
 `sample_arrays(...)` returns the raw `(configs, probs)` tuple, and `sample(...)`
 returns the list-based `TreeSampleResult`. To score existing configurations:
@@ -85,6 +89,16 @@ bond; unvisited sibling subtrees telescope to the identity, keeping the density
 transfer bounded by the bond dimension squared. All samples share the cached
 arrays and advance together through batched contractions, and each returned
 probability is the exact product of that shot's conditional Born probabilities.
+
+Within each dense batch, the incoming density is shared until physical
+conditioning distinguishes the shots. Shared first-child transfers contract
+the density with the node tensor directly, avoiding both repeated per-shot
+work and a quartic transfer environment. This applies with and without
+chunking; subsequent shot-dependent densities use the existing batched path.
+The optimization preserves the uniform-draw order and introduces no
+truncation. Densities are local to a batch, so no new persistent numerical
+cache requires invalidation. Unlike MPS prefix vectors, tree densities can be
+mixed because sibling branches remain unmeasured.
 
 ## Fermionic tree states
 

@@ -1190,7 +1190,14 @@ class TreeSampler:
     # -- sampling ------------------------------------------------------------
 
     def _sample_first_child_density(self, rho, ur):
-        """Contract an exact density transfer with bounded environment tiles."""
+        """Transfer a shared density directly, or tile shot-dependent ones."""
+        if rho.shape[0] == 1:
+            # Before physical conditioning distinguishes shots, keep just one
+            # density. Contract it first instead of forming the quartic map
+            # from parent-density entries to child-density entries.
+            weighted = self._einsum("BaA,acF->BAcF", rho, ur)
+            return self._einsum("BAcF,AdF->Bcd", weighted, ur.conj())
+
         par, child, _ = ur.shape
         itemsize = ur.element_size() if self.resolved_backend == "torch" else ur.dtype.itemsize
         width = max(1, min(child, _SAMPLE_ENV_BYTES // (par * par * child * itemsize)))
@@ -1238,7 +1245,9 @@ class TreeSampler:
 
         def visit(nid, rho):
             nonlocal draw_index
-            # rho: (B, d_par, d_par) reduced density on nid's parent bond.
+            # rho: (1 or B, d_par, d_par) density on nid's parent bond.
+            # A singleton batch is shared until physical conditioning makes
+            # the sibling remainder depend on each shot's selected outcome.
             ch = children[nid]
             arr = arrays[nid]
             q = qubit_of_node.get(nid)
@@ -1251,7 +1260,7 @@ class TreeSampler:
                 p = self._clip_nonnegative(p)
                 total = self._sum(p, axis=1, keepdims=True)
                 safe_total = self._where(total > 0.0, total, 1.0)
-                probs = p / safe_total
+                probs = self._broadcast_to(p / safe_total, (B, p.shape[1]))
                 draws = physical_draws[draw_index]
                 draw_index += 1
                 cdf = self._cumsum(probs, axis=1)
@@ -1282,12 +1291,12 @@ class TreeSampler:
                 d0 = arr.shape[1]
                 F0 = int(np.prod(arr.shape[2:])) if len(ch) > 1 else 1
                 ur = arr.reshape(par, d0, F0)
-                if self.chunk_size is None:
+                if rho.shape[0] == 1 or self.chunk_size is not None:
+                    rho0 = self._sample_first_child_density(rho, ur)
+                else:
                     env = self._einsum("acF,AdF->acAd", ur, ur.conj())
                     rho0 = self._einsum("BaA,acAd->Bcd", rho, env)
                     del env
-                else:
-                    rho0 = self._sample_first_child_density(rho, ur)
                 phi0 = visit(ch[0], rho0)
                 # Collapse child 0 into the node tensor -> batched remainder.
                 K = self._tensordot(phi0, arr, axes=([1], [1]))
@@ -1304,7 +1313,7 @@ class TreeSampler:
                 K = Knew.reshape((B, par) + K.shape[3:])
             return K.reshape(B, par)
 
-        rho_root = self._ones((B, 1, 1), dtype=arrays[self._root].dtype)
+        rho_root = self._ones((1, 1, 1), dtype=arrays[self._root].dtype)
         try:
             visit(self._root, rho_root)
         finally:

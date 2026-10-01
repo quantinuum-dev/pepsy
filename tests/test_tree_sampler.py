@@ -297,7 +297,8 @@ def test_cupy_chunk_sampling_uses_state_device():
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch", "cupy"])
-def test_chunked_density_transfer_matches_dense_without_full_environment(monkeypatch, backend):
+@pytest.mark.parametrize("batch", [1, 3])
+def test_chunked_density_transfer_matches_dense_without_full_environment(monkeypatch, backend, batch):
     import pepsy.sampling.tree as module
 
     state = TreeOptimizer([], n=2).tn
@@ -315,7 +316,7 @@ def test_chunked_density_transfer_matches_dense_without_full_environment(monkeyp
     sampler = TreeSampler(state, chunk_size=3)
     rng = np.random.default_rng(27)
     ur = rng.normal(size=(5, 7, 3)) + 1j * rng.normal(size=(5, 7, 3))
-    x = rng.normal(size=(3, 5, 5)) + 1j * rng.normal(size=(3, 5, 5))
+    x = rng.normal(size=(batch, 5, 5)) + 1j * rng.normal(size=(batch, 5, 5))
     rho = x @ x.conj().transpose(0, 2, 1)
     expected = np.einsum("BaA,acF,AdF->Bcd", rho, ur, ur.conj())
     monkeypatch.setattr(module, "_SAMPLE_ENV_BYTES", 5 * 5 * 7 * 16 * 2)
@@ -339,7 +340,98 @@ def test_chunked_density_transfer_matches_dense_without_full_environment(monkeyp
         assert isinstance(actual, cp.ndarray)
         actual = actual.get()
     np.testing.assert_allclose(actual, expected, atol=1e-11)
-    assert widths == [2, 2, 2, 1]
+    assert widths == ([] if batch == 1 else [2, 2, 2, 1])
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch", "torch_cuda", "cupy"])
+@pytest.mark.parametrize("root_qubit,chunk_size", [(None, None), (None, 7), (2, 7)])
+def test_shared_density_samples_match_dense_conditionals(
+    monkeypatch, backend, root_qubit, chunk_size,
+):
+    """Shared prefixes must branch with the same draws and exact Born weights."""
+    n, count, seed = 7, 31, 17
+    plan = TreePlan.from_order(
+        [q for q in range(n) if q != root_qubit],
+        structure="balanced", max_arity=3,
+        top_arity=3 if root_qubit is None else 2, root_qubit=root_qubit,
+    )
+    state = pepsy.TreeTensorNetwork.rand(plan, D=5, seed=19, dtype="complex128")
+    vector = np.asarray(state.to_dense()).reshape(-1)
+    exact = np.abs(vector) ** 2
+    exact /= exact.sum()
+    if backend.startswith("torch"):
+        torch = pytest.importorskip("torch")
+        if backend == "torch_cuda" and not torch.cuda.is_available():
+            pytest.skip("Torch CUDA unavailable")
+        device = "cuda:0" if backend == "torch_cuda" else "cpu"
+        state.apply_to_arrays(lambda a: torch.as_tensor(a, device=device))
+    elif backend == "cupy":
+        cp = pytest.importorskip("cupy")
+        try:
+            if cp.cuda.runtime.getDeviceCount() < 1:
+                pytest.skip("CUDA unavailable")
+        except cp.cuda.runtime.CUDARuntimeError:
+            pytest.skip("CUDA unavailable")
+        state.apply_to_arrays(cp.asarray)
+
+    center = state.orthogonality_center
+    source_arrays = tuple(t.data for t in state.tensors)
+    sampler = TreeSampler(state, backend="native", chunk_size=chunk_size)
+    # Enumerate the dense conditional distribution in physical traversal order.
+    order, stack = [], [plan.root]
+    while stack:
+        node = stack.pop()
+        if node in plan.qubit_of_node:
+            order.append(plan.qubit_of_node[node])
+        stack.extend(reversed(plan.children[node]))
+    basis = _all_configs(n)
+    weights = np.broadcast_to(exact, (count, len(exact))).copy()
+    expected = np.empty((count, n), dtype=np.int64)
+    for q, draws in zip(order, np.random.default_rng(seed).random((n, count))):
+        p0 = weights[:, basis[:, q] == 0].sum(axis=1) / weights.sum(axis=1)
+        expected[:, q] = draws > p0
+        weights *= basis[None, :, q] == expected[:, None, q]
+
+    physical_batches = []
+    einsum = sampler._einsum
+
+    def record_physical_batch(equation, *operands):
+        if equation == "BaA,axF,AxF->Bx":
+            physical_batches.append(operands[0].shape[0])
+        return einsum(equation, *operands)
+
+    monkeypatch.setattr(sampler, "_einsum", record_physical_batch)
+    result = sampler.sample_batch(count, seed=seed)
+    nchunks = 1 if chunk_size is None else (count + chunk_size - 1) // chunk_size
+    assert physical_batches[::n] == [1] * nchunks
+    assert max(physical_batches) == min(chunk_size or count, count)
+    assert result.backend == ("torch" if backend.startswith("torch") else backend)
+    if backend != "numpy":
+        assert result.configs.device == result.probs.device == source_arrays[0].device
+    actual = result.to_numpy()
+    np.testing.assert_array_equal(actual.configs, expected)
+    indices = expected @ (2 ** np.arange(n - 1, -1, -1))
+    np.testing.assert_allclose(actual.probs, exact[indices], atol=1e-12, rtol=1e-12)
+    assert state.orthogonality_center == center
+    assert all(t.data is original for t, original in zip(state.tensors, source_arrays))
+
+
+def test_shared_density_transfer_preserves_torch_gradients():
+    torch = pytest.importorskip("torch")
+    state = TreeOptimizer([], n=2).tn
+    state.apply_to_arrays(lambda a: torch.as_tensor(a, dtype=torch.complex128))
+    sampler = TreeSampler(state, backend="native")
+    rng = torch.Generator().manual_seed(21)
+    x = torch.randn(1, 3, 3, dtype=torch.complex128, generator=rng, requires_grad=True)
+    ur = torch.randn(3, 4, 2, dtype=torch.complex128, generator=rng, requires_grad=True)
+    rho = x @ x.mH
+    actual = sampler._sample_first_child_density(rho, ur)
+    expected = torch.einsum("BaA,acF,AdF->Bcd", rho, ur, ur.conj())
+    torch.testing.assert_close(actual, expected, atol=1e-11, rtol=1e-11)
+    actual_grads = torch.autograd.grad(actual.real.sum(), (x, ur), retain_graph=True)
+    expected_grads = torch.autograd.grad(expected.real.sum(), (x, ur))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=1e-11, rtol=1e-11)
 
 
 def test_sample_frequencies_converge_to_born():

@@ -232,6 +232,12 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Changed
 
+- Dense `TreeSampler` shares the incoming density across shots until physical
+  conditioning distinguishes them, and contracts shared first-child transfers
+  without a quartic environment. Chunked and unchunked sampling retain exact
+  Born probabilities, native backends, and uniform-draw order, with unchanged
+  canonical-center handling.
+
 - Removed `MpsOptimizer(mode="dmrg1")`; use `mode="dmrg"` for one-site
   FIT refinement from the initialized guess. `dmrg` rejects block sizes two
   and three; select `dmrg2` or `dmrg3` for multi-site updates. DMRG2/3 schedules
