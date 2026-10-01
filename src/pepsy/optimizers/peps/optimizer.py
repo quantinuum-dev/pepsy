@@ -11,6 +11,7 @@ from typing import Any
 
 import autoray as ar
 
+from ..._internal.cutoff import resolve_fit_rtol
 from ...boundary._fit_policy import (
     _FIT_QUIMB_MODES,
     _SWEEP_BOUNDARY_INIT_KEYS,
@@ -20,8 +21,17 @@ from ...boundary._fit_policy import (
 )
 from ...boundary.metrics import peps_infidelity as boundary_infidelity
 from ...boundary.metrics import peps_normalize as boundary_normalize
-from ...backends import TorchLinalgConfig, to_float as _backend_to_float
-from ...operators.gates import _normalize_gate_entries, gate as apply_gate
+from ...backends import (
+    TorchLinalgConfig,
+    resolve_backend_sample_data_from_tn,
+    to_float as _backend_to_float,
+)
+from ...operators.gates import (
+    _normalize_gate_entries,
+    _resolve_gate_cutoff,
+    _resolve_gate_cutoff_mode,
+    gate as apply_gate,
+)
 from ..global_opt import GlobalOptimizer
 from ..sweep import SweepOptimizer
 from ..sweep.environments import (
@@ -35,6 +45,7 @@ __all__ = ["PepsOptimizer"]
 
 _DEFAULT_BOUNDARY_KWARGS = {
     "n_iter": 10,
+    "fit_init_strategy": "guess-src",
     "direction": "y",
     "max_separation": 1,
     "track_boundary_fidelity": False,
@@ -152,8 +163,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
       state. The default ``reset_traces=True`` resets diagnostics only; use
       :meth:`set_state` when you want to replay from a fresh input state.
     - If ``normalize_chi`` or ``evaluation_chi`` is left as ``None``, standalone
-      normalization and infidelity diagnostics use ``2 * max(boundary_chi)``.
-      This is often more accurate, but it can dominate runtime.
+      normalization and infidelity diagnostics use ``(4 * chi, 5 * chi)``
+      as norm/overlap caps. Normalization uses only the first entry.
     - ``accept_if_improved=True`` is most meaningful with
       ``measure_final_infidelity=True``. If final measurement is disabled, the
       optimizer loss used as a fallback can come from the coarser
@@ -185,20 +196,18 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Maximum trainable PEPS/PEPO virtual bond dimension.
     boundary_chi : int | tuple[int, int] | None, optional
         Boundary contraction bond dimension used by the sweep/global
-        optimization backends. Defaults to ``chi``. Tuple values are forwarded
-        to :class:`SweepOptimizer`; when no explicit ``normalize_chi`` or
-        ``evaluation_chi`` is supplied, normalization and standalone infidelity
-        estimates use ``2 * max(boundary_chi)``.
-    normalize_chi : int | None, optional
-        Boundary bond dimension used for PEPS normalization calls. Use this to
-        normalize with a larger boundary than the trainable PEPS bond ``chi``
-        or the optimizer environment ``boundary_chi``. If ``None``, the
-        normalization chi defaults to ``2 * max(boundary_chi)``.
-    evaluation_chi : int | None, optional
+        optimization backends. Defaults to ``(4 * chi, 5 * chi)`` for norm and
+        overlap environments, respectively. A scalar sets both caps equally.
+        Normalization and evaluation defaults are independent of this override.
+    normalize_chi : int | tuple[int, int] | None, optional
+        Boundary cap or norm/overlap pair used for PEPS normalization calls.
+        Defaults to ``(4 * chi, 5 * chi)``; only the norm (first) entry is used.
+    evaluation_chi : int | tuple[int, int] | None, optional
         Boundary bond dimension used for pre/post local infidelity estimates
         that decide whether the warm start or optimized candidate is accepted.
         This is the knob for stricter initial/final diagnostics. If ``None``,
-        the evaluation chi defaults to ``2 * max(boundary_chi)``.
+        the evaluation chi defaults to ``(4 * chi, 5 * chi)``. Both state norms
+        use the first entry; the overlap uses the second. A scalar sets both.
     mode : {"sweep", "global"}, default="sweep"
         Variational optimizer backend used when the warm start is not good
         enough.
@@ -223,6 +232,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         estimates, and sweep environment updates. Defaults are
         ``n_iter=10``, ``direction="y"``, ``max_separation=1``,
         ``track_boundary_fidelity=False``, and ``strip_exponent=True``.
+        Boundary FIT uses ``fit_init_strategy="guess-src"`` by default;
+        explicit direct arguments or mapping entries override this policy.
         FIT controls such as ``fit_mode``, ``fit_layer_mode``, ``layer_tags``,
         the ``fit_*`` initialization/convergence options, and ``cutoff`` are
         shared across all three paths. Metric-only controls such as
@@ -364,17 +375,17 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.chi = self._validate_scalar_chi(chi, name="chi")
         self.boundary_chi = self._validate_boundary_chi(
-            self.chi if boundary_chi is None else boundary_chi
+            (4 * self.chi, 5 * self.chi) if boundary_chi is None else boundary_chi
         )
         self.normalize_chi = (
             None
             if normalize_chi is None
-            else self._validate_scalar_chi(normalize_chi, name="normalize_chi")
+            else self._validate_boundary_chi(normalize_chi, name="normalize_chi")
         )
         self.evaluation_chi = (
             None
             if evaluation_chi is None
-            else self._validate_scalar_chi(evaluation_chi, name="evaluation_chi")
+            else self._validate_boundary_chi(evaluation_chi, name="evaluation_chi")
         )
         self.mode = self._normalize_mode(mode)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
@@ -464,15 +475,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         return chi
 
     @classmethod
-    def _validate_boundary_chi(cls, chi):
+    def _validate_boundary_chi(cls, chi, *, name="boundary_chi"):
         if isinstance(chi, (tuple, list)):
             if len(chi) != 2:
-                raise ValueError("boundary_chi tuple must be length 2.")
+                raise ValueError(f"{name} tuple must be length 2.")
             return (
-                cls._validate_scalar_chi(chi[0], name="boundary_chi[0]"),
-                cls._validate_scalar_chi(chi[1], name="boundary_chi[1]"),
+                cls._validate_scalar_chi(chi[0], name=f"{name}[0]"),
+                cls._validate_scalar_chi(chi[1], name=f"{name}[1]"),
             )
-        return cls._validate_scalar_chi(chi, name="boundary_chi")
+        return cls._validate_scalar_chi(chi, name=name)
 
     @staticmethod
     def _require_torch_symmray_backend(*states, role="inputs"):
@@ -496,24 +507,32 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             "with pepsy.backend_torch(...) before optimization."
         )
 
-    def _boundary_chi_max(self):
-        if isinstance(self.boundary_chi, tuple):
-            return max(int(self.boundary_chi[0]), int(self.boundary_chi[1]))
-        return int(self.boundary_chi)
-
     def _boundary_chi_for_norm(self, override=None):
         if override is not None:
-            return self._validate_scalar_chi(override, name="normalize_chi")
+            return self._validate_boundary_chi(override, name="normalize_chi")
         if self.normalize_chi is not None:
-            return int(self.normalize_chi)
-        return 2 * self._boundary_chi_max()
+            return self.normalize_chi
+        return (4 * self.chi, 5 * self.chi)
 
     def _boundary_chi_for_infidelity(self, override=None):
         if override is not None:
-            return self._validate_scalar_chi(override, name="evaluation_chi")
+            return self._validate_boundary_chi(override, name="evaluation_chi")
         if self.evaluation_chi is not None:
-            return int(self.evaluation_chi)
-        return 2 * self._boundary_chi_max()
+            return self.evaluation_chi
+        return (4 * self.chi, 5 * self.chi)
+
+    def _resolve_infidelity_tol(self, value):
+        """Use the current PEPS precision without transferring tensor data."""
+        if isinstance(value, str) and value.strip().lower() == "auto":
+            sample = resolve_backend_sample_data_from_tn(self.state)
+            return resolve_fit_rtol("auto", dtype=getattr(sample, "dtype", "complex128"))
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("infidelity_tol must be 'auto' or a non-negative number.") from exc
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("infidelity_tol must be 'auto' or a non-negative number.")
+        return value
 
     def _validate_boundary_fit_policy(self):
         """Validate constructor-level FIT/layer policy before any contraction."""
@@ -569,10 +588,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         boundary_chi : int | tuple[int, int] | None, optional
             Boundary chi used by the optimizer backends. ``None`` preserves the
             current value.
-        normalize_chi : int | None, optional
+        normalize_chi : int | tuple[int, int] | None, optional
             Boundary chi used by :meth:`normalize` and run-time normalization
             calls. ``None`` preserves the current value.
-        evaluation_chi : int | None, optional
+        evaluation_chi : int | tuple[int, int] | None, optional
             Boundary chi used by :meth:`estimate_infidelity` and run-time
             accept/reject diagnostics. ``None`` preserves the current value.
 
@@ -584,12 +603,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         if boundary_chi is not None:
             self.boundary_chi = self._validate_boundary_chi(boundary_chi)
         if normalize_chi is not None:
-            self.normalize_chi = self._validate_scalar_chi(
+            self.normalize_chi = self._validate_boundary_chi(
                 normalize_chi,
                 name="normalize_chi",
             )
         if evaluation_chi is not None:
-            self.evaluation_chi = self._validate_scalar_chi(
+            self.evaluation_chi = self._validate_boundary_chi(
                 evaluation_chi,
                 name="evaluation_chi",
             )
@@ -1294,7 +1313,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             target_opt,
         )
         init_kwargs["boundary_engine"] = boundary_engine
-        normalize_payload = init_kwargs.get("normalize_kwargs")
+        normalize_payload = _merge_opts(
+            {"chi": self._boundary_chi_for_norm(normalize_chi)},
+            init_kwargs.get("normalize_kwargs"),
+        )
         if boundary_engine == "quimb-mps":
             normalize_payload = _merge_opts(
                 {"method": "mps", "mode_": "mps", "balance_bonds": False},
@@ -1372,8 +1394,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             progress=False,
         )
         normalize_defaults = dict(norm_defaults)
-        if normalize_chi is not None or self.normalize_chi is not None:
-            normalize_defaults["chi"] = self._boundary_chi_for_norm(normalize_chi)
+        normalize_defaults["chi"] = self._boundary_chi_for_norm(normalize_chi)
         loss_defaults = self._global_loss_defaults(
             cutoff=cutoff,
             progress=False,
@@ -1687,8 +1708,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         mode=None,
         progbar=False,
         progress=None,
-        cutoff=1.0e-12,
-        cutoff_mode="rsum2",
+        cutoff="auto",
+        cutoff_mode="auto",
         k_2q_batch=1,
         non_unitary=False,
         normalize_target=True,
@@ -1696,7 +1717,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_chi=None,
         evaluation_chi=None,
         normalize_final=True,
-        infidelity_tol=1.0e-10,
+        infidelity_tol="auto",
         measure_infidelity=True,
         optimize=True,
         measure_final_infidelity=True,
@@ -1727,9 +1748,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         progress, progbar : bool, optional
             Show the outer PEPS progress bar. ``progress`` is preferred;
             ``progbar`` is kept as a short alias.
-        cutoff, cutoff_mode
+        cutoff, cutoff_mode : float | str, default="auto"
             Truncation settings passed to gate application and target-derived
-            warm-start compression.
+            warm-start compression. Automatic cutoff follows the current PEPS
+            dtype: 1e-12 for float64/complex128, 1e-6 for float32/complex64,
+            and 1e-3 for 16-bit data. Automatic cutoff mode is "rsum2".
         k_2q_batch : int, default=1
             Number of sequential two-site gates to absorb into one target
             before the warm-start truncation and optional sweep/global
@@ -1745,19 +1768,22 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             legacy behavior of following ``non_unitary``.
         normalize_initial : bool | None, optional
             Override the constructor's one-time initial normalization setting.
-        normalize_chi : int | None, optional
+        normalize_chi : int | tuple[int, int] | None, optional
             Per-run PEPS normalization boundary chi override. This affects
             initial, target, warm-start, and final-candidate normalization
             calls made during this run.
-        evaluation_chi : int | None, optional
+        evaluation_chi : int | tuple[int, int] | None, optional
             Per-run boundary chi override for pre/post infidelity estimates.
             This is the recommended way to judge acceptance with a larger chi
             than the optimizer environment uses.
         normalize_final : bool, default=True
             Normalize an optimized candidate before measuring and accepting it.
-        infidelity_tol : float, default=1e-10
+        infidelity_tol : float | {"auto"}, default="auto"
             Accept the chi-truncated warm start without optimization when its
-            estimated infidelity is at or below this threshold.
+            estimated infidelity is at or below this threshold. Automatic
+            values use the MPS FIT tolerance scale: 1e-9 for float64/complex128,
+            1e-5 for float32/complex64, and 1e-3 for 16-bit data. This is a
+            refinement-entry threshold, not a guarantee on the final error.
         measure_infidelity : bool, default=True
             Measure the warm-start local infidelity before deciding whether to
             optimize.
@@ -1792,6 +1818,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             state; this flag controls only the recorded losses, infidelities,
             step records, and normalization events.
         """
+        # Resolve on every run, before normalization or gate application. A
+        # replacement state can have a different dtype. Quimb compress_all
+        # and global cleanup must receive concrete numerical policies.
+        cutoff = _resolve_gate_cutoff(self.state, cutoff)
+        cutoff_mode = _resolve_gate_cutoff_mode(cutoff_mode)
+        infidelity_tol = self._resolve_infidelity_tol(infidelity_tol)
         if mode is not None:
             self.set_mode(mode)
         run_mode = self.mode
@@ -2050,6 +2082,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "state_max_bond": self._max_bond(self.state),
                     "normalize_chi": self._boundary_chi_for_norm(normalize_chi),
                     "evaluation_chi": self._boundary_chi_for_infidelity(evaluation_chi),
+                    "cutoff": cutoff,
+                    "cutoff_mode": cutoff_mode,
+                    "infidelity_tol": infidelity_tol,
                     "pre_infidelity": pre_infidelity,
                     "optimizer_infidelity": opt_infidelity,
                     "post_infidelity": post_infidelity,

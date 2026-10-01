@@ -1341,14 +1341,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             method = "mps"
         self._ensure_boundary_chi(chi)
 
-        # boundary_infidelity() expects one scalar chi even though local sweep
-        # environments can carry separate norm/overlap caps. Use the larger
-        # requested cap for this diagnostic so neither contraction is
-        # accidentally limited by a rank-one warm state.
+        # Keep norm and overlap caps independent during diagnostic contractions,
+        # including when the current boundary starts at a smaller warm rank.
         requested_chi = chi if chi is not None else getattr(self, "chi", None)
         chi_bdy, chi_overlap = self._unpack_chi(requested_chi)
         if chi_bdy is not None:
-            chi_for_call = max(chi_bdy, chi_overlap)
+            chi_for_call = (chi_bdy, chi_overlap)
         elif uses_quimb:
             chi_for_call = max(
                 int(getattr(self.bdy, "chi", 1)),
@@ -1439,10 +1437,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self._append_metric_fit_diagnostics(result)
         self._update_boundaries_from_result(result)
         if requested_chi is not None:
-            # peps_infidelity() currently accepts one scalar chi and therefore
-            # uses max(chi_norm, chi_overlap). Restore the independent stored
-            # caps afterwards; in two-site mode this only compresses a boundary
-            # that actually grew beyond its own cap and never pads a warm state.
+            # Preserve the requested caps when replacing cached boundaries.
             self._ensure_boundary_chi(requested_chi)
 
         return float(result["infidelity"])

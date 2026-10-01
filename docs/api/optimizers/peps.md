@@ -3,10 +3,19 @@
 `PepsOptimizer` has separate chi controls for different jobs:
 
 - `chi` caps the optimized PEPS/PEPO virtual bonds.
-- `boundary_chi` controls sweep/global optimizer environments.
+- `boundary_chi` controls sweep/global optimizer environments; when omitted,
+  it defaults to `(4*D, 5*D)`, where `D=chi`.
 - `normalize_chi` controls PEPS normalization contractions.
 - `evaluation_chi` controls pre/post infidelity diagnostics used for accepting
   or rejecting a candidate.
+
+With no cap overrides, all three settings resolve to `(4*D, 5*D)`.
+Each accepts a scalar or a `(norm cap, overlap cap)` pair. Normalization uses
+only the first entry; infidelity uses the first for both state norms and the
+second for their overlap. For example, `chi=4` gives `(16, 20)` throughout.
+Automatic normalization/evaluation caps remain independent of an explicit
+environment override. Explicit constructor and per-run metric caps still
+take precedence. A scalar applies equally to all contractions for that setting.
 
 Use `evaluation_chi` larger than `boundary_chi` when you want a stricter final
 quality check without making every optimization environment more expensive.
@@ -28,6 +37,33 @@ requests truncation for the warm start. An explicit truncating value in
 the requested `cutoff` and `cutoff_mode`; one-site gates continue to use the
 run's gate options directly. Infidelity estimates must be finite; a
 substantially negative value raises rather than counting as a perfect update.
+
+`run()` defaults to `cutoff="auto"`, `cutoff_mode="auto"`, and
+`infidelity_tol="auto"`. Each run resolves these from the current PEPS array
+dtype, without transferring tensor data to the host:
+
+| PEPS precision | Warm-start cutoff | Infidelity threshold |
+| --- | --- | --- |
+| float64 / complex128 | 1e-12 | 1e-9 |
+| float32 / complex64 | 1e-6 | 1e-5 |
+| 16-bit floating point | 1e-3 | 1e-3 |
+
+Automatic cutoff mode is `"rsum2"`. The cutoff uses the shared MPS/gate
+truncation policy, while the infidelity threshold uses the MPS FIT tolerance
+scale. The latter decides whether to skip refinement of the compressed
+warm start; it does not guarantee the final infidelity reaches that value.
+Explicit nonnegative finite numbers retain precedence, including zero.
+`cutoff_mode=None` remains equivalent to `"auto"`. Policies are resolved anew
+after `set_state`, and gate/batch step records include the resolved `cutoff`,
+`cutoff_mode`, and `infidelity_tol`. Exact post-gate targets remain untruncated.
+The prior fixed settings remain available through
+`run(cutoff=1e-12, cutoff_mode="rsum2", infidelity_tol=1e-10)`.
+
+By default, the initial PEPS is normalized once on the first `run()`, and
+each newly generated gate/batch target is normalized before the bond-cap
+decision, warm-start compression, and infidelity precheck. Normalization does
+not depend on the infidelity threshold. Warm starts and optimized candidates
+are normalized as well. All these norm estimates use finite-cap contractions.
 
 The FIT controls can be supplied directly to `PepsOptimizer`, matching the
 `SweepOptimizer` names, for example `fit_mode`, `fit_layer_mode`,
@@ -68,8 +104,13 @@ optimizer = pepsy.PepsOptimizer(
 ```
 
 `fit_init_strategy` selects only the disposable FIT initial guess:
-`"guess-direct"`, `"guess-src"`, and `"guess-sdc"` are available in
-addition to the default `"direct"`. The exact boundary target, live state,
+`PepsOptimizer` defaults to `"guess-src"` (SRC initialization), with a boundary
+FIT iteration budget of `n_iter=10`. The spelling `"src"` belongs to
+`fit_mode`; use `"guess-src"` for initialization followed by FIT refinement.
+Explicit `fit_init_strategy="direct"`, `"guess-direct"`, or `"guess-sdc"`
+overrides this default, as does an entry in `boundary_kwargs` when the direct
+argument is omitted. Standalone boundary helpers and `SweepOptimizer` retain
+their own defaults. The exact boundary target, live state,
 and reusable boundary handles remain authoritative. Symmray boundaries safely
 fall back to direct initialization with a warning for dense Quimb guesses.
 
@@ -183,8 +224,9 @@ SWAP routing. Use `route_opts` for routing controls such as `sequence`,
   The default `reset_traces=True` resets diagnostics only; use `set_state(...)`
   when you want to replay from a fresh input state.
 - If `normalize_chi` or `evaluation_chi` is left unset, standalone
-  normalization and infidelity diagnostics use `2 * max(boundary_chi)`.
-  This can be more accurate, but it is often the expensive part of a run.
+  normalization and infidelity diagnostics use `(4*D, 5*D)`, independently
+  of the optimizer environment cap. Increase these explicitly for stricter
+  metric contractions, at extra computational cost.
 - `accept_if_improved=True` is most consistent with
   `measure_final_infidelity=True`. If final measurement is disabled, the
   fallback optimizer loss can come from the coarser `boundary_chi` environment

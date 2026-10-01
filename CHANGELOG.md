@@ -238,6 +238,27 @@ releases remain backwards-compatible. From 1.0 onward:
   Born probabilities, native backends, and uniform-draw order, with unchanged
   canonical-center handling.
 
+- `PepsOptimizer.run` now defaults `cutoff`, `cutoff_mode`, and `infidelity_tol`
+  to `"auto"`, resolved from the current PEPS dtype on each run. Complex128
+  uses cutoff 1e-12 and infidelity threshold 1e-9; complex64 uses 1e-6 and
+  1e-5, respectively. Automatic cutoff mode is `rsum2`. Explicit settings
+  retain precedence, exact targets remain untruncated, and step records save
+  the resolved values. Invalid cutoffs/tolerances fail before normalization.
+
+- `PepsOptimizer` now defaults omitted `boundary_chi`, `normalize_chi`, and
+  `evaluation_chi` to `(4*D, 5*D)` for norm/overlap contractions, with `D=chi`.
+  Normalization uses only the first entry. All three accept scalar or pair
+  overrides; `peps_infidelity` and `peps_normalize` support the same convention.
+  Sweep infidelity diagnostics preserve separate norm/overlap caps.
+  Automatic normalization and evaluation caps resolve independently of
+  environment cap overrides. The normalization cap is passed to delegated
+  sweep/global normalization as well. Explicit caps retain precedence.
+
+- `PepsOptimizer` now defaults to SRC boundary-FIT initialization
+  (`fit_init_strategy="guess-src"`), retaining `n_iter=10`. The shared policy
+  reaches normalization, local-infidelity checks, and sweep environments;
+  explicit constructor or `boundary_kwargs` settings still override it.
+
 - Removed `MpsOptimizer(mode="dmrg1")`; use `mode="dmrg"` for one-site
   FIT refinement from the initialized guess. `dmrg` rejects block sizes two
   and three; select `dmrg2` or `dmrg3` for multi-site updates. DMRG2/3 schedules

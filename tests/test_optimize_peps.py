@@ -128,6 +128,34 @@ def _install_fake_normalize(monkeypatch):
     return calls
 
 
+@pytest.mark.parametrize("options,strategy,iterations", [
+    ({}, "guess-src", 10),
+    ({"boundary_kwargs": {"fit_init_strategy": "direct", "n_iter": 3}}, "direct", 3),
+    ({"boundary_kwargs": {"fit_init_strategy": "direct"},
+      "fit_init_strategy": "guess-sdc"}, "guess-sdc", 10),
+])
+def test_peps_optimizer_default_boundary_initialization_routes_to_all_consumers(
+    monkeypatch, options, strategy, iterations,
+):
+    """The package default and explicit overrides reach metrics and sweep FIT."""
+    normalization_calls = _install_fake_normalize(monkeypatch)
+    infidelity_calls = []
+
+    def estimate(_state, _target, **kwargs):
+        infidelity_calls.append(kwargs)
+        return {"infidelity": 0.0}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", estimate)
+    opt = PepsOptimizer(DummyState(), chi=3, **options)
+    opt.normalize()
+    opt.estimate_infidelity(DummyState(), DummyState())
+    init_kwargs, optimize_kwargs, _ = opt._sweep_boundary_kwargs(progress=False)
+    for payload in (normalization_calls[-1][1], infidelity_calls[-1], init_kwargs):
+        assert payload["fit_init_strategy"] == strategy
+        assert payload["n_iter"] == iterations
+    assert optimize_kwargs["env_n_iter"] == iterations
+
+
 def test_peps_optimizer_routes_two_site_boundary_policy(monkeypatch):
     """Boundary kwargs should configure normalization and inner PEPS sweeps."""
     calls = _install_fake_normalize(monkeypatch)
@@ -466,6 +494,33 @@ def test_sweep_optimizer_retains_fit_diagnostics_in_run_result():
     assert tuple(sweep.fit_diagnostics) == result["fit_diagnostics"]
 
 
+@pytest.mark.parametrize("engine,fit_mode", [("dmrg", "dmrg2"), ("quimb-mps", "eff")])
+def test_peps_optimizer_boundary_pairs_complete_real_sweep(engine, fit_mode):
+    """Default cap pairs work with both boundary engines and actual cleanup."""
+    pytest.importorskip("nlopt")
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=901)
+    original = state.to_dense().copy()
+    gate = np.diag(np.exp(-0.17j * np.array([1., -1., -1., 1.])))
+    opt = PepsOptimizer(
+        state, [(gate, ((0, 0), (0, 1)))], chi=1,
+        fit_mode=fit_mode, boundary_engine=engine, fit_timing=True,
+        optimizer_options={"maxeval": 10},
+        sweep_optimize_kwargs={"n_round_trips": 1},
+    )
+    output = opt.run(infidelity_tol=0., progress=False)
+    record = opt.get_step_records()[0]
+    assert record["optimizer_attempted"]
+    assert record["final_infidelity"] <= record["pre_infidelity"]
+    assert output.max_bond() == 1
+    vector = output.to_dense().reshape(-1)
+    assert np.vdot(vector, vector).real == pytest.approx(1., abs=1e-10)
+    if engine == "dmrg":
+        assert opt.get_fit_diagnostics()
+    assert opt.boundary_chi == (4, 5)
+    assert record["normalize_chi"] == record["evaluation_chi"] == (4, 5)
+    np.testing.assert_array_equal(state.to_dense(), original)
+
+
 def test_sweep_optimizer_builds_two_site_cached_boundary_pair():
     """PEPS sweep cleanup should construct both CompBdy objects consistently."""
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=5)
@@ -612,7 +667,7 @@ def test_sweep_optimizer_infidelity_uses_requested_chi_and_none_override(
     sweep.infidelity(fit_min_iter=None, fit_rtol=None)
 
     inherited, fixed_sweeps = calls
-    assert inherited["chi"] == fixed_sweeps["chi"] == 6
+    assert inherited["chi"] == fixed_sweeps["chi"] == (4, 6)
     assert inherited["cutoff"] == fixed_sweeps["cutoff"] == 2.0e-10
     assert inherited["fit_min_iter"] == 2
     assert inherited["fit_rtol"] == 3.0e-8
@@ -641,6 +696,77 @@ def test_peps_optimizer_target_is_exact_before_chi_decision():
     assert optimizer.step_records[0]["reason"] == "within_chi"
     assert optimizer.step_records[0]["final_infidelity"] == 0.0
     assert output.max_bond() == 2
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("dtype,cutoff,tolerance", [
+    ("complex64", 1e-6, 1e-5), ("complex128", 1e-12, 1e-9),
+])
+def test_peps_optimizer_auto_matches_explicit_policy(backend, dtype, cutoff, tolerance):
+    """Native PEPS precision controls real compression and the refinement check."""
+    state = qtn.PEPS.product_state([[np.array([1., 0.], dtype=dtype)] * 2] * 2)
+    x = np.array([[0., 1.], [1., 0.]])
+    angle = 1e-3
+    gate = (np.cos(angle) * np.eye(4) - 1j * np.sin(angle) * np.kron(x, x)).astype(dtype)
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        state.apply_to_arrays(torch.as_tensor)
+        gate = torch.as_tensor(gate)
+    automatic = PepsOptimizer(
+        state, [(gate, ((0, 0), (0, 1)))], chi=1, boundary_chi=8,
+        boundary_engine="quimb-mps", contraction_opt="greedy",
+    )
+    explicit = PepsOptimizer(
+        state, [(gate, ((0, 0), (0, 1)))], chi=1, boundary_chi=8,
+        boundary_engine="quimb-mps", contraction_opt="greedy",
+    )
+    actual = automatic.run(optimize=False)
+    expected = explicit.run(cutoff=cutoff, cutoff_mode="rsum2",
+                            infidelity_tol=tolerance, optimize=False)
+    np.testing.assert_allclose(actual.to_dense(), expected.to_dense(), atol=cutoff)
+    record = automatic.get_step_records()[0]
+    assert record["target_max_bond"] == 2
+    assert record["state_max_bond"] == 1
+    assert record["cutoff"] == cutoff
+    assert record["cutoff_mode"] == "rsum2"
+    assert record["infidelity_tol"] == tolerance
+    assert record["reason"] == ("below_tol" if dtype == "complex64" else "warmstart")
+    assert str(next(iter(actual)).data.dtype).removeprefix("torch.") == dtype
+
+
+def test_peps_optimizer_auto_rechecks_replacement_state_dtype(monkeypatch):
+    """Auto settings follow set_state, and numeric settings retain precedence."""
+    _install_fake_gate(monkeypatch)
+    _install_fake_normalize(monkeypatch)
+
+    def typed_state(dtype):
+        state = DummyState()
+        state.tensor_map = {0: SimpleNamespace(data=np.ones(1, dtype=dtype))}
+        return state
+
+    opt = PepsOptimizer(typed_state("complex128"),
+                        [({"bond": 2}, ((0, 0), (0, 1)))], chi=3, inplace=True)
+    opt.run()
+    assert opt.step_records[0]["cutoff"] == 1e-12
+    assert opt.step_records[0]["infidelity_tol"] == 1e-9
+    opt.set_state(typed_state("complex64"))
+    opt.run()
+    assert opt.step_records[0]["cutoff"] == 1e-6
+    assert opt.step_records[0]["infidelity_tol"] == 1e-5
+    opt.run(cutoff=0., cutoff_mode="abs", infidelity_tol=2e-8)
+    assert opt.step_records[0]["cutoff"] == 0.
+    assert opt.step_records[0]["cutoff_mode"] == "abs"
+    assert opt.step_records[0]["infidelity_tol"] == 2e-8
+
+
+@pytest.mark.parametrize("key", ["cutoff", "infidelity_tol"])
+@pytest.mark.parametrize("value", [-1., np.nan, np.inf, "bad", None])
+def test_peps_optimizer_invalid_tolerance_fails_before_mutation(key, value):
+    opt = PepsOptimizer(DummyState(), [], chi=2)
+    with pytest.raises(ValueError, match=key):
+        opt.run(**{key: value})
+    assert opt.state.normalized == 0
+    assert not opt.get_step_records()
 
 
 @pytest.mark.parametrize("target_kwargs", [
@@ -749,7 +875,7 @@ def test_peps_optimizer_truncated_warmstart_below_tol_skips_sweep(monkeypatch):
     assert out.bond == 3
     assert out.normalized == 2
     assert len(norm_calls) == 2
-    assert norm_calls[0][1]["chi"] == 6
+    assert norm_calls[0][1]["chi"] == (12, 15)
     assert norm_calls[0][1]["n_iter"] == 10
     assert norm_calls[0][1]["direction"] == "y"
     assert norm_calls[0][1]["max_separation"] == 1
@@ -913,7 +1039,17 @@ def test_peps_optimizer_runs_sweep_and_records_geometric_fidelity(monkeypatch):
     assert "inner_loss_traces" not in result_summary
 
 
-def test_peps_optimizer_separates_optimization_normalize_and_evaluation_chi(monkeypatch):
+@pytest.mark.parametrize("caps,environment,normalization,evaluation", [
+    ({}, (12, 15), (12, 15), (12, 15)),
+    ({"boundary_chi": 4}, 4, (12, 15), (12, 15)),
+    ({"boundary_chi": (5, 7)}, (5, 7), (12, 15), (12, 15)),
+    ({"boundary_chi": 4, "normalize_chi": 6, "evaluation_chi": 9}, 4, 6, 9),
+    ({"normalize_chi": 6, "evaluation_chi": 9}, (12, 15), 6, 9),
+    ({"normalize_chi": (6, 7), "evaluation_chi": (8, 9)}, (12, 15), (6, 7), (8, 9)),
+])
+def test_peps_optimizer_separates_optimization_normalize_and_evaluation_chi(
+    monkeypatch, caps, environment, normalization, evaluation,
+):
     """Normalization and acceptance diagnostics can use stricter boundary chis."""
     _install_fake_gate(monkeypatch)
     norm_calls = _install_fake_normalize(monkeypatch)
@@ -953,30 +1089,31 @@ def test_peps_optimizer_separates_optimization_normalize_and_evaluation_chi(monk
         DummyState(bond=1),
         [({"bond": 8}, ((0, 0), (0, 1)))],
         chi=3,
-        boundary_chi=4,
-        normalize_chi=6,
-        evaluation_chi=9,
         normalize_initial=True,
+        **caps,
     )
 
     out = opt.run(progress=False, infidelity_tol=1.0e-9)
 
     assert out.name == "best"
-    assert [call[1]["chi"] for call in norm_calls] == [6, 6, 6, 6]
-    assert [call["chi"] for call in infidelity_calls] == [9, 9]
-    assert captured["init"]["kwargs"]["chi"] == 4
-    assert captured["init"]["kwargs"]["normalize_kwargs"]["chi"] == 6
+    assert [call[1]["chi"] for call in norm_calls] == [normalization] * 4
+    assert [call["chi"] for call in infidelity_calls] == [evaluation] * 2
+    assert captured["init"]["kwargs"]["chi"] == environment
+    assert captured["init"]["kwargs"]["normalize_kwargs"]["chi"] == normalization
     assert captured["init"]["kwargs"]["normalize_kwargs"]["strip_exponent"] is True
     assert captured["optimize_kwargs"]["env_n_iter"] == 10
     record = opt.step_records[0]
-    assert record["normalize_chi"] == 6
-    assert record["evaluation_chi"] == 9
+    assert record["normalize_chi"] == normalization
+    assert record["evaluation_chi"] == evaluation
     assert record["pre_infidelity"] == pytest.approx(0.2)
     assert record["post_infidelity"] == pytest.approx(0.03)
     assert record["reason"] == "optimized"
 
 
-def test_peps_optimizer_run_overrides_normalize_and_evaluation_chi(monkeypatch):
+@pytest.mark.parametrize("norm_cap,eval_cap", [(10, 11), ((10, 12), (11, 13))])
+def test_peps_optimizer_run_overrides_normalize_and_evaluation_chi(
+    monkeypatch, norm_cap, eval_cap,
+):
     """Per-run chi overrides should win over constructor diagnostic chis."""
     _install_fake_gate(monkeypatch)
     norm_calls = _install_fake_normalize(monkeypatch)
@@ -1002,17 +1139,34 @@ def test_peps_optimizer_run_overrides_normalize_and_evaluation_chi(monkeypatch):
     out = opt.run(
         progress=False,
         optimize=False,
-        normalize_chi=10,
-        evaluation_chi=11,
+        normalize_chi=norm_cap,
+        evaluation_chi=eval_cap,
     )
 
     assert out.bond == 3
-    assert [call[1]["chi"] for call in norm_calls] == [10, 10]
-    assert [call["chi"] for call in infidelity_calls] == [11]
+    assert [call[1]["chi"] for call in norm_calls] == [norm_cap, norm_cap]
+    assert [call["chi"] for call in infidelity_calls] == [eval_cap]
     record = opt.step_records[0]
-    assert record["normalize_chi"] == 10
-    assert record["evaluation_chi"] == 11
+    assert record["normalize_chi"] == norm_cap
+    assert record["evaluation_chi"] == eval_cap
     assert record["reason"] == "warmstart"
+
+
+@pytest.mark.parametrize("name", ["boundary_chi", "normalize_chi", "evaluation_chi"])
+@pytest.mark.parametrize("value", [(0, 5), (4, -1), (4,), (4, 5, 6), (4, None), (4, 5.5)])
+def test_peps_optimizer_rejects_invalid_cap_pairs(name, value):
+    with pytest.raises((TypeError, ValueError), match=name):
+        PepsOptimizer(DummyState(), chi=2, **{name: value})
+
+
+def test_peps_optimizer_set_boundary_chi_accepts_metric_pairs(monkeypatch):
+    calls = _install_fake_normalize(monkeypatch)
+    opt = PepsOptimizer(DummyState(), chi=2)
+    opt.set_boundary_chi((7, 9), normalize_chi=(8, 10), evaluation_chi=(9, 11))
+    opt.normalize()
+    assert calls[0][1]["chi"] == (8, 10)
+    assert opt.boundary_chi == (7, 9)
+    assert opt._boundary_chi_for_infidelity() == (9, 11)
 
 
 def test_peps_optimizer_rejects_optimizer_when_final_infidelity_is_worse(monkeypatch):
@@ -1136,6 +1290,7 @@ def test_peps_optimizer_global_defaults_options_and_torch_svd(monkeypatch):
     init_kwargs = captured["init"]["kwargs"]
     assert init_kwargs["chi"] == (16, 16)
     assert init_kwargs["norm_kwargs"]["chi"] == (16, 16)
+    assert init_kwargs["normalize_kwargs"]["chi"] == (12, 15)
     assert init_kwargs["norm_kwargs"]["mode"] == "mps"
     assert init_kwargs["norm_kwargs"]["mode_"] == "mps"
     assert init_kwargs["norm_kwargs"]["max_separation"] == 1

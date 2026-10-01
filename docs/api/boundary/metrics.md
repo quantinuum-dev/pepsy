@@ -1,5 +1,11 @@
 # `pepsy.boundary.metrics`
 
+`peps_infidelity(..., chi=(chi_norm, chi_overlap))` uses the first cap for
+both state norms and the second for the overlap. A scalar uses one cap for
+all three contractions. `peps_normalize` also accepts this pair and uses only
+its first entry, since normalization has no overlap contraction. Both entries
+must be positive integers. Supplied norms still skip their contractions.
+
 `peps_norm`, `peps_normalize`, `peps_infidelity`, and `contract_flat` accept
 the following boundary-compression modes:
 

@@ -900,6 +900,18 @@ def _validate_chi(chi):
     return int(chi)
 
 
+def _split_metric_chi(chi):
+    """Resolve scalar or (norm, overlap) caps for PEPS metrics."""
+    if isinstance(chi, (tuple, list)):
+        if len(chi) != 2:
+            raise ValueError("chi must have length 2: (chi_norm, chi_overlap).")
+        if any(value is None for value in chi):
+            raise TypeError("chi pair entries must be positive integers.")
+        return _validate_chi(chi[0]), _validate_chi(chi[1])
+    value = _validate_chi(chi)
+    return value, value
+
+
 def _normalize_contraction_method(method):
     """Normalize PEPS metric contraction method names."""
     key = str(method).strip().lower().replace("-", "_")
@@ -2538,8 +2550,9 @@ def peps_normalize(
     ----------
     p : qtn.TensorNetwork
         Input PEPS state.
-    chi : int | None, default=None
-        Boundary MPS bond dimension used when ``bdy`` is not provided.
+    chi : int | tuple[int, int] | None, default=None
+        Boundary MPS cap, or ``(norm cap, overlap cap)`` pair. Normalization
+        uses only the first entry. Required when ``bdy`` is not provided.
     bdy : pepsy.boundary.states.BdyMPS | dict | None, default=None
         Boundary handle:
 
@@ -2655,7 +2668,7 @@ def peps_normalize(
     """
     if p is None:
         raise ValueError("p must not be None.")
-    chi = _validate_chi(chi)
+    chi, _ = _split_metric_chi(chi)
 
     contract_kwargs = dict(
         chi=chi,
@@ -3119,9 +3132,10 @@ def peps_infidelity(
         Trial PEPS state.
     p_target : qtn.TensorNetwork
         Target PEPS state.
-    chi : int | None, default=None
-        Boundary MPS bond dimension. Required when the corresponding
-        ``bdy*`` argument is not supplied.
+    chi : int | tuple[int, int] | None, default=None
+        Boundary MPS cap, or ``(norm cap, overlap cap)`` pair. Both state
+        norms use the first entry; their overlap uses the second. A scalar
+        sets both caps. Required when the corresponding ``bdy*`` is absent.
     norm : complex | float | None, default=None
         Known value of :math:`\langle p | p \rangle`.  When provided the
         :math:`\langle p | p \rangle` boundary contraction is skipped
@@ -3243,13 +3257,12 @@ def peps_infidelity(
         raise ValueError("p must not be None.")
     if p_target is None:
         raise ValueError("p_target must not be None.")
-    chi = _validate_chi(chi)
+    chi_norm, chi_overlap = _split_metric_chi(chi)
     method = _normalize_contraction_method(method)
 
     # Shared contraction kwargs
     _kw = dict(
         method=method,
-        chi=chi,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
         fit_layer_mode=fit_layer_mode,
@@ -3295,6 +3308,7 @@ def peps_infidelity(
         _, norm_tn = build_bra_ket(ket=p, bra=None)
         norm_result, bdy_obj = _contract_peps_double_layer(
             norm_tn,
+            chi=chi_norm,
             bdy=bdy,
             single_layer=single_layer,
             bdy_name="bdy",
@@ -3314,6 +3328,7 @@ def peps_infidelity(
         _, norm_target_tn = build_bra_ket(ket=p_target, bra=None)
         norm_target_result, bdy_target_obj = _contract_peps_double_layer(
             norm_target_tn,
+            chi=chi_norm,
             bdy=bdy_target,
             single_layer=single_layer,
             bdy_name="bdy_target",
@@ -3330,6 +3345,7 @@ def peps_infidelity(
     _, overlap_tn = build_bra_ket(ket=p, bra=p_target)
     overlap_result, bdy_overlap_obj = _contract_peps_double_layer(
         overlap_tn,
+        chi=chi_overlap,
         bdy=bdy_overlap,
         single_layer=single_layer,
         bdy_name="bdy_overlap",
