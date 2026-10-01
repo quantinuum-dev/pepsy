@@ -12,8 +12,9 @@ Algorithm
 ---------
 The state is first put in canonical form with the orthogonality centre on the
 root and normalized, so every non-root node is isometric toward its parent
-bond.  Sampling then walks the tree depth-first, carrying a per-sample
-**reduced density matrix** on the active parent bond.  At each node the
+bond. Sampling then walks the tree depth-first, carrying an amplitude vector
+for structurally pure environments and a per-sample **reduced density matrix**
+for mixed environments on the active parent bond. At each node the
 not-yet-visited sibling subtrees telescope to the identity (the isometry
 property), so the density transfer stays bounded by the bond dimension squared
 -- the exact tree generalisation of the MPS right-environment sweep, where a
@@ -268,8 +269,9 @@ class TreeSampler:
     chunk_size : int or None, default=None
         Optional maximum shots per dense contraction batch. Also tile the
         first-child density transfer to avoid a full quartic bond tensor.
-        None preserves the unchunked path. Native Symmray already samples
-        one shot at a time. The returned sample count is unchanged.
+        None sets no explicit shot limit; the factor workspace target can
+        still reduce a batch. Native Symmray already samples one shot at a
+        time. The returned sample count is unchanged.
     backend : {"auto", "native", "numpy", "torch", "cupy", "symmray"}, default="auto"
         Backend used for cached node arrays and batched contractions. ``auto``
         preserves the existing dense compatibility path for Symmray trees;
@@ -282,6 +284,16 @@ class TreeSampler:
         occupation decoder is attached to the sample results when supported.
         Supplying a ``fermion`` pins the recorded ``symmetry``/``spinful``
         labels.
+    strategy : {"standard", "factor"}, default="standard"
+        Experimental ``factor`` retains compact exact factors, groups repeated
+        prefixes and caches child densities within one call. Dense backends
+        only; native Symmray retains its existing algorithm.
+    cache_bytes : int, default=134217728
+        Retained key/value budget for the factor strategy; zero disables
+        cross-chunk caching, while preserving within-chunk grouping.
+    workspace_bytes : int, default=536870912
+        Factor strategy's intermediate tiling target. Can reduce the effective
+        chunk size. This is not a total-memory bound; one shot can exceed it.
 
     Notes
     -----
@@ -299,6 +311,9 @@ class TreeSampler:
         chunk_size: int | None = None,
         backend="auto",
         fermion=None,
+        strategy="standard",
+        cache_bytes=128 * 1024**2,
+        workspace_bytes=512 * 1024**2,
     ):
         if chunk_size is not None and (
             isinstance(chunk_size, bool)
@@ -307,6 +322,16 @@ class TreeSampler:
         ):
             raise ValueError("chunk_size must be a positive integer or None.")
         self.chunk_size = None if chunk_size is None else int(chunk_size)
+        if strategy not in {"standard", "factor"}:
+            raise ValueError("strategy must be 'standard' or 'factor'.")
+        for name, value, minimum in (
+            ("cache_bytes", cache_bytes, 0), ("workspace_bytes", workspace_bytes, 1),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}.")
+        self.strategy = strategy
+        self.cache_bytes = int(cache_bytes)
+        self.workspace_bytes = int(workspace_bytes)
         self._rng = np.random.default_rng(seed)
         self.threads = None if threads is None else int(threads)
         self.backend = _normalize_tree_sampler_backend(backend)
@@ -1189,7 +1214,7 @@ class TreeSampler:
 
     # -- sampling ------------------------------------------------------------
 
-    def _sample_first_child_density(self, rho, ur):
+    def _sample_first_child_density(self, rho, ur, *, workspace_bytes=None):
         """Transfer a shared density directly, or tile shot-dependent ones."""
         if rho.shape[0] == 1:
             # Before physical conditioning distinguishes shots, keep just one
@@ -1200,7 +1225,8 @@ class TreeSampler:
 
         par, child, _ = ur.shape
         itemsize = ur.element_size() if self.resolved_backend == "torch" else ur.dtype.itemsize
-        width = max(1, min(child, _SAMPLE_ENV_BYTES // (par * par * child * itemsize)))
+        target = _SAMPLE_ENV_BYTES if workspace_bytes is None else workspace_bytes
+        width = max(1, min(child, target // (par * par * child * itemsize)))
         result = self._zeros((rho.shape[0], child, child), dtype=ur.dtype)
         conjugate = ur.conj()
         for start in range(0, child, width):
@@ -1212,7 +1238,7 @@ class TreeSampler:
             del env
         return result
 
-    def _sample_arrays(self, n_samples, rng, *, physical_draws=None):
+    def _sample_arrays(self, n_samples, rng, *, physical_draws=None, _factor_context=None):
         """Batched perfect sampling; returns backend-native arrays."""
         B = int(n_samples)
         arrays = self._arrays
@@ -1242,10 +1268,21 @@ class TreeSampler:
                 rng.random((len(qubit_of_node), B)), dtype=prob_dtype
             )
         draw_index = 0
+        context = _factor_context
 
-        def visit(nid, rho):
+        def select(value, indices, mapping=None):
+            if value.shape[0] == 1:
+                return value
+            if mapping is not None:
+                return value[mapping if indices is None else mapping[indices]]
+            return value if indices is None else value[indices]
+
+        def visit(nid, rho=None, vector=None, factor=None, factor_inverse=None, rho_inverse=None):
             nonlocal draw_index
             # rho: (1 or B, d_par, d_par) density on nid's parent bond.
+            # vector: (1 or B, d_par), only when purity follows from the
+            # traversal: the root is pure, and a remaining sibling bond space
+            # of dimension one preserves purity. Never use a rank tolerance.
             # A singleton batch is shared until physical conditioning makes
             # the sibling remainder depend on each shot's selected outcome.
             ch = children[nid]
@@ -1254,9 +1291,22 @@ class TreeSampler:
             if q is not None:
                 # p[B, x] = Re sum_{a,a'} rho[a,a'] T[a,x] conj(T[a',x]).
                 flat = arr.reshape(arr.shape[0], arr.shape[1], -1)
-                p = self._einsum(
-                    "BaA,axF,AxF->Bx", rho, flat, flat.conj()
-                ).real
+                if vector is not None:
+                    amplitudes = self._einsum("Ba,axF->BxF", vector, flat)
+                    p = self._sum(self._xp().abs(amplitudes) ** 2, axis=2)
+                    del amplitudes
+                elif factor is not None:
+                    amplitudes = self._einsum("Bra,axF->BrxF", factor, flat)
+                    p = self._sum(self._xp().abs(amplitudes) ** 2, axis=(1, 3))
+                    del amplitudes
+                    if factor_inverse is not None and p.shape[0] > 1:
+                        p = p[factor_inverse]
+                else:
+                    p = self._einsum(
+                        "BaA,axF,AxF->Bx", rho, flat, flat.conj()
+                    ).real
+                    if rho_inverse is not None and p.shape[0] > 1:
+                        p = p[rho_inverse]
                 p = self._clip_nonnegative(p)
                 total = self._sum(p, axis=1, keepdims=True)
                 safe_total = self._where(total > 0.0, total, 1.0)
@@ -1271,7 +1321,13 @@ class TreeSampler:
                 # Selecting one physical value leaves a batched tensor over
                 # the parent and child bonds. A physical leaf has no remaining
                 # child axes and can return immediately.
-                selected = self._moveaxis(arr[:, x, ...], 1, 0)
+                k_inverse = None
+                selection = x
+                if context is not None and ch and B > 1 and math.prod(arr.shape) // arr.shape[1] >= context.min_collapse:
+                    _, representatives, k_inverse = context.groups(configs, nid)
+                    context.check_remainder(len(representatives), math.prod(arr.shape) // arr.shape[1])
+                    selection = x[representatives]
+                selected = self._moveaxis(arr[:, selection, ...], 1, 0)
                 if not ch:
                     return selected.reshape(B, arr.shape[0])
 
@@ -1291,36 +1347,172 @@ class TreeSampler:
                 d0 = arr.shape[1]
                 F0 = int(np.prod(arr.shape[2:])) if len(ch) > 1 else 1
                 ur = arr.reshape(par, d0, F0)
-                if rho.shape[0] == 1 or self.chunk_size is not None:
+                if vector is not None:
+                    if context is not None and F0 > 1:
+                        rho0 = context.factor_density(vector[:, None, :], ur)
+                        phi0 = visit(ch[0], rho0)
+                    elif F0 == 1:
+                        projected = self._einsum("Ba,acF->BcF", vector, ur)
+                        phi0 = visit(ch[0], vector=projected[:, :, 0])
+                    else:
+                        projected = self._einsum("Ba,acF->BcF", vector, ur)
+                        rho0 = self._einsum("BcF,BdF->Bcd", projected, projected.conj())
+                        del projected
+                        phi0 = visit(ch[0], rho0)
+                elif context is not None:
+                    incoming = factor if factor is not None else rho
+                    rho0 = context.transfer(
+                        nid, incoming, ur, configs, factor=factor is not None,
+                        incoming_inverse=factor_inverse if factor is not None else rho_inverse,
+                    )
+                    phi0 = visit(ch[0], rho0)
+                elif rho.shape[0] == 1 or self.chunk_size is not None:
                     rho0 = self._sample_first_child_density(rho, ur)
+                    phi0 = visit(ch[0], rho0)
                 else:
                     env = self._einsum("acF,AdF->acAd", ur, ur.conj())
                     rho0 = self._einsum("BaA,acAd->Bcd", rho, env)
                     del env
-                phi0 = visit(ch[0], rho0)
+                    phi0 = visit(ch[0], rho0)
                 # Collapse child 0 into the node tensor -> batched remainder.
-                K = self._tensordot(phi0, arr, axes=([1], [1]))
+                k_inverse = None
+                if context is not None and B > 1 and math.prod(arr.shape) // d0 >= context.min_collapse:
+                    _, indices, k_inverse = context.groups(configs, nid)
+                    context.check_remainder(len(indices), math.prod(arr.shape) // d0)
+                    K = self._tensordot(phi0[indices], arr, axes=([1], [1]))
+                else:
+                    K = self._tensordot(phi0, arr, axes=([1], [1]))
                 start = 1
 
             for i in range(start, len(ch)):
                 di = K.shape[2]
                 Fi = int(np.prod(K.shape[3:])) if K.ndim > 3 else 1
-                Kf = K.reshape(B, par, di, Fi)
-                X = self._einsum("BaA,BacF->BAcF", rho, Kf)
-                rho_i = self._einsum("BAcF,BAdF->Bcd", X, Kf.conj())
-                phi_i = visit(ch[i], rho_i)
-                Knew = self._einsum("BpcF,Bc->BpF", Kf, phi_i)
-                K = Knew.reshape((B, par) + K.shape[3:])
-            return K.reshape(B, par)
+                Kf = K.reshape(K.shape[0], par, di, Fi)
+                indices = inverse = None
+                if context is not None and B > 1 and (
+                    k_inverse is not None or par >= context.min_parent
+                    or par * di * Fi >= context.min_collapse
+                ):
+                    _, indices, inverse = context.groups(configs)
+                rows = Kf.shape[0] if indices is None else len(indices)
+                tile_vector = (
+                    context is not None and vector is not None
+                    and rows * par * di * Fi * context.itemsize > context.workspace_bytes
+                )
+                tile_factor = (
+                    factor is not None and rows * factor.shape[1] * par * context.itemsize > context.workspace_bytes
+                )
+                if context is not None and not tile_vector and not tile_factor:
+                    context.check_remainder(Kf.shape[0] if indices is None else len(indices), par * di * Fi)
+                if tile_vector or tile_factor:
+                    active_K = None
+                elif indices is None or (
+                    k_inverse is not None and nid == self._root and context.radix is not None
+                ):
+                    # Root subtree keys are whole-prefix keys, with identical
+                    # sorted representatives. Reuse its compact remainder.
+                    active_K = Kf
+                else:
+                    active_K = Kf[indices if k_inverse is None else k_inverse[indices]]
+                active_vector = select(vector, indices) if vector is not None else None
+                active_factor = select(factor, indices, factor_inverse) if factor is not None and not tile_factor else None
 
-        rho_root = self._ones((1, 1, 1), dtype=arrays[self._root].dtype)
+                def expand(value):
+                    return value if inverse is None else value[inverse]
+
+                if vector is not None:
+                    projected = (
+                        context.project_vector(active_vector, Kf, indices, k_inverse)
+                        if tile_vector else self._einsum("Ba,BacF->BcF", active_vector, active_K)
+                    )
+                    if Fi == 1:
+                        phi_i = visit(ch[i], vector=expand(projected[:, :, 0]))
+                    elif context is not None and Fi <= di:
+                        phi_i = visit(ch[i], factor=self._moveaxis(projected, 1, 2), factor_inverse=inverse)
+                    else:
+                        if context is not None:
+                            context.check_remainder(rows, di * di)
+                        rho_i = self._einsum("BcF,BdF->Bcd", projected, projected.conj())
+                        del projected
+                        phi_i = visit(ch[i], rho_i, rho_inverse=inverse)
+                elif factor is not None:
+                    context.check_remainder(rows, di * di)
+                    if tile_factor:
+                        rho_i = context.project_factor_density(factor, Kf, indices, k_inverse, factor_inverse)
+                    else:
+                        projected = self._einsum("Bra,BacF->BrcF", active_factor, active_K)
+                        rho_i = self._einsum("BrcF,BrdF->Bcd", projected, projected.conj())
+                        del projected
+                    phi_i = visit(ch[i], rho_i, rho_inverse=inverse)
+                else:
+                    if context is not None:
+                        context.check_remainder(rows, di * di)
+                    X = self._einsum("BaA,BacF->BAcF", select(rho, indices, rho_inverse), active_K)
+                    rho_i = self._einsum("BAcF,BAdF->Bcd", X, active_K.conj())
+                    del X
+                    phi_i = visit(ch[i], rho_i, rho_inverse=inverse)
+                if context is not None and B > 1 and (k_inverse is not None or par * Fi >= context.min_collapse):
+                    _, representatives, new_inverse = context.groups(configs, nid)
+                    context.check_remainder(len(representatives), par * Fi)
+                    Knew = context.collapse(Kf, phi_i, representatives, k_inverse)
+                    k_inverse = new_inverse
+                else:
+                    Knew = self._einsum("BpcF,Bc->BpF", Kf, phi_i)
+                K = Knew.reshape((Knew.shape[0], par) + K.shape[3:])
+            result = K.reshape(K.shape[0], par)
+            return result if k_inverse is None else result[k_inverse]
+
+        vector_root = self._ones((1, 1), dtype=arrays[self._root].dtype)
         try:
-            visit(self._root, rho_root)
+            visit(self._root, vector=vector_root)
         finally:
             # Break the recursive closure's self-reference so completed chunk
             # buffers are released without waiting for cyclic GC.
             visit = None
         return configs, prob
+
+    def _sample_dense_arrays(self, count, rng):
+        """Own optional factor scratch across chunks and clear it on exit."""
+        from ._tree_factor import _FactorWorkspaceExceeded
+
+        context = None
+        kwargs = {}
+        chunk = min(self.chunk_size or count, count)
+        if getattr(self, "strategy", "standard") == "factor":
+            from ._tree_factor import _FactorSamplingContext
+
+            context = _FactorSamplingContext(self, self.cache_bytes, self.workspace_bytes)
+            kwargs["_factor_context"] = context
+            chunk = min(chunk, context.batch_limit)
+        try:
+            if chunk == count and context is None:
+                return self._sample_arrays(count, rng, **kwargs)
+            draws = self._as_backend(rng.random((len(self._qubit_of_node), count)))
+            start = 0
+            while start < count:
+                stop = min(start + chunk, count)
+                try:
+                    chunk_configs, chunk_probs = self._sample_arrays(
+                        stop - start, rng, physical_draws=draws[:, start:stop], **kwargs,
+                    )
+                except _FactorWorkspaceExceeded:
+                    # Prefix results already cached remain exact. Retry the
+                    # same uniform slice without advancing the random stream.
+                    chunk = max(1, (stop - start) // 2)
+                    continue
+                if start == 0 and stop == count:
+                    return chunk_configs, chunk_probs
+                if start == 0:
+                    configs = self._zeros((count, self._nqubits), dtype=chunk_configs.dtype)
+                    probs = self._zeros((count,), dtype=chunk_probs.dtype)
+                configs[start:stop] = chunk_configs
+                probs[start:stop] = chunk_probs
+                del chunk_configs, chunk_probs
+                start = stop
+            return configs, probs
+        finally:
+            if context is not None:
+                context.clear()
 
     def sample_arrays(self, n_samples: int = 1, seed=None, *, to_numpy=False):
         """Draw samples and return raw ``(configs, probs)`` arrays.
@@ -1361,26 +1553,8 @@ class TreeSampler:
                             probs,
                             dtype=self._symmray_state["template"].real.dtype,
                         )
-            elif self.chunk_size is not None and self.chunk_size < int(n_samples):
-                # Preserve RNG ordering, but retain only the final outputs and
-                # one chunk instead of collecting and concatenating all chunks.
-                count = int(n_samples)
-                draws = self._as_backend(rng.random((len(self._qubit_of_node), count)))
-                for start in range(0, count, self.chunk_size):
-                    stop = min(start + self.chunk_size, count)
-                    chunk_configs, chunk_probs = self._sample_arrays(
-                        stop - start, rng, physical_draws=draws[:, start:stop],
-                    )
-                    if start == 0:
-                        configs = self._zeros(
-                            (count, self._nqubits), dtype=chunk_configs.dtype,
-                        )
-                        probs = self._zeros((count,), dtype=chunk_probs.dtype)
-                    configs[start:stop] = chunk_configs
-                    probs[start:stop] = chunk_probs
-                    del chunk_configs, chunk_probs
             else:
-                configs, probs = self._sample_arrays(int(n_samples), rng)
+                configs, probs = self._sample_dense_arrays(int(n_samples), rng)
         if to_numpy:
             return _backend_array_to_numpy(configs), _backend_array_to_numpy(probs)
         return configs, probs
@@ -1484,7 +1658,12 @@ class TreeSampler:
                     K = Knew.reshape((B, par) + K.shape[3:])
             return K.reshape(B, par)
 
-        return visit(self._root)[:, 0]
+        try:
+            return visit(self._root)[:, 0]
+        finally:
+            # As in sampling, release the recursive closure and its captured
+            # snapshot/configurations without waiting for cyclic collection.
+            visit = None
 
     def amplitudes(self, configs, *, to_numpy: bool = True):
         """Return amplitudes ``<config|psi>`` for batched ``configs``.

@@ -9,7 +9,8 @@ Pass a positive `threads` value to explicitly limit BLAS/OpenMP around sampling.
 
 Dense sampling can optionally use `TreeSampler(..., chunk_size=1000)` to
 process at most 1,000 shots per contraction batch while returning the requested
-total sample count. The default `chunk_size=None` keeps unchunked sampling.
+total sample count. The default `chunk_size=None` sets no explicit shot limit;
+the factor strategy can still reduce batches to meet its workspace target.
 Chunking also tiles the first-child density environment, avoiding the complete
 quartic bond tensor and its transpose copy. Its internal environment target is
 1 GiB per tile (or one child-index slice when larger); this is not a bound on
@@ -23,6 +24,41 @@ changes the current CUDA device. Uniform draws retain the same
 seed ordering across chunk sizes; floating-point rounding can still change
 outcomes exactly at a probability threshold. Native Symmray already draws one
 shot at a time and accepts this option without changing that algorithm.
+
+Dense NumPy, Torch and CuPy trees can opt into the experimental, exact
+`strategy="factor"`. The default remains `strategy="standard"`. Both use
+structural pure vectors; the factor strategy additionally retains compact
+mixed factors, groups identical measurement prefixes and keeps large branch
+remainders grouped. It groups collapsed messages by their own subtree codes,
+while conditional densities use the entire measured prefix. Each shot keeps
+its own uniform draws. No bond/rank truncation or dtype reduction is applied.
+
+```python
+from pepsy.sampling import TreeSampler
+
+sampler = TreeSampler(tree, strategy="factor", chunk_size=2048)
+configs, probabilities = sampler.sample_arrays(8192, seed=0)
+```
+
+`cache_bytes` defaults to 128 MiB and bounds retained density keys and values
+within one sampling call. Zero disables cross-chunk caching; within-chunk
+grouping remains enabled. Cached hits and already-computed misses are reused
+even when admission is refused. Caches are cleared on success or failure and
+never survive a call or `refresh()`.
+
+`workspace_bytes` defaults to 512 MiB. It controls factor projections,
+remainder gathers and density-transfer tiles, and can reduce effective chunk
+sizes. If a grouped remainder exceeds the target, sampling retries smaller
+chunks with the same uniform draws. This target is not a total-memory limit:
+source tensors, simultaneous buffers, cache growth/sorting copies, outputs and
+Torch autograd graphs require additional memory, and a minimum one-shot or
+one-slice tile can exceed the target. Signed 64-bit key overflow falls back to
+exact row grouping without cross-chunk caching.
+
+Torch source gradients, dtype/device preservation and native result conversion
+are supported. Sharing thresholds are performance heuristics, so speedups
+depend on bond dimensions and repeated configurations. Native Symmray trees
+retain their existing block-sparse sampling algorithm with either strategy.
 
 ```python
 from pepsy.optimizers import TreeOptimizer
@@ -70,7 +106,9 @@ The source object is never mutated: the sampler copies the tree, moves the
 orthogonality centre onto the root, normalizes, and caches the per-node arrays.
 Existing canonical-region metadata limits this move to the required region/path;
 a source already centered at the root requires no new gauging. Sampling batches
-do not move the canonical center. After the source state changes, call
+do not move the canonical center. Live tensor `left_inds` identify each proven
+isometry's direction, allowing redundant lossless QR moves to be skipped.
+After the source state changes, call
 `sampler.refresh()` before sampling again. An immediate refresh after constructing
 the sampler is unnecessary.
 
@@ -90,15 +128,25 @@ transfer bounded by the bond dimension squared. All samples share the cached
 arrays and advance together through batched contractions, and each returned
 probability is the exact product of that shot's conditional Born probabilities.
 
-Within each dense batch, the incoming density is shared until physical
-conditioning distinguishes the shots. Shared first-child transfers contract
+Within each dense batch, the incoming environment is shared until physical
+conditioning distinguishes the shots. The root begins with an amplitude
+vector. When only trivial unmeasured sibling bonds remain, an incoming vector
+yields a pure child environment, carried as a vector instead of a squared
+bond density. Unmeasured siblings can make it mixed, so those branches retain
+the density route. Purity follows from the traversal, without a numerical
+rank test or approximation. Shared first-child density transfers contract
 the density with the node tensor directly, avoiding both repeated per-shot
 work and a quartic transfer environment. This applies with and without
 chunking; subsequent shot-dependent densities use the existing batched path.
 The optimization preserves the uniform-draw order and introduces no
-truncation. Densities are local to a batch, so no new persistent numerical
-cache requires invalidation. Unlike MPS prefix vectors, tree densities can be
-mixed because sibling branches remain unmeasured.
+truncation. The standard strategy keeps densities local to a batch; the factor
+strategy can reuse them across chunks within one call and clears its cache on
+return. Unlike MPS prefix vectors, tree densities can be mixed because sibling
+branches remain unmeasured.
+
+Sampling and dense scoring release their recursive traversal closures on both
+success and failure. Discarded sampler snapshots and shot buffers therefore do
+not wait for cyclic garbage collection to release their CPU/GPU arrays.
 
 ## Fermionic tree states
 

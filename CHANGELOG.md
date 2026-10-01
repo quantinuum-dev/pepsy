@@ -14,6 +14,21 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Experimental exact `TreeSampler(strategy="factor")` retains compact mixed
+  factors, groups repeated prefixes/subtree messages and caches child densities
+  within one call. Cache exhaustion reuses computed misses; large remainder
+  gathers and projections are tiled, and oversized grouped remainders retry
+  smaller chunks with unchanged uniform draws. NumPy, Torch CPU/CUDA and CuPy
+  preserve dtype/device and Torch gradients; integer-key overflow has an exact
+  row-grouping fallback. `cache_bytes` and `workspace_bytes` control retained
+  cache storage and intermediate targets, not total memory. The default
+  strategy and native Symmray algorithm remain unchanged.
+
+- Dense `TreeSampler` carries exact amplitude vectors for structurally pure
+  conditional environments, avoiding unnecessary squared-bond densities.
+  Mixed sibling environments retain the density route, with physical draw
+  ordering, precision, and exact Born probabilities preserved.
+
 - `PepsSampler(amplitude_mode="proposal")` names sampling without separate
   amplitude evaluation. `"none"` remains a compatible alias, including its
   existing result metadata. Both return q, `ps=None`, and equal averaging
@@ -524,6 +539,15 @@ releases remain backwards-compatible. From 1.0 onward:
   ordered rotations and pair wires.
 
 ### Fixed
+
+- Dense TreeSampler amplitude/probability scoring clears its recursive
+  traversal closure on success and failure, releasing discarded snapshots
+  without waiting for cyclic garbage collection.
+
+- Gradient-based SciPy solvers now return the actual termination message in
+  `OptimizationResult.convergence_reason` instead of always reporting
+  `"maxiter"`. Pepsy's `"patience"` and `"bad_max"` callback reasons retain
+  precedence.
 
 - Named PEPS normalization/evaluation caps now override stored option mappings;
   per-call mapping caps retain precedence. Run records and delegated

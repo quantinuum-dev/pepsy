@@ -12,6 +12,7 @@ state representation; the direct PEPS and BP proposal algorithms are distinct.
 | `results.py` | Sample records, batch conversions, fermionic configuration encodings |
 | `_common.py` | Site-map validation, array conversion, fermionic code ordering |
 | `tree.py` | Tree conditional sampling and tree-specific records |
+| `_tree_factor.py` | Call-local exact grouping, density caches and tiled factor/remainder transfers |
 | `stabilizer.py` | Physical-state sampling through stabilizer frame projectors |
 | `samplers.py` | Compatibility imports and old serialized class paths |
 

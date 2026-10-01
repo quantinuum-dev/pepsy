@@ -214,6 +214,69 @@ def test_scipy_solver_reduces_quadratic_if_available():
     assert abs(float(result.params["x"].detach().item())) < 1e-6
 
 
+@pytest.mark.parametrize(
+    ("method", "n_steps", "options", "success", "status"),
+    [
+        ("L-BFGS-B", 100, {}, True, 0),
+        ("BFGS", 100, {}, True, 0),
+        ("L-BFGS-B", 1, {}, False, 1),
+        ("L-BFGS-B", 100, {"maxfun": 1}, False, 1),
+        ("L-BFGS-B", 100, {"maxls": 1}, False, 2),
+    ],
+)
+def test_scipy_solver_reports_actual_termination(
+    monkeypatch, method, n_steps, options, success, status,
+):
+    """Convergence, budget limits and failed line searches keep SciPy's reason."""
+    scipy = pytest.importorskip("scipy")
+    real_minimize = scipy.optimize.minimize
+    raw_results = []
+
+    def capture_minimize(*args, **kwargs):
+        raw_result = real_minimize(*args, **kwargs)
+        raw_results.append(raw_result)
+        return raw_result
+
+    monkeypatch.setattr(scipy.optimize, "minimize", capture_minimize)
+
+    def rosenbrock(params):
+        x, y = params["x"]
+        return (1 - x) ** 2 + 100 * (y - x ** 2) ** 2
+
+    result = GradientOptimizer(
+        solver="scipy", n_steps=n_steps,
+        options={"algorithm": method, **options},
+    ).run(
+        params_init={"x": torch.tensor([-1.2, 1.0], dtype=torch.float64)},
+        loss_fn=rosenbrock,
+    )
+    raw_result = raw_results[0]
+    assert bool(raw_result.success) is success
+    assert raw_result.status == status
+    assert result.convergence_reason == str(raw_result.message)
+
+
+@pytest.mark.parametrize("control", ["patience", "bad_max"])
+def test_scipy_solver_preserves_pepsy_stop_reason(control):
+    """SciPy's callback message must not hide Pepsy's early-stop controls."""
+    pytest.importorskip("scipy")
+
+    def loss_fn(params):
+        x = params["x"]
+        if control == "bad_max" and x.item() < 1.5:
+            return x * float("nan")
+        return x ** 2
+
+    options = {"patience": 0} if control == "patience" else {
+        "bad_max": 1, "penalty_on_bad": 0.0,
+    }
+    result = GradientOptimizer(solver="scipy", n_steps=100, options=options).run(
+        params_init={"x": torch.tensor(2.0, dtype=torch.float64)}, loss_fn=loss_fn,
+    )
+    assert result.convergence_reason == control
+    assert result.n_steps == 1
+
+
 def test_scipy_solver_consumes_nlopt_tolerance_aliases_if_available(monkeypatch):
     """Package-relative tolerances must not leak into scipy.minimize."""
     scipy = pytest.importorskip("scipy")

@@ -1254,6 +1254,10 @@ def _run_scipy_lbfgs(
         )
     except StopIteration:
         pass
+    # Preserve Pepsy's callback stops; otherwise report SciPy's actual cause
+    # (convergence, a resource limit, or failure) rather than the initial label.
+    if result is not None and state["convergence_reason"] == "maxiter":
+        state["convergence_reason"] = str(result.message)
     if pbar is not None:
         pbar.close()
     if controls["restore_best"] and state["best_x"] is not None:

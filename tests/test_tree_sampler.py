@@ -396,7 +396,7 @@ def test_shared_density_samples_match_dense_conditionals(
     einsum = sampler._einsum
 
     def record_physical_batch(equation, *operands):
-        if equation == "BaA,axF,AxF->Bx":
+        if equation in {"BaA,axF,AxF->Bx", "Ba,axF->BxF"}:
             physical_batches.append(operands[0].shape[0])
         return einsum(equation, *operands)
 
@@ -432,6 +432,122 @@ def test_shared_density_transfer_preserves_torch_gradients():
     expected_grads = torch.autograd.grad(expected.real.sum(), (x, ur))
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, atol=1e-11, rtol=1e-11)
+
+
+@pytest.mark.parametrize("root_qubit", [None, 2])
+def test_pure_sampling_environment_avoids_last_density(monkeypatch, root_qubit):
+    """The final physical site uses a vector while earlier siblings stay mixed."""
+    plan = TreePlan.from_order(
+        [q for q in range(7) if q != root_qubit], structure="balanced",
+        max_arity=3, top_arity=3 if root_qubit is None else 2,
+        root_qubit=root_qubit,
+    )
+    state = pepsy.TreeTensorNetwork.rand(plan, D=5, seed=19, dtype="complex128")
+    sampler = TreeSampler(state, chunk_size=11)
+    physical_routes = []
+    einsum = sampler._einsum
+
+    def record_route(equation, *operands):
+        if equation in {"BaA,axF,AxF->Bx", "Ba,axF->BxF"}:
+            physical_routes.append(equation)
+        return einsum(equation, *operands)
+
+    monkeypatch.setattr(sampler, "_einsum", record_route)
+    actual = sampler.sample_batch(11, seed=17)
+    assert physical_routes[-1] == "Ba,axF->BxF"
+    assert "BaA,axF,AxF->Bx" in physical_routes
+    exact = np.abs(np.asarray(state.to_dense()).reshape(-1)) ** 2
+    exact /= exact.sum()
+    indices = actual.configs @ (2 ** np.arange(6, -1, -1))
+    np.testing.assert_allclose(actual.probs, exact[indices], atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 3])
+@pytest.mark.parametrize("root_qubit", [None, 2])
+def test_vector_sampling_preserves_torch_probability_gradients(chunk_size, root_qubit):
+    """For the drawn configurations, sampling and independent scoring differentiate alike."""
+    torch = pytest.importorskip("torch")
+    plan = TreePlan.from_order(
+        [q for q in range(5) if q != root_qubit],
+        structure="balanced", root_qubit=root_qubit,
+    )
+    state = pepsy.TreeTensorNetwork.rand(plan, D=4, seed=19, dtype="complex128")
+    state.apply_to_arrays(lambda a: torch.as_tensor(a).requires_grad_())
+    # Free source parameters need differentiable QR factors; an isometry
+    # proof establishes a value, not unconstrained parameter derivatives.
+    state.invalidate_canonical_form()
+    inputs = tuple(t.data for t in state.tensors)
+    sampler = TreeSampler(state, backend="native", chunk_size=chunk_size)
+    configs, actual = sampler.sample_arrays(7, seed=17)
+    # Sampling differentiates normalized conditionals. Explicit normalization
+    # also differentiates the captured scoring arrays' overall scale.
+    expected = sampler.probabilities(configs, to_numpy=False)
+    expected = expected / sampler.probabilities(_all_configs(5), to_numpy=False).sum()
+    torch.testing.assert_close(actual, expected, atol=1e-11, rtol=1e-11)
+    actual_gradients = torch.autograd.grad(actual.sum(), inputs, retain_graph=True)
+    expected_gradients = torch.autograd.grad(expected.sum(), inputs)
+    for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual_gradient, expected_gradient, atol=1e-10, rtol=1e-10)
+
+
+@pytest.mark.parametrize("method", ["amplitudes", "probabilities"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_scoring_releases_snapshot_without_cyclic_gc(monkeypatch, method, fail):
+    """Discarded sampler snapshots die immediately, including after a scoring error."""
+    state = pepsy.TreeTensorNetwork.rand(
+        TreePlan.from_order(range(5), structure="balanced"), D=4, seed=19,
+    )
+    sampler = TreeSampler(state)
+    sampler_ref = weakref.ref(sampler)
+    snapshot_refs = [weakref.ref(a) for a in sampler._arrays.values()]
+    configs = np.zeros((3, 5), dtype=np.int64)
+    configs_ref = weakref.ref(configs)
+    if fail:
+        def failed_contract(*args, **kwargs):
+            raise RuntimeError("injected scoring failure")
+
+        monkeypatch.setattr(TreeSampler, "_tensordot", failed_contract)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        if fail:
+            with pytest.raises(RuntimeError, match="injected scoring failure"):
+                getattr(sampler, method)(configs)
+        else:
+            getattr(sampler, method)(configs)
+        del sampler, configs
+        assert sampler_ref() is None
+        assert configs_ref() is None
+        assert all(ref() is None for ref in snapshot_refs)
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("off_root", [False, True])
+def test_sampling_reuses_canonical_path_and_does_not_move_center(monkeypatch, off_root):
+    plan = TreePlan.from_order(range(7), structure="balanced")
+    state = pepsy.TreeTensorNetwork.rand(plan, D=4, seed=19, dtype="complex128")
+    if off_root:
+        state.shift_orthogonality_center(plan.leaf_of_qubit[0])
+    center = state.orthogonality_center
+    source = [(t.data, t.left_inds) for t in state.tensors]
+    edges = []
+    original = pepsy.TreeTensorNetwork.canonize_edge_
+
+    def record_edge(network, a, b, **kwargs):
+        edges.append((a, b))
+        return original(network, a, b, **kwargs)
+
+    monkeypatch.setattr(pepsy.TreeTensorNetwork, "canonize_edge_", record_edge)
+    sampler = TreeSampler(state)
+    assert len(edges) == len(plan.node_path(center, plan.root)) - 1
+    before = len(edges)
+    sampler.sample_arrays(13, seed=17)
+    assert len(edges) == before
+    assert state.orthogonality_center == center
+    assert all(t.data is data and t.left_inds == left_inds
+               for t, (data, left_inds) in zip(state.tensors, source))
 
 
 def test_sample_frequencies_converge_to_born():
@@ -741,10 +857,11 @@ def test_fermionic_tree_probabilities_match_statevector(root_qubit):
     assert np.max(np.abs(probs - exact)) < 1e-10
 
 
-def test_fermionic_tree_samples_conserve_charge_and_decode():
+@pytest.mark.parametrize("strategy", ["standard", "factor"])
+def test_fermionic_tree_samples_conserve_charge_and_decode(strategy):
     pytest.importorskip("symmray")
     engine, fermion, target, L = _fermionic_tree(chi=64)
-    sampler = TreeSampler(engine, fermion=fermion, seed=0)
+    sampler = TreeSampler(engine, fermion=fermion, seed=0, strategy=strategy)
 
     res = sampler.sample_batch(2000, seed=42)
     assert res.configs.shape == (2000, L)
@@ -786,7 +903,8 @@ def test_non_fermionic_occupations_raises():
         res.occupations()
 
 
-def test_tree_sampler_symmray_generic_abelian_stays_block_sparse(monkeypatch):
+@pytest.mark.parametrize("strategy", ["standard", "factor"])
+def test_tree_sampler_symmray_generic_abelian_stays_block_sparse(monkeypatch, strategy):
     """Generic Abelian TTNs use the native path without densifying tensors."""
     pytest.importorskip("symmray")
     plan = TreePlan.from_order(range(4), max_arity=2, top_arity=2)
@@ -804,7 +922,7 @@ def test_tree_sampler_symmray_generic_abelian_stays_block_sparse(monkeypatch):
         raise AssertionError("native TreeSampler must not densify Symmray data")
 
     monkeypatch.setattr(type(state.node_tensor(0).data), "to_dense", fail_dense)
-    sampler = TreeSampler(state, backend="symmray", seed=7)
+    sampler = TreeSampler(state, backend="symmray", seed=7, strategy=strategy)
     configs = np.asarray(list(product(range(2), repeat=4)), dtype=np.int64)
     amplitudes = sampler.amplitudes(configs)
     probabilities = sampler.probabilities(configs)
@@ -826,7 +944,8 @@ def test_tree_sampler_symmray_generic_abelian_stays_block_sparse(monkeypatch):
 
 
 @pytest.mark.parametrize("symmetry", ("U1",))
-def test_tree_sampler_symmray_fermionic_native_matches_statevector(symmetry):
+@pytest.mark.parametrize("strategy", ["standard", "factor"])
+def test_tree_sampler_symmray_fermionic_native_matches_statevector(symmetry, strategy):
     """Native fermionic tree probabilities agree with a dense oracle."""
     pytest.importorskip("symmray")
     fermion = pepsy.Fermion(spinful=True, symmetry=symmetry)
@@ -837,7 +956,7 @@ def test_tree_sampler_symmray_fermionic_native_matches_statevector(symmetry):
         chi=4,
         seed=17,
     )
-    sampler = TreeSampler(state, backend="symmray", fermion=fermion)
+    sampler = TreeSampler(state, backend="symmray", fermion=fermion, strategy=strategy)
     configs = np.asarray(
         list(product(*(range(len(code_map)) for code_map in sampler.physical_code_maps))),
         dtype=np.int64,
@@ -857,6 +976,8 @@ def test_tree_sampler_symmray_fermionic_native_matches_statevector(symmetry):
         probabilities,
         atol=1e-11,
     )
+    sampled = sampler.sample_batch(8, seed=11)
+    np.testing.assert_allclose(sampler.probabilities(sampled.configs), sampled.probs, atol=1e-11)
 
 
 @pytest.mark.parametrize(

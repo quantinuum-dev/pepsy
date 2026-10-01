@@ -20,6 +20,10 @@ print(result.params["x"], result.best_loss)
 
 The result contains optimized `params`, loss `history`, `best_loss`,
 `final_loss`, `convergence_reason`, and evaluation count `n_evals`.
+For the gradient-based `scipy` family, `convergence_reason` contains SciPy's
+termination message, identifying convergence, budget exhaustion, or failure.
+Pepsy's callback stops retain the labels `"patience"` and `"bad_max"`.
+These messages are solver-specific strings, rather than a fixed enumeration.
 `optimize_packed_params(...)` provides the function form, returning
 `(params, history)`.
 
