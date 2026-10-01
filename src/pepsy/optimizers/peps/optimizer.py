@@ -67,6 +67,7 @@ _DEFAULT_GLOBAL_FALLBACK_KWARGS = {
     "optimizer": "lbfgs",
 }
 _TRACE_FIDELITY_FLOOR = 1.0e-15
+_UNSET_METRIC_CHI = object()
 
 
 def _normalize_gate_queue(gates):
@@ -507,19 +508,33 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             "with pepsy.backend_torch(...) before optimization."
         )
 
-    def _boundary_chi_for_norm(self, override=None):
-        if override is not None:
-            return self._validate_boundary_chi(override, name="normalize_chi")
-        if self.normalize_chi is not None:
-            return self.normalize_chi
-        return (4 * self.chi, 5 * self.chi)
+    def _resolve_metric_chi(self, override, configured, stored, options, *, name):
+        """Resolve metric caps consistently for contractions and run records."""
+        if options is not None and "chi" in options:
+            value = options["chi"]
+        elif override is not None:
+            value = override
+        elif configured is not None:
+            value = configured
+        elif "chi" in stored:
+            value = stored["chi"]
+        else:
+            value = self.boundary_kwargs.get("chi", (4 * self.chi, 5 * self.chi))
+        if value is None:
+            return None
+        return self._validate_boundary_chi(value, name=name)
 
-    def _boundary_chi_for_infidelity(self, override=None):
-        if override is not None:
-            return self._validate_boundary_chi(override, name="evaluation_chi")
-        if self.evaluation_chi is not None:
-            return self.evaluation_chi
-        return (4 * self.chi, 5 * self.chi)
+    def _boundary_chi_for_norm(self, override=None, *, options=None):
+        return self._resolve_metric_chi(
+            override, self.normalize_chi, self.normalize_kwargs, options,
+            name="normalize_chi",
+        )
+
+    def _boundary_chi_for_infidelity(self, override=None, *, options=None):
+        return self._resolve_metric_chi(
+            override, self.evaluation_chi, self.infidelity_kwargs, options,
+            name="evaluation_chi",
+        )
 
     def _resolve_infidelity_tol(self, value):
         """Use the current PEPS precision without transferring tensor data."""
@@ -669,7 +684,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             self.normalize_kwargs,
             normalize_kwargs,
         )
-        opts.setdefault("chi", self._boundary_chi_for_norm(normalize_chi))
+        opts["chi"] = self._boundary_chi_for_norm(normalize_chi, options=normalize_kwargs)
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
         _prefer_boundary_engine_mps(opts, self.boundary_engine, state, normalize=True)
@@ -744,7 +759,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         opts.update(self.target_gate_kwargs)
         for key, exact_value in (
-            ("cutoff", 0.0), ("max_bond", None), ("path_compress", False)
+            ("cutoff", 0.0), ("max_bond", None), ("path_compress", False), ("chi", None)
         ):
             if key in self.target_gate_kwargs and self.target_gate_kwargs[key] != exact_value:
                 raise ValueError(
@@ -1063,7 +1078,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             self.infidelity_kwargs,
             kwargs,
         )
-        opts.setdefault("chi", self._boundary_chi_for_infidelity(evaluation_chi))
+        opts["chi"] = self._boundary_chi_for_infidelity(evaluation_chi, options=kwargs)
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
         opts.setdefault("norm", 1.0)
@@ -1279,7 +1294,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         progress,
         sweep_progress=None,
-        normalize_chi=None,
+        normalize_chi=_UNSET_METRIC_CHI,
         sweep_kwargs=None,
         sweep_optimize_kwargs=None,
     ):
@@ -1314,18 +1329,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         init_kwargs["boundary_engine"] = boundary_engine
         normalize_payload = _merge_opts(
-            {"chi": self._boundary_chi_for_norm(normalize_chi)},
+            {"chi": self._boundary_chi_for_norm()
+             if normalize_chi is _UNSET_METRIC_CHI else normalize_chi},
             init_kwargs.get("normalize_kwargs"),
         )
         if boundary_engine == "quimb-mps":
             normalize_payload = _merge_opts(
                 {"method": "mps", "mode_": "mps", "balance_bonds": False},
                 normalize_payload,
-            )
-        if normalize_chi is not None or self.normalize_chi is not None:
-            normalize_payload = _merge_opts(
-                normalize_payload,
-                {"chi": self._boundary_chi_for_norm(normalize_chi)},
             )
         if strip_exponent is not None:
             normalize_payload = _merge_opts(
@@ -1380,7 +1391,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         progress,
         cutoff,
-        normalize_chi=None,
+        normalize_chi=_UNSET_METRIC_CHI,
         global_kwargs=None,
         global_optimize_kwargs=None,
     ):
@@ -1394,7 +1405,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             progress=False,
         )
         normalize_defaults = dict(norm_defaults)
-        normalize_defaults["chi"] = self._boundary_chi_for_norm(normalize_chi)
+        normalize_defaults["chi"] = (
+            self._boundary_chi_for_norm()
+            if normalize_chi is _UNSET_METRIC_CHI else normalize_chi
+        )
         loss_defaults = self._global_loss_defaults(
             cutoff=cutoff,
             progress=False,
@@ -1824,6 +1838,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff = _resolve_gate_cutoff(self.state, cutoff)
         cutoff_mode = _resolve_gate_cutoff_mode(cutoff_mode)
         infidelity_tol = self._resolve_infidelity_tol(infidelity_tol)
+        normalize_chi = self._boundary_chi_for_norm(normalize_chi, options=normalize_kwargs)
+        evaluation_chi = self._boundary_chi_for_infidelity(evaluation_chi, options=infidelity_kwargs)
         if mode is not None:
             self.set_mode(mode)
         run_mode = self.mode
@@ -2080,8 +2096,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "two_site_batch": int(two_site_in_batch),
                     "target_max_bond": target_max_bond,
                     "state_max_bond": self._max_bond(self.state),
-                    "normalize_chi": self._boundary_chi_for_norm(normalize_chi),
-                    "evaluation_chi": self._boundary_chi_for_infidelity(evaluation_chi),
+                    "normalize_chi": normalize_chi,
+                    "evaluation_chi": evaluation_chi,
                     "cutoff": cutoff,
                     "cutoff_mode": cutoff_mode,
                     "infidelity_tol": infidelity_tol,

@@ -16,6 +16,13 @@ second for their overlap. For example, `chi=4` gives `(16, 20)` throughout.
 Automatic normalization/evaluation caps remain independent of an explicit
 environment override. Explicit constructor and per-run metric caps still
 take precedence. A scalar applies equally to all contractions for that setting.
+Metric cap precedence is: per-call mapping `chi`, named per-call cap,
+named constructor cap, stored metric mapping `chi`, shared `boundary_kwargs`
+`chi`, then the automatic pair. The same resolved metric caps are used in run
+records and as defaults for delegated normalization. Explicit backend-specific
+normalization mappings remain available through `sweep_kwargs`/`global_kwargs`.
+An explicit mapping `chi=None` is preserved for exact metrics or reuse of
+existing DMRG boundary handles. Named caps require positive integers or pairs.
 
 Use `evaluation_chi` larger than `boundary_chi` when you want a stricter final
 quality check without making every optimization environment more expensive.
@@ -32,7 +39,8 @@ Use `PepsOptimizer.run(k_2q_batch=N)` to absorb up to `N` sequential two-site
 gates, plus intervening one-site gates, into one PEPS target before truncating
 to `chi` and optionally running the sweep/global cleanup. Two-site targets use
 `cutoff=0`, no bond cap, and no path compression, even when `run(cutoff=...)`
-requests truncation for the warm start. An explicit truncating value in
+requests truncation for the warm start. Inherited final gate `chi` is disabled
+for exact targets. An explicit truncating value, including final `chi`, in
 `target_gate_kwargs` raises `ValueError`. Warm-start `compress_all` receives both
 the requested `cutoff` and `cutoff_mode`; one-site gates continue to use the
 run's gate options directly. Infidelity estimates must be finite; a
@@ -64,6 +72,9 @@ each newly generated gate/batch target is normalized before the bond-cap
 decision, warm-start compression, and infidelity precheck. Normalization does
 not depend on the infidelity threshold. Warm starts and optimized candidates
 are normalized as well. All these norm estimates use finite-cap contractions.
+Delegated sweep initialization also uses `normalize_chi`, independently of
+`boundary_chi`. An explicit `sweep_kwargs["renormalize_kwargs"]["chi"]`
+overrides only the sweep constructor's normalization cap.
 
 The FIT controls can be supplied directly to `PepsOptimizer`, matching the
 `SweepOptimizer` names, for example `fit_mode`, `fit_layer_mode`,

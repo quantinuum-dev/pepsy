@@ -3086,7 +3086,10 @@ def _apply_chi_compression(tn, *, chi=None, chi_cutoff=1.0e-12):
         raise ValueError("chi must be a positive integer when provided.")
 
     if hasattr(tn, "compress"):
-        tn.compress(form="left", max_bond=chi_value, cutoff=chi_cutoff)
+        opts = {"max_bond": chi_value, "cutoff": chi_cutoff}
+        if isinstance(tn, qtn.TensorNetwork1D):
+            opts["form"] = "left"
+        tn.compress(**opts)
     elif hasattr(tn, "compress_all_"):
         tn.compress_all_(max_bond=chi_value, cutoff=chi_cutoff)
 

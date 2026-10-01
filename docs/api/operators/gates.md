@@ -45,6 +45,9 @@ and gate backends explicitly; this does not convert user gates.
 For `gate`, the optional final compression `chi_cutoff` also accepts and
 defaults to `auto`. Both APIs accept `path_compress_cutoff="auto"`;
 the existing `None` default inherits the resolved local gate cutoff.
+Final `chi` compression uses canonical left compression for 1D networks and
+the lattice compression API for PEPS/PEPO networks, preserving their native
+array backend. It is separate from each gate's local `max_bond` split cap.
 
 `build_pepo_from_gates(..., cutoff_mode="rsum2")` applies the requested
 truncation policy to both gate splits and fallback compression. The fallback

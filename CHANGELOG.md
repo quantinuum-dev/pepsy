@@ -525,6 +525,20 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Named PEPS normalization/evaluation caps now override stored option mappings;
+  per-call mapping caps retain precedence. Run records and delegated
+  normalization defaults use the resolved caps. Exact PEPS targets disable
+  inherited final gate `chi` and reject explicit target caps.
+  Explicit metric mapping `chi=None` remains supported for exact contraction
+  and existing boundary handles.
+- Final `gate(..., chi=...)` compression no longer sends the 1D-only `form`
+  option to PEPS/PEPO lattice compression.
+
+- Sweep constructor normalization now honors `normalize_kwargs["chi"]`
+  independently of the environment cap. This preserves `PepsOptimizer`'s
+  automatic or explicit `normalize_chi` during sweep initialization; explicit
+  `renormalize_kwargs["chi"]` retains precedence for the initial call.
+
 - Tree Kraus sampling computes exact local Born weights before branch
   compression or stabilization, preserving unequal and zero probabilities
   and cancelling common stored scales. Importance-sampled positive branches

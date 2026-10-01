@@ -36,6 +36,9 @@ for FIT/DMRG modes. Direct Quimb modes can use
 `fit_timing_sync_device=True` adds accelerator synchronization only when
 timing is enabled. These options can be supplied at construction or through
 `normalize_kwargs` / `infidelity(...)` per-call overrides.
+With `renormalize_state=True`, constructor normalization uses
+`normalize_kwargs["chi"]` when supplied, otherwise the environment `chi`.
+An explicit `renormalize_kwargs["chi"]` takes precedence for that initial call.
 The latest metric diagnostics are available as `optimizer.fit_diagnostics`,
 and sweep runs also return them under the `fit_diagnostics` result key.
 

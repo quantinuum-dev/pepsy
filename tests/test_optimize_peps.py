@@ -494,6 +494,48 @@ def test_sweep_optimizer_retains_fit_diagnostics_in_run_result():
     assert tuple(sweep.fit_diagnostics) == result["fit_diagnostics"]
 
 
+@pytest.mark.parametrize("engine,normalize_chi,renormalize_kwargs,backend_cap,expected", [
+    ("dmrg", None, None, None, [4, 4]),
+    ("quimb-mps", None, None, None, [4, 4]),
+    ("quimb-mps", (8, 10), None, None, [8, 8]),
+    ("quimb-mps", 8, {"chi": 6}, None, [6, 8]),
+    ("quimb-mps", 8, None, 6, [6, 6]),
+])
+def test_peps_optimizer_sweep_constructor_preserves_normalization_cap(
+    monkeypatch, engine, normalize_chi, renormalize_kwargs, backend_cap, expected,
+):
+    """Real initial and subsequent contractions honor independent metric caps."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=1, seed=907, dtype="complex128")
+    original = state.to_dense().copy()
+    calls = []
+    normalize = sweep_mod.peps_normalize
+
+    def record_normalization(*args, **kwargs):
+        cap = kwargs["chi"]
+        calls.append(cap[0] if isinstance(cap, tuple) else cap)
+        return normalize(*args, **kwargs)
+
+    def run(sweep):
+        sweep._normalize_state()
+        vector = sweep.state.to_dense().reshape(-1)
+        assert np.vdot(vector, vector).real == pytest.approx(1., abs=1e-10)
+        return {"best_state": sweep.state}
+
+    monkeypatch.setattr(sweep_mod, "peps_normalize", record_normalization)
+    monkeypatch.setattr(sweep_mod.SweepOptimizer, "run", run)
+    opt = PepsOptimizer(
+        state, chi=1, boundary_chi=2, normalize_chi=normalize_chi,
+        boundary_engine=engine, contraction_opt="greedy",
+        sweep_kwargs={
+            "renormalize_kwargs": renormalize_kwargs,
+            "normalize_kwargs": {} if backend_cap is None else {"chi": backend_cap},
+        },
+    )
+    opt._optimize_with_sweep(state.copy(), state.copy(), progress=False)
+    assert calls == expected
+    np.testing.assert_array_equal(state.to_dense(), original)
+
+
 @pytest.mark.parametrize("engine,fit_mode", [("dmrg", "dmrg2"), ("quimb-mps", "eff")])
 def test_peps_optimizer_boundary_pairs_complete_real_sweep(engine, fit_mode):
     """Default cap pairs work with both boundary engines and actual cleanup."""
@@ -770,7 +812,7 @@ def test_peps_optimizer_invalid_tolerance_fails_before_mutation(key, value):
 
 
 @pytest.mark.parametrize("target_kwargs", [
-    {"cutoff": 0.1}, {"max_bond": 1}, {"path_compress": True},
+    {"cutoff": 0.1}, {"max_bond": 1}, {"path_compress": True}, {"chi": 1},
 ])
 def test_peps_optimizer_rejects_truncated_target_options(target_kwargs):
     """Explicit target overrides must not silently defeat the exact target."""
@@ -780,6 +822,96 @@ def test_peps_optimizer_rejects_truncated_target_options(target_kwargs):
     )
     with pytest.raises(ValueError, match="exact post-gate target"):
         optimizer.run(normalize_target=False)
+
+
+@pytest.mark.parametrize("per_call", [False, True])
+def test_peps_optimizer_exact_target_ignores_general_final_gate_cap(per_call):
+    """Output compression cannot remove entanglement from the target."""
+    state = qtn.PEPS.product_state([[np.array([1., 0.], dtype="complex128")] * 2] * 2)
+    x = np.array([[0., 1.], [1., 0.]])
+    angle = .3
+    payload = np.cos(angle) * np.eye(4) - 1j * np.sin(angle) * np.kron(x, x)
+    options = {"chi": 1, "chi_cutoff": .5}
+    opt = PepsOptimizer(
+        state, [(payload, ((0, 0), (0, 1)))], chi=1,
+        gate_kwargs=None if per_call else options, boundary_engine="quimb-mps",
+        contraction_opt="greedy",
+    )
+    target = opt._build_target(
+        state, payload, ((0, 0), (0, 1)), None, cutoff=1e-12,
+        cutoff_mode="rsum2", gate_kwargs=options if per_call else None,
+    )
+    expected = np.zeros(16, dtype="complex128")
+    expected[0], expected[12] = np.cos(angle), -1j * np.sin(angle)
+    np.testing.assert_allclose(target.to_dense().reshape(-1), expected, atol=1e-12)
+    opt.run(optimize=False, gate_kwargs=options if per_call else None)
+    record = opt.get_step_records()[0]
+    assert record["target_max_bond"] == 2
+    assert record["reason"] == "warmstart"
+
+
+@pytest.mark.parametrize("configured,run_options,expected", [
+    ({}, {}, (2, 3)),
+    ({}, {"normalize_chi": 8, "evaluation_chi": 9}, (8, 9)),
+    ({"normalize_chi": 4, "evaluation_chi": 5}, {}, (4, 5)),
+    ({}, {"normalize_chi": 8, "evaluation_chi": 9,
+          "normalize_kwargs": {"chi": (10, 12)},
+          "infidelity_kwargs": {"chi": (11, 13)}}, ((10, 12), (11, 13))),
+    ({}, {"normalize_kwargs": {"chi": None},
+          "infidelity_kwargs": {"chi": None}}, (None, None)),
+    ({"normalize_chi": 4, "evaluation_chi": 5},
+     {"normalize_kwargs": {"chi": None},
+      "infidelity_kwargs": {"chi": None}}, (None, None)),
+])
+def test_peps_optimizer_metric_cap_precedence_matches_run_records(
+    monkeypatch, configured, run_options, expected,
+):
+    """Named caps override stored mappings; per-call mappings remain explicit."""
+    _install_fake_gate(monkeypatch)
+    norms = _install_fake_normalize(monkeypatch)
+    evaluations = []
+
+    def estimate(*args, **kwargs):
+        evaluations.append(kwargs["chi"])
+        return {"infidelity": 0.}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", estimate)
+    opt = PepsOptimizer(
+        DummyState(), [({"bond": 2}, ((0, 0), (0, 1)))], chi=1,
+        normalize_kwargs={"chi": 2}, infidelity_kwargs={"chi": 3}, **configured,
+    )
+    opt.run(optimize=False, **run_options)
+    assert all(call[1]["chi"] == expected[0] for call in norms)
+    assert evaluations == [expected[1]]
+    record = opt.get_step_records()[0]
+    assert (record["normalize_chi"], record["evaluation_chi"]) == expected
+    norms.clear()
+    evaluations.clear()
+    opt.normalize(normalize_chi=8)
+    opt.estimate_infidelity(opt.state, DummyState(), evaluation_chi=9)
+    assert norms[0][1]["chi"] == 8
+    assert evaluations == [9]
+
+
+@pytest.mark.parametrize("source", ["call", "stored", "shared"])
+def test_peps_optimizer_exact_metrics_accept_optional_mapping_chi(source):
+    """Explicit uncapped mappings preserve real exact metric contractions."""
+    state = qtn.PEPS.product_state([[np.array([2., 0.])] * 2] * 2)
+    original = state.to_dense().copy()
+    options = {"method": "exact", "chi": None}
+    constructor = {}
+    if source == "stored":
+        constructor = {"normalize_kwargs": options, "infidelity_kwargs": options}
+    elif source == "shared":
+        constructor = {"boundary_kwargs": options}
+    opt = PepsOptimizer(state, chi=1, contraction_opt="greedy", **constructor)
+    call_options = options if source == "call" else {}
+    opt.normalize(**call_options)
+    np.testing.assert_allclose(np.linalg.norm(opt.state.to_dense()), 1., atol=1e-12)
+    assert opt.estimate_infidelity(
+        opt.state, opt.state.copy(), norm=None, norm_target=None, **call_options,
+    ) == pytest.approx(0., abs=1e-12)
+    np.testing.assert_allclose(state.to_dense(), original)
 
 
 def test_peps_optimizer_warmstart_uses_requested_cutoff_mode():

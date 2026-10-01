@@ -671,7 +671,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self._warned_nested_param_tree = False
 
         init_renormalize_kwargs = self._collect_init_renormalize_kwargs(
-            chi=self.chi,
+            chi=self.normalize_kwargs.get("chi", self.chi),
             renormalize_kwargs=renormalize_kwargs,
             n_iter=n_iter,
             direction=direction,

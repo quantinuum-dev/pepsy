@@ -1107,6 +1107,59 @@ def test_apply_gates_runs_final_compress_when_chi_given():
     assert dummy.called == (2, 1.0e-12)
 
 
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_peps_final_gate_compression_uses_lattice_api(backend):
+    """Final PEPS compression keeps the dominant Schmidt term and input intact."""
+    state = qtn.PEPS.product_state([[np.array([1., 0.], dtype="complex128")] * 2] * 2)
+    x = np.array([[0., 1.], [1., 0.]])
+    angle = .3
+    payload = np.cos(angle) * np.eye(4) - 1j * np.sin(angle) * np.kron(x, x)
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        state.apply_to_arrays(torch.as_tensor)
+        payload = torch.as_tensor(payload)
+    result = apply_gate(
+        state, payload, ((0, 0), (0, 1)), cutoff=0., chi=1,
+        chi_cutoff=0., inplace=False,
+    )
+    assert result.max_bond() == 1
+    expected = np.zeros(16, dtype="complex128")
+    expected[0] = np.cos(angle)
+    if backend == "torch":
+        assert all(t.data.dtype == torch.complex128 and t.data.device.type == "cpu"
+                   for t in result)
+        dense = result.to_dense().detach().numpy()
+        initial = state.to_dense().detach().numpy()
+    else:
+        dense, initial = result.to_dense(), state.to_dense()
+    np.testing.assert_allclose(dense.reshape(-1), expected, atol=1e-12)
+    expected[0] = 1.
+    np.testing.assert_allclose(initial.reshape(-1), expected, atol=1e-12)
+
+
+def test_native_pepo_final_gate_compression_preserves_operator():
+    """Lattice compression preserves an uncapped native fermionic operator."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion
+
+    fermion = Fermion(spinful=False, symmetry="U1")
+    edge = ((0, 0), (0, 1))
+    term = fermion.operator_term(
+        [(1., ((edge[0], "create"), (edge[1], "annihilate")))],
+        sites=edge, add_hc=True,
+    )
+    state = fermion.to_pepo(
+        {edge: term}, Lx=2, Ly=2, mapper=OneDMap(2, 2, mode="snake-row-major"),
+        max_bond=16, compress=False,
+    )
+    result = apply_gate(state, [], chi=16, chi_cutoff=0., inplace=False)
+    assert all(type(t.data).__name__ == "U1FermionicArray" for t in result)
+    norm = complex(state.norm())
+    assert complex(result.norm()) == pytest.approx(norm, abs=1e-12)
+    overlap = (state.H & result).contract(all, optimize="greedy")
+    assert complex(overlap) == pytest.approx(norm ** 2, abs=1e-12)
+
+
 def test_apply_gates_invalid_chi_raises():
     """Non-positive chi should fail with ValueError."""
     peps = ps_to_peps(2, 2, dtype="complex128")
