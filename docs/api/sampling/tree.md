@@ -36,9 +36,23 @@ its own uniform draws. No bond/rank truncation or dtype reduction is applied.
 ```python
 from pepsy.sampling import TreeSampler
 
-sampler = TreeSampler(tree, strategy="factor", chunk_size=2048)
+sampler = TreeSampler(
+    tree, strategy="factor", chunk_size=1000, backend="native",
+)
 configs, probabilities = sampler.sample_arrays(8192, seed=0)
 ```
+
+For large-bond dense GPU trees, this is a starting configuration to compare
+against `strategy="standard"` on the same state and sample count. Keep the
+default cache and workspace budgets initially; reduce the chunk size when
+sampling intermediates exceed the available memory. Smaller chunks trade
+throughput for memory, and factor does not guarantee a lower peak on every
+tree. In a [30-site CuPy comparison](../../development/notes/2026-10-01-tree-factor-small-chunks.md),
+factor reduced additional live memory at maximum bond 256 with chunks of 16
+and 128; at maximum bond 32 and chunk 128, standard used less. The
+chunk-1,000 factor configuration also completed 8,192 samples at bond 256.
+These synthetic measurements do not establish production-checkpoint or
+Torch memory requirements; the package default remains standard.
 
 `cache_bytes` defaults to 128 MiB and bounds retained density keys and values
 within one sampling call. Zero disables cross-chunk caching; within-chunk
