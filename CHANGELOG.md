@@ -14,6 +14,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Native Symmray scalar extraction preserves Torch gradients and CuPy arrays,
+  unwrapping only tensor-network containers. Native normalization and scoring
+  keep their backend graphs; canonical capture normalizes its graded root
+  directly and clears an extracted positive global scale.
+
 - TreeSampler rescales dense conditional messages to prevent long-tree
   complex64 sampling bias and scores probabilities with float64 scale
   bookkeeping. Dense root normalization handles extreme finite scales,
@@ -24,6 +29,21 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Native `TreeSampler(..., backend="native", strategy="factor")` shares
+  measurement prefixes using exact, sector-preserving canonical factors.
+  Graded centre norms preserve fermionic phases, physical codes are remapped
+  after unreachable sectors disappear, and prefixes are normalized with
+  float64 sample-probability bookkeeping. NumPy, Torch CPU/CUDA and CuPy retain
+  blocks and device; Torch fixed-configuration scores retain gradients.
+  `cache_bytes` bounds retained payloads within a call; single-chunk native
+  requests skip unused prefix-cache retention. `workspace_bytes`
+  continues to tile dense kernels rather than native QR.
+
+- Dense factor sampling reuses the virtual root's unconditioned first-child
+  density across chunks when its cache budget admits it. Cache growth merges
+  sorted keys by direct scatter, avoiding full density concatenation and
+  permutation copies; cache-disabled and exhausted paths remain exact.
+
 - Exact `TreeSampler(strategy="factor")` retains compact mixed
   factors, groups repeated prefixes/subtree messages and caches child densities
   within one call. Cache exhaustion reuses computed misses; large remainder
@@ -32,7 +52,8 @@ releases remain backwards-compatible. From 1.0 onward:
   preserve dtype/device and Torch gradients; integer-key overflow has an exact
   row-grouping fallback. `cache_bytes` and `workspace_bytes` control retained
   cache storage and intermediate targets, not total memory. The default
-  strategy is now factor; the native Symmray algorithm remains unchanged.
+  strategy is now factor for dense and native Symmray sampling; the previous
+  algorithms remain available with explicit `strategy="standard"`.
 
 - Dense `TreeSampler` carries exact amplitude vectors for structurally pure
   conditional environments, avoiding unnecessary squared-bond densities.

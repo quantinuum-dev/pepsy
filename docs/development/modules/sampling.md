@@ -13,6 +13,7 @@ state representation; the direct PEPS and BP proposal algorithms are distinct.
 | `_common.py` | Site-map validation, array conversion, fermionic code ordering |
 | `tree.py` | Tree conditional sampling, scale-safe dense scoring, physical-code validation and tree-specific records |
 | `_tree_factor.py` | Call-local exact grouping, density caches and tiled factor/remainder transfers |
+| `_tree_symmray.py` | Native canonical factors, graded centre weights and call-local prefix sharing |
 | `stabilizer.py` | Physical-state sampling through stabilizer frame projectors |
 | `samplers.py` | Compatibility imports and old serialized class paths |
 
@@ -30,6 +31,8 @@ See the [sampling API guide](../../api/sampling/samplers.md) for supported
 backends, result shapes, seeds, and approximation controls.
 
 New dense `TreeSampler` instances default to exact factor sampling; explicit
-`strategy="standard"` retains the density route. Native Symmray sampling is
-independent of this selector. Older serialized samplers without strategy/cache
-settings retain their original density route.
+`strategy="standard"` retains the density route. Native Symmray factor sampling
+uses existing lossless tree QR and graded one-tensor norm contractions; standard
+retains the full projected-tree reference. Source physical codes remain stable
+when canonical movement removes unreachable sectors. Older serialized samplers
+without strategy/cache settings retain their original density/projected-norm route.

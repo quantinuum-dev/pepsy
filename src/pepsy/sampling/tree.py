@@ -27,8 +27,9 @@ exact product of its conditional Born probabilities, so it equals
 Symmray states
 --------------
 Native Symmray trees can be selected with ``backend="symmray"``.  This path
-keeps the canonical tree block-sparse and performs exact projected-norm and
-amplitude contractions without calling ``to_dense``.  It supports both
+keeps the tree block-sparse. The factor strategy shares native canonical
+factors by measured prefix and reads exact graded centre norms; the standard
+strategy retains full projected-tree norms. Neither calls ``to_dense``. Both support
 ordinary Abelian and fermionic Symmray arrays; source physical charge-sector
 maps are retained so sampled integer codes remain interpretable even when
 canonicalisation removes an identically-zero sector.  Fermionic results also
@@ -267,11 +268,12 @@ class TreeSampler:
         Leave ambient CPU thread settings unchanged. A positive integer
         explicitly caps BLAS/OpenMP around batched contractions.
     chunk_size : int or None, default=None
-        Optional maximum shots per dense contraction batch. Also tile the
+        Optional maximum shots per sampling chunk. Dense chunks also tile the
         first-child density transfer to avoid a full quartic bond tensor.
         None sets no explicit shot limit; the factor workspace target can
-        still reduce a batch. Native Symmray already samples one shot at a
-        time. The returned sample count is unchanged.
+        still reduce a batch. Native Symmray factor sampling shares prefixes
+        within each chunk; standard samples one shot at a time. The returned
+        sample count is unchanged.
     backend : {"auto", "native", "numpy", "torch", "cupy", "symmray"}, default="auto"
         Backend used for cached node arrays and batched contractions. ``auto``
         preserves the existing dense compatibility path for Symmray trees;
@@ -286,15 +288,16 @@ class TreeSampler:
         labels.
     strategy : {"standard", "factor"}, default="factor"
         ``factor`` retains compact exact factors, groups repeated
-        prefixes and caches child densities within one call. Dense backends
-        only; native Symmray retains its existing algorithm. Select
-        ``standard`` explicitly to disable factor grouping and caching.
+        prefixes and caches child densities within one call. Native Symmray
+        uses lossless canonical factors and shared measurement prefixes.
+        Select ``standard`` for the original density/projected-norm strategy.
     cache_bytes : int, default=134217728
         Retained key/value budget for the factor strategy; zero disables
         cross-chunk caching, while preserving within-chunk grouping.
     workspace_bytes : int, default=536870912
-        Factor strategy's intermediate tiling target. Can reduce the effective
-        chunk size. This is not a total-memory bound; one shot can exceed it.
+        Dense factor strategy's intermediate tiling target. Can reduce the
+        effective chunk size. Native Symmray QR is unbatched and not tiled by
+        this setting. This is not a total-memory bound; one shot can exceed it.
 
     Notes
     -----
@@ -398,9 +401,8 @@ class TreeSampler:
             if self.backend in {"native", "symmray"}:
                 return "symmray"
             if self.backend in {"auto", "numpy"}:
-                # Keep the established default fast batched path. Native
-                # block-sparse sampling is explicit because its tree branch
-                # contractions currently trade throughput for generality.
+                # Keep the established dense NumPy compatibility selection.
+                # Native block-sparse factors require an explicit backend.
                 return "numpy"
             raise ValueError(
                 f"TreeSampler backend={self.backend!r} requested for a "
@@ -705,7 +707,11 @@ class TreeSampler:
     @staticmethod
     def _symmray_scalar(value):
         """Extract a scalar without densifying a Symmray array."""
-        if hasattr(value, "data") and not np.isscalar(value):
+        from quimb.tensor import Tensor
+
+        # Only unwrap tensor-network containers. Torch scalar .data detaches
+        # its graph, while CuPy scalar .data is a device pointer, not an array.
+        if isinstance(value, Tensor):
             value = value.data
         blocks = getattr(value, "blocks", None)
         if isinstance(blocks, dict) and not blocks:
@@ -715,29 +721,44 @@ class TreeSampler:
         return value
 
     @classmethod
-    def _symmray_norm_squared(cls, tn):
-        """Return a full native Symmray norm without a dense conversion."""
+    def _symmray_norm_value(cls, tn):
+        """Return a native real norm scalar, preserving its backend graph."""
         value = (tn.H | tn).contract(all, optimize="auto")
         value = cls._symmray_scalar(value)
-        return float(np.real(ar.to_numpy(value)))
+        return ar.do("real", value)
+
+    @classmethod
+    def _symmray_norm_squared(cls, tn):
+        """Return a host norm for the projected-tree reference algorithm."""
+        return float(ar.to_numpy(cls._symmray_norm_value(tn)))
 
     def _symmray_output(self, values, *, dtype):
-        """Stack host sampling results on the Symmray block backend."""
+        """Stack scalar results on the Symmray block backend, retaining graphs."""
         state = self._symmray_state
         backend = state["array_backend"]
         template = state["template"]
         if backend == "torch":
             import torch
 
-            return torch.as_tensor(values, dtype=dtype, device=template.device)
+            dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+            if len(values) == 0:
+                return torch.empty(0, dtype=dtype, device=template.device)
+            return torch.stack([
+                torch.as_tensor(value, dtype=dtype, device=template.device)
+                for value in values
+            ])
         if backend == "cupy":
             import cupy as cp
 
-            return cp.asarray(values, dtype=dtype)
+            if len(values) == 0:
+                return cp.empty(0, dtype=dtype)
+            return cp.stack([cp.asarray(value, dtype=dtype) for value in values])
         return np.asarray(values, dtype=dtype)
 
     def _extract_symmray(self, tn, source_tn):
         """Prepare a native Symmray tree and retain its physical code maps."""
+        from quimb.tensor import TensorNetwork
+
         (
             physical_code_maps,
             local_to_source,
@@ -745,11 +766,18 @@ class TreeSampler:
             array_backend,
             template,
         ) = self._symmray_metadata(source_tn, tn)
-        norm_squared = self._symmray_norm_squared(tn)
+        # Capture is already canonical at the root. Network conjugation of
+        # this centre supplies the graded identity of its isometric exterior,
+        # avoiding an unnecessary complete doubled-tree normalization.
+        root_tensor = tn.node_tensor(tn.root)
+        norm_value = self._symmray_norm_value(TensorNetwork([root_tensor.copy()]))
+        norm_squared = float(ar.to_numpy(norm_value))
         if not np.isfinite(norm_squared) or norm_squared <= 0.0:
             raise ValueError("Symmray tree state has a zero or non-finite norm.")
-        root_tensor = tn.node_tensor(tn.root)
-        root_tensor.modify(data=root_tensor.data / math.sqrt(norm_squared))
+        root_tensor.modify(data=root_tensor.data / (norm_value ** 0.5))
+        # Sampling represents the normalized state, so any extracted positive
+        # global scale must be cleared along with the raw centre norm.
+        tn.exponent = 0.0
         if hasattr(tn, "_invalidate_norm_cache"):
             tn._invalidate_norm_cache()
 
@@ -1178,7 +1206,7 @@ class TreeSampler:
             except (KeyError, IndexError, TypeError):
                 return 0.0
         branch = self._symmray_project(state["tn"], selections)
-        return self._symmray_branch_norm(branch)
+        return self._symmray_norm_value(branch)
 
     def _symmray_amplitudes(self, configs):
         values = [self._symmray_amplitude_one(config) for config in configs]
@@ -1398,7 +1426,8 @@ class TreeSampler:
                 ur = arr.reshape(par, d0, F0)
                 if vector is not None:
                     if context is not None and F0 > 1:
-                        rho0 = context.factor_density(vector[:, None, :], ur)
+                        rho0 = (context.root_density(vector, ur) if nid == self._root
+                                else context.factor_density(vector[:, None, :], ur))
                         phi0 = visit(ch[0], rho0)
                     elif F0 == 1:
                         projected = self._einsum("Ba,acF->BcF", vector, ur)
@@ -1585,7 +1614,17 @@ class TreeSampler:
         rng = self._rng if seed is None else np.random.default_rng(seed)
         with self._thread_ctx(), self._array_device_context():
             if self.resolved_backend == "symmray":
-                configs, probs = self._symmray_sample_arrays(int(n_samples), rng)
+                factor = getattr(self, "strategy", "standard") == "factor"
+                if factor:
+                    from ._tree_symmray import _SymmrayFactorContext
+
+                    context = _SymmrayFactorContext(self, int(n_samples))
+                    try:
+                        configs, probs = context.sample(int(n_samples), rng)
+                    finally:
+                        context.clear()
+                else:
+                    configs, probs = self._symmray_sample_arrays(int(n_samples), rng)
                 if not to_numpy:
                     if self._symmray_state["array_backend"] == "torch":
                         import torch
@@ -1597,7 +1636,7 @@ class TreeSampler:
                         )
                         probs = torch.as_tensor(
                             probs,
-                            dtype=self._symmray_state["template"].real.dtype,
+                            dtype=torch.float64 if factor else self._symmray_state["template"].real.dtype,
                             device=self._symmray_state["template"].device,
                         )
                     elif self._symmray_state["array_backend"] == "cupy":
@@ -1606,7 +1645,7 @@ class TreeSampler:
                         configs = cp.asarray(configs, dtype=cp.int64)
                         probs = cp.asarray(
                             probs,
-                            dtype=self._symmray_state["template"].real.dtype,
+                            dtype=cp.float64 if factor else self._symmray_state["template"].real.dtype,
                         )
             else:
                 configs, probs = self._sample_dense_arrays(int(n_samples), rng)

@@ -22,8 +22,9 @@ the total requested samples. Arrays remain on the selected backend/device;
 CuPy sampling and scoring use the captured tree device even if the caller
 changes the current CUDA device. Uniform draws retain the same
 seed ordering across chunk sizes; floating-point rounding can still change
-outcomes exactly at a probability threshold. Native Symmray already draws one
-shot at a time and accepts this option without changing that algorithm.
+outcomes exactly at a probability threshold. Native Symmray factor sampling
+also uses chunks for prefix grouping; its standard strategy draws one shot
+at a time and accepts this option without changing that reference algorithm.
 
 Dense NumPy, Torch and CuPy trees default to the exact `strategy="factor"`.
 Select `strategy="standard"` explicitly to use the previous strategy. Both use
@@ -56,11 +57,18 @@ Torch memory requirements. Use `strategy="standard"` for workloads where its
 timing or memory use is better. `chunk_size=None`, the cache/workspace budgets
 and thread/backend defaults are unchanged.
 
-`cache_bytes` defaults to 128 MiB and bounds retained density keys and values
-within one sampling call. Zero disables cross-chunk caching; within-chunk
-grouping remains enabled. Cached hits and already-computed misses are reused
-even when admission is refused. Caches are cleared on success or failure and
+For dense factor sampling, `cache_bytes` defaults to 128 MiB and bounds retained
+density keys and values within one sampling call. Zero disables cross-chunk
+caching; within-chunk grouping remains enabled. Cached hits and already-computed
+misses are reused even when admission is refused. Caches are cleared on success or failure and
 never survive a call or `refresh()`.
+
+The virtual root's unconditioned first-child density is also cached within
+this budget, avoiding its reconstruction for every dense chunk. A physical
+root is conditioned on its sampled value and does not use that unconditioned
+cache. Density-cache growth scatters old/new entries directly into their
+merged sorted positions, avoiding concatenation and permutation copies of
+the full density values.
 
 `workspace_bytes` defaults to 512 MiB. It controls factor projections,
 remainder gathers and density-transfer tiles, and can reduce effective chunk
@@ -73,8 +81,7 @@ exact row grouping without cross-chunk caching.
 
 Torch source gradients, tensor dtype/device preservation and native result
 conversion are supported. Sharing thresholds are performance heuristics, so
-speedups depend on bond dimensions and repeated configurations. Native Symmray trees
-retain their existing block-sparse sampling algorithm with either strategy.
+speedups depend on bond dimensions and repeated configurations.
 
 ```python
 from pepsy.optimizers import TreeOptimizer
@@ -106,12 +113,38 @@ numpy_configs = batch.to_numpy().configs
 ```
 
 Native Symmray trees can use `backend="symmray"` (or
-`backend="native"`). The sampler keeps the canonical tree block-sparse and
-uses native projected-norm contractions for sampling, amplitudes, and
-probabilities. The default `backend="auto"` remains the fast dense batched
-compatibility path for Symmray trees; select `symmray` when avoiding dense
-materialization is more important than maximum throughput. The
-`physical_code_maps` property exposes each source physical code's
+`backend="native"`). The sampler keeps the canonical tree block-sparse.
+Amplitudes and fixed-configuration probabilities use native projected
+contractions. With the default `strategy="factor"`, sampling moves
+lossless, sector-preserving canonical factors to the next physical site and
+uses one-tensor network norms for its conditional weights. Network conjugation
+retains the graded outer-leg phases for fermionic trees. Shots with the same
+measurement prefix share these factors; a bounded call-local cache reuses
+them across chunks. Source codes are remapped by `(charge, sector_offset)`
+after QR removes unreachable physical sectors. `strategy="standard"` retains
+the full projected-tree norm reference sampler.
+
+```python
+sampler = TreeSampler(symmray_tree, backend="native", chunk_size=1000)
+batch = sampler.sample_batch(8192, seed=0)
+```
+
+Native factor draws retain the standard native sampler's shot-major random
+ordering. Prefix states are normalized before further measurements, with
+sample probabilities accumulated in float64 on the block backend. Torch
+normalization, amplitudes and scores retain gradients; factor sampled
+probabilities also retain gradients for fixed configurations. The sampled
+codes are discrete. Native factors are visited depth-first, and `cache_bytes`
+conservatively charges retained block
+payloads and keys, excluding captured source blocks. It is not a bound on
+Python metadata, QR scratch or autograd graphs. `workspace_bytes` tiles dense
+factor kernels; it does not tile native Symmray QR. A zero cache budget still
+shares prefixes within each native chunk. Single-chunk native calls retain no
+prefix-cache payloads because every prefix is visited only once.
+
+The default `backend="auto"` retains dense NumPy compatibility for Symmray
+input. Select `native` or `symmray` to use factors without dense materialization.
+The `physical_code_maps` property exposes each source physical code's
 `(charge, sector_offset)` pair for both ordinary Abelian and fermionic trees.
 
 `amplitudes(..., to_numpy=False)` and `probabilities(..., to_numpy=False)`
@@ -119,10 +152,11 @@ likewise return arrays on the resolved native backend. The legacy `sample()`
 method continues to return host Python lists.
 
 The source object is never mutated: the sampler copies the tree, moves the
-orthogonality centre onto the root, normalizes, and caches the per-node arrays.
+orthogonality centre onto the root, normalizes, and captures canonical tensors.
 Existing canonical-region metadata limits this move to the required region/path;
-a source already centered at the root requires no new gauging. Sampling batches
-do not move the canonical center. Live tensor `left_inds` identify each proven
+a source already centered at the root requires no new gauging. Dense sampling
+batches do not move the canonical center; native factor sampling moves centres
+only in private conditional copies. Live tensor `left_inds` identify each proven
 isometry's direction, allowing redundant lossless QR moves to be skipped.
 After the source state changes, call
 `sampler.refresh()` before sampling again. An immediate refresh after constructing
@@ -164,8 +198,8 @@ does not recover those components. Use source components in the normal dtype
 range for that backend. The long-tree rescaling checks keep their individual
 tensor components in that range.
 
-The sampler canonicalizes once with the centre on the root, so every non-root
-node is isometric toward its parent bond. Sampling then walks the tree
+The dense sampler canonicalizes once with the centre on the root, so every
+non-root node is isometric toward its parent bond. Sampling then walks the tree
 depth-first carrying a per-sample reduced density matrix on the active parent
 bond; unvisited sibling subtrees telescope to the identity, keeping the density
 transfer bounded by the bond dimension squared. All samples share the cached
@@ -185,7 +219,8 @@ chunking; subsequent shot-dependent densities use the existing batched path.
 The optimization preserves the uniform-draw order and introduces no
 truncation. The standard strategy keeps densities local to a batch; the factor
 strategy can reuse them across chunks within one call and clears its cache on
-return. Unlike MPS prefix vectors, tree densities can be mixed because sibling
+success or failure. Native canonical-factor caches follow the same call scope.
+Unlike MPS prefix vectors, tree densities can be mixed because sibling
 branches remain unmeasured.
 
 Sampling and dense scoring release their recursive traversal closures on both

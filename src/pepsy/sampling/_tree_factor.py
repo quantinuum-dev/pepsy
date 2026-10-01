@@ -23,6 +23,7 @@ class _FactorSamplingContext:
         self.workspace_bytes = workspace_bytes
         self.cache = {}
         self.cache_used = 0
+        self._root_density = None
         self.sites = {}
         self.radix = None
         dims = [int(sampler._arrays[sampler._node_of_qubit[q]].shape[1])
@@ -72,7 +73,19 @@ class _FactorSamplingContext:
 
     def clear(self):
         self.cache.clear()
+        self._root_density = None
         self.cache_used = 0
+
+    def root_density(self, vector, ur):
+        """Reuse the unconditioned virtual root's first marginal within a call."""
+        if self._root_density is None:
+            value = self.factor_density(vector[:, None, :], ur)
+            size = math.prod(value.shape) * self.itemsize
+            if self.cache_used + size <= self.cache_bytes:
+                self._root_density = value
+                self.cache_used += size
+            return value
+        return self._root_density
 
     def _subtree_sites(self, node):
         if node not in self.sites:
@@ -154,14 +167,19 @@ class _FactorSamplingContext:
         values[missing] = newvalues
         size = len(newkeys) * (8 + math.prod(newvalues.shape[1:]) * self.itemsize)
         if self.cache_used + size <= self.cache_bytes:
-            if sampler.resolved_backend == "torch":
-                allkeys = xp.cat((oldkeys, newkeys))
-                allvalues = xp.cat((oldvalues, newvalues))
-            else:
-                allkeys = xp.concatenate((oldkeys, newkeys))
-                allvalues = xp.concatenate((oldvalues, newvalues))
-            order = xp.argsort(allkeys)
-            self.cache[node] = (allkeys[order], allvalues[order])
+            # Both sets are sorted and disjoint. Scatter directly into their
+            # merged positions instead of concatenating and sorting a second
+            # full copy of the (much larger) density values.
+            old_positions = sampler._arange(len(oldkeys)) + xp.searchsorted(newkeys, oldkeys)
+            new_positions = sampler._arange(len(newkeys)) + xp.searchsorted(oldkeys, newkeys)
+            length = len(oldkeys) + len(newkeys)
+            merged_keys = sampler._zeros((length,), dtype=oldkeys.dtype)
+            merged_values = sampler._zeros((length,) + tuple(newvalues.shape[1:]), dtype=newvalues.dtype)
+            merged_keys[old_positions] = oldkeys
+            merged_keys[new_positions] = newkeys
+            merged_values[old_positions] = oldvalues
+            merged_values[new_positions] = newvalues
+            self.cache[node] = (merged_keys, merged_values)
             self.cache_used += size
         return values[inverse]
 

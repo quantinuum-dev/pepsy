@@ -14,6 +14,19 @@ Phys. Rev. Research 7, 023193 (2025).
 
 ## Upstream audit and current opportunities
 
+### 2026-10-01: native tree factor sampling
+
+Rechecked Symmray `0.4.1.dev7+g83fb22865`, Quimb
+`1.15.1.dev66+ge927f06e1`, Autoray `0.11.1.dev3+g1b476b305` and Cotengra
+`0.8.3.dev7+g1d7fd333f` in this device's selected environment. The
+[tree factor audit and evidence](2026-10-01-tree-native-factor-improvements.md)
+records public projection/copy/conjugation signatures, official upstream
+sources and unavailable documentation pages. **Adopt:** existing lossless
+native tree QR, graded centre norms and exact prefix sharing. **Compatibility
+correction:** scalar extraction and graph-preserving native normalization.
+**Defer:** dependency upgrades and new upstream algorithms. Earlier entries
+describe their own environment/version audits and remain historical evidence.
+
 ### 2026-09-26: symmetric MPO builder extraction
 
 The installed versions remain Symmray `0.4.1.dev8+gc45f91457`, Quimb

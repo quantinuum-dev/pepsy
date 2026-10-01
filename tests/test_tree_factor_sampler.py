@@ -156,6 +156,59 @@ def test_cache_exhaustion_computes_only_misses(force_grouping, monkeypatch):
     assert context.cache_used == 80
 
 
+@pytest.mark.parametrize("backend", ["numpy", "torch", "torch_cuda", "cupy"])
+@pytest.mark.parametrize("cache", [0, 8, 4096])
+def test_root_density_reused_across_chunks_only_when_budgeted(monkeypatch, backend, cache):
+    state = TreeTensorNetwork.rand(
+        TreePlan.from_order(range(7), max_arity=3, top_arity=3), D=5, seed=19,
+    )
+    _backend(state, backend)
+    sampler = TreeSampler(state, chunk_size=3, cache_bytes=cache)
+    root_transfers = []
+    original = _FactorSamplingContext.factor_density
+
+    def transfer(context, factor, ur):
+        if ur.shape[0] == 1:
+            root_transfers.append(1)
+        return original(context, factor, ur)
+
+    monkeypatch.setattr(_FactorSamplingContext, "factor_density", transfer)
+    for call in range(2):
+        result = sampler.sample_batch(13, seed=17).to_numpy()
+        reference = TreeSampler(state, strategy="standard", chunk_size=3).sample_batch(13, seed=17).to_numpy()
+        np.testing.assert_array_equal(result.configs, reference.configs)
+        np.testing.assert_allclose(result.probs, reference.probs, rtol=2e-11, atol=1e-13)
+        assert len(root_transfers) == (call + 1) * (1 if cache == 4096 else 5)
+
+
+def test_density_cache_growth_avoids_full_value_concatenation(force_grouping, monkeypatch):
+    state = TreeTensorNetwork.from_order(range(3), dtype="float64")
+    sampler = TreeSampler(state)
+    context = _FactorSamplingContext(sampler, 4096, 1024)
+    work = []
+    original = np.concatenate
+
+    def concatenate(values, *args, **kwargs):
+        assert all(value.ndim < 3 for value in values), "cache growth copied full density values"
+        return original(values, *args, **kwargs)
+
+    def transfer(rho, ur, **kwargs):
+        work.append(len(rho))
+        return rho.copy()
+
+    monkeypatch.setattr(np, "concatenate", concatenate)
+    monkeypatch.setattr(sampler, "_sample_first_child_density", transfer)
+    ur = np.ones((2, 2, 1))
+    # Interleave new sorted keys with retained ones, then request all hits in
+    # another order. This detects incorrect scatter positions after growth.
+    for codes in ([0, 2], [3, 0, 1], [2, 1, 0, 3]):
+        configs = np.array([[code // 4, (code // 2) % 2, code % 2] for code in codes])
+        incoming = np.array([np.eye(2) * (code + 1) for code in codes])
+        actual = context.transfer(0, incoming, ur, configs)
+        np.testing.assert_array_equal(actual, incoming)
+    assert work == [2, 2]
+
+
 def test_grouped_remainder_stays_compact(force_grouping, monkeypatch):
     state = TreeTensorNetwork.rand(
         TreePlan.from_order(range(7), max_arity=3, top_arity=3), D=5, seed=19,
