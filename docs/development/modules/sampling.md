@@ -28,3 +28,8 @@ may reuse a sampled-prefix environment as an unconditioned future boundary.
 
 See the [sampling API guide](../../api/sampling/samplers.md) for supported
 backends, result shapes, seeds, and approximation controls.
+
+New dense `TreeSampler` instances default to exact factor sampling; explicit
+`strategy="standard"` retains the density route. Native Symmray sampling is
+independent of this selector. Older serialized samplers without strategy/cache
+settings retain their original density route.

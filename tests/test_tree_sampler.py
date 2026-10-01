@@ -376,7 +376,7 @@ def test_shared_density_samples_match_dense_conditionals(
 
     center = state.orthogonality_center
     source_arrays = tuple(t.data for t in state.tensors)
-    sampler = TreeSampler(state, backend="native", chunk_size=chunk_size)
+    sampler = TreeSampler(state, backend="native", strategy="standard", chunk_size=chunk_size)
     # Enumerate the dense conditional distribution in physical traversal order.
     order, stack = [], [plan.root]
     while stack:
@@ -443,7 +443,7 @@ def test_pure_sampling_environment_avoids_last_density(monkeypatch, root_qubit):
         root_qubit=root_qubit,
     )
     state = pepsy.TreeTensorNetwork.rand(plan, D=5, seed=19, dtype="complex128")
-    sampler = TreeSampler(state, chunk_size=11)
+    sampler = TreeSampler(state, strategy="standard", chunk_size=11)
     physical_routes = []
     einsum = sampler._einsum
 

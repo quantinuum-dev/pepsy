@@ -1,4 +1,4 @@
-"""Observable regressions for the opt-in exact factor tree sampler."""
+"""Observable regressions for the default exact factor tree sampler."""
 
 import gc
 from itertools import product
@@ -62,7 +62,7 @@ def test_factor_samples_match_dense_and_standard(force_grouping, backend, dtype,
     _backend(state, backend)
     center = state.orthogonality_center
     originals = [(t.data, t.left_inds) for t in state.tensors]
-    standard = TreeSampler(state, seed=11, chunk_size=chunk)
+    standard = TreeSampler(state, seed=11, strategy="standard", chunk_size=chunk)
     factor = TreeSampler(
         state, seed=11, strategy="factor", chunk_size=chunk,
         cache_bytes=1024, workspace_bytes=4096,
@@ -84,7 +84,7 @@ def test_factor_samples_match_dense_and_standard(force_grouping, backend, dtype,
 
 @pytest.mark.parametrize("backend", ["numpy", "torch", "torch_cuda", "cupy"])
 @pytest.mark.parametrize("n,root", [(1, None), (1, 0), (7, None), (7, 2)])
-def test_factor_default_settings_match_dense(backend, n, root):
+def test_default_factor_samples_match_dense_and_standard(backend, n, root):
     # The larger matrix above forces grouping with small budgets. Exercise
     # the actual defaults separately, including the single-site boundary.
     plan = TreePlan.from_order(
@@ -99,10 +99,11 @@ def test_factor_default_settings_match_dense(backend, n, root):
     weights = 2 ** np.arange(n - 1, -1, -1)
     _backend(state, backend)
     for chunk in (None, 7):
-        standard = TreeSampler(state, seed=11, chunk_size=chunk, threads=1)
+        standard = TreeSampler(state, seed=11, strategy="standard", chunk_size=chunk, threads=1)
         factor = TreeSampler(
-            state, seed=11, strategy="factor", chunk_size=chunk, threads=1,
+            state, seed=11, chunk_size=chunk, threads=1,
         )
+        assert factor.strategy == "factor"
         for seed in (17, None, None):
             expected = standard.sample_batch(41, seed=seed).to_numpy()
             actual = factor.sample_batch(41, seed=seed).to_numpy()
@@ -169,7 +170,7 @@ def test_grouped_remainder_stays_compact(force_grouping, monkeypatch):
 
     monkeypatch.setattr(sampler, "_tensordot", record)
     actual = sampler.sample_batch(128, seed=17)
-    expected = TreeSampler(state).sample_batch(128, seed=17)
+    expected = TreeSampler(state, strategy="standard").sample_batch(128, seed=17)
     np.testing.assert_array_equal(actual.configs, expected.configs)
     np.testing.assert_allclose(actual.probs, expected.probs, rtol=1e-11, atol=1e-13)
     assert max(batches) < 128
@@ -196,7 +197,7 @@ def test_overflow_uses_exact_row_keys(force_grouping, backend):
         assert len(indices) == 3
         np.testing.assert_array_equal(configs[indices][inverse], configs)
     actual = sampler.sample_batch(17, seed=17).to_numpy()
-    expected = TreeSampler(state).sample_batch(17, seed=17).to_numpy()
+    expected = TreeSampler(state, strategy="standard").sample_batch(17, seed=17).to_numpy()
     np.testing.assert_array_equal(actual.configs, expected.configs)
     np.testing.assert_allclose(actual.probs, expected.probs, rtol=1e-11, atol=1e-30)
 
@@ -252,7 +253,7 @@ def test_factor_sampling_is_reentrant(force_grouping, monkeypatch):
     monkeypatch.setattr(sampler, "_sample_arrays", kernel)
     actual = sampler.sample_batch(17, seed=17).to_numpy()
     for result, count, seed in [(actual, 17, 17), (nested[0], 11, 21)]:
-        expected = TreeSampler(state).sample_batch(count, seed=seed).to_numpy()
+        expected = TreeSampler(state, strategy="standard").sample_batch(count, seed=seed).to_numpy()
         np.testing.assert_array_equal(result.configs, expected.configs)
         np.testing.assert_allclose(result.probs, expected.probs, rtol=1e-11, atol=1e-13)
 
@@ -293,7 +294,7 @@ def test_factor_workspace_reduces_chunks(force_grouping, monkeypatch):
 
     monkeypatch.setattr(sampler, "_sample_arrays", record)
     actual = sampler.sample_batch(11, seed=17)
-    expected = TreeSampler(state).sample_batch(11, seed=17)
+    expected = TreeSampler(state, strategy="standard").sample_batch(11, seed=17)
     assert work == [1] * 11
     np.testing.assert_array_equal(actual.configs, expected.configs)
     np.testing.assert_allclose(actual.probs, expected.probs, rtol=1e-11, atol=1e-13)
@@ -320,7 +321,7 @@ def test_remainder_retry_preserves_draws_and_cache(force_grouping, monkeypatch):
     monkeypatch.setattr(_FactorSamplingContext, "check_remainder", check)
     monkeypatch.setattr(sampler, "_sample_arrays", record)
     actual = sampler.sample_batch(31, seed=17)
-    expected = TreeSampler(state).sample_batch(31, seed=17)
+    expected = TreeSampler(state, strategy="standard").sample_batch(31, seed=17)
     assert work == [31, 15, 15, 1]
     np.testing.assert_array_equal(actual.configs, expected.configs)
     np.testing.assert_allclose(actual.probs, expected.probs, rtol=1e-11, atol=1e-13)
@@ -334,7 +335,7 @@ def test_factor_cache_does_not_survive_refresh(force_grouping):
     replacement = TreeTensorNetwork.rand(plan, D=5, seed=21)
     sampler.refresh(replacement)
     actual = sampler.sample_batch(31, seed=17)
-    expected = TreeSampler(replacement).sample_batch(31, seed=17)
+    expected = TreeSampler(replacement, strategy="standard").sample_batch(31, seed=17)
     np.testing.assert_array_equal(actual.configs, expected.configs)
     np.testing.assert_allclose(actual.probs, expected.probs, rtol=1e-11, atol=1e-13)
 

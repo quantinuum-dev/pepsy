@@ -284,10 +284,11 @@ class TreeSampler:
         occupation decoder is attached to the sample results when supported.
         Supplying a ``fermion`` pins the recorded ``symmetry``/``spinful``
         labels.
-    strategy : {"standard", "factor"}, default="standard"
-        Experimental ``factor`` retains compact exact factors, groups repeated
+    strategy : {"standard", "factor"}, default="factor"
+        ``factor`` retains compact exact factors, groups repeated
         prefixes and caches child densities within one call. Dense backends
-        only; native Symmray retains its existing algorithm.
+        only; native Symmray retains its existing algorithm. Select
+        ``standard`` explicitly to disable factor grouping and caching.
     cache_bytes : int, default=134217728
         Retained key/value budget for the factor strategy; zero disables
         cross-chunk caching, while preserving within-chunk grouping.
@@ -311,7 +312,7 @@ class TreeSampler:
         chunk_size: int | None = None,
         backend="auto",
         fermion=None,
-        strategy="standard",
+        strategy="factor",
         cache_bytes=128 * 1024**2,
         workspace_bytes=512 * 1024**2,
     ):
@@ -1530,6 +1531,8 @@ class TreeSampler:
         context = None
         kwargs = {}
         chunk = min(self.chunk_size or count, count)
+        # Old serialized samplers without strategy/cache settings keep their
+        # original density route; newly constructed samplers default to factor.
         if getattr(self, "strategy", "standard") == "factor":
             from ._tree_factor import _FactorSamplingContext
 

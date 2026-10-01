@@ -24,7 +24,7 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
-- Experimental exact `TreeSampler(strategy="factor")` retains compact mixed
+- Exact `TreeSampler(strategy="factor")` retains compact mixed
   factors, groups repeated prefixes/subtree messages and caches child densities
   within one call. Cache exhaustion reuses computed misses; large remainder
   gathers and projections are tiled, and oversized grouped remainders retry
@@ -32,7 +32,7 @@ releases remain backwards-compatible. From 1.0 onward:
   preserve dtype/device and Torch gradients; integer-key overflow has an exact
   row-grouping fallback. `cache_bytes` and `workspace_bytes` control retained
   cache storage and intermediate targets, not total memory. The default
-  strategy and native Symmray algorithm remain unchanged.
+  strategy is now factor; the native Symmray algorithm remains unchanged.
 
 - Dense `TreeSampler` carries exact amplitude vectors for structurally pure
   conditional environments, avoiding unnecessary squared-bond densities.
@@ -260,6 +260,12 @@ releases remain backwards-compatible. From 1.0 onward:
   and JAX JIT gradients.
 
 ### Changed
+
+- Dense `TreeSampler` now defaults to the exact factor strategy, retaining
+  compact factors and sharing repeated prefixes within each sampling call.
+  Select `strategy="standard"` explicitly for the previous strategy, which
+  can use less memory on small-bond trees. Chunk, cache/workspace, backend and
+  thread defaults are unchanged; native Symmray sampling is unchanged.
 
 - Dense `TreeSampler` shares the incoming density across shots until physical
   conditioning distinguishes them, and contracts shared first-child transfers

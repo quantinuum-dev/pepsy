@@ -25,8 +25,8 @@ seed ordering across chunk sizes; floating-point rounding can still change
 outcomes exactly at a probability threshold. Native Symmray already draws one
 shot at a time and accepts this option without changing that algorithm.
 
-Dense NumPy, Torch and CuPy trees can opt into the experimental, exact
-`strategy="factor"`. The default remains `strategy="standard"`. Both use
+Dense NumPy, Torch and CuPy trees default to the exact `strategy="factor"`.
+Select `strategy="standard"` explicitly to use the previous strategy. Both use
 structural pure vectors; the factor strategy additionally retains compact
 mixed factors, groups identical measurement prefixes and keeps large branch
 remainders grouped. It groups collapsed messages by their own subtree codes,
@@ -37,7 +37,7 @@ its own uniform draws. No bond/rank truncation or dtype reduction is applied.
 from pepsy.sampling import TreeSampler
 
 sampler = TreeSampler(
-    tree, strategy="factor", chunk_size=1000, backend="native",
+    tree, chunk_size=1000, backend="native",
 )
 configs, probabilities = sampler.sample_arrays(8192, seed=0)
 ```
@@ -52,7 +52,9 @@ factor reduced additional live memory at maximum bond 256 with chunks of 16
 and 128; at maximum bond 32 and chunk 128, standard used less. The
 chunk-1,000 factor configuration also completed 8,192 samples at bond 256.
 These synthetic measurements do not establish production-checkpoint or
-Torch memory requirements; the package default remains standard.
+Torch memory requirements. Use `strategy="standard"` for workloads where its
+timing or memory use is better. `chunk_size=None`, the cache/workspace budgets
+and thread/backend defaults are unchanged.
 
 `cache_bytes` defaults to 128 MiB and bounds retained density keys and values
 within one sampling call. Zero disables cross-chunk caching; within-chunk
