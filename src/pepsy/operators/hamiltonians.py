@@ -23,6 +23,7 @@ from .._internal.formatting import (
 from ..tensors.maps import OneDMap
 from ..tensors.bonds import new_native_bond
 from ._structural_compression import (
+    _delinearize_mpo,
     _structural_compress_mpo,
     _structural_compress_tree,
 )
@@ -56,6 +57,16 @@ class _InheritBackend:
 
 
 _DEFAULT_BACKEND = _InheritBackend()
+
+
+class _DefaultDelinearize:
+    """Signature-friendly sentinel for automatic delinearization default."""
+
+    def __repr__(self):
+        return "auto"
+
+
+_DEFAULT_DELINEARIZE = _DefaultDelinearize()
 
 
 class _InheritMaxBond:
@@ -1034,13 +1045,14 @@ class ham_tn:
         records,
         *,
         phys_dim,
+        delinearize=False,
     ):
         """Compile canonical local terms through the finite-state MPO builder."""
         automaton = self._compile_automaton(
             records,
             phys_dim=phys_dim,
         )
-        mpo = automaton.to_mpo()
+        mpo = automaton.to_mpo(delinearize=delinearize)
         self._swap_mpo_phys_inds_(mpo)
         return mpo, automaton
 
@@ -1060,6 +1072,7 @@ class ham_tn:
         create_bond=False,
         compress_opts=None,
         mode=None,
+        delinearize=_DEFAULT_DELINEARIZE,
         to_backend=_DEFAULT_BACKEND,
         mapper=None,
         map_mode=None,
@@ -1114,6 +1127,19 @@ class ham_tn:
             compresses after each sequential term; ``False`` compresses once
             after the complete sum. Prefer the strategy-bearing
             ``compress=`` spelling.
+        delinearize : bool, default=True for dense builds
+            Reduce dependent channels in two roundoff-safe rank-revealing
+            sweeps before any optional SVD cap. For ``compress="automaton"``
+            without a backend converter, this operates on automaton arrays
+            before Quimb MPO materialization. With a converter, it runs on
+            the backend MPO before the final cap. The term route runs it after
+            accumulation; sequential compression, when active, still occurs
+            during accumulation.
+            The default enables the sweep for NumPy, Torch, CuPy, and JAX
+            dense tensors. Rank selection reads a small scalar diagnostic on
+            the host; tensor factorization and transfer remain on the array
+            backend. Explicitly passing ``True`` with an unsupported backend
+            raises.
         cutoff_mode : str | {"auto"} | None, default=None
             Cutoff mode forwarded to Quimb. ``"auto"`` resolves to ``"rsum2"``;
             None preserves Quimb's default.
@@ -1182,6 +1208,12 @@ class ham_tn:
         to_backend = self.to_backend if to_backend is _DEFAULT_BACKEND else to_backend
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None.")
+        delinearize_was_default = delinearize is _DEFAULT_DELINEARIZE
+        if delinearize_was_default:
+            delinearize = fermion is None
+        elif not isinstance(delinearize, (bool, np.bool_)):
+            raise TypeError("delinearize must be a boolean.")
+        delinearize = bool(delinearize)
         if mapper is not None and map_mode is not None:
             raise TypeError("Pass only one of mapper and map_mode.")
         if map_mode is not None:
@@ -1284,8 +1316,11 @@ class ham_tn:
                 "mode must be 'term', 'automaton', 'analytic', or 'auto'."
             )
         mode_auto = mode == "auto"
-
         if fermion is not None:
+            if delinearize:
+                raise TypeError(
+                    "delinearize=True is only available for dense local-term MPOs."
+                )
             if mode != "term" or form is not None or create_bond or compress_extra:
                 raise TypeError(
                     "mode='automaton', form, create_bond, and extra compress_opts "
@@ -1398,6 +1433,7 @@ class ham_tn:
         automaton_records = None
         automaton = None
         structural_applied = False
+        delinearization_report = None
         progress_bar = None
         if mode in {"automaton", "auto"}:
             automaton_records = builder._normalize_automaton_terms(
@@ -1430,10 +1466,12 @@ class ham_tn:
                 mpo_total, automaton = builder._build_mpo_from_automaton(
                     automaton_records,
                     phys_dim=phys_dim,
+                    delinearize=delinearize and to_backend is None,
                 )
-                if to_backend is not None:
-                    builder._apply_to_backend(mpo_total, to_backend)
-                elif automaton is not None:
+                if delinearize and to_backend is None:
+                    delinearization_report = mpo_total.pepsy_delinearization
+                    structural_applied = True
+                elif to_backend is None and automaton is not None:
                     # Remove exact boundary dependencies before the optional
                     # numerical sweep. This is the dense analogue of
                     # deparallelization/delinearization and leaves the
@@ -1442,6 +1480,12 @@ class ham_tn:
                         mpo_total,
                         method="auto",
                     )
+                    structural_applied = True
+                if to_backend is not None:
+                    builder._apply_to_backend(mpo_total, to_backend)
+                if delinearize and to_backend is not None:
+                    delinearization_report = _delinearize_mpo(mpo_total)
+                    mpo_total.pepsy_delinearization = delinearization_report
                     structural_applied = True
                 peak_bond = _operator_max_bond(mpo_total)
                 if compression_enabled:
@@ -1502,6 +1546,9 @@ class ham_tn:
                     )
                     structural_applied = True
                 mpo_total.compress(**compress_options)
+            if delinearize:
+                delinearization_report = _delinearize_mpo(mpo_total)
+                structural_applied = True
             _set_operator_progress_postfix(
                 progress_bar,
                 mpo_total,
@@ -1518,6 +1565,8 @@ class ham_tn:
             # The explicit term route can also leave exact dependencies after
             # its additions. This is a no-op for an already reduced network.
             _structural_compress_mpo(mpo_total, method="auto")
+        if delinearization_report is not None:
+            mpo_total.pepsy_delinearization = delinearization_report
         return mpo_total
 
     def build_mpo(self, ints=None, **kwargs):

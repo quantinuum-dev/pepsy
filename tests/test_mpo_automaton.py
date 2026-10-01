@@ -53,6 +53,35 @@ def test_factorized_paths_materialize_exact_mpo_without_compression():
     np.testing.assert_allclose(mpo.to_dense(), expected)
 
 
+def test_automaton_to_mpo_delinearizes_before_quimb_materialization():
+    """Layer-array rank reduction is explicit and preserves the operator."""
+    pytest.importorskip("scipy")
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    y = np.array([[0.0, -1.0j], [1.0j, 0.0]])
+    rotated = x + y
+    automaton = MPOAutomaton.from_product_terms(
+        2,
+        [
+            ((0, 1), (x, x), 1.0),
+            ((0, 1), (y, y), 1.0),
+            ((0, 1), (rotated, rotated), 0.7),
+        ],
+    )
+
+    raw = automaton.to_mpo(delinearize=False)
+    reduced = automaton.to_mpo()
+
+    assert raw.max_bond() == 5
+    assert reduced.max_bond() == 2
+    assert reduced.pepsy_delinearization["sweeps"] == 2
+    assert np.allclose(
+        reduced.to_dense(),
+        raw.to_dense(),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
 def test_legacy_channels_and_transitions_round_trip():
     """Existing tuple data can be wrapped and emitted unchanged."""
     identity = np.eye(2)
@@ -132,6 +161,99 @@ def test_compression_must_be_an_explicit_follow_up_operation():
     automaton.add_local_term(0, np.eye(2))
     with pytest.raises(ValueError, match="never compresses"):
         automaton.to_mpo(compress=True)
+
+
+def test_backend_delinearization_preserves_torch_gradients():
+    """Torch rank reduction stays native and keeps gradients finite."""
+    torch = pytest.importorskip("torch")
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
+    z = torch.diag(torch.tensor([1.0, -1.0], dtype=torch.float64))
+    theta = torch.tensor(0.2, dtype=torch.float64, requires_grad=True)
+    rotated = x + theta * z
+    automaton = MPOAutomaton.from_product_terms(
+        2,
+        [
+            ((0, 1), (x, x), 1.0),
+            ((0, 1), (z, z), 1.0),
+            ((0, 1), (rotated, rotated), 0.7),
+        ],
+    )
+
+    raw = automaton.to_mpo(delinearize=False)
+    reduced = automaton.to_mpo()
+    torch.testing.assert_close(reduced.to_dense(), raw.to_dense())
+    raw_gradient = torch.autograd.grad(raw.to_dense()[0, 0], theta, retain_graph=True)[0]
+    reduced_gradient = torch.autograd.grad(reduced.to_dense()[0, 0], theta)[0]
+
+    assert reduced.max_bond() == 2
+    assert torch.isfinite(reduced_gradient)
+    torch.testing.assert_close(reduced_gradient, raw_gradient)
+
+
+def test_backend_delinearization_supports_jax_arrays():
+    """JAX arrays are rank-reduced without conversion to NumPy tensors."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    x = jnp.array([[0.0, 1.0], [1.0, 0.0]])
+    z = jnp.diag(jnp.array([1.0, -1.0]))
+    automaton = MPOAutomaton.from_product_terms(
+        2,
+        [
+            ((0, 1), (x, x), 1.0),
+            ((0, 1), (z, z), 1.0),
+            ((0, 1), (x + z, x + z), 0.7),
+        ],
+    )
+
+    raw = automaton.to_mpo(delinearize=False)
+    mpo = automaton.to_mpo()
+
+    assert type(mpo[0].data).__module__.startswith("jax")
+    assert mpo.max_bond() == 2
+    assert mpo.pepsy_delinearization["changed"]
+    assert bool(jnp.allclose(mpo.to_dense(), raw.to_dense()))
+
+    def traced_value(theta):
+        traced_automaton = MPOAutomaton.from_product_terms(
+            2,
+            [
+                ((0, 1), (x, x), 1.0),
+                ((0, 1), (z, z), 1.0),
+                ((0, 1), (x + theta * z, x + theta * z), 0.7),
+            ],
+        )
+        return jnp.real(traced_automaton.to_mpo().to_dense()[0, 0])
+
+    gradient = jax.grad(traced_value)(0.2)
+    assert float(gradient) == pytest.approx(0.28)
+
+
+def test_backend_delinearization_supports_cupy_arrays():
+    """CuPy arrays are rank-reduced on their device when available."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy has no available CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError:
+        pytest.skip("CuPy has no available CUDA device.")
+    x = cupy.array([[0.0, 1.0], [1.0, 0.0]])
+    z = cupy.diag(cupy.array([1.0, -1.0]))
+    automaton = MPOAutomaton.from_product_terms(
+        2,
+        [
+            ((0, 1), (x, x), 1.0),
+            ((0, 1), (z, z), 1.0),
+            ((0, 1), (x + z, x + z), 0.7),
+        ],
+    )
+
+    raw = automaton.to_mpo(delinearize=False)
+    mpo = automaton.to_mpo()
+
+    assert type(mpo[0].data).__module__.startswith("cupy")
+    assert mpo.max_bond() == 2
+    assert mpo.pepsy_delinearization["changed"]
+    assert bool(cupy.allclose(mpo.to_dense(), raw.to_dense()).item())
 
 
 def test_backend_parameters_are_kept_in_raw_mpo_tensors():
