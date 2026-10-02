@@ -14,6 +14,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Dense TreeSampler normalizes its accumulated conditional CDF endpoint,
+  preventing draws near one from selecting trailing zero-weight physical
+  codes when cumulative probabilities round below one. Applies to both
+  strategies, chunked and unchunked, on NumPy, Torch and CuPy.
+
 - Native Symmray scalar extraction preserves Torch gradients and CuPy arrays,
   unwrapping only tensor-network containers. Native normalization and scoring
   keep their backend graphs; canonical capture normalizes its graded root

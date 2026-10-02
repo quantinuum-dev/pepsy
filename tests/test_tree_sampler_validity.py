@@ -174,6 +174,30 @@ def test_zero_draw_skips_zero_weight_branch(convert, strategy):
     assert bool((probs == 1).all())
 
 
+@pytest.mark.parametrize("strategy", ["standard", "factor"])
+@pytest.mark.parametrize("chunk", [None, 2])
+@pytest.mark.parametrize("dtype,components", [
+    ("float64", [0.5085427383566555, 0.8648174831367542, 0.8668144811764711, 0.0]),
+    ("float32", [0.1564759761095047, 0.8447070121765137, 0.22817593812942505, 0.0]),
+])
+def test_largest_draw_skips_trailing_zero_weight(convert, strategy, chunk, dtype, components):
+    values = np.asarray(components, dtype=dtype)
+    sampler = TreeSampler(_single_site(convert, values), strategy=strategy, chunk_size=chunk)
+
+    class LargestDraws:
+        def random(self, shape):
+            return np.full(shape, np.nextafter(1.0, 0.0))
+
+    sampler._rng = LargestDraws()
+    batch = sampler.sample_batch(3).to_numpy()
+    np.testing.assert_array_equal(batch.configs, np.full((3, 1), 2))
+    weights = values.astype(np.float64) ** 2
+    expected = weights[2] / weights.sum()
+    tolerance = 2e-6 if dtype == "float32" else 1e-13
+    np.testing.assert_allclose(batch.probs, expected, rtol=tolerance)
+    np.testing.assert_allclose(sampler.probabilities(batch.configs), expected, rtol=tolerance)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_general_torch_scoring_gradients_match_dense_reference(device):
     torch = pytest.importorskip("torch")

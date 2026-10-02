@@ -330,3 +330,40 @@ def test_native_factor_cdf_rounding_does_not_select_trailing_zero(monkeypatch):
     configurations, probabilities = sampler.sample_arrays(3)
     np.testing.assert_array_equal(configurations, np.ones((3, 1), dtype=np.int64))
     np.testing.assert_allclose(probabilities, 0.75)
+
+
+@pytest.mark.parametrize("spinful,symmetry", [
+    (False, "Z2"), (False, "U1"), (True, "Z2"),
+    (True, "U1"), (True, "U1U1"), (True, "Z2Z2"),
+])
+@pytest.mark.parametrize("root", [None, 1])
+def test_native_factor_preserves_odd_global_parity_and_relative_signs(spinful, symmetry, root):
+    pytest.importorskip("symmray")
+    fermion = Fermion(spinful=spinful, symmetry=symmetry)
+    occupied = (0, 1) if symmetry in {"U1U1", "Z2Z2"} else 1
+    plan = TreePlan.from_order([q for q in range(3) if q != root], root_qubit=root)
+    state = hrs_to_ttn(
+        3, tree=plan, fermion=fermion,
+        occupations=[occupied, fermion.zero_charge, fermion.zero_charge], chi=5, seed=19,
+    )
+    sampler = TreeSampler(state, backend="native", fermion=fermion, chunk_size=3)
+    reference = TreeSampler(state, backend="native", fermion=fermion, strategy="standard")
+    actual = sampler.sample_batch(11, seed=17).to_numpy()
+    expected = reference.sample_batch(11, seed=17).to_numpy()
+    np.testing.assert_array_equal(actual.configs, expected.configs)
+    np.testing.assert_allclose(actual.probs, expected.probs, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(sampler.probabilities(actual.configs), actual.probs, rtol=1e-10, atol=1e-12)
+    source_amplitudes = []
+    for configuration in actual.configs:
+        selected = state.isel({state.site_ind(q): int(code) for q, code in enumerate(configuration)})
+        source_amplitudes.append(TreeSampler._symmray_scalar(selected.contract(all)))
+    source_amplitudes = np.asarray(source_amplitudes) / TreeSampler._symmray_norm_squared(state) ** 0.5
+    amplitudes = sampler.amplitudes(actual.configs)
+    index = np.argmax(abs(source_amplitudes))
+    phase = amplitudes[index] / source_amplitudes[index]
+    np.testing.assert_allclose(amplitudes, phase * source_amplitudes, rtol=1e-10, atol=1e-12)
+    occupations = actual.occupations()
+    np.testing.assert_array_equal(
+        occupations.sum(axis=tuple(range(1, occupations.ndim))) % 2,
+        np.ones(11, dtype=int),
+    )

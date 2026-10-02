@@ -186,9 +186,11 @@ rescales conditional environments and collapsed messages by positive powers
 of two, preserving their ratios and tensor dtype without accumulating a long
 prefix's probability in those messages. A zero or non-finite conditional norm
 raises `ValueError`; zero-weight branches are skipped even for a zero uniform
-draw. Dense `probabilities()` uses the same tensor dtype for contractions,
-tracks removed scales in float64 logarithms and returns float64 scores on the
-captured backend/device. Thus small representable probabilities survive even
+draw or one at the largest representable value below one. The accumulated
+sampling CDF is normalized by its endpoint so rounding cannot expose trailing
+zero-weight codes. Dense `probabilities()` uses the same tensor dtype for
+contractions, tracks removed scales in float64 logarithms and returns float64
+scores on the captured backend/device. Thus small representable probabilities survive even
 when their amplitude square would underflow in float32. `amplitudes()` retains
 the source amplitude dtype and its representable range. Probabilities below
 float64's range still underflow.
@@ -231,10 +233,10 @@ not wait for cyclic garbage collection to release their CPU/GPU arrays.
 
 Native Symmray fermionic trees (for example a spinful `phys_dim=4` Fermi-Hubbard
 tree) are sampled through the native path without calling `to_dense`. The
-canonical tree is projected one physical code at a time and the exact native
-branch norm supplies the conditional Born probability. This is a general
-fallback for Abelian tree geometries; the existing dense path remains
-available for high-throughput batches.
+default factor strategy shares canonical conditional trees by measured prefix
+and uses exact graded centre norms. `strategy="standard"` retains the complete
+projected-tree norm reference. Select `backend="native"` or `"symmray"` to keep
+blocks; `backend="auto"` uses the dense NumPy compatibility path.
 
 Sampled physical codes retain the source Symmray basis order. For supported
 fermionic sectors, the batched and list results carry a
@@ -246,7 +248,10 @@ from pepsy.tensors import Fermion
 from pepsy.sampling import TreeSampler
 
 # psi_tree: a native Symmray fermionic TreeTensorNetwork / TreeOptimizer state.
-sampler = TreeSampler(psi_tree, fermion=Fermion(spinful=True, symmetry="U1U1"))
+sampler = TreeSampler(
+    psi_tree, backend="native",
+    fermion=Fermion(spinful=True, symmetry="U1U1"),
+)
 batch = sampler.sample_batch(n_samples=4096, seed=0)
 
 codes = batch.configs            # (n_samples, nqubits) dense-basis codes
@@ -255,6 +260,6 @@ occ = batch.occupations()        # (n_samples, nqubits, 2) in (n_up, n_down)
 
 The fermionic state is detected automatically, so passing `fermion=` is
 optional; it only pins the recorded `symmetry`/`spinful` labels. Signed
-`amplitudes(...)` follow the same dense basis convention and may differ from the
-graded amplitude ordering by a per-configuration sign, whereas
-`probabilities(...)` are exact.
+`amplitudes(...)` on the native path retain the graded source-projection
+ordering. The dense compatibility path can differ by a per-configuration
+sign; both paths return the same Born `probabilities(...)`.

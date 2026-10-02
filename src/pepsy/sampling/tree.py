@@ -8,8 +8,8 @@ public surface -- :meth:`~TreeSampler.sample`, :meth:`~TreeSampler.sample_batch`
 :meth:`~TreeSampler.probabilities`, and :meth:`~TreeSampler.refresh` -- and the
 same batched, environment-caching efficiency.
 
-Algorithm
----------
+Dense algorithm
+---------------
 The state is first put in canonical form with the orthogonality centre on the
 root and normalized, so every non-root node is isometric toward its parent
 bond. Sampling then walks the tree depth-first, carrying an amplitude vector
@@ -1389,6 +1389,10 @@ class TreeSampler:
                 draws = physical_draws[draw_index]
                 draw_index += 1
                 cdf = self._cumsum(probs, axis=1)
+                # Normalize the accumulated endpoint too: summation can round
+                # below one and otherwise expose a trailing zero-weight code.
+                endpoint = cdf[:, -1:]
+                cdf = cdf / self._where(endpoint > 0, endpoint, 1.0)
                 x = self._sum(draws[:, None] >= cdf, axis=1)
                 x = self._as_int64(self._clip_max(x, probs.shape[1] - 1))
                 configs[:, q] = x
