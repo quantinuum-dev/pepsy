@@ -86,25 +86,12 @@ def _normalize_tree_stab_mode(mode):
     StabilizerTreeSimulator's numerical coefficient updates are naturally
     represented by a compact TreeMPO on the active tree span. Keep the older
     stabilizer route names accepted for stream compatibility, but make the two
-    explicit TreeMPO modes the canonical interface.
+    explicit TreeMPO modes the default interface. Numerical algorithm names
+    are validated by TreeOptimizer and use its shared coefficient engine.
     """
     if mode is None:
         return "tree_mpo_direct"
-    requested = str(mode).strip().lower().replace("-", "_")
-    aliases = {
-        "tree_mpo": "tree_mpo_direct",
-        "treempo": "tree_mpo_direct",
-        "treempo_direct": "tree_mpo_direct",
-        "tree_mpo_svd": "tree_mpo_direct",
-        "treempo_dm": "tree_mpo_dm",
-        "treempo_dem": "tree_mpo_dm",
-        "tree_mpo_dem": "tree_mpo_dm",
-        "tree_mpo_eig": "tree_mpo_dm",
-        "dem": "dm",
-    }
-    requested = aliases.get(requested, requested)
-    if requested in {"tree_mpo_direct", "tree_mpo_dm", "dm"}:
-        return requested
+    requested = TreeOptimizer._normalize_mode(mode)
     if requested in {"auto", "direct", "mpo", "submpo"}:
         warnings.warn(
             f"StabilizerTreeSimulator mode={mode!r} is a legacy compatibility "
@@ -112,12 +99,7 @@ def _normalize_tree_stab_mode(mode):
             DeprecationWarning,
             stacklevel=3,
         )
-        return requested
-    raise ValueError(
-        "StabilizerTreeSimulator mode must be 'tree_mpo_direct' or "
-        "'tree_mpo_dm' (hyphenated spellings and 'tree_mpo_dem' are "
-        f"accepted), got {mode!r}."
-    )
+    return requested
 
 
 def _normalize_sites(where):
@@ -415,26 +397,17 @@ def _infer_stream_n(entries):
     return required
 
 
-def _dense_to_tree_state(state, plan, *, max_bond=None, cutoff=0.0, dtype=complex):
+def _dense_to_tree_state(state, plan, *, dtype=complex):
     """Build a hierarchical Tucker/TTN factorization of a dense state.
 
     The decomposition uses one state-vs-complement SVD per planned subtree and
     projects each parent basis onto its child Schmidt bases. It therefore
     allocates state-sized matrices, not a rank-one ``2**n`` by ``2**n``
-    operator. ``max_bond`` and ``cutoff`` are applied to the subtree bases.
+    operator. This construction is lossless; compression belongs to the
+    TreeOptimizer engine after backend conversion.
     """
     if not isinstance(plan, TreePlan):
         raise TypeError("plan must be a TreePlan.")
-    if max_bond is not None:
-        if isinstance(max_bond, bool):
-            raise TypeError("max_bond must be a positive integer or None.")
-        max_bond = int(max_bond)
-        if max_bond < 1:
-            raise ValueError("max_bond must be a positive integer or None.")
-    cutoff = float(cutoff)
-    if cutoff < 0.0:
-        raise ValueError("cutoff must be non-negative.")
-
     dense = np.asarray(ar.to_numpy(state), dtype=dtype).reshape(-1)
     expected_size = 2 ** plan.n
     if dense.size != expected_size:
@@ -467,20 +440,14 @@ def _dense_to_tree_state(state, plan, *, max_bond=None, cutoff=0.0, dtype=comple
             2 ** len(support), -1
         )
         u, singular_values, _vh = np.linalg.svd(matrix, full_matrices=False)
-        if singular_values.size == 0 or singular_values[0] <= cutoff:
+        if singular_values.size == 0 or singular_values[0] == 0.0:
             # A zero state still needs a valid rank-one tensor network so that
             # the reduced state can be installed and evolved further.
             basis = np.zeros((2 ** len(support), 1), dtype=dense.dtype)
             basis[0, 0] = 1.0
             rank = 1
         else:
-            keep = singular_values > cutoff
-            if max_bond is not None:
-                keep_indices = np.flatnonzero(keep)[:max_bond]
-            else:
-                keep_indices = np.flatnonzero(keep)
-            if keep_indices.size == 0:
-                keep_indices = np.array([0])
+            keep_indices = np.flatnonzero(singular_values > 0.0)
             rank = int(keep_indices.size)
             basis = u[:, keep_indices]
         bases[node] = basis
@@ -732,9 +699,11 @@ class StabilizerTreeSimulator:
     ``max_operator_qubits`` through bounded Pauli decomposition. Set
     ``exact_cooling=False`` to exercise the ordinary multi-site rotation path.
     Coefficient-side numerical updates use the tree-native
-    ``tree_mpo_direct`` or ``tree_mpo_dm`` route; ``tree_mpo_dem`` and
+    ``tree_mpo_direct`` or ``tree_mpo_dm`` route by default; ``tree_mpo_dem`` and
     hyphenated spellings are accepted aliases. Legacy stabilizer route names
-    remain compatibility aliases for existing streams.
+    remain compatibility aliases for existing streams. DMRG/FIT and the other
+    TreeOptimizer algorithms use the same coefficient engine and constructor
+    controls, without duplicating compression kernels here.
     """
 
     def __init__(
@@ -755,12 +724,39 @@ class StabilizerTreeSimulator:
         layout_weight_mode="count",
         mode="tree_mpo_direct",
         compression_mode="direct",
+        compression_seed=None,
+        max_bond_oversample=None,
+        cutoff_oversample=0.0,
+        cutoff_mode_oversample="rel",
+        fit_block_size=1,
+        fit_n_iter=4,
+        fit_adaptive_sweeps=2,
+        fit_two_site_transition_sweeps=1,
+        fit_min_iter=2,
+        fit_rtol="auto",
+        fit_patience=1,
+        fit_init_strategy="auto",
+        fit_init_rand_strength=0.0,
+        fit_init_seed=0,
+        fit_sweep_sequence="inward-outward",
+        fit_overlap_diagnostics=False,
+        fit_traversal="auto",
+        fit_environment_strategy="default",
+        fit_single_node_fast_path=True,
+        fit_finite_check=False,
+        stabilize_unitary=False,
         dtype=complex,
         threads=1,
+        subtree_workers=1,
         seed=None,
         inplace=True,
         track_truncation=False,
         track_infidelity=True,
+        max_intermediate_bond=None,
+        record_history=True,
+        profile=False,
+        profile_sync=False,
+        track_bond_diagnostics=False,
         max_operator_qubits=DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS,
         max_pauli_decomposition_qubits=None,
         max_pauli_terms=256,
@@ -965,6 +961,27 @@ class StabilizerTreeSimulator:
             cutoff_mode=cutoff_mode,
             mode=tree_mode,
             compression_mode=compression_mode,
+            compression_seed=compression_seed,
+            max_bond_oversample=max_bond_oversample,
+            cutoff_oversample=cutoff_oversample,
+            cutoff_mode_oversample=cutoff_mode_oversample,
+            fit_block_size=fit_block_size,
+            fit_n_iter=fit_n_iter,
+            fit_adaptive_sweeps=fit_adaptive_sweeps,
+            fit_two_site_transition_sweeps=fit_two_site_transition_sweeps,
+            fit_min_iter=fit_min_iter,
+            fit_rtol=fit_rtol,
+            fit_patience=fit_patience,
+            fit_init_strategy=fit_init_strategy,
+            fit_init_rand_strength=fit_init_rand_strength,
+            fit_init_seed=fit_init_seed,
+            fit_sweep_sequence=fit_sweep_sequence,
+            fit_overlap_diagnostics=fit_overlap_diagnostics,
+            fit_traversal=fit_traversal,
+            fit_environment_strategy=fit_environment_strategy,
+            fit_single_node_fast_path=fit_single_node_fast_path,
+            fit_finite_check=fit_finite_check,
+            stabilize_unitary=stabilize_unitary,
             structure=structure,
             max_arity=max_arity,
             top_arity=top_arity,
@@ -974,11 +991,17 @@ class StabilizerTreeSimulator:
             layout=layout,
             dtype=dtype,
             threads=threads,
+            subtree_workers=subtree_workers,
             seed=seed,
             run=False,
             tn=coefficient_state,
             track_truncation=track_truncation,
             track_infidelity=track_infidelity,
+            max_intermediate_bond=max_intermediate_bond,
+            record_history=record_history,
+            profile=profile,
+            profile_sync=profile_sync,
+            track_bond_diagnostics=track_bond_diagnostics,
             max_operator_qubits=max_operator_qubits,
             max_subtree_nodes=max_subtree_nodes,
         )
@@ -1147,9 +1170,9 @@ class StabilizerTreeSimulator:
         mps_advice = StabilizerMpsSimulator.recommend_settings(gates, **kwargs)
         settings = dict(mps_advice.settings)
         settings.pop("layout_report", None)
-        # MPS-only stabilization is not a TreeStab constructor option. Tree's
-        # retained-norm ledger remains opt-in/out through its own historical
-        # ``track_infidelity`` flag, whose default is enabled.
+        # Keep the tree's stabilization default instead of importing the
+        # MPS advisor's recommendation. Tree's retained-norm ledger remains
+        # controlled by ``track_infidelity``, whose default is enabled.
         settings.pop("stabilize_unitary", None)
         settings.setdefault("track_infidelity", True)
         settings.setdefault(
@@ -1256,74 +1279,23 @@ class StabilizerTreeSimulator:
     def mode(self):
         """Canonical coefficient-update route.
 
-        The public TreeStab modes are ``tree_mpo_direct`` and
-        ``tree_mpo_dm``.  Legacy TreeOptimizer routes remain visible when
-        explicitly requested so existing stream code can inspect its original
-        compatibility choice; the ``dm`` shorthand is reported canonically.
+        Defaults use ``tree_mpo_direct`` or ``tree_mpo_dm``. Named FIT schedules
+        and explicitly requested legacy routes remain visible; the ``dm``
+        shorthand is reported canonically.
         """
         if self._tree.mode == "auto" and self._tree.compression_mode == "dm":
             return "tree_mpo_dm"
-        return self._tree.mode
+        return self._tree._dmrg_mode_alias or self._tree.mode
 
     def _apply_tree_gate(
         self, gate, where, *, renormalize=False, track_norm=True
     ):
-        """Apply one coefficient-side gate through a true TreeMPO.
-
-        This helper is used for stabilizer-frame localizers and exact-cooling
-        pivots as well as ordinary matrix entries. Keeping canonical TreeStab
-        modes on this helper avoids silently falling back to a dense local
-        kernel. The explicit legacy ``mode='mpo'`` compatibility route is
-        handled separately below.
-        """
-        if self._tree.mode == "mpo":
-            # Preserve the historical explicit ``mode='mpo'`` contract for
-            # callers that still inspect its two-factor kernel. New TreeStab
-            # modes below never take this branch.
-            logical_where = _normalize_sites(where)
-            gate = self._tree._as_state_backend(gate, warn=False)
-            if len(logical_where) == 1:
-                self._tree.apply_1q(
-                    gate,
-                    logical_where[0],
-                    renormalize=renormalize,
-                    track_norm=track_norm,
-                )
-                return self
-            if len(logical_where) == 2:
-                self._tree.apply_2q(
-                    gate,
-                    logical_where[0],
-                    logical_where[1],
-                    track_norm=track_norm,
-                )
-                if renormalize:
-                    self._tree.normalize()
-                return self
-            raise ValueError("legacy mode='mpo' supports at most two sites.")
-        from ..tree.operators import TreeMPO
-
-        logical_where = _normalize_sites(where)
-        compact_where = self._tree._validate_support(logical_where)
+        """Use ordinary gate routing for coefficient localizers and pivots."""
         gate = self._tree._as_state_backend(gate, warn=False)
-        tree_mpo = TreeMPO.from_gate(
-            self.plan,
-            gate,
-            compact_where,
-            fermionic=bool(getattr(self.p, "fermionic", False)),
-            symmetry=getattr(self.p, "symmetry", None),
-            dtype=self._tree.backend_dtype,
-        )
-        self._tree.apply_subtreempo(
-            tree_mpo,
-            tree_mpo.operator_support,
-            max_bond=self._tree.chi,
-            cutoff=self._tree.cutoff,
+        self._tree.apply_gate(
+            gate, _normalize_sites(where), renormalize=renormalize,
             track_norm=track_norm,
-            _validate_backend=False,
         )
-        if renormalize:
-            self._tree.normalize()
         return self
 
     def _apply_tree_pauli_sum(
@@ -1923,37 +1895,24 @@ class StabilizerTreeSimulator:
             raise TypeError("plan must be a TreePlan or a frame-layout report.")
         if selected.n != self.n:
             raise ValueError("frame layout plan does not match the simulator size.")
+        settings = self._coefficient_tree_settings()
+        settings["top_arity"] = selected.top_arity
         self._tree = TreeOptimizer(
-            None,
-            n=self.n,
-            chi=self._tree.chi,
-            cutoff=self._tree.cutoff,
-            cutoff_mode=self._tree.cutoff_mode,
-            mode=self._tree.mode,
-            compression_mode=self._tree.compression_mode,
-            structure=self._tree.structure,
-            max_arity=self._tree.max_arity,
-            top_arity=selected.top_arity,
-            layout_objective=self._tree.layout_objective,
-            layout_weight_mode=self._tree.layout_weight_mode,
-            tree=selected,
-            dtype=self._tree.dtype,
-            threads=self._tree.threads,
-            seed=0,
-            run=False,
-            tn=self.p,
-            track_truncation=self._tree.track_truncation,
-            track_infidelity=self._tree.track_infidelity,
-            max_operator_qubits=self._tree.max_operator_qubits,
-            max_subtree_nodes=self._tree.max_subtree_nodes,
-            record_history=self._tree.record_history,
+            None, **settings, tree=selected, tn=self.p, seed=0, run=False,
         )
         self.frame_layout_plan = selected
         self.frame_layout_events = tuple(
             self._frame_layout_records(self._queue)
         )
         self.projection_diagnostics = self._tree.projection_diagnostics
+        self.norm_events = self._tree.norm_events
         return self
+
+    def _coefficient_tree_settings(self):
+        """Snapshot live engine controls, including the named FIT schedule."""
+        settings = self._tree._configuration_snapshot()
+        settings["mode"] = self._tree._dmrg_mode_alias or self._tree.mode
+        return settings
 
     def queued_stream_analysis(self, **kwargs):
         """Analyze the queued stream without consuming it."""
@@ -2064,6 +2023,12 @@ class StabilizerTreeSimulator:
         )
 
         workers = _resolve_local_workers(workers, shots=shots)
+        if workers > 1 and parallel_backend == "thread":
+            # Stim's pybind NumPy bridge can deadlock when its first matrix
+            # conversion initializes imports in concurrent worker threads.
+            # Initialize the small classifier before dispatch, without
+            # touching the tableau or coefficient state.
+            _tableau_from_exact_unitary(np.eye(2, dtype=complex))
         progress_mode = _validate_progress(progress)
         progress_bar = (
             _make_progress_bar(progress_mode, shots, desc="shots")
@@ -2273,7 +2238,7 @@ class StabilizerTreeSimulator:
         tree_mpo_parts = _tree_mpo_event_parts(entry)
         if tree_mpo_parts is not None:
             tree_mpo, where = tree_mpo_parts
-            self._tree.apply_subtreempo(
+            self._tree.apply_sub_mpotree(
                 tree_mpo,
                 where,
                 max_bond=self._tree.chi,
@@ -4583,8 +4548,6 @@ class StabilizerTreeSimulator:
         coefficient = _dense_to_tree_state(
             capped,
             new_plan,
-            max_bond=old_tree.chi,
-            cutoff=old_tree.cutoff,
             dtype=old_tree.dtype,
         )
         if self.to_backend is not None:
@@ -4593,32 +4556,26 @@ class StabilizerTreeSimulator:
             coefficient.apply_to_arrays(
                 self._tree._backend_converter(self._tree._state_like())
             )
+        settings = self._coefficient_tree_settings()
+        settings["n"] = reduced_n
+        settings["top_arity"] = new_plan.top_arity
         new_tree = TreeOptimizer(
-            None,
-            n=reduced_n,
-            chi=old_tree.chi,
-            cutoff=old_tree.cutoff,
-            cutoff_mode=old_tree.cutoff_mode,
-            mode=old_tree.mode,
-            compression_mode=old_tree.compression_mode,
-            structure=old_tree.structure,
-            max_arity=old_tree.max_arity,
-            community_frac=old_tree.community_frac,
-            star_frac=old_tree.star_frac,
-            layout_objective=old_tree.layout_objective,
-            layout_weight_mode=old_tree.layout_weight_mode,
-            tree=new_plan,
-            dtype=old_tree.dtype,
-            threads=old_tree.threads,
-            seed=0,
-            run=False,
-            track_truncation=old_tree.track_truncation,
-            max_intermediate_bond=old_tree.max_intermediate_bond,
-            max_operator_qubits=old_tree.max_operator_qubits,
-            max_subtree_nodes=old_tree.max_subtree_nodes,
-            record_history=old_tree.record_history,
-            tn=coefficient,
+            None, **settings, tree=new_plan, tn=coefficient, seed=0, run=False,
         )
+        # Dense reconstruction is exact. Apply a bond-one identity over the
+        # complete reduced tree so the selected ordinary algorithm owns all
+        # truncation, cutoff conventions, FIT controls and diagnostics.
+        from ..tree.operators import TreeMPO
+
+        if np.any(capped):
+            identity = TreeMPO.from_gate(
+                new_plan, np.eye(2, dtype=old_tree.dtype), (0,),
+            ).identity()
+            new_tree.apply_sub_mpotree(
+                identity, track_norm=False, _validate_backend=False,
+            )
+        # A zero cap already constructs an exact rank-one tree. No truncation
+        # is needed, and normalized density-matrix splits are undefined there.
 
         self._tree = new_tree
         self.state = _TreeStabilizerFrame(reduced_n)
@@ -4878,6 +4835,10 @@ class StabilizerTreeSimulator:
 
     def get_projection_diagnostics(self):
         return self._tree.get_projection_diagnostics()
+
+    def get_fit_diagnostics(self):
+        """Return the coefficient engine's latest FIT diagnostics, if any."""
+        return self._tree.get_fit_diagnostics()
 
     def __repr__(self):  # pragma: no cover - cosmetic
         return (

@@ -18,6 +18,17 @@ releases remain backwards-compatible. From 1.0 onward:
   support during adjacent and routed updates without dividing by zero.
   Nonzero weights and requested truncation controls are unchanged.
 
+- StabilizerTreeSimulator exposes TreeOptimizer's DMRG/FIT and compression
+  algorithms and controls through the shared coefficient engine. Copies,
+  shots, frame-layout changes and cap reconstruction preserve named FIT
+  schedules and live compression policies. Generic DMRG remains one-node;
+  larger-block growth requires `dmrg2` or `dmrg3`.
+  Coefficient localizers share ordinary compact gate routing; full and compact
+  tree operators share `apply_sub_mpotree`. Physical caps reconstruct exactly
+  before selected-engine compression, honoring relative cutoff conventions.
+  Public threaded TreeStab shot replay initializes Stim's NumPy matrix
+  bridge before dispatch, avoiding a reproduced first-use deadlock.
+
 - Trajectory importance sampling rejects omitted positive target branches,
   however rare, and proposal mass on impossible outcomes before replay.
   Callable coalesced mixture proposals receive each live parent optimizer.

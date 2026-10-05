@@ -46,6 +46,13 @@ conversion, and when a TreeStab constructor independently proves a canonical
 tree (such as dense cap factorization), install the proven metadata without a
 redundant numerical QR sweep.
 
+Keep coefficient gate construction and compression in TreeOptimizer:
+localizers call `apply_gate`, and full/compact tree operators use
+`apply_sub_mpotree`. Physical caps construct the reduced tree losslessly,
+then compress through that dispatcher with a bond-one full-tree identity.
+Exact zero caps already have rank one and need no compression. Do not add
+an independent cutoff convention or a legacy gate splitter to the facade.
+
 Clifford events update `C`. Physical Pauli rotations, measurements, resets,
 and magic gadgets map through `C† P C` and update `|p>`. Coefficient-frame
 sub-MPO events go directly to `TreeOptimizer.apply_submpo`; they are not
