@@ -125,7 +125,7 @@ class GradSolverResult:
 # ---------------------------------------------------------------------------
 
 # Map bare scipy shorthand names to the full scipy method string.
-_SCIPY_METHOD_MAP: dict[str, str] = {
+_SCIPY_SHORT_NAMES: dict[str, str] = {
     "lbfgs":        "L-BFGS-B",
     "l-bfgs-b":     "L-BFGS-B",
     "bfgs":         "BFGS",
@@ -183,7 +183,7 @@ def _resolve_solver(solver: str) -> tuple[str, str | None]:
     # 3. Explicit "scipy-METHOD" prefix.
     if key.startswith("scipy-"):
         suffix = key[6:]
-        method = _SCIPY_METHOD_MAP.get(suffix, solver[6:].strip())
+        method = _SCIPY_SHORT_NAMES.get(suffix, solver[6:].strip())
         return "scipy", method
 
     # 4. Explicit finite-difference "fd-nlopt-ALGO" prefix.
@@ -194,7 +194,7 @@ def _resolve_solver(solver: str) -> tuple[str, str | None]:
     # 5. Explicit finite-difference "fd-scipy-METHOD" prefix.
     if key.startswith("fd-scipy-"):
         suffix = key[9:]
-        method = _SCIPY_METHOD_MAP.get(suffix, solver[9:].strip())
+        method = _SCIPY_SHORT_NAMES.get(suffix, solver[9:].strip())
         return "fd-scipy", method
 
     # 6. Bare nlopt algorithm names: LD_* / LN_* / GD_* / GN_*
@@ -203,8 +203,8 @@ def _resolve_solver(solver: str) -> tuple[str, str | None]:
         return "nlopt", key_up
 
     # 7. Bare scipy method shorthand.
-    if key in _SCIPY_METHOD_MAP:
-        return "scipy", _SCIPY_METHOD_MAP[key]
+    if key in _SCIPY_SHORT_NAMES:
+        return "scipy", _SCIPY_SHORT_NAMES[key]
 
     # 8. Bare torch optimizer short name.
     if key in _TORCH_SHORT_NAMES:
@@ -1018,9 +1018,134 @@ def _run_torch_solver(
     return params_run, history, best_loss, final_loss, convergence_reason, eval_counter["value"]
 
 
+def _is_jax_array(value: Any) -> bool:
+    """Detect native JAX inputs without importing an optional backend."""
+    return type(value).__module__.split(".", 1)[0] in {"jax", "jaxlib"}
+
+
+class _TorchHostProblem:
+    """Torch autograd callbacks for host-controlled SciPy/NLopt solvers."""
+
+    def __init__(self, items, loss_fn):
+        self.params = dict(items)
+        self.specs = _build_param_specs(items)
+        self.x0 = _flatten_params_real_numpy(self.specs)
+        self.loss_fn = loss_fn
+
+    def value_and_grad(self, vector):
+        return _evaluate_loss_and_grad(vector, self.params, self.specs, self.loss_fn)
+
+    def assign(self, vector):
+        _assign_flat_params(vector, self.specs)
+
+    def loss_value(self):
+        return float(_scalar_real_loss(self.loss_fn(self.params)).detach().cpu())
+
+    def hessian(self, vector):
+        return _evaluate_hessian(vector, self.specs, self.loss_fn)
+
+    def hessp(self, vector, direction):
+        return _evaluate_hessp(vector, direction, self.specs, self.loss_fn)
+
+
+class _JaxHostProblem:
+    """Pack real coordinates on the host; differentiate on the JAX device.
+
+    Complex parameters use separate real/imaginary coordinates, so JAX's
+    complex-gradient convention cannot reverse the imaginary update. Only
+    the flat iterate, scalar value and derivatives cross the host boundary.
+    """
+
+    def __init__(self, items, loss_fn):
+        jax, jnp = _require_jax()
+        self.jax = jax
+        reference = next(value for _, value in items if _is_jax_array(value))
+        self.device = reference.device
+        self.params = {}
+        self.specs = []
+        parts = []
+        for name, value in items:
+            if torch is not None and isinstance(value, torch.Tensor):
+                raise TypeError("SciPy/NLopt parameters cannot mix Torch and JAX arrays")
+            array = jax.device_put(jnp.asarray(value), self.device)
+            if _is_jax_array(value) and value.device != self.device:
+                raise ValueError("JAX SciPy/NLopt parameters must be on one device")
+            if not jnp.issubdtype(array.dtype, jnp.inexact):
+                array = array.astype(jnp.float64 if jax.config.x64_enabled else jnp.float32)
+            self.params[name] = array
+            is_complex = jnp.issubdtype(array.dtype, jnp.complexfloating)
+            self.specs.append((name, array.shape, array.size, array.dtype, is_complex))
+            host = np.asarray(jax.device_get(array)).reshape(-1)
+            parts.append(host.real.astype(np.float64))
+            if is_complex:
+                parts.append(host.imag.astype(np.float64))
+        self.x0 = np.concatenate(parts) if parts else np.empty(0, dtype=np.float64)
+
+        def unpack(vector):
+            params = {}
+            offset = 0
+            for name, shape, size, dtype, is_complex in self.specs:
+                value = vector[offset:offset + size]
+                offset += size
+                if is_complex:
+                    value = value + 1j * vector[offset:offset + size]
+                    offset += size
+                params[name] = value.astype(dtype).reshape(shape)
+            return params
+
+        self.unpack = unpack
+
+        def loss_with_imag(vector):
+            loss = jnp.asarray(loss_fn(unpack(vector)))
+            if loss.ndim != 0:
+                raise ValueError("loss_fn must return a scalar")
+            return loss.real, loss.imag
+
+        self.evaluate = jax.jit(jax.value_and_grad(loss_with_imag, has_aux=True))
+        def real_loss(vector):
+            return loss_with_imag(vector)[0]
+
+        self.evaluate_hessian = jax.jit(jax.hessian(real_loss))
+        grad_fn = jax.grad(real_loss)
+        self.evaluate_hessp = jax.jit(
+            lambda vector, direction: jax.jvp(grad_fn, (vector,), (direction,))[1]
+        )
+
+    def _vector(self, vector):
+        # SciPy/NLopt supply float64 CPU vectors even for float32 parameters.
+        return self.jax.device_put(np.asarray(vector), self.device)
+
+    def value_and_grad(self, vector):
+        (loss, imag), grad = self.jax.device_get(self.evaluate(self._vector(vector)))
+        if not np.isfinite(imag) or abs(float(imag)) > 1e-10:
+            raise ValueError("loss_fn must return a real scalar")
+        return float(loss), np.asarray(grad, dtype=np.float64)
+
+    def assign(self, vector):
+        self.current_vector = np.array(vector, dtype=np.float64, copy=True)
+        self.params.update(self.unpack(self._vector(vector)))
+
+    def loss_value(self):
+        return self.value_and_grad(self.current_vector)[0]
+
+    def hessian(self, vector):
+        return np.asarray(self.jax.device_get(self.evaluate_hessian(self._vector(vector))))
+
+    def hessp(self, vector, direction):
+        return np.asarray(self.jax.device_get(
+            self.evaluate_hessp(self._vector(vector), self._vector(direction))
+        ))
+
+
+def _host_problem(items, loss_fn):
+    if any(_is_jax_array(value) for _, value in items):
+        return _JaxHostProblem(items, loss_fn)
+    return _TorchHostProblem(items, loss_fn)
+
+
 def _run_scipy_lbfgs(
-    items: list[tuple[str, torch.Tensor]],
-    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+    items: list[tuple[str, Any]],
+    loss_fn: Callable[[dict[str, Any]], Any],
     *,
     solver_options: dict[str, Any],
     n_steps: int,
@@ -1036,9 +1161,9 @@ def _run_scipy_lbfgs(
             "solver='scipy' requires SciPy. Install with: pip install scipy"
         ) from exc
 
-    params_run = dict(items)
-    specs = _build_param_specs(items)
-    x0 = _flatten_params_real_numpy(specs)
+    problem = _host_problem(items, loss_fn)
+    params_run = problem.params
+    x0 = problem.x0
     if x0.size == 0:
         return params_run, [], float("nan"), float("nan"), "empty_params", 0
 
@@ -1161,7 +1286,7 @@ def _run_scipy_lbfgs(
     def objective(x):
         eval_counter["value"] += 1
         try:
-            loss_value, grad_value = _evaluate_loss_and_grad(x, params_run, specs, loss_fn)
+            loss_value, grad_value = problem.value_and_grad(x)
             if not np.isfinite(loss_value) or not np.isfinite(grad_value).all():
                 raise FloatingPointError("non-finite objective or gradient")
         except (FloatingPointError, RuntimeError, ValueError):
@@ -1202,7 +1327,7 @@ def _run_scipy_lbfgs(
         step_num = step_counter["value"]
         loss_value = state["last_loss"]
         if loss_value is None:
-            loss_value, _grad = _evaluate_loss_and_grad(_xk, params_run, specs, loss_fn)
+            loss_value, _grad = problem.value_and_grad(_xk)
         history.append(float(loss_value))
         if pbar is not None:
             pbar.update(1)
@@ -1231,13 +1356,9 @@ def _run_scipy_lbfgs(
     hess_fn = None
     hessp_fn = None
     if _needs_hess:
-        def _hess_fn_impl(x, _specs=specs, _loss_fn=loss_fn):
-            return _evaluate_hessian(x, _specs, _loss_fn)
-        hess_fn = _hess_fn_impl
+        hess_fn = problem.hessian
     elif _needs_hessp:
-        def _hessp_fn_impl(x, p, _specs=specs, _loss_fn=loss_fn):
-            return _evaluate_hessp(x, p, _specs, _loss_fn)
-        hessp_fn = _hessp_fn_impl
+        hessp_fn = problem.hessp
 
     result = None
     try:
@@ -1268,11 +1389,11 @@ def _run_scipy_lbfgs(
         best_x = state["best_x"]
     else:
         best_x = np.asarray(x0, dtype=np.float64)
-    _assign_flat_params(best_x, specs)
+    problem.assign(best_x)
 
     if not history:
         try:
-            fallback = float(_scalar_real_loss(loss_fn(params_run)).detach().cpu())
+            fallback = problem.loss_value()
         except (RuntimeError, ValueError, FloatingPointError):
             fallback = controls["penalty_on_bad"]
         history.append(fallback)
@@ -1286,8 +1407,8 @@ def _run_scipy_lbfgs(
 
 
 def _run_nlopt_lbfgs(
-    items: list[tuple[str, torch.Tensor]],
-    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+    items: list[tuple[str, Any]],
+    loss_fn: Callable[[dict[str, Any]], Any],
     *,
     solver_options: dict[str, Any],
     n_steps: int,
@@ -1303,9 +1424,9 @@ def _run_nlopt_lbfgs(
             "solver='nlopt' requires NLopt. Install with: pip install nlopt"
         ) from exc
 
-    params_run = dict(items)
-    specs = _build_param_specs(items)
-    x0 = _flatten_params_real_numpy(specs)
+    problem = _host_problem(items, loss_fn)
+    params_run = problem.params
+    x0 = problem.x0
     if x0.size == 0:
         return params_run, [], float("nan"), float("nan"), "empty_params", 0
 
@@ -1500,7 +1621,7 @@ def _run_nlopt_lbfgs(
             eval_state["prev_x"] = np.array(x_vec, dtype=np.float64, copy=True)
 
         try:
-            loss_value, grad_value = _evaluate_loss_and_grad(x_vec, params_run, specs, loss_fn)
+            loss_value, grad_value = problem.value_and_grad(x_vec)
             if not np.isfinite(loss_value) or not np.isfinite(grad_value).all():
                 raise FloatingPointError("non-finite objective or gradient")
         except (FloatingPointError, RuntimeError, ValueError):
@@ -1605,10 +1726,10 @@ def _run_nlopt_lbfgs(
         best_x = np.asarray(x_opt, dtype=np.float64)
     else:
         best_x = np.asarray(x0, dtype=np.float64)
-    _assign_flat_params(best_x, specs)
+    problem.assign(best_x)
     if not history:
         try:
-            loss_fallback = float(_scalar_real_loss(loss_fn(params_run)).detach().cpu())
+            loss_fallback = problem.loss_value()
         except (RuntimeError, ValueError, FloatingPointError):
             loss_fallback = controls["penalty_on_bad"]
         history.append(loss_fallback)
@@ -1870,7 +1991,7 @@ def _run_jax_solver(
 
 def _optimize_dispatch(
     params_init: Mapping[str, Any],
-    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+    loss_fn: Callable[[dict[str, Any]], Any],
     *,
     solver: str,
     solver_options: Mapping[str, Any] | None,
@@ -1931,8 +2052,13 @@ def _optimize_dispatch(
             progress_callback=progress_callback,
         )
 
-    _require_torch()
-    items = _param_ordered_items(params_init)
+    if solver_name in {"scipy", "nlopt"} and any(
+        _is_jax_array(value) for value in params_init.values()
+    ):
+        items = list(params_init.items())
+    else:
+        _require_torch()
+        items = _param_ordered_items(params_init)
     if solver_name in _TORCH_SOLVERS:
         return _run_torch_solver(
             items,
@@ -2013,7 +2139,7 @@ def _optimize_dispatch(
 
 def optimize_packed_params(
     params_init: Mapping[str, Any],
-    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+    loss_fn: Callable[[dict[str, Any]], Any],
     *,
     solver: str = "scipy",
     solver_options: Mapping[str, Any] | None = None,
@@ -2022,7 +2148,7 @@ def optimize_packed_params(
     log_every: int = 1,
     opt_desc: str | None = None,
     progress_callback: Callable[[int, float], None] | None = None,
-) -> tuple[dict[str, torch.Tensor], list[float]]:
+) -> tuple[dict[str, Any], list[float]]:
     """Optimize a dict of packed parameters against a differentiable loss.
 
     This is the primary entry point used by :class:`pepsy.SweepOptimizer`.
@@ -2034,8 +2160,8 @@ def optimize_packed_params(
     Parameters
     ----------
     params_init : dict[str, Any]
-        Initial parameter values. Torch tensors are kept on their current
-        device; other array types are converted with ``torch.as_tensor``.
+        Initial parameter values. SciPy/NLopt preserve native Torch or JAX
+        arrays on their current device; NumPy inputs use Torch by default.
     loss_fn : callable
         ``loss_fn(params) -> scalar tensor``.  Must be differentiable when
         using autograd-based solvers.
@@ -2058,7 +2184,7 @@ def optimize_packed_params(
 
     Returns
     -------
-    tuple[dict[str, torch.Tensor], list[float]]
+    tuple[dict[str, Any], list[float]]
         ``(params_opt, history)`` where ``params_opt`` maps parameter names
         to optimised tensors on their original devices (detached, no grad),
         and ``history`` is the per-step loss trace.
@@ -2076,7 +2202,7 @@ def optimize_packed_params(
     )
     # Detach returned tensors — optimisation is done, grad tracking not needed.
     params_out = {
-        name: t.detach() if isinstance(t, torch.Tensor) else t
+        name: t.detach() if torch is not None and isinstance(t, torch.Tensor) else t
         for name, t in params_opt.items()
     }
     return params_out, history
@@ -2110,9 +2236,9 @@ class GradientOptimizer:
 
     @staticmethod
     def _bind_loss(
-        loss_fn: Callable[..., torch.Tensor],
+        loss_fn: Callable[..., Any],
         loss_kwargs: Mapping[str, Any] | None,
-    ) -> Callable[[dict[str, torch.Tensor]], torch.Tensor]:
+    ) -> Callable[[dict[str, Any]], Any]:
         if loss_kwargs is None:
             return loss_fn
         if not isinstance(loss_kwargs, Mapping):
@@ -2128,7 +2254,7 @@ class GradientOptimizer:
         self,
         *,
         params_init: Mapping[str, Any],
-        loss_fn: Callable[..., torch.Tensor],
+        loss_fn: Callable[..., Any],
         loss_kwargs: Mapping[str, Any] | None = None,
         solver: str | None = None,
         options: Mapping[str, Any] | None = None,
@@ -2182,7 +2308,7 @@ class GradientOptimizer:
         # the working tensors after restoring the best vector. Consumers of
         # GradSolverResult should not need to clean up autograd state.
         params_out = {
-            name: t.detach() if isinstance(t, torch.Tensor) else t
+            name: t.detach() if torch is not None and isinstance(t, torch.Tensor) else t
             for name, t in params_opt.items()
         }
 

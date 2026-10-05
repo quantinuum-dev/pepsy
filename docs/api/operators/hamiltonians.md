@@ -105,8 +105,16 @@ run after accumulation, so sequential SVDs still happen during accumulation.
 The automaton route applies them directly to its arrays before Quimb
 materializes the MPO, except when a backend converter is configured. This can
 reduce bonds for generic long-range terms, though it does not certify globally
-minimal bonds for every MPO. Under JAX tracing, data-dependent rank reduction
-is skipped so gradients can pass through the unreduced build.
+minimal bonds for every MPO. Trainable Torch tensors and JAX tracers keep the
+unreduced channels to preserve parameter derivatives at zero as well as away
+from zero. Numerical rank reduction is also skipped for decomposition dtypes
+other than float32/float64/complex64/complex128, preserving the original dtype
+without invoking an unsupported SVD. The delinearization report records
+`skipped_reason` and zero `sweeps` when the entire pass is skipped. Other
+accepted reductions check each bond channel's reconstruction and its error
+after weighting by the opposing tensor; these are local roundoff safeguards,
+not a global MPO error certificate. The same safeguards apply to the builder's
+existing structural cleanup.
 
 For a 2D builder, locations can be lattice coordinates and are mapped through
 `OneDMap`; a one-site coordinate can be written as `((x, y),)`:

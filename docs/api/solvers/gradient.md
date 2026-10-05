@@ -30,9 +30,26 @@ These messages are solver-specific strings, rather than a fixed enumeration.
 | Solver family | Dependencies and behavior |
 | --- | --- |
 | `torch-*` | Torch; differentiable scalar loss, parameters stay on their device |
-| `scipy`, `nlopt` | Torch plus the selected solver; CPU parameter packing |
+| `scipy`, `nlopt` | Torch or JAX plus the selected solver; CPU parameter packing, native device autodiff |
 | `jax-*` | JAX and Optax; JAX-compatible scalar loss |
 | `fd-*` | Finite differences; see [FDSolver](finite_difference.md) |
 
 `SUPPORTED_SOLVERS` lists canonical solver names. Install the relevant
 [optional profile](../../installation.md#optional-features) before using one.
+
+`solver="lbfgs"` or `"scipy-lbfgs"` selects SciPy L-BFGS-B;
+`solver="LD_LBFGS"` selects NLopt L-BFGS. Both accept Torch or native JAX
+parameters. The callback backend follows the input arrays; loss functions must
+use that backend. NumPy inputs retain the Torch default. JAX losses must be
+JIT-compatible; neither Torch nor Optax is required for the JAX host-solver path.
+JAX parameters must share one device. Floating/complex dtype, shape and device
+are preserved, and complex values are packed as real/imaginary coordinates.
+SciPy's second-order methods use native JAX Hessians or Hessian-vector products.
+Enable JAX x64 before constructing float64/complex128 parameters if needed.
+
+The host solver transfers a packed iterate to the device and reads back the
+scalar loss and flat gradient per evaluation. `n_steps` limits SciPy iterations
+or NLopt objective evaluations; the budgets have different meanings. Use
+`options={"assume_nonnegative": False}` for signed losses, including cluster
+infidelity approximations that can be negative. `torch-lbfgs` explicitly selects
+Torch's optimizer and accepts only Torch-compatible inputs.

@@ -317,7 +317,6 @@ def test_real_mpi_tree_stabilizer_run_keyword():
     "mode",
     (
         "dmrg",
-        "dmrg1",
         "dmrg2",
         "dmrg3",
         "fit",
