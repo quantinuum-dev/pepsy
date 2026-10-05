@@ -182,6 +182,8 @@ class StreamAnalysisRecord(_TypedRecord):
     is_clifford_only: bool
     is_clifford_t_like: bool
     warnings: tuple[str, ...] = ()
+    trajectory_entries: int = 0
+    clifford_trajectory_entries: int = 0
 
 
 @dataclass

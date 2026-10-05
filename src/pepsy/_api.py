@@ -198,6 +198,8 @@ _SYMBOL_MODULES = {
     "TreeStabOptimizer": ".optimizers",
     "TreeTensorNetwork": ".optimizers",
     "compile_stim_circuit": ".optimizers",
+    "stim_plan_to_gate_stream": ".optimizers",
+    "stim_readout_parities": ".optimizers",
     "compile_trajectory_stream": ".optimizers",
     "run_coalesced_noisy_shots": ".optimizers",
     "run_coalesced_stim_shots": ".optimizers",

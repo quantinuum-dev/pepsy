@@ -2642,29 +2642,7 @@ class MpsGateStreamLayoutFinder:
             self.sites,
             self.event_weights,
         )
-        self.site_usage = _gate_stream_site_usage(
-            self.sites,
-            self.supports,
-            self.event_types,
-            site_roles=self.qubit_roles,
-        )
-        self.inferred_site_roles, self.role_evidence = _infer_site_roles(
-            self.sites,
-            self.supports,
-            self.event_types,
-        ) if not self.qubit_roles else ({}, {})
-        self.effective_site_roles = (
-            dict(self.qubit_roles)
-            if self.qubit_roles
-            else dict(self.inferred_site_roles)
-        )
-        if self.effective_site_roles:
-            self.site_usage = _gate_stream_site_usage(
-                self.sites,
-                self.supports,
-                self.event_types,
-                site_roles=self.effective_site_roles,
-            )
+        self._set_usage_metadata(self.supports, self.event_types)
         self.inferred_site_coords = None
         self.coordinate_source = "provided" if self.site_coords is not None else None
         if self.site_coords is None:
@@ -2679,6 +2657,39 @@ class MpsGateStreamLayoutFinder:
         self._replay_supports = ()
         self._replay_event_types = ()
         self._replay_event_indices = ()
+
+    def _set_usage_metadata(self, supports, event_types):
+        """Share lifetime/role inference while preserving operator event types.
+
+        Frame projectors are multi-site coefficient operators, so their cost
+        type remains sub-MPO even when their lifetime hint is measure/reset.
+        These hints never authorize scheduling or physical-qubit relabeling.
+        """
+        self._usage_supports = tuple(supports)
+        self._usage_event_types = tuple(event_types)
+        self.site_usage = _gate_stream_site_usage(
+            self.sites,
+            self._usage_supports,
+            self._usage_event_types,
+            site_roles=self.qubit_roles,
+        )
+        self.inferred_site_roles, self.role_evidence = _infer_site_roles(
+            self.sites,
+            self._usage_supports,
+            self._usage_event_types,
+        ) if not self.qubit_roles else ({}, {})
+        self.effective_site_roles = (
+            dict(self.qubit_roles)
+            if self.qubit_roles
+            else dict(self.inferred_site_roles)
+        )
+        if self.effective_site_roles:
+            self.site_usage = _gate_stream_site_usage(
+                self.sites,
+                self._usage_supports,
+                self._usage_event_types,
+                site_roles=self.effective_site_roles,
+            )
 
     @classmethod
     def from_optimizer(
@@ -2759,29 +2770,7 @@ class MpsGateStreamLayoutFinder:
         )
         finder._replay_event_types = tuple(optimizer.event_types)
         finder._replay_event_indices = tuple(replay_event_indices)
-        finder.site_usage = _gate_stream_site_usage(
-            finder.sites,
-            finder._replay_supports,
-            finder._replay_event_types,
-            site_roles=finder.qubit_roles,
-        )
-        finder.inferred_site_roles, finder.role_evidence = _infer_site_roles(
-            finder.sites,
-            finder._replay_supports,
-            finder._replay_event_types,
-        ) if not finder.qubit_roles else ({}, {})
-        finder.effective_site_roles = (
-            dict(finder.qubit_roles)
-            if finder.qubit_roles
-            else dict(finder.inferred_site_roles)
-        )
-        if finder.effective_site_roles:
-            finder.site_usage = _gate_stream_site_usage(
-                finder.sites,
-                finder._replay_supports,
-                finder._replay_event_types,
-                site_roles=finder.effective_site_roles,
-            )
+        finder._set_usage_metadata(finder._replay_supports, finder._replay_event_types)
         if finder.site_coords is None:
             finder.inferred_site_coords = _gate_stream_graph_coords(
                 finder.sites,
@@ -3291,26 +3280,14 @@ class MpsGateStreamLayoutFinder:
             candidates = _gate_stream_layout_candidates(
                 self.sites,
                 pair_weights,
-                supports=(
-                    self._replay_supports
-                    if self._optimizer is not None
-                    else self.supports
-                ),
-                event_types=(
-                    self._replay_event_types
-                    if self._optimizer is not None
-                    else self.event_types
-                ),
+                supports=self._usage_supports,
+                event_types=self._usage_event_types,
                 include_lifetime=(
                     role_order is not None
                     or bool(site_roles)
                     or any(
                         event_type in _LIFETIME_BOUNDARY_EVENT_TYPES
-                        for event_type in (
-                            self._replay_event_types
-                            if self._optimizer is not None
-                            else self.event_types
-                        )
+                        for event_type in self._usage_event_types
                     )
                     or order_name in {
                         "lifetime",

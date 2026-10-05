@@ -300,6 +300,8 @@ _EXPECTED_NOT_IN_ALL = [
     "sampler",
 ]
 
+_EXPECTED_IN_ALL.extend(["stim_plan_to_gate_stream", "stim_readout_parities"])
+
 
 def test_symbols_exported():
     """All documented public symbols should be in ``__all__``."""
@@ -312,6 +314,7 @@ def test_internal_symbols_not_exported():
 
 
 _CALLABLE_EXPORTS = [
+    "stim_plan_to_gate_stream", "stim_readout_parities",
     "contract_boundary", "contract_flat", "contract_layered", "build_bra_ket", "normalize", "peps_normalize",
     "boundary_norm", "peps_norm", "infidelity", "peps_infidelity", "peps_fidelity",
     "backend_infer", "to_float", "gauge_all", "gauge_all_simple", "compress_all_gauge", "one_norm_bp",

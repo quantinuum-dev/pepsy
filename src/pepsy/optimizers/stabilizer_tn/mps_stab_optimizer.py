@@ -935,10 +935,27 @@ class StabilizerMpsSimulator:
         return self.state.p
 
     def set_gates(self, gates) -> "StabilizerMpsSimulator":
-        """Replace the queued gate stream."""
-        entries = self._as_entries(gates)
-        self._install_stream_plan(entries)
+        """Replace and compile the queue; equivalent to :meth:`compile`."""
+        return self.compile(gates)
+
+    def compile(self, gates) -> "StabilizerMpsSimulator":
+        """Prepare a Pepsy gate stream for replay without executing it.
+
+        Accept raw entries or an already compiled ``TrajectoryStreamPlan``.
+        Normalize stochastic events and validate matrix backend/dtype/device
+        once, then replace the queue. Existing plans are reused by identity.
+        This returns the simulator for chaining; the plan is available through
+        :attr:`compiled_stream`. State, measurements and RNG are unchanged.
+        Analysis is optional and separate: use :meth:`analyze_stream` before
+        preparation or :meth:`queued_stream_analysis` afterward.
+        """
+        self._install_stream_plan(gates)
         return self
+
+    @property
+    def compiled_stream(self):
+        """The reusable queued trajectory plan, or None before preparation."""
+        return self._trajectory_plan
 
     def add_gates(self, gates) -> "StabilizerMpsSimulator":
         """Append to the queued gate stream."""
@@ -952,7 +969,7 @@ class StabilizerMpsSimulator:
             compile_trajectory_stream,
         )
 
-        plan = compile_trajectory_stream(tuple(entries))
+        plan = compile_trajectory_stream(entries)
         self._validate_gate_stream_backend(plan.entries)
         self._trajectory_plan = plan
         self._gate_stream = tuple(plan.entries)
@@ -1612,7 +1629,7 @@ class StabilizerMpsSimulator:
         importance_sampling=None,
         max_branch_factor=None,
         parallel_workers=1,
-        parallel_backend="thread",
+        parallel_backend="auto",
         retain="all",
         auto_max_expected_faults=0.1,
         mpi=None,
@@ -1702,10 +1719,18 @@ class StabilizerMpsSimulator:
                 checkpoint_id=checkpoint_id,
                 progress=progress,
             )
-        if workers in {None, "auto"}:
-            from ..mpi import _resolve_local_workers  # pylint: disable=import-outside-toplevel
+        from ._backend import shot_parallelism
 
-            workers = _resolve_local_workers(workers, shots=shots)
+        workers, parallel_backend = shot_parallelism(
+            infer_backend_signature(self._state_backend_like()),
+            workers=workers,
+            shots=shots,
+            parallel_backend=parallel_backend,
+        )
+        if workers > 1 and parallel_backend != "serial":
+            # Match TreeStab: initialize Stim's NumPy bridge before worker
+            # threads can race its first import/matrix conversion.
+            _tableau_from_exact_unitary(np.eye(2, dtype=complex))
         from ..mpi import (  # pylint: disable=import-outside-toplevel
             _make_progress_bar,
             _validate_progress,
@@ -1715,7 +1740,7 @@ class StabilizerMpsSimulator:
             from ..noise import _resolve_auto_parallel_strategy
 
             progress_strategy = _resolve_auto_parallel_strategy(
-                self._gate_stream,
+                self._trajectory_plan if error_model is None else self._gate_stream,
                 shots,
                 error_model=error_model,
                 max_branches=max_branches,
@@ -1755,10 +1780,9 @@ class StabilizerMpsSimulator:
                     from ..noise import compile_trajectory_stream
 
                     plan = compile_trajectory_stream(self._gate_stream)
-                shot_gates = plan.entries if workers > 1 else plan
                 raw = run_trajectory_shots(
                     self._shot_factory(),
-                    shot_gates,
+                    plan,
                     shots,
                     _progress=(
                         update_progress if progress_bar is not None else None
@@ -2118,7 +2142,7 @@ class StabilizerMpsSimulator:
         importance_sampling=None,
         max_branch_factor=None,
         parallel_workers=1,
-        parallel_backend="thread",
+        parallel_backend="auto",
         retain="all",
         auto_max_expected_faults=0.1,
         mpi=None,
@@ -2265,7 +2289,7 @@ class StabilizerMpsSimulator:
             or importance_sampling is not None
             or max_branch_factor is not None
             or int(parallel_workers) != 1
-            or parallel_backend != "thread"
+            or parallel_backend not in {"auto", "thread"}
             or retain != "all"
             or (mpi is not None and mpi is not False)
             or workers not in {None, "auto"}

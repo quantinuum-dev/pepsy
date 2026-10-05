@@ -64,6 +64,8 @@ __all__ = [
     "TrajectorySample",
     "TrajectoryShotResult",
     "compile_stim_circuit",
+    "stim_plan_to_gate_stream",
+    "stim_readout_parities",
     "compile_trajectory_stream",
     "run_coalesced_noisy_shots",
     "run_coalesced_stim_shots",
@@ -534,7 +536,9 @@ class _StimPlanOperation:
 class StimCircuitPlan:
     """Reusable compilation of a supported Stim circuit into Pepsy events.
 
-    Build this once with :func:`compile_stim_circuit`, then pass it to
+    Build this once with :func:`compile_stim_circuit`, then lower independent
+    Pauli channels with :func:`stim_plan_to_gate_stream` for ``engine.compile``
+    and ``engine.run(shots=...)``, or pass it to
     :func:`sample_stim_circuit`, :func:`sample_stim_circuits`, or
     :func:`run_stim_shots`. Compiling once avoids repeated repeat-block
     expansion and repeated construction of small Clifford matrices.
@@ -4153,6 +4157,11 @@ def _copy_coalesced_node(node: _CoalescedNode) -> _CoalescedNode:
     optimizer = branch_copy() if callable(branch_copy) else node.optimizer.copy()
     if optimizer is node.optimizer:
         raise TypeError("optimizer.copy() must return an independent optimizer state.")
+    # Public optimizer copies may intentionally reset classical history. Branch
+    # replay must preserve it: later rec offsets/feedback depend on the prefix.
+    measurements = getattr(node.optimizer, "measurements", None)
+    if isinstance(measurements, list):
+        optimizer.measurements = list(measurements)
     return _CoalescedNode(
         optimizer=optimizer,
         count=node.count,
@@ -5243,7 +5252,7 @@ def run_trajectory_shots(
                 try:
                     return run_parallel_trajectory_shots(
                         optimizer_factory,
-                        plan.entries,
+                        plan,
                         shots,
                         seed=seed,
                         run_kwargs=run_kwargs,
@@ -5266,7 +5275,7 @@ def run_trajectory_shots(
                     strategy = "independent"
         return run_parallel_trajectory_shots(
             optimizer_factory,
-            gates,
+            plan,
             shots,
             seed=seed,
             run_kwargs=run_kwargs,
@@ -5644,8 +5653,7 @@ def run_parallel_trajectory_shots(
 
     if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
         raise ValueError("shots must be a nonnegative integer.")
-    entries = _as_entries(gates)
-    plan = compile_trajectory_stream(entries)
+    plan = compile_trajectory_stream(gates)
     child_seeds = _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids)
 
     def run_one(child_seed):
@@ -5656,7 +5664,7 @@ def run_parallel_trajectory_shots(
         )
         return run_trajectory_shots(
             optimizer_factory,
-            entries,
+            plan,
             1,
             seed=child,
             run_kwargs=run_kwargs,
@@ -6128,6 +6136,38 @@ def compile_stim_circuit(circuit) -> StimCircuitPlan:
     operations remain rejected.
     """
     return _stim_compile.compile_stim_circuit(circuit)
+
+
+def stim_plan_to_gate_stream(plan: StimCircuitPlan) -> tuple[object, ...]:
+    """Translate a compiled Stim plan into one unsampled Pepsy gate stream.
+
+    Ideal gates, measurements, resets and record-controlled Paulis retain their
+    order. Independent Pauli/depolarizing noise becomes stream-local stochastic
+    entries, so ``engine.run(shots=...)`` draws fresh faults internally. No RNG
+    or evolving state is used here. The returned tuple can be inspected or
+    passed to :func:`compile_trajectory_stream` or ``engine.compile``.
+
+    Correlated-error chains and heralded channels require the native Stim shot
+    runners and raise NotImplementedError here. Readout annotations remain in
+    ``plan``; resolve them with :func:`stim_readout_parities`. Generated ideal
+    matrices are NumPy complex128; explicit backend conversion is required
+    before installing them on a simulator using another backend or dtype.
+    """
+    return _stim_compile.stim_plan_to_gate_stream(plan)
+
+
+def stim_readout_parities(plan: StimCircuitPlan, measurement_records):
+    """Return raw detector and logical-observable parity arrays (uint8).
+
+    ``measurement_records`` is an iterable of per-shot or per-leaf structured
+    records whose outcomes are +1/-1. Internal bare-reset records are excluded.
+    Detector columns follow plan order; observable columns follow logical IDs,
+    combining repeated OBSERVABLE_INCLUDE annotations by XOR and retaining
+    missing IDs as zero columns. Empty batches retain their column dimensions.
+    Weight coalesced rows with the result's counts. These are raw parities,
+    without Stim reference-sample subtraction or decoder correction.
+    """
+    return _stim_compile.stim_readout_parities(plan, measurement_records)
 
 
 def _sample_label(

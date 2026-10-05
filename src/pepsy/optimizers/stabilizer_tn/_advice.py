@@ -53,6 +53,16 @@ def _analysis_matrix_kind(cls, entry) -> str:
 
 def _analysis_entry_kind(cls, entry) -> str:
     """Classify one Pepsy stream entry for whole-stream advice."""
+    from ..noise import TrajectoryEvent
+
+    if isinstance(entry, TrajectoryEvent):
+        if entry.channel.mode == "mixture" and all(
+            outcome.probability == 0
+            or cls._analysis_matrix_kind((outcome.gate, entry.where)) == "clifford_matrix"
+            for outcome in entry.channel.outcomes
+        ):
+            return "clifford_trajectory"
+        return "trajectory"
     if submpo_event_parts(entry, normalize_where=True) is not None:
         return "submpo"
     if not (isinstance(entry, (list, tuple)) and entry):
@@ -90,6 +100,10 @@ def _analysis_entry_kind(cls, entry) -> str:
 
 def _analysis_entry_sites(cls, entry, n_qubits: Optional[int]) -> Optional[set[int]]:
     """Return touched physical sites for a stream entry, if cheaply known."""
+    from ..noise import TrajectoryEvent
+
+    if isinstance(entry, TrajectoryEvent):
+        return set(entry.where)
     parts = submpo_event_parts(entry, normalize_where=True)
     if parts is not None:
         _mpo, where = parts
@@ -169,7 +183,9 @@ def analyze_stream(cls, gates, *, n_qubits: Optional[int] = None) -> StreamAnaly
         if n_qubits < 0:
             raise ValueError("n_qubits must be nonnegative.")
 
-    entries = cls._as_entries(gates)
+    from ..noise import compile_trajectory_stream
+
+    entries = compile_trajectory_stream(gates).entries
     counts = {
         "clifford": 0,
         "injectable": 0,
@@ -185,6 +201,8 @@ def analyze_stream(cls, gates, *, n_qubits: Optional[int] = None) -> StreamAnaly
         "reset": 0,
         "measure_reset": 0,
         "cap": 0,
+        "trajectory": 0,
+        "clifford_trajectory": 0,
     }
     touched: set[int] = set()
     unknown_support = 0
@@ -192,7 +210,10 @@ def analyze_stream(cls, gates, *, n_qubits: Optional[int] = None) -> StreamAnaly
 
     for entry in entries:
         kind = cls._analysis_entry_kind(entry)
-        if kind == "clifford" or kind == "clifford_matrix":
+        if kind in {"trajectory", "clifford_trajectory"}:
+            counts["trajectory"] += 1
+            counts["clifford_trajectory"] += int(kind == "clifford_trajectory")
+        elif kind == "clifford" or kind == "clifford_matrix":
             counts["clifford"] += 1
         elif kind == "injectable":
             counts["injectable"] += 1
@@ -277,11 +298,13 @@ def analyze_stream(cls, gates, *, n_qubits: Optional[int] = None) -> StreamAnaly
             "stream-layout assumptions past the cap."
         )
 
-    nonmagic_work = counts["nonclifford"] + counts["opaque"]
+    general_trajectories = counts["trajectory"] - counts["clifford_trajectory"]
+    nonmagic_work = counts["nonclifford"] + counts["opaque"] + general_trajectories
     is_clifford_t_like = (
         counts["injectable"] > 0
         and counts["nonclifford"] == 0
         and counts["opaque"] == 0
+        and general_trajectories == 0
     )
     is_clifford_only = (
         counts["injectable"] == 0
@@ -311,6 +334,8 @@ def analyze_stream(cls, gates, *, n_qubits: Optional[int] = None) -> StreamAnaly
         is_clifford_only=bool(is_clifford_only),
         is_clifford_t_like=bool(is_clifford_t_like),
         warnings=tuple(_unique_ordered(warnings)),
+        trajectory_entries=int(counts["trajectory"]),
+        clifford_trajectory_entries=int(counts["clifford_trajectory"]),
     )
 
 
@@ -663,10 +688,16 @@ def recommend_settings(
 def queued_stream_analysis(self, **kwargs) -> StreamAnalysisRecord:
     """Analyze the currently queued Pepsy stream without consuming it."""
     kwargs.setdefault("n_qubits", self.n)
-    return type(self).analyze_stream(self._queue, **kwargs)
+    plan = getattr(self, "compiled_stream", None)
+    return type(self).analyze_stream(
+        self._queue if plan is None else plan, **kwargs
+    )
 
 
 def queued_recommend_settings(self, **kwargs) -> StabilizerMpsSettingsAdvice:
     """Recommend settings for the currently queued Pepsy stream."""
     kwargs.setdefault("n_qubits", self.n)
-    return type(self).recommend_settings(self._queue, **kwargs)
+    plan = getattr(self, "compiled_stream", None)
+    return type(self).recommend_settings(
+        self._queue if plan is None else plan, **kwargs
+    )

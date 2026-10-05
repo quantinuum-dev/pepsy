@@ -6,6 +6,31 @@ import numpy as np
 from ...backends import to_float
 
 
+def shot_parallelism(signature, *, workers, shots, parallel_backend):
+    """Resolve local execution without moving coefficient arrays.
+
+    CPU auto workers use the shared host budget. A single accelerator defaults
+    to one worker to avoid multiplying large state/device allocations; explicit
+    worker and dispatcher choices remain authoritative.
+    """
+    from ..mpi import _resolve_local_workers
+    from ..noise import _validate_parallel_backend
+
+    backend = signature[3] if len(signature) > 3 else signature[0]
+    device = str(signature[2] or "").lower()
+    accelerator = backend == "cupy" or any(
+        label in device for label in ("cuda", "gpu", "mps", "tpu")
+    )
+    if workers in {None, "auto"} and accelerator:
+        workers = 1
+    workers = _resolve_local_workers(workers, shots=shots)
+    if str(parallel_backend).strip().lower() == "auto":
+        parallel_backend = (
+            "serial" if workers == 1 else "gpu" if accelerator else "thread"
+        )
+    return workers, _validate_parallel_backend(parallel_backend)
+
+
 def array_namespace(like):
     """Use cached early dispatch when available, otherwise Autoray dispatch."""
     factory = getattr(ar, "get_namespace", None)

@@ -117,6 +117,13 @@ def current_frame_layout(
         for record in records
     ]
     finder = MpsGateStreamLayoutFinder(stream, L=self.n)
+    lifetime_types = tuple(
+        record["kind"]
+        if record["kind"] in {"measure", "reset", "measure_reset"}
+        else "submpo"
+        for record in records
+    )
+    finder._set_usage_metadata(finder.supports, lifetime_types)
 
     def weight_fn(payload, _support, _event_type):
         if isinstance(payload, Mapping):
@@ -142,6 +149,8 @@ def current_frame_layout(
     plan["source"] = "queued_frame_supports"
     plan["frame_events"] = tuple(records)
     plan["frame_weight_mode"] = weight_mode
+    plan["frame_lifetime_event_types"] = lifetime_types
+    plan["frame_role_source"] = "coefficient_support_lifetimes"
     return plan
 
 

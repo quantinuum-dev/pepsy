@@ -153,6 +153,8 @@ build_real_time_cluster_expansion_pepo
 build_tree_operator
 cnot
 compile_stim_circuit
+stim_plan_to_gate_stream
+stim_readout_parities
 compile_trajectory_stream
 compose_cluster_expansion_pepo
 compose_pepo_layers

@@ -122,6 +122,15 @@ an explicit execution method (`apply`, `with_injection`, or
 `with_deferred_injection`), ancilla requirements, warnings, and a
 human-readable `message`.
 
+For an explicit prepare/run workflow, call `engine.compile(gate_stream)` after
+optional analysis, then `engine.run(shots=..., strategy=..., workers=...)`.
+Preparation replaces the queue without executing any gates or drawing noise;
+`set_gates` remains equivalent. An existing `TrajectoryStreamPlan` is reused
+by identity and exposed through `engine.compiled_stream`. Stream analysis
+reports `trajectory_entries`, `clifford_trajectory_entries`, and channel qubit
+support as well as deterministic counts. See the
+[Stim translation and preparation example](noise.md#translate-analyze-prepare-run).
+
 `recommend_settings` calls the narrower
 `StabilizerMpsSimulator.recommend_magic_strategy(gates, ...)` internally for the
 `direct` / `immediate` / `deferred` decision. On an unrun simulator,
@@ -298,6 +307,27 @@ MPS compression while retaining
 `weight_mode="count"` for the historical uniform score. `"angle"` and
 `"auto"` remain available for angle-based weighting. The weight is a static
 operator proxy, not a prediction of the evolving state's exact entanglement.
+
+The adapter retains measurement/reset kinds as lifetime hints for the shared
+MPS finder, including quality-search lifetime and role candidates. Operator
+costs still treat these multi-site frame projectors as sub-MPOs. Plans expose
+`frame_lifetime_event_types`, `site_usage`, and inferred role evidence; these
+describe coefficient-support reuse, not physical data/ancilla identities or
+permission to reschedule measurements. Ordinary-MPS replay pilots remain
+outside this static STN planner.
+
+After `compile`, `queued_stream_analysis()` and `queued_recommend_settings()`
+inspect the installed trajectory plan and reuse its prepared noise channels.
+
+Local shot replay accepts `parallel_backend="auto"` (the default).
+With `workers="auto"`, CPU arrays use the host worker budget, while CUDA,
+MPS, CuPy GPU and JAX GPU/TPU placements default to one worker to limit
+simultaneous device-state allocations. Explicit workers and dispatchers win.
+This does not move arrays or imply batched GPU execution. Replay
+`strategy="auto"` remains a separate branch-cap decision between independent
+and shared-prefix trajectories; backend alone does not predict branch growth.
+Coalesced copies preserve native visible measurement history for later feedback
+and raw readout. Weight each retained branch by its shot count.
 
 For measurement/feed-forward circuits, use
 `("if", record, bit, action)`. `record=-1` means the latest measurement,
