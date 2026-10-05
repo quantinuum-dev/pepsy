@@ -6,6 +6,16 @@ the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
 
+## Dense zero-weight simple update, 2026-10-05
+
+The public `gate_simple` adapter projects exactly zero external weights onto
+their support during unsmeared dense updates, preserving the represented
+operator and restoring the original external gauge vectors. Gaugy's SU
+builder and loss now use this public adapter. This does not extend native
+Symmray or rank-changing derivative support. See the
+[gate contract](../api/operators/gates.md#gauge-scale-extraction) and
+[validation record](../../history/2026-10-05-zero-weight-simple-update.md).
+
 ## Local cluster integration, 2026-09-30
 
 The user approved committing all pending Pepsy work and merging `develop`

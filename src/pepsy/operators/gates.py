@@ -2542,6 +2542,45 @@ def _gate_simple_one(
             tn_work.site_ind_id = old_site_ind_id
 
 
+@contextmanager
+def _zero_safe_outer_gauges(tn, tags, gauges, smudge):
+    """Ungauge dense zero modes by their support projector, not 1 / 0.
+
+    Only external legs of this update are affected. The original weights
+    remain the physical representation; no small nonzero weight is clipped.
+    Derivatives at changes of the gauge support are not defined by this rule.
+    """
+    saved = []
+    try:
+        if smudge == 0 and gauges:
+            local = tn.select(tags, which="any")
+            for ix in local.outer_inds():
+                g = gauges.get(ix)
+                if g is None or hasattr(g, "blocks"):
+                    continue
+                one = ar.do("ones_like", g)
+                safe = ar.do("where", g == 0, one, g)
+                support = ar.do("where", g == 0, ar.do("zeros_like", g), one)
+                tensor = next(t for t in local.tensors if ix in t.inds)
+                saved.append((ix, g, tensor, support))
+                tensor.multiply_index_diagonal_(ix, support)
+                gauges[ix] = safe
+        yield
+    finally:
+        for ix, g, tensor, support in saved:
+            # A split can populate null coordinates by roundoff. Keep the
+            # Moore-Penrose inverse exactly zero on the excluded support.
+            tensor.multiply_index_diagonal_(ix, support)
+            gauges[ix] = g
+
+
+def _gate_simple_adjacent(tn, gate, *, where, gauges, smudge, **opts):
+    tags = tuple(tn.site_tag(site) for site in where)
+    with _zero_safe_outer_gauges(tn, tags, gauges, smudge):
+        return tn.gate_simple_(gate, where=where, gauges=gauges,
+                               smudge=smudge, **opts)
+
+
 def _gate_simple_one_with_current_site_ind_id(
     tn_work,
     G,
@@ -2612,8 +2651,8 @@ def _gate_simple_one_with_current_site_ind_id(
             path_canonize_distance=path_canonize_distance,
             path_canonize_opts=path_canonize_opts,
         )
-        tn_work.gate_simple_(
-            G, where=where, gauges=gauges,
+        _gate_simple_adjacent(
+            tn_work, G, where=where, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
             **transform_opts,
             **gate_opts,
@@ -2693,8 +2732,8 @@ def _gate_simple_one_with_current_site_ind_id(
             dtype="complex128",
             inferred_converter=inferred_converter,
         )
-        tn_work.gate_simple_(
-            swap_gate, where=pair, gauges=gauges,
+        _gate_simple_adjacent(
+            tn_work, swap_gate, where=pair, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
             **gate_opts,
         )
@@ -2702,8 +2741,8 @@ def _gate_simple_one_with_current_site_ind_id(
             renorm_gauge(tn_work, gauges, pair, smudge=0.0)
 
     # Apply the actual gate on the final (now adjacent) pair.
-    tn_work.gate_simple_(
-        G, where=final, gauges=gauges,
+    _gate_simple_adjacent(
+        tn_work, G, where=final, gauges=gauges,
         renorm=renorm, smudge=smudge, inplace=True,
         **transform_opts,
         **gate_opts,
@@ -2721,8 +2760,8 @@ def _gate_simple_one_with_current_site_ind_id(
             dtype="complex128",
             inferred_converter=inferred_converter,
         )
-        tn_work.gate_simple_(
-            swap_gate, where=pair, gauges=gauges,
+        _gate_simple_adjacent(
+            tn_work, swap_gate, where=pair, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
             **gate_opts,
         )

@@ -55,6 +55,15 @@ also uses the supplied `cutoff`, rather than a separate hard-coded threshold.
 
 ## Gauge scale extraction
 
+With dense arrays and `smudge=0`, `gate_simple` handles exactly zero external
+bond weights by projecting onto their nonzero support before and after the
+update. Original external weights are restored, including on an exception;
+nonzero weights, requested cutoffs and bond caps are unchanged. This is an
+exact support projection, not an epsilon regularization. It does not define
+derivatives when the support changes or alter native Symmray gauge handling.
+When differentiating a subsequent contraction at zero weights, absorb each
+full weight once; splitting it as two square roots has a singular derivative.
+
 For scale-preserving simple update, use:
 
 ```python

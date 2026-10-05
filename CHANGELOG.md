@@ -14,6 +14,10 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Dense `gate_simple(..., smudge=0)` preserves exact-zero external bond
+  support during adjacent and routed updates without dividing by zero.
+  Nonzero weights and requested truncation controls are unchanged.
+
 - Dense TreeSampler normalizes its accumulated conditional CDF endpoint,
   preventing draws near one from selecting trailing zero-weight physical
   codes when cumulative probabilities round below one. Applies to both
