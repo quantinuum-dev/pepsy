@@ -404,6 +404,20 @@ def test_vmc_torch_package_preserves_lazy_public_exports():
         assert getattr(torch_vmc, name) is getattr(vmc, name)
 
 
+def test_public_projector_registration_drives_quimb_numpy_split():
+    import numpy as np
+    import quimb.tensor as qtn
+    from pepsy.backends import register_projector_split
+
+    method = register_projector_split()
+    assert register_projector_split() == method
+    a = np.diag([3., 2., .5])
+    left, right = qtn.Tensor(a, inds=("a", "b")).split(
+        left_inds=("a",), method=method, absorb="right", max_bond=2,
+        cutoff=0., get="arrays")
+    np.testing.assert_allclose(left @ right, np.diag([3., 2., 0.]), atol=1e-14)
+
+
 def test_optional_linalg_registrations_resolve():
     """Optional linalg helpers resolve from their owning backend namespace."""
     has_torch = importlib.util.find_spec("torch") is not None
@@ -419,6 +433,7 @@ def test_optional_linalg_registrations_resolve():
         "reg_rel_svd_jax",
         "reg_real_svd_jax",
         "reg_complex_svd_jax",
+        "register_projector_split",
     ):
         assert callable(getattr(pepsy.backends, name))
     assert pepsy.register_jax_linalg is pepsy.backends.register_jax_linalg

@@ -6,6 +6,14 @@ the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
 
+## Public paired-factor registration, 2026-10-05
+
+The existing paired-factor primitive is now exposed as
+`pepsy.backends.register_projector_split` for downstream cube algorithms.
+This adds a public lazy export, not a change to Pepsy's decompositions or
+boundary defaults. See the [export validation](../../history/2026-10-05-projector-export.md)
+and [factorization contract](../api/boundary/metrics.md#differentiating-rank-deficient-boundary-mps-contractions).
+
 ## Dense zero-weight simple update, 2026-10-05
 
 The public `gate_simple` adapter projects exactly zero external weights onto

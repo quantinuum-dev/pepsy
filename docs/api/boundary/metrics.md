@@ -119,6 +119,14 @@ The layer policy applies to the package `method="dmrg"` path. Quimb's native
 
 ## Differentiating rank-deficient boundary MPS contractions
 
+Custom dense NumPy/Torch boundary algorithms can register the same split via
+`from pepsy.backends import register_projector_split`. Calling it returns the
+Quimb method name `pepsy:projector`; registration is idempotent and does not
+replace global QR/SVD drivers. Use the returned method with left/right
+absorption and gauge-invariant paired factors. This exposes the existing
+primitive; its fixed-rank, resolved-gap and first-order derivative limits
+remain unchanged. Registration itself does not import Torch.
+
 For a closed dense 2D NumPy/Torch network, select the composed-factor path:
 
 ```python

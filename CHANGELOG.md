@@ -14,6 +14,10 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Export `pepsy.backends.register_projector_split` for custom dense boundary
+  algorithms to reuse the existing paired-factor Quimb split registration.
+  The decomposition and its derivative contracts are unchanged.
+
 - Public `stim_plan_to_gate_stream` translates compiled Stim plans into
   unsampled independent Pauli-noise streams; `stim_readout_parities` resolves
   raw detector and indexed logical-observable parities. StabilizerMpsSimulator
