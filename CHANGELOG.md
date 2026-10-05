@@ -18,6 +18,23 @@ releases remain backwards-compatible. From 1.0 onward:
   support during adjacent and routed updates without dividing by zero.
   Nonzero weights and requested truncation controls are unchanged.
 
+- Trajectory importance sampling rejects omitted positive target branches,
+  however rare, and proposal mass on impossible outcomes before replay.
+  Callable coalesced mixture proposals receive each live parent optimizer.
+  One-site exact MPS Kraus Gram contractions preserve the state backend;
+  MPS outcomes reuse the base norm, and discarded-shot diagnostics aggregate
+  without retaining a dictionary per shot.
+
+- StabilizerMpsSimulator `dmrg2` adjacent-pair compression honors the requested
+  FIT sweep budget and convergence controls, matching MpsOptimizer. The
+  one-update shortcut requires explicit `fit_single_pair_fast_path=True`.
+
+- StabilizerMpsSimulator `dmrg`/`fit` now fixes one-site FIT, matching ordinary
+  MpsOptimizer; select `dmrg2`/`dmrg3` for multi-site growth. Added the shared
+  adjacent-window `fit_single_pair_n_iter` cap and dense Quimb
+  `compression_opts` controls, with shot propagation and per-run restoration.
+  Legacy STN `dmrg1` retains its previous growth schedule.
+
 - Dense TreeSampler normalizes its accumulated conditional CDF endpoint,
   preventing draws near one from selecting trailing zero-weight physical
   codes when cumulative probabilities round below one. Applies to both
