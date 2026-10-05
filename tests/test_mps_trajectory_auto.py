@@ -179,14 +179,18 @@ def test_rare_mixture_actual_cap_overflow_matches_independent(workers):
     with pytest.raises(noise._CoalescedBranchCapExceeded):
         sim.run(strategy="coalesced", **kwargs)
     result = sim.run(strategy="auto", **kwargs)
-    reference = sim.run(strategy="independent", **kwargs)
     assert result.diagnostics.planned_strategy == "coalesced"
     assert result.diagnostics.fallback_reason is not None
-    assert not result.coalesced
-    assert result.raw.records == reference.raw.records
+    assert result.coalesced
+    assert result.diagnostics.continued_from_cap
+    assert result.diagnostics.continued_shots == 16
+    repeated = sim.run(strategy="auto", **kwargs)
+    assert result.records == repeated.records
     assert len(result.optimizers) == 16
-    for actual, wanted in zip(result.optimizers, reference.optimizers):
-        np.testing.assert_allclose(actual.to_dense(), wanted.to_dense(), atol=1e-12)
+    for leaf in result.raw.leaves:
+        parity = sum(record.label == "X" for record in leaf.records) % 2
+        np.testing.assert_allclose(abs(leaf.optimizer.to_dense().ravel()),
+                                   [1 - parity, parity], atol=1e-12)
 
 
 @pytest.mark.parametrize("workers", [1, 2])

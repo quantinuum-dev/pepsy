@@ -7,6 +7,9 @@ ownership, rollback, and canonical metadata remain on ``MpsOptimizer``.
 from __future__ import annotations
 
 import quimb.tensor as qtn
+import autoray as ar
+
+from ...backends.convert import _small_matrix_precision
 
 from ..._internal.quimb import (
     quimb_1d_compression_cutoff_mode as _quimb_compression_cutoff_mode,
@@ -254,7 +257,19 @@ def _apply_dense_gate_with_method(
             opts["canonize"] = False
         opts.update(compression_opts or {})
         quimb_seed = seed if method in _MPO_METHODS_USE_SEED else None
-        return _run_seeded_quimb(quimb_seed, p.gate_nonlocal_, gate, where, **opts)
+        with _small_matrix_precision(gate) as factor_gate:
+            if factor_gate is gate:
+                return _run_seeded_quimb(quimb_seed, p.gate_nonlocal_, gate, where, **opts)
+            submpo = qtn.MatrixProductOperator.from_dense(
+                factor_gate, dims=dims, sites=where, L=p.L,
+            )
+            dtype = ar.get_dtype_name(gate)
+            submpo.apply_to_arrays(lambda x: ar.astype(x, dtype))
+        opts.pop("dims")
+        return _run_seeded_quimb(
+            quimb_seed, p.gate_with_submpo_, submpo, where=where,
+            inplace_mpo=True, **opts,
+        )
 
     submpo = qtn.MatrixProductOperator.from_dense(
         gate,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import autoray as ar
@@ -30,6 +30,40 @@ def _high_precision_matmul(like):
 
     with jax.default_matmul_precision("highest"):
         yield
+
+
+@contextmanager
+def _small_matrix_precision(array):
+    """Use double precision for small dense operator factorizations only.
+
+    The caller casts factors back before applying them to a state. No host
+    transfer or global linear-algebra registration is involved.
+    """
+    backend = ar.infer_backend(array)
+    if backend not in {"numpy", "torch", "cupy", "jax"}:
+        yield array
+        return
+    dtype = ar.get_dtype_name(array)
+    if (dtype not in {"float32", "complex64"}
+            or ar.size(array) > 256
+            or getattr(getattr(array, "device", None), "type", None) == "mps"):
+        yield array
+        return
+    context = nullcontext()
+    if backend == "jax":
+        import jax
+
+        # A temporary x64 scope cannot outlive a traced SVD's backward pass.
+        # Keep the caller's precision for transforms when x64 is disabled.
+        if isinstance(array, jax.core.Tracer) and not jax.config.x64_enabled:
+            yield array
+            return
+        enable = getattr(jax, "enable_x64", None)
+        if enable is None:
+            from jax.experimental import enable_x64 as enable
+        context = enable()
+    with context:
+        yield ar.astype(array, "complex128" if dtype == "complex64" else "float64")
 
 
 def _real_if_compatible(array, like):

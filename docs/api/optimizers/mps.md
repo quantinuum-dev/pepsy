@@ -451,8 +451,15 @@ by complex64 contractions and decompositions. Replay respects the registered
 `TorchLinalgConfig`; it does not install a global SVD policy during batching.
 That public configuration defaults to the non-approximate CUDA `gesvd` driver,
 while an unconfigured Torch environment can use Torch's native driver choice.
-See the [CUDA driver comparison](../../development/notes/2026-10-05-mps-gpu-frontier-research.md)
-for the measured complex64 discrepancy and remaining regression failures.
+Small dense gate-to-MPO factorizations (at most 256 array entries) use a
+double-precision operator workspace on supported backends, then cast the
+factors back before state compression. MPS tensors keep their dtype/device;
+state SVDs, their registered driver and the requested truncation are unchanged.
+This resolves the three previously recorded complex64 ledger comparisons.
+Metal and larger operators keep their original path. JAX eager factorization
+restores its temporary x64 context; traced operators with x64 disabled retain
+the caller's precision so the backward pass remains valid. See the
+[precision and memory audit](../../development/notes/2026-10-05-mps-precision-memory.md).
 
 Optional checks and profiling are disabled by default: `finite_check=False`,
 `fit_overlap_diagnostics=False`, `quality_check_every=False`, `timing=False`,
@@ -574,15 +581,53 @@ forces one worker.
 
 Importance-sampled streams use structural branch bounds rather than physical
 mixture probabilities. Planning does not evaluate proposal callbacks. Dynamic
-controls and Kraus probabilities are also treated conservatively. If an
-automatic coalesced run exceeds either branch cap, it restarts independently
-with the original seed; no branches are pruned. Changing representation can
-change the sampled ensemble for a given seed, while preserving its law.
+controls and Kraus probabilities are also treated conservatively. For local
+`MpsOptimizer.run(strategy="auto")`, a selected coalesced run checks a
+conservative upper bound before sampling the next split. If it could exceed
+either branch cap, completed prefixes are preserved and their remaining shots
+finish one at a time. This also covers `error_model` and threaded local runs;
+the continuation itself is serial. No sampled histories are discarded.
+Retaining final states still requires memory for all shots. Explicit
+`strategy="coalesced"` keeps its strict cap error. MPI automatic execution
+still chooses independent shots.
+
+Continuation can begin before an actual overflow. It preserves the sampling
+law, weights and control histories, but changes seeded draw ordering relative
+to restarting independently. The returned result stays count-aware
+(`coalesced=True`), with count-one leaves after continuation; the final number
+of retained leaves can exceed `max_branches`. Diagnostics expose
+`continued_from_cap`, `continued_shots` and a descriptive `fallback_reason`.
 
 For local MPS runs, `result.diagnostics` includes `planned_strategy`, `workers`
 (the selected worker budget), `execution_reason` and `fallback_reason`.
 `result.coalesced` reports the representation actually returned. These extra
 diagnostic fields are optional and may be `None` for other runners.
+
+Local shots default to `memory_budget="auto"`. Torch CUDA and CuPy query the
+state's device and include reusable allocator cache; Torch/CuPy allocator
+limits are respected. JAX uses allocator statistics when available. Half of
+the reported available bytes form the budget. CPU and unsupported queries
+leave the existing branch/shot policy in place. An integer supplies a byte
+budget (including on CPU); `None` disables this planner.
+
+The planner estimates MPS storage allowing bond growth up to `chi`, bounded
+by physical dimensions, and never underestimates the initial tensor storage.
+Exact modes use a dense-state estimate. It reserves eight estimated states
+for active work plus 32 MiB for probability batching, then two state copies
+per live branch for parent/child overlap. The resulting capacity tightens
+`max_branches` and automatic worker counts. Explicit numerical settings and
+retention are preserved. Independent `retain="all"`/`"final"` results must fit
+all shots; `retain="none"` needs only the active workers. An insufficient
+budget raises `MemoryError` before independent replay, including after a
+coalesced-cap fallback. Explicit coalesced runs retain the branch-cap error.
+
+Diagnostics add `memory_budget_bytes`, `estimated_state_bytes`,
+`memory_max_branches` and `memory_reason`. This is a conservative planning
+estimate, **not an allocator reservation or an OOM guarantee**: allocator
+fragmentation, other processes, large operator/compression workspaces, cached
+payloads and retained autodiff graphs can exceed its allowance. MPI memory
+planning is not implemented; explicit MPI byte budgets are rejected. MPI's
+existing chunk/retention controls remain available.
 
 Dense Kraus probability evaluation reuses one canonical amplitude block and
 batches outcomes through Autoray on the MPS backend, including Torch CUDA and
@@ -601,12 +646,27 @@ operator caches, allocator reserves and autograd storage. Total retained-state
 memory still depends on `max_branches`, `shots` and `retain`.
 
 The sampler reads one small parent-by-outcome norm array per batch, plus the
-existing per-parent state-norm guards. Branch application and adaptive SVDs
-keep their normal execution paths. State-dependent proposal callbacks use
+existing per-parent state-norm guards. State-dependent proposal callbacks use
 per-parent evaluation to preserve their ordering. Exact/native-symmetry,
 multi-site and CPU probabilities retain their existing implementations.
 `result.diagnostics.max_kraus_parent_batch` reports the largest parent batch
 used, defaulting to one for per-parent execution.
+
+On Torch CUDA/CuPy, coalesced `mode="swap"` replay also batches a deterministic
+segment containing one ascending adjacent two-site gate across compatible
+parents. Gate contractions and SVD run through Autoray; each parent keeps its
+own cutoff-selected rank and `chi` limit, without rank padding. The usual
+optimizer replay maintains norm diagnostics, stabilization, gradients, tags
+and canonical centers. The caller's Torch SVD configuration is preserved.
+Groups are limited to 32 parents and a conservative 32 MiB workspace target.
+Only the small rank vector is downloaded for truncation.
+
+`result.diagnostics.max_gate_parent_batch` reports the largest gate batch.
+Other modes, nonlocal/reversed gates, multi-gate segments, CPU/JAX/native
+symmetry, active layouts, normalization, timing/finite/quality checks and
+multi-worker execution keep their ordinary gate path. No numerical mode is
+changed to obtain batching. Speed depends on matrix size and backend; this
+path is most useful for small compatible matrices.
 
 With `stabilize_unitary=True`, trajectory replay stabilizes unitary gate
 segments and disables that restoration only while applying a selected Kraus

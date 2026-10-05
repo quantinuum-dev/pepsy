@@ -14,6 +14,20 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Performance
 
+- Local automatic MPS trajectories continue from completed shared prefixes
+  before a possible branch-cap overflow, preserving counts, weights and
+  controls. Pauli error models and threaded local runs are supported;
+  explicit coalesced runs retain strict caps.
+- Torch CUDA/CuPy coalesced swap-mode trajectories batch compatible adjacent
+  two-site gate contractions and SVDs through Autoray. Independent truncation
+  ranks, norm accounting and caller-selected Torch gradient policy are kept.
+  Diagnostics expose continuation and the largest gate batch used.
+- MPI configuration hashing now compares backend gate-array contents instead
+  of process-local Torch storage serialization, including compiled plans.
+- Local MPS trajectories automatically budget retained states from available
+  GPU allocator memory and projected bond growth. Explicit byte budgets and
+  diagnostic estimates are supported. Memory-limited coalescing preserves
+  retention and validates independent fallback before allocating its results.
 - Coalesced MPS trajectories automatically batch compatible one-site Kraus
   parent states on Torch CUDA/CuPy through Autoray. Shape/dtype/device grouping,
   a bounded temporary workspace and conservative fallbacks preserve sampling,
@@ -32,6 +46,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Small dense MPS gate-to-MPO factorizations use a bounded double-precision
+  operator workspace and cast factors back before applying them. This resolves
+  the recorded Torch CUDA/JAX complex64 ledger comparisons without changing
+  state dtype, SVD registration or test tolerances; unsupported precision and
+  JAX transformations with x64 disabled retain their existing factorization.
 - Automatic trajectory planning respects per-event branch caps without a
   total cap and accounts conservatively for importance proposals and dynamic
   controls. Conditional tuple-form resets and measure-resets retain their

@@ -2613,6 +2613,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         workers="auto",
         checkpoint_path=None,
         observable=None,
+        memory_budget="auto",
     ):
         """Return whether ``run`` needs the multi-shot trajectory machinery."""
         if mpi is not None and mpi is not False:
@@ -2639,6 +2640,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 auto_max_expected_faults
                 != _SHOT_DEFAULT_AUTO_MAX_EXPECTED_FAULTS,
                 retain != "all",
+                memory_budget != "auto",
             )
         )
 
@@ -2697,6 +2699,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         checkpoint_sync=True,
         collect_diagnostics=False,
         checkpoint_id=None,
+        memory_budget="auto",
     ):
         """Replay this stream as an independent or coalesced shot ensemble."""
         self._validate_shot_compatibility(error_model=error_model)
@@ -2722,6 +2725,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
 
         mpi_enabled = mpi is not None and mpi is not False
+        if mpi_enabled and memory_budget not in {None, "auto"}:
+            raise ValueError("Explicit memory_budget is currently supported only for local shots.")
         if not mpi_enabled and any(
             value is not None
             for value in (observable, checkpoint_path)
@@ -2800,6 +2805,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             _make_progress_bar,
             _validate_progress,
         )
+        from ._trajectory_execution import _trajectory_memory_plan
+        from ..noise import _validate_max_branches, _validate_retain, _validate_strategy
+
+        strategy = _validate_strategy(strategy)
+        retain = _validate_retain(retain)
+        max_branches = _validate_max_branches(max_branches)
+        initial_state = self.p if self._initial_p is None else self._initial_p
+        replay_mode = (run_kwargs or {}).get("mode") or self.mode
+        memory = _trajectory_memory_plan(
+            initial_state, self.chi, self._normalize_mode(replay_mode), memory_budget,
+        )
+        if shots and memory.capacity is not None:
+            memory.check_independent(1, "none", 1)
+            max_branches = min(max_branches, memory.capacity) if max_branches is not None else memory.capacity
         progress_strategy = strategy
         if strategy == "auto":
             from ..noise import _resolve_auto_parallel_strategy
@@ -2827,10 +2846,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 self._state_backend_info_for(initial_state), initial_state,
                 self._stream_plan.entries, shots, progress_strategy,
             )
+            if memory.capacity is not None and shots:
+                workers = min(workers, memory.capacity)
         workers = _validate_parallel_workers(workers)
         if parallel_backend == "serial":
             workers = 1
             execution_reason = "explicit serial execution backend"
+
+        if memory.capacity is not None and progress_strategy == "independent":
+            memory.check_independent(shots, retain, workers)
 
         progress_mode = _validate_progress(progress)
         progress_bar = _make_progress_bar(
@@ -2857,14 +2881,36 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "parallel_backend": parallel_backend,
             "retain": retain,
         }
-        try:
+        # Own automatic continuation and its retention check at this boundary.
+        if strategy == "auto":
+            common["strategy"] = progress_strategy
+
+        def execute():
+            if strategy == "auto" and common["strategy"] == "coalesced":
+                from ..noise import run_coalesced_trajectory_shots, run_coalesced_noisy_shots
+
+                continuation = dict(common)
+                continuation.pop("strategy")
+                continuation.update(
+                    _continue_on_cap=True,
+                    _continuation_check=lambda: memory.check_independent(shots, retain, 1),
+                )
+                if error_model is None:
+                    return run_coalesced_trajectory_shots(
+                        self._shot_factory(), self._stream_plan.trajectory_plan,
+                        shots, **continuation,
+                    )
+                return run_coalesced_noisy_shots(
+                    self._shot_factory(), self._gate_stream, error_model,
+                    shots, **continuation,
+                )
             if error_model is None:
                 shot_gates = (
                     self._stream_plan.entries
                     if workers > 1
                     else self._stream_plan.trajectory_plan
                 )
-                raw = run_trajectory_shots(
+                return run_trajectory_shots(
                     self._shot_factory(),
                     shot_gates,
                     shots,
@@ -2872,7 +2918,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     **common,
                 )
             else:
-                raw = run_noisy_shots(
+                return run_noisy_shots(
                     self._shot_factory(),
                     self._gate_stream,
                     error_model,
@@ -2881,6 +2927,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     _progress=update_progress if progress_bar is not None else None,
                     **common,
                 )
+
+        try:
+            from ..noise import _CoalescedBranchCapExceeded
+
+            retry = False
+            try:
+                raw = execute()
+            except _CoalescedBranchCapExceeded:
+                if strategy != "auto":
+                    raise
+                retry = True
+            # Leave the exception scope before retrying: its traceback owns
+            # the failed frontier and otherwise keeps GPU states alive.
+            if retry:
+                memory.check_independent(shots, retain, workers)
+                common["strategy"] = "independent"
+                raw = execute()
         finally:
             if progress_bar is not None:
                 progress_bar.close()
@@ -2894,7 +2957,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 planned_strategy=progress_strategy,
                 workers=workers,
                 execution_reason=execution_reason,
-                fallback_reason="coalesced branch cap exceeded" if fallback else None,
+                fallback_reason=("continued from shared prefixes at branch cap"
+                                 if raw.diagnostics.continued_from_cap else
+                                 "coalesced branch cap exceeded" if fallback else None),
+                memory_budget_bytes=memory.budget,
+                estimated_state_bytes=memory.state_bytes or None,
+                memory_max_branches=memory.capacity,
+                memory_reason=memory.reason,
             ))
         return NoisyResult(raw)
 
@@ -3149,6 +3218,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         collect_diagnostics=False,
         checkpoint_id=None,
         retain="all",
+        memory_budget="auto",
     ):
         """Run the currently queued gates.
 
@@ -3510,6 +3580,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Result retention policy for shot replay. ``"all"`` retains final
             states and replay metadata, ``"final"`` retains final states only,
             and ``"none"`` retains no optimizer states.
+        memory_budget : {"auto", None} or int, default="auto"
+            Local trajectory memory budget in bytes. Automatic accelerator
+            budgeting uses half the queried available allocator memory,
+            estimates bond growth up to ``chi``, and limits live branches.
+            Retained independent results that cannot fit raise MemoryError;
+            retention and numerical settings are never silently changed.
+            None disables budgeting. This is a planning estimate, not a hard
+            allocator limit; CPU/unsupported allocator queries remain unbudgeted.
 
         Returns
         -------
@@ -3538,6 +3616,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             workers=workers,
             checkpoint_path=checkpoint_path,
             observable=observable,
+            memory_budget=memory_budget,
         ):
             if mode is not None:
                 self.set_mode(mode)
@@ -3566,6 +3645,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 checkpoint_sync=checkpoint_sync,
                 collect_diagnostics=collect_diagnostics,
                 checkpoint_id=checkpoint_id,
+                memory_budget=memory_budget,
             )
 
         timing = bool(timing)
@@ -8305,10 +8385,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Each gate location must have one or two sites.")
                 two_qubit_count += 1
                 xmin, xmax = sorted(where)
-                self.canonize_mps(p, (xmin, xmax))
-
                 compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
-                if self._replay_has_symmray_data(p) and self._native_needs_safe_qr(p):
+                prepared = getattr(self, "_trajectory_prepared_gate", None)
+                if prepared is not None:
+                    prepared_where, left_inds, left_data, right_inds, right_data = prepared
+                    if tuple(where) != prepared_where or len(G_seq) != 1 or not swap_back:
+                        raise RuntimeError("Prepared trajectory gate does not match replay.")
+                    p[xmin].modify(data=left_data, inds=left_inds)
+                    p[xmax].modify(data=right_data, inds=right_inds)
+                    self._record_orthog_span(p, (xmax, xmax))
+                elif self._replay_has_symmray_data(p) and self._native_needs_safe_qr(p):
+                    self.canonize_mps(p, (xmin, xmax))
                     self._apply_symmray_auto_swap_gate(
                         p,
                         gate,
@@ -8320,6 +8407,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         swap_back=swap_back,
                     )
                 else:
+                    self.canonize_mps(p, (xmin, xmax))
                     p.gate_with_auto_swap_(
                         gate,
                         where,

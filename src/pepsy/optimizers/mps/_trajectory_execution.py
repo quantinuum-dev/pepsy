@@ -1,6 +1,77 @@
 """Metadata-only scheduling for local MPS trajectory ensembles."""
 
 import sys
+from dataclasses import dataclass
+from numbers import Integral
+
+import autoray as ar
+import numpy as np
+
+from ...backends._memory import available_device_memory
+
+
+@dataclass(frozen=True)
+class _TrajectoryMemoryPlan:
+    budget: int | None
+    state_bytes: int
+    capacity: int | None
+    reason: str
+
+    def check_independent(self, shots, retain, workers):
+        required = shots if retain != "none" else min(shots, workers)
+        if self.capacity is not None and required > self.capacity:
+            raise MemoryError(
+                f"Trajectory memory budget ({self.budget} bytes) admits "
+                f"{self.capacity} estimated live states, but independent replay "
+                f"requires {required}. Use retain='none', fewer shots/workers, "
+                "or an explicit larger memory_budget. No states were discarded."
+            )
+
+
+def _estimated_state_bytes(state, chi, mode):
+    """Allow bond growth up to chi without allocating or reading array data."""
+    sizes = [int(state.phys_dim(i)) for i in range(state.L)]
+    itemsize = max(np.dtype(ar.get_dtype_name(t.data)).itemsize for t in state.tensors)
+    current = sum(int(ar.size(t.data)) for t in state.tensors) * itemsize
+    if mode in {"exact", "exact-batch"}:
+        import math
+
+        return max(current, math.prod(sizes) * itemsize)
+    # Dense dimensions conservatively cover native block-sparse storage too.
+    bound = max(int(chi or 1), int(state.max_bond() or 1)) if chi is not None else None
+    left, right = [1], [1]
+    for dim in sizes:
+        rank = left[-1] * dim
+        left.append(min(rank, bound) if bound is not None else rank)
+    for dim in reversed(sizes):
+        rank = right[-1] * dim
+        right.append(min(rank, bound) if bound is not None else rank)
+    bonds = [min(a, b) for a, b in zip(left, reversed(right))]
+    projected = sum(bonds[i] * d * bonds[i + 1] for i, d in enumerate(sizes))
+    return max(current, projected * itemsize)
+
+
+def _trajectory_memory_plan(state, chi, mode, memory_budget):
+    if memory_budget != "auto" and memory_budget is not None and (
+        isinstance(memory_budget, bool) or not isinstance(memory_budget, Integral)
+        or memory_budget <= 0
+    ):
+        raise ValueError("memory_budget must be 'auto', None, or a positive integer of bytes.")
+    if memory_budget is None:
+        return _TrajectoryMemoryPlan(None, 0, None, "memory budgeting disabled")
+    budget = memory_budget
+    reason = "explicit byte budget"
+    if budget == "auto":
+        available = available_device_memory(state.tensors[0].data)
+        if available is None:
+            return _TrajectoryMemoryPlan(None, 0, None, "allocator memory query unavailable")
+        budget = available // 2
+        reason = "half of available device allocator memory"
+    state_bytes = _estimated_state_bytes(state, chi, mode)
+    # Reserve an active compression workspace and the probability-batch target.
+    # Two state copies per slot cover a parent/child split before parent release.
+    capacity = max(0, (int(budget) - 8 * state_bytes - (32 << 20)) // (2 * state_bytes))
+    return _TrajectoryMemoryPlan(int(budget), state_bytes, capacity, reason)
 
 
 def _is_accelerator(info):

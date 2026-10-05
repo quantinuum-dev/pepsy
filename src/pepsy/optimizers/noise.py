@@ -441,6 +441,13 @@ class TrajectoryDiagnostics:
     execution_reason: str | None = None
     fallback_reason: str | None = None
     max_kraus_parent_batch: int = 1
+    memory_budget_bytes: int | None = None
+    estimated_state_bytes: int | None = None
+    memory_max_branches: int | None = None
+    memory_reason: str | None = None
+    continued_from_cap: bool = False
+    continued_shots: int = 0
+    max_gate_parent_batch: int = 1
 
 
 @dataclass(frozen=True)
@@ -1316,6 +1323,8 @@ def _trajectory_diagnostic_snapshot(optimizer) -> dict[str, Any]:
     """Copy scalar trajectory-quality counters before a state is discarded."""
     info = getattr(optimizer, "_trajectory_diagnostics", None) or {}
     return {
+        "max_gate_parent_batch": int(info.get("max_gate_parent_batch", 1)),
+        "max_kraus_parent_batch": int(info.get("max_kraus_parent_batch", 1)),
         "max_kraus_probability_residual": float(
             info.get("max_kraus_probability_residual", 0.0)
         ),
@@ -1333,6 +1342,8 @@ def _accumulate_trajectory_diagnostics(summary, optimizer):
         abs(snapshot["max_kraus_probability_residual"]),
     )
     summary["used_kraus_copy_fallback"] |= snapshot["used_kraus_copy_fallback"]
+    for key in ("max_gate_parent_batch", "max_kraus_parent_batch"):
+        summary[key] = max(summary.get(key, 1), snapshot.get(key, 1))
 
 
 def _trajectory_diagnostics(
@@ -1361,9 +1372,11 @@ def _trajectory_diagnostics(
     max_residual = 0.0
     used_fallback = False
     max_parent_batch = 1
+    max_gate_batch = 1
     for state in states:
         optimizer = getattr(state, "optimizer", state)
         info = getattr(optimizer, "_trajectory_diagnostics", None) or {}
+        max_gate_batch = max(max_gate_batch, int(info.get("max_gate_parent_batch", 1)))
         max_parent_batch = max(max_parent_batch, int(info.get("max_kraus_parent_batch", 1)))
         max_residual = max(
             max_residual,
@@ -1373,6 +1386,7 @@ def _trajectory_diagnostics(
             used_fallback or info.get("used_kraus_copy_fallback", False)
         )
     for info in diagnostic_infos:
+        max_gate_batch = max(max_gate_batch, int(info.get("max_gate_parent_batch", 1)))
         max_parent_batch = max(max_parent_batch, int(info.get("max_kraus_parent_batch", 1)))
         max_residual = max(
             max_residual,
@@ -1399,6 +1413,7 @@ def _trajectory_diagnostics(
         max_kraus_probability_residual=float(max_residual),
         used_kraus_copy_fallback=bool(used_fallback),
         max_kraus_parent_batch=max_parent_batch,
+        max_gate_parent_batch=max_gate_batch,
     )
 
 
@@ -4301,9 +4316,12 @@ def _run_coalesced_entries(
             node.gate_stream.extend(active)
             return node
 
-        nodes[:] = _parallel_map_ordered(
-            run_node, nodes, parallel_workers, parallel_backend
-        )
+        from .mps._trajectory_batch import try_run_gate_batch
+
+        if parallel_workers != 1 or not try_run_gate_batch(nodes, entries, run_kwargs, run_node):
+            nodes[:] = _parallel_map_ordered(
+                run_node, nodes, parallel_workers, parallel_backend
+            )
         pending = []
 
     for event_index, entry in indexed_entries:
@@ -5180,6 +5198,8 @@ def run_trajectory_shots(
     retain: str = "all",
     _shot_ids=None,
     _progress=None,
+    _continue_on_cap=False,
+    _continuation_check=None,
 ) -> TrajectoryShotResult | CoalescedTrajectoryResult:
     """Replay user-defined noisy gate-stream trajectories on MPS or tree optimizers.
 
@@ -5381,6 +5401,8 @@ def run_trajectory_shots(
             max_branch_factor=max_branch_factor,
             importance_sampling=policy,
             retain=retain,
+            _continue_on_cap=_continue_on_cap,
+            _continuation_check=_continuation_check,
         )
     if strategy == "auto" and _trajectory_coalescing_fits_cap(
         plan, shots, max_branches, max_branch_factor, importance_sampling=policy,
@@ -5396,6 +5418,8 @@ def run_trajectory_shots(
                 max_branch_factor=max_branch_factor,
                 importance_sampling=policy,
                 retain=retain,
+                _continue_on_cap=_continue_on_cap,
+                _continuation_check=_continuation_check,
             )
         except _CoalescedBranchCapExceeded:
             pass
@@ -5785,6 +5809,11 @@ def run_coalesced_trajectory_shots(
     parallel_workers: int = 1,
     parallel_backend: str = "thread",
     retain: str = "all",
+    _continue_on_cap=False,
+    _continuation_check=None,
+    _nodes=None,
+    _start_index=0,
+    _rng=None,
 ) -> CoalescedTrajectoryResult:
     """Replay an exact count-coalesced ensemble of quantum trajectories.
 
@@ -5809,11 +5838,14 @@ def run_coalesced_trajectory_shots(
     policy = _coerce_importance_policy(importance_sampling)
     plan = compile_trajectory_stream(gates)
     entries = plan.entries
-    nodes = _initial_coalesced_nodes(optimizer_factory, shots)
-    channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
-    if nodes:
-        _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
-    rng = np.random.default_rng(channel_seed)
+    nodes = _initial_coalesced_nodes(optimizer_factory, shots) if _nodes is None else _nodes
+    if _rng is None:
+        channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
+        if nodes and _nodes is None:
+            _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
+        rng = np.random.default_rng(channel_seed)
+    else:
+        rng = _rng
     pending = []
 
     def flush():
@@ -5831,6 +5863,21 @@ def run_coalesced_trajectory_shots(
         pending = []
 
     for event_index, entry in enumerate(entries):
+        if event_index < _start_index:
+            continue
+        if _continue_on_cap and (isinstance(entry, TrajectoryEvent)
+                                or MpsOptimizer.control_event_parts(entry) is not None
+                                or _leakage_event_parts(entry) is not None):
+            flush()
+        if _continue_on_cap and _frontier_needs_continuation(
+            nodes, entry, max_branches, max_branch_factor, policy=policy,
+        ):
+            flush()
+            if _continuation_check is not None:
+                _continuation_check()
+            return _continue_trajectory_frontier(
+                nodes, plan, event_index, rng, run_kwargs, policy, retain,
+            )
         if not isinstance(entry, TrajectoryEvent):
             pending.append((event_index, entry))
             continue
@@ -5945,6 +5992,74 @@ def run_coalesced_trajectory_shots(
     return _coalesced_result(nodes, plan=plan, retain=retain)
 
 
+def _frontier_needs_continuation(nodes, entry, max_branches, max_branch_factor,
+                                 *, policy=None):
+    """Decide before sampling; discarding an overflowing draw would bias shots."""
+    if not nodes or (max_branches is None and max_branch_factor is None):
+        return False
+    if isinstance(entry, TrajectoryEvent):
+        arity = len(entry.channel.outcomes)
+        if entry.channel.mode == "mixture" and policy is None:
+            arity = sum(outcome.probability > 0 for outcome in entry.channel.outcomes)
+        children = [min(node.count, arity) for node in nodes]
+    else:
+        parts = MpsOptimizer.control_event_parts(entry)
+        if not (_leakage_event_parts(entry) is not None or parts is not None
+                and parts[0] in {"measure", "reset", "measure_reset", "conditional"}):
+            return False
+        # Composite controls can contain hidden resets or conditional branches.
+        children = [node.count for node in nodes]
+    return (max_branches is not None and sum(children) > max_branches) or (
+        max_branch_factor is not None and max(children, default=0) > max_branch_factor
+    )
+
+
+def _continue_trajectory_frontier(nodes, plan, start, rng, run_kwargs, policy, retain,
+                                  *, resume=None):
+    """Finish each counted prefix one shot at a time, without replaying it."""
+    shots = sum(node.count for node in nodes)
+    leaves = []
+    summary = {"max_kraus_probability_residual": 0.0, "used_kraus_copy_fallback": False}
+    max_parent_batch = 1
+    max_gate_batch = 1
+    frontier_size = len(nodes)
+    for index in range(len(nodes)):
+        node = nodes[index]
+        count = int(node.count)
+        for shot in range(count):
+            child = node if shot == count - 1 else _copy_coalesced_node(node)
+            child.count = 1
+            result = resume(child) if resume is not None else run_coalesced_trajectory_shots(
+                lambda: None, plan, 1, run_kwargs=run_kwargs,
+                importance_sampling=policy, retain=retain, _nodes=[child],
+                _start_index=start, _rng=rng,
+            )
+            diagnostics = result.diagnostics
+            summary["max_kraus_probability_residual"] = max(
+                summary["max_kraus_probability_residual"],
+                diagnostics.max_kraus_probability_residual,
+            )
+            summary["used_kraus_copy_fallback"] |= diagnostics.used_kraus_copy_fallback
+            max_parent_batch = max(max_parent_batch, diagnostics.max_kraus_parent_batch)
+            max_gate_batch = max(max_gate_batch, diagnostics.max_gate_parent_batch)
+            leaves.extend(result.leaves)
+        nodes[index] = None  # Release completed prefixes when retain='none'.
+    diagnostics = _trajectory_diagnostics(
+        plan, (), shots=shots, coalesced=True,
+        max_live_branches=shots if retain != "none" else min(shots, frontier_size + 1),
+        diagnostic_infos=(summary,),
+    )
+    from dataclasses import replace
+
+    diagnostics = replace(
+        diagnostics, branches=len(leaves), continued_from_cap=True,
+        continued_shots=shots, max_kraus_parent_batch=max_parent_batch,
+        max_gate_parent_batch=max_gate_batch,
+    )
+    return CoalescedTrajectoryResult(tuple(leaves), plan=plan, shot_count=shots,
+                                     diagnostics=diagnostics)
+
+
 def run_coalesced_noisy_shots(
     optimizer_factory: Callable[[], Any],
     gates,
@@ -5959,6 +6074,11 @@ def run_coalesced_noisy_shots(
     parallel_workers: int = 1,
     parallel_backend: str = "thread",
     retain: str = "all",
+    _continue_on_cap=False,
+    _continuation_check=None,
+    _nodes=None,
+    _start_index=0,
+    _rng=None,
 ) -> CoalescedTrajectoryResult:
     """Replay independent Pauli-noise shots using exact count coalescing.
 
@@ -5996,11 +6116,14 @@ def run_coalesced_noisy_shots(
         importance_sampling, PauliErrorModel
     ):
         raise TypeError("importance_sampling must be a PauliErrorModel for Pauli noise.")
-    nodes = _initial_coalesced_nodes(optimizer_factory, shots)
-    channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
-    if nodes:
-        _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
-    rng = np.random.default_rng(channel_seed)
+    nodes = _initial_coalesced_nodes(optimizer_factory, shots) if _nodes is None else _nodes
+    if _rng is None:
+        channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
+        if nodes and _nodes is None:
+            _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
+        rng = np.random.default_rng(channel_seed)
+    else:
+        rng = _rng
     pending = []
 
     def flush():
@@ -6024,6 +6147,36 @@ def run_coalesced_noisy_shots(
         proposal_model.probabilities[label] for label in outcomes
     )
     for gate_index, entry in enumerate(entries):
+        if gate_index < _start_index:
+            continue
+        if _continue_on_cap:
+            support = _event_support(entry)
+            control = MpsOptimizer.control_event_parts(entry)
+            arity = sum(probability > 0 for probability in proposal_probabilities)
+            children = []
+            for node in nodes:
+                bound = 1
+                for _ in support or ():
+                    bound = min(node.count, bound * arity)
+                if control is not None:
+                    bound = node.count
+                children.append(bound)
+            if ((max_branches is not None and sum(children) > max_branches)
+                    or (max_branch_factor is not None
+                        and max(children, default=0) > max_branch_factor)):
+                if _continuation_check is not None:
+                    _continuation_check()
+
+                def resume(child):
+                    return run_coalesced_noisy_shots(
+                        lambda: None, entries, error_model, 1, run_kwargs=run_kwargs,
+                        importance_sampling=importance_sampling, retain=retain,
+                        _nodes=[child], _start_index=gate_index, _rng=rng,
+                    )
+
+                return _continue_trajectory_frontier(
+                    nodes, plan, gate_index, rng, run_kwargs, None, retain, resume=resume,
+                )
         pending.append((gate_index, entry))
         flush()
         conditional = _conditional_pauli_support(entry)

@@ -346,6 +346,13 @@ the partial tree and restarts the whole ensemble independently. Pass
 instead of silently changing strategy. `auto_max_expected_faults` can tune the
 default `0.1` threshold when profiling a different workload.
 
+The higher-level local `MpsOptimizer.run(strategy="auto")` preserves completed
+prefixes instead: before a possible cap overflow it finishes their remaining
+shots individually, retaining a count-aware result and the requested histories
+and weights. Its memory budget must still accommodate retained final states.
+See [MPS trajectory execution](mps.md) for continuation and GPU gate/SVD batch
+diagnostics. The low-level runners described above retain their restart policy.
+
 ## Rare-event importance sampling
 
 For a logical event much rarer than the physical noise rate, bias the proposal
@@ -397,6 +404,14 @@ before stacking, and outcome weights keep the scaled-amplitude/host-float64
 rule. Sampling order, branch budgets and importance ratios remain unchanged.
 Callable proposals use the per-parent path. See the [MPS API](mps.md) for the
 workspace scope and `max_kraus_parent_batch` diagnostic.
+
+The optimizer-level local MPS API also defaults to `memory_budget="auto"`,
+which estimates retained-state storage and limits live branches using
+available GPU allocator memory. Independent retained results must fit the
+budget, including when automatic coalescing falls back. This preserves
+retention and sampling probabilities or raises a memory-budget error; it does
+not discard shots. Low-level factory runners retain their explicit branch
+limits and do not perform this optimizer-level memory planning.
 
 Library-generated NumPy operators with exactly zero imaginary components keep
 a real MPS dtype, including real Torch states with bit-flip or amplitude-damping
@@ -577,7 +592,12 @@ consistent across ranks. `result.reduce_mean(...)` uses the same shot-count
 denominator as the underlying result estimator while combining rank-local
 multiplicities and importance weights. `result.reduce_sum(value)` combines
 already-computed local scalars or arrays. The runner materializes the gate
-stream once, so it can be reused for multiple collective runs. MPI is the
+stream once, so it can be reused for multiple collective runs. Backend gate
+arrays are fingerprinted by dtype, shape and contents, including arrays nested
+in compiled plans. This performs a host transfer at runner construction and
+ignores device ordinals and process-local storage IDs. NumPy-only checkpoint
+fingerprints are unchanged; old backend-array checkpoint fingerprints may
+be rejected and should be regenerated. MPI is the
 outer process-level parallelism; `local_workers` can optionally enable
 the existing thread/GPU runner inside each rank. The direct runner defaults to
 one local worker to avoid oversubscription; pass `local_workers="auto"` to
