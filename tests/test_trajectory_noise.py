@@ -430,7 +430,7 @@ def test_gate_oriented_modes_reject_control_shots(mode):
 
 @pytest.mark.parametrize(
     "mode",
-    ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "perm", "svd", "exact"),
+    ("dmrg", "dmrg2", "dmrg3", "mpo", "mix", "swap", "perm", "svd", "exact"),
 )
 def test_unitary_shot_replay_has_a_valid_path_for_each_mps_mode(mode):
     simulator = pepsy.MpsOptimizer(
@@ -478,7 +478,7 @@ def test_shot_replay_reuses_a_frozen_persistent_layout():
 
 
 @pytest.mark.parametrize(
-    "mode", ("dmrg", "dmrg1", "dmrg2", "dmrg3", "mpo", "mix", "swap", "svd", "perm", "exact")
+    "mode", ("dmrg", "dmrg2", "dmrg3", "mpo", "mix", "swap", "svd", "perm", "exact")
 )
 def test_canonical_mps_modes_replay_kraus_shots(mode):
     simulator = pepsy.MpsOptimizer(

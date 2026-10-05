@@ -27,7 +27,7 @@ updates remain free in every mode.
 64-bit, `1e-6` for 32-bit, and `1e-3` for 16-bit data). `cutoff_mode="auto"`
 uses `"rsum2"` for FIT while leaving native MPO methods on Quimb's method
 default. `run()` accepts the ordinary MPS FIT controls, including `n_iter`,
-`fit_min_iter`, `fit_rtol`, `fit_patience`, `fit_block_size`,
+`fit_single_pair_n_iter`, `fit_min_iter`, `fit_rtol`, `fit_patience`, `fit_block_size`,
 `fit_adaptive_sweeps`, `fit_sweep_sequence`, `finite_check`, and optional
 `fit_overlap_diagnostics`. `fit_rtol="auto"` uses `1e-3` for 16-bit data,
 `1e-5` for float32/complex64, and `1e-9` for higher precision. These are FIT
@@ -50,10 +50,12 @@ one-site phase after expansion. `"auto"` resolves to `"guess-src"`.
 `"random_expand"`, and `"svd_guess"` are also supported. The underscore
 spelling, for example `"guess_zipup"`, remains a compatibility alias. Set
 `compression_seed` separately from the STN measurement `seed` for randomized
-native methods. The STN DMRG wrapper grows with a two-site FIT target for
-`dmrg`, `dmrg1`, and `dmrg2`, and a three-site target for `dmrg3` when the
+native methods. Like ordinary `MpsOptimizer`, `dmrg`/`fit` uses fixed-rank
+one-site FIT and rejects larger block overrides. Select `dmrg2` for two-site
+growth or `dmrg3` for a three-site target when the
 active frame window spans at least three sites; `dmrg3` falls back to two-site
-FIT for the common two-qubit window. Each update finishes with a one-site
+FIT for the common two-qubit window. Legacy STN `dmrg1` retains its two-site
+growth and rank-ceiling latch. Multi-site growth finishes with a one-site
 refinement on multi-site windows, while the SRC guess is kept isolated from
 the exact target construction. On dense backends, the exact coefficient
 sub-MPO is retained as a tagged lazy FIT target layer: the active MPS window
@@ -63,6 +65,22 @@ routes retain the materialized backend-safe target fallback. The resulting
 `get_fit_diagnostics()` record includes the selected convergence controls.
 `get_fit_diagnostics()` reports the selected block size, growth/refinement
 sweeps, SRC guess method, target representation, and the DMRG1 one-site latch.
+
+Adjacent two-site windows honor `n_iter` and the convergence controls in every
+DMRG mode, matching the ordinary MPS engine. With `fit_rtol=None`, the requested
+sweep budget is used in full. An omitted or None `fit_single_pair_n_iter`
+inherits `n_iter`; a positive cap selects `min(n_iter, cap)` for adjacent
+windows, including one-site FIT. It does not cap longer windows. Set
+`fit_single_pair_fast_path=True` explicitly to select one two-site update
+instead. These controls propagate to shot replay and are restored after a run.
+
+Dense native Quimb coefficient-MPS replay accepts `run(compression_opts=...)`
+with the same capability-checked intermediate/final options as ordinary MPS
+replay; see [compression stages](../boundary/compression.md). Options also
+reach the interior sub-MPO workaround. Caller mappings are copied, and `chi`
+remains the final cap. FIT, Symmray/fermionic replay and dense Pauli branch-sum
+fallback reject explicit settings instead of silently ignoring them. Run
+overrides do not leak into later replay.
 
 `StabilizerMpsSimulator` is the descriptive public name for the simulator, with
 `MpsStabOptimizer` kept as the long-standing compatibility alias. Both are

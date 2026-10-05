@@ -82,11 +82,19 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   underscore `guess_<method>` spelling remains a compatibility alias. Native
   Symmray and fermionic paths retain their sector-aware materialized target
   and direct FIT initialization.
-- STN `dmrg1`, `dmrg2`, and `dmrg3` mirror the ordinary MPS local schedule:
+- STN `dmrg`/`fit` fixes one-site FIT, matching ordinary MPS. Reject multi-site
+  overrides and select `dmrg2`/`dmrg3` explicitly for growth.
+  STN `dmrg2` and `dmrg3` mirror the ordinary MPS local schedule:
   isolated SRC warm-up, two-site or three-site growth, then one-site refinement
   on longer windows. `dmrg3` falls back to two-site FIT on an adjacent two-site
-  window, and `dmrg1` latches one-site updates after full-chain rank ceilings
-  are reached. `get_fit_diagnostics()` exposes this schedule.
+  window. Legacy STN `dmrg1` retains two-site growth and latches one-site
+  updates after full-chain rank ceilings are reached. Adjacent windows inherit
+  `n_iter`, or `min(n_iter, fit_single_pair_n_iter)` with a positive explicit
+  cap; a one-update shortcut requires `fit_single_pair_fast_path=True`.
+  Dense native replay accepts the shared capability-checked `compression_opts`
+  mapping, including interior sub-MPO dispatch. FIT/native graded/branch-sum
+  routes reject unsupported explicit options. Keep run controls isolated and
+  forward them to shot replay. `get_fit_diagnostics()` exposes the schedule.
 - **Canonical-centre discipline** → preserve the simulator's `cur_orthog` info through
   quimb operations. Canonicalize explicitly before local projection, evaluate local
   expectations and unitary norm loss at the tracked centre, and renormalize the centre

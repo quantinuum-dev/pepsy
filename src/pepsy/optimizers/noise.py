@@ -233,9 +233,11 @@ class ImportanceSamplingPolicy:
     optimizer)``.  The target probabilities always come from the physical
     channel and the runner records the likelihood ratio ``target/proposal``.
 
-    Proposal distributions must have support wherever the target distribution
-    is nonzero.  ``max_likelihood_ratio`` is an optional safety guard against a
-    numerically explosive proposal; it raises before applying a sampled branch.
+    Proposal distributions must have exactly the support of the target
+    distribution, including arbitrarily rare positive outcomes. Impossible
+    outcomes must have zero proposal mass. ``max_likelihood_ratio`` is an
+    optional safety guard against a numerically explosive proposal; it raises
+    before applying a sampled branch.
     """
 
     proposal: Any
@@ -298,9 +300,14 @@ class ImportanceSamplingPolicy:
                 f"importance proposal for event {event_index} must sum to one."
             )
         proposal = np.maximum(proposal, 0.0)
-        if np.any((target > 1e-14) & (proposal <= 1e-14)):
+        if np.any((target > 0.0) & (proposal == 0.0)):
             raise ValueError(
                 f"importance proposal for event {event_index} omits a target branch."
+            )
+        if np.any((target == 0.0) & (proposal > 0.0)):
+            raise ValueError(
+                f"importance proposal for event {event_index} assigns probability "
+                "to an impossible target branch."
             )
         return proposal
 
@@ -1300,6 +1307,16 @@ def _trajectory_diagnostic_snapshot(optimizer) -> dict[str, Any]:
             info.get("used_kraus_copy_fallback", False)
         ),
     }
+
+
+def _accumulate_trajectory_diagnostics(summary, optimizer):
+    """Fold discarded-state diagnostics without retaining one entry per shot."""
+    snapshot = _trajectory_diagnostic_snapshot(optimizer)
+    summary["max_kraus_probability_residual"] = max(
+        summary["max_kraus_probability_residual"],
+        abs(snapshot["max_kraus_probability_residual"]),
+    )
+    summary["used_kraus_copy_fallback"] |= snapshot["used_kraus_copy_fallback"]
 
 
 def _trajectory_diagnostics(
@@ -3039,11 +3056,14 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
         if len(support) == 1 and int(getattr(p, "L", 0)) == 1:
             dense = getattr(p, "to_dense", None)
             if callable(dense):
-                vector = np.asarray(dense(), dtype=complex).reshape(-1)
-                gram_numpy = np.asarray(gram, dtype=complex)
-                denominator = float(np.vdot(vector, vector).real)
+                vector = ar.do("reshape", dense(), (-1,))
+                conjugate = ar.do("conj", vector)
+                denominator = _trajectory_real_scalar(
+                    ar.do("real", ar.do("sum", conjugate * vector)),
+                    label="local Kraus state norm",
+                )
                 if denominator > 0.0:
-                    value = np.vdot(vector, gram_numpy @ vector) / denominator
+                    value = ar.do("sum", conjugate * (gram @ vector)) / denominator
                     value = _trajectory_real_scalar(
                         value, label="local Kraus probability"
                     )
@@ -3075,7 +3095,9 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
         return None
 
 
-def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
+def _mps_outcome_norm_squared(
+    optimizer, matrix, where, *, base_norm_squared=None
+) -> float:
     """Evaluate one Kraus branch without mutating an MPS or exact leaf."""
     p = getattr(optimizer, "p", None)
     apply_gate = getattr(optimizer, "_apply_gate", None)
@@ -3090,7 +3112,9 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
         optimizer, matrix, physical_where
     )
     if local_probability is not None:
-        return local_probability * _trajectory_norm_squared(optimizer)
+        if base_norm_squared is None:
+            base_norm_squared = _trajectory_norm_squared(optimizer)
+        return local_probability * base_norm_squared
     _record_kraus_probability_diagnostic(optimizer, used_copy_fallback=True)
     candidate = apply_gate(
         p.copy(),
@@ -3226,7 +3250,10 @@ def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.nda
     else:
         branch_norm_squared = np.asarray(
             [
-                _mps_outcome_norm_squared(optimizer, outcome.gate, where)
+                _mps_outcome_norm_squared(
+                    optimizer, outcome.gate, where,
+                    base_norm_squared=base_norm_squared,
+                )
                 for outcome in channel.outcomes
             ],
             dtype=float,
@@ -5021,7 +5048,10 @@ def run_trajectory_shots(
         leakage_records = []
         measurement_records = []
         weights = []
-        diagnostic_infos = []
+        diagnostic_info = {
+            "max_kraus_probability_residual": 0.0,
+            "used_kraus_copy_fallback": False,
+        }
         for child_seed in _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids):
             noise_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
             sample = sample_trajectory_stream(
@@ -5045,7 +5075,8 @@ def run_trajectory_shots(
                 reset_ancillas=magic_reset_ancillas,
                 **dict(run_kwargs),
             )
-            diagnostic_infos.append(_trajectory_diagnostic_snapshot(optimizer))
+            if retain == "none":
+                _accumulate_trajectory_diagnostics(diagnostic_info, optimizer)
             if retain != "none":
                 optimizers.append(optimizer)
                 weights.append(float(sample.weight))
@@ -5068,7 +5099,7 @@ def run_trajectory_shots(
                 shots=int(shots),
                 coalesced=False,
                 diagnostic_infos=(
-                    diagnostic_infos if retain == "none" else ()
+                    (diagnostic_info,) if retain == "none" else ()
                 ),
             ),
         )
@@ -5108,7 +5139,10 @@ def run_trajectory_shots(
     leakage_records = []
     measurement_records = []
     weights = []
-    diagnostic_infos = []
+    diagnostic_info = {
+        "max_kraus_probability_residual": 0.0,
+        "used_kraus_copy_fallback": False,
+    }
     for child_seed in _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids):
         channel_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
         optimizer = optimizer_factory()
@@ -5246,7 +5280,8 @@ def run_trajectory_shots(
         flush_pending()
         if magic_context is not None:
             _finish_magic_context(optimizer, magic_context)
-        diagnostic_infos.append(_trajectory_diagnostic_snapshot(optimizer))
+        if retain == "none":
+            _accumulate_trajectory_diagnostics(diagnostic_info, optimizer)
         if retain != "none":
             optimizers.append(optimizer)
             weights.append(float(shot_weight))
@@ -5269,7 +5304,7 @@ def run_trajectory_shots(
             shots=int(shots),
             coalesced=False,
             diagnostic_infos=(
-                diagnostic_infos if retain == "none" else ()
+                (diagnostic_info,) if retain == "none" else ()
             ),
         ),
     )
@@ -5533,7 +5568,9 @@ def run_coalesced_trajectory_shots(
             pending.append((event_index, entry))
             continue
         flush()
-        if entry.channel.mode == "mixture":
+        if entry.channel.mode == "mixture" and (
+            policy is None or not callable(policy.proposal)
+        ):
             outcomes = entry.channel.outcomes
             target, proposal, ratios = _importance_distribution(
                 policy,
@@ -5575,8 +5612,14 @@ def run_coalesced_trajectory_shots(
         else:
             split = []
             for index, node in enumerate(nodes):
-                probabilities = _kraus_probabilities(
-                    node.optimizer, entry.channel, entry.where
+                # Callable mixture proposals may depend on each parent's
+                # current state, just like state-dependent Kraus proposals.
+                probabilities = (
+                    [outcome.probability for outcome in entry.channel.outcomes]
+                    if entry.channel.mode == "mixture"
+                    else _kraus_probabilities(
+                        node.optimizer, entry.channel, entry.where
+                    )
                 )
                 target, proposal, ratios = _importance_distribution(
                     policy,
@@ -5610,7 +5653,10 @@ def run_coalesced_trajectory_shots(
                         proposal,
                         apply,
                         rng,
-                        context="trajectory Kraus channel",
+                        context=(
+                            "trajectory mixture" if entry.channel.mode == "mixture"
+                            else "trajectory Kraus channel"
+                        ),
                         max_branches=_remaining_coalesced_budget(
                             max_branches, len(split), len(nodes) - index - 1,
                         ),

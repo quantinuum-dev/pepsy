@@ -72,6 +72,8 @@ from ...fitting.local import FIT
 from ..._internal.cutoff import dtype_auto_cutoff, resolve_fit_rtol
 from ..._internal.random import fit_random_array
 from ..._internal.quimb import (
+    quimb_compression_options,
+    quimb_1d_compression_cutoff_mode,
     require_quimb_1d_compression_method as _require_quimb_compression_method,
     run_seeded_quimb as _run_seeded_quimb,
 )
@@ -302,6 +304,9 @@ class StabilizerMpsSimulator:
         The ``"dmrg"``, ``"dmrg1"``, ``"dmrg2"``, and ``"dmrg3"``
         modes use local FIT on the coefficient
         target; ``fit_init_strategy`` controls their disposable initial guess.
+        ``"dmrg"``/``"fit"`` fixes one-site updates; use ``"dmrg2"`` or
+        ``"dmrg3"`` for multi-site growth. Legacy ``"dmrg1"`` retains its
+        rank-adaptive two-site growth schedule.
         On dense backends, DMRG retains the exact coefficient sub-MPO as a
         tagged lazy FIT target layer after canonicalizing the active MPS window;
         Symmray and fermionic routes use the materialized backend-safe target.
@@ -561,6 +566,8 @@ class StabilizerMpsSimulator:
         self._fit_sweep_sequence = "RL"
         self._fit_two_site_transition_sweeps = None
         self._fit_single_pair_fast_path = False
+        self._fit_single_pair_n_iter = None
+        self._compression_opts = {}
         self._fit_finite_check = False
         self._fit_overlap_diagnostics = False
 
@@ -1871,6 +1878,8 @@ class StabilizerMpsSimulator:
         fit_sweep_sequence,
         fit_two_site_transition_sweeps,
         fit_single_pair_fast_path,
+        fit_single_pair_n_iter,
+        compression_opts,
         finite_check,
         fit_overlap_diagnostics,
         fit_init_strategy,
@@ -1885,6 +1894,34 @@ class StabilizerMpsSimulator:
         successful replay or an exception. An explicitly supplied ``mode`` is
         the one intentional persistent state transition.
         """
+        # Validate new controls before changing any retained run settings.
+        resolved_mode = self.mode if mode is None else self._normalize_mode(mode)
+        if fit_single_pair_n_iter is not None:
+            fit_single_pair_n_iter = self._validate_positive_int(
+                fit_single_pair_n_iter, "fit_single_pair_n_iter"
+            )
+        if resolved_mode == "dmrg" and fit_block_size is not None:
+            if (
+                isinstance(fit_block_size, bool)
+                or not isinstance(fit_block_size, Integral)
+                or fit_block_size != 1
+            ):
+                raise ValueError("mode='dmrg' fixes fit_block_size to 1; use dmrg2 or dmrg3.")
+        if compression_opts:
+            self.backend_info()
+            if (
+                not self._is_quimb_mode(resolved_mode)
+                or self.backend == "symmray"
+                or self.state.p.isfermionic()
+            ):
+                raise NotImplementedError(
+                    "compression_opts requires dense Quimb coefficient-MPS compression replay."
+                )
+        compression_opts = quimb_compression_options(
+            self._mode_quimb_method(resolved_mode)
+            if self._is_quimb_mode(resolved_mode) else "direct",
+            compression_opts,
+        )
         # Keep these overrides isolated from queue execution: FIT and native
         # Quimb paths read the optimizer attributes directly while replaying.
         original = {
@@ -1902,6 +1939,8 @@ class StabilizerMpsSimulator:
             "fit_sweep_sequence": self._fit_sweep_sequence,
             "fit_two_site_transition_sweeps": self._fit_two_site_transition_sweeps,
             "fit_single_pair_fast_path": self._fit_single_pair_fast_path,
+            "fit_single_pair_n_iter": self._fit_single_pair_n_iter,
+            "compression_opts": self._compression_opts,
             "fit_finite_check": self._fit_finite_check,
             "fit_overlap_diagnostics": self._fit_overlap_diagnostics,
             "fit_init_strategy": self.fit_init_strategy,
@@ -1957,7 +1996,9 @@ class StabilizerMpsSimulator:
         )
         self._fit_rtol = self._resolve_fit_rtol(fit_rtol)
         if fit_block_size is None:
-            fit_block_size = 3 if self.mode == "dmrg3" else 2
+            fit_block_size = (
+                1 if self.mode == "dmrg" else 3 if self.mode == "dmrg3" else 2
+            )
         if (
             isinstance(fit_block_size, bool)
             or not isinstance(fit_block_size, Integral)
@@ -2025,6 +2066,8 @@ class StabilizerMpsSimulator:
             ) or int(fit_init_seed) < 0:
                 raise ValueError("fit_init_seed must be a non-negative integer.")
             self.fit_init_seed = int(fit_init_seed)
+        self._fit_single_pair_n_iter = fit_single_pair_n_iter
+        self._compression_opts = compression_opts
         return original
 
     def _restore_run_configuration(self, original, *, keep_mode=False):
@@ -2052,6 +2095,8 @@ class StabilizerMpsSimulator:
             "fit_two_site_transition_sweeps"
         ]
         self._fit_single_pair_fast_path = original["fit_single_pair_fast_path"]
+        self._fit_single_pair_n_iter = original["fit_single_pair_n_iter"]
+        self._compression_opts = original["compression_opts"]
         self._fit_finite_check = original["fit_finite_check"]
         self._fit_overlap_diagnostics = original["fit_overlap_diagnostics"]
         self.fit_init_strategy = original["fit_init_strategy"]
@@ -2103,6 +2148,8 @@ class StabilizerMpsSimulator:
         fit_sweep_sequence="RL",
         fit_two_site_transition_sweeps=None,
         fit_single_pair_fast_path=False,
+        fit_single_pair_n_iter=None,
+        compression_opts=None,
         finite_check=False,
         fit_overlap_diagnostics=False,
         fit_init_strategy=None,
@@ -2156,6 +2203,13 @@ class StabilizerMpsSimulator:
         fit_single_pair_fast_path, finite_check : optional
             Enable the structural adjacent-pair shortcut or FIT validation
             checks. Validation is opt-in because it adds tensor-scan cost.
+        fit_single_pair_n_iter : int | None
+            Optional adjacent-window sweep cap. None inherits n_iter;
+            a positive cap selects min(n_iter, cap), including one-site FIT.
+        compression_opts : mapping | None
+            Independent intermediate/final controls for dense Quimb sub-MPO
+            compression, matching MpsOptimizer. Native and FIT replay reject
+            explicit options; dense branch-sum fallback does not support them.
         fit_overlap_diagnostics : bool, optional
             If true, compute a diagnostic overlap between the exact FIT target
             and fitted MPS after each FIT update. This is separate from the
@@ -2181,6 +2235,8 @@ class StabilizerMpsSimulator:
             "fit_sweep_sequence": fit_sweep_sequence,
             "fit_two_site_transition_sweeps": fit_two_site_transition_sweeps,
             "fit_single_pair_fast_path": fit_single_pair_fast_path,
+            "fit_single_pair_n_iter": fit_single_pair_n_iter,
+            "compression_opts": compression_opts,
             "finite_check": finite_check,
             "fit_overlap_diagnostics": fit_overlap_diagnostics,
         }.items():
@@ -2266,6 +2322,8 @@ class StabilizerMpsSimulator:
             fit_sweep_sequence=fit_sweep_sequence,
             fit_two_site_transition_sweeps=fit_two_site_transition_sweeps,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
+            fit_single_pair_n_iter=fit_single_pair_n_iter,
+            compression_opts=compression_opts,
             finite_check=finite_check,
             fit_overlap_diagnostics=fit_overlap_diagnostics,
             fit_init_strategy=fit_init_strategy,
@@ -4657,13 +4715,14 @@ class StabilizerMpsSimulator:
         opts = {
             "cutoff": 0.0 if method in _MPO_METHODS_IGNORE_CUTOFF else self.cutoff,
         }
+        cutoff_mode = quimb_1d_compression_cutoff_mode(method, self.cutoff_mode)
         if (
-            self.cutoff_mode is not None
+            cutoff_mode is not None
             and method not in _MPO_METHODS_IGNORE_CUTOFF_MODE
         ):
-            opts["cutoff_mode"] = self.cutoff_mode
+            opts["cutoff_mode"] = cutoff_mode
         optimize = self.contraction_opt
-        if optimize is not None and not (
+        if method != "direct" and optimize is not None and not (
             isinstance(optimize, str)
             and optimize.strip().lower() in {"auto", "auto-hq"}
         ):
@@ -4674,6 +4733,7 @@ class StabilizerMpsSimulator:
             # Match the ordinary MPS path: projector fitting does not need the
             # optional pre-gauge and is safer on exact product-state bonds.
             opts["canonize"] = False
+        opts.update(self._compression_opts)
         return opts
 
     def _apply_quimb_submpo(self, p, mpo, where, *, method, max_bond, info):
@@ -4704,6 +4764,7 @@ class StabilizerMpsSimulator:
                 inplace_mpo=False,
                 optimize=self._native_contraction_opt(),
                 seed=self.compression_seed,
+                compression_opts=self._compression_opts,
             )
 
         seed = (
@@ -5105,7 +5166,7 @@ class StabilizerMpsSimulator:
                 "layered" if self._fit_target_is_layered(target) else "mps"
             )
         requested_block_size = self._fit_block_size or (
-            3 if self.mode == "dmrg3" else 2
+            1 if self.mode == "dmrg" else 3 if self.mode == "dmrg3" else 2
         )
         block_size = min(requested_block_size, span)
         self._maybe_lock_dmrg1_one_site_phase(p)
@@ -5148,13 +5209,13 @@ class StabilizerMpsSimulator:
             copy_target=False,
         )
         adjacent_two_site = span == 2 and block_size == 2
-        single_pair_fast_path = bool(
-            self._fit_single_pair_fast_path
-            or (self.mode == "dmrg2" and adjacent_two_site)
-        )
+        single_pair_fast_path = bool(self._fit_single_pair_fast_path)
+        window_n_iter = self._fit_n_iter
+        if span == 2 and self._fit_single_pair_n_iter is not None:
+            window_n_iter = min(window_n_iter, self._fit_single_pair_n_iter)
         growth_sweeps = 0 if block_size == 1 else min(
             self._fit_adaptive_sweeps,
-            self._fit_n_iter,
+            window_n_iter,
         )
         resolved_fit_init_strategy = self._resolved_fit_init_strategy(
             self.fit_init_strategy
@@ -5176,13 +5237,12 @@ class StabilizerMpsSimulator:
             and not p.isfermionic()
         )
         fit.run_gate(
-            # A two-site gate is already the complete local problem. Match
-            # MpsOptimizer's structural fast path and spend one FIT update on
-            # it; longer windows use two growth sweeps and one-site handoff.
+            # Match MpsOptimizer: adjacent pairs inherit the requested budget
+            # unless the caller explicitly selects the one-update shortcut.
             n_iter=(
                 1
                 if single_pair_fast_path and adjacent_two_site
-                else self._fit_n_iter
+                else window_n_iter
             ),
             block_size=block_size,
             sweep_sequence=self._fit_sweep_sequence,
@@ -5233,6 +5293,8 @@ class StabilizerMpsSimulator:
             "cutoff_mode": self.cutoff_mode or "rsum2",
             "contraction_opt": self.contraction_opt,
             "fit_n_iter": int(self._fit_n_iter),
+            "fit_window_n_iter": int(window_n_iter),
+            "fit_single_pair_n_iter": self._fit_single_pair_n_iter,
             "fit_min_iter": int(self._fit_min_iter),
             "fit_rtol": self._fit_rtol,
             "fit_patience": int(self._fit_patience),
@@ -7216,6 +7278,11 @@ class StabilizerMpsSimulator:
         norm-loss proxy. Dense non-unitary sums return the retained norm ratio
         when a physical ``G^dagger G`` target norm was supplied.
         """
+        if self._compression_opts:
+            raise NotImplementedError(
+                "compression_opts is not supported by the dense Pauli branch-sum "
+                "fallback; use a coefficient-frame sub-MPO."
+            )
         p = self.state.p
         branches = tuple(branches)
         if unitary and self._infidelity_valid:

@@ -360,14 +360,41 @@ print(estimate, result.effective_sample_size)
 ```
 
 The policy mapping can be label-based for every event, event-index keyed, or a
-callable `(event_index, labels, target_probabilities, optimizer)`. Every target
-branch must have nonzero proposal probability. `TrajectoryRecord` exposes both
+callable `(event_index, labels, target_probabilities, optimizer)`. Stateful
+trajectory replay passes the current optimizer to the callback, including each
+parent state in coalesced mixtures. Stream-only sampling has no optimizer state.
+Every positive target branch must have positive proposal probability, including
+arbitrarily rare outcomes. Impossible target branches must have zero proposal
+probability; invalid support raises before applying a branch. `TrajectoryRecord`
+exposes both
 `probability` (physical) and `proposal_probability`, plus `likelihood_ratio`.
 Coalesced leaves carry the product ratio in `leaf.weight`, and
 `CoalescedTrajectoryResult.estimate(...)` includes leaf multiplicities. For the
 Pauli convenience API, pass a proposal `PauliErrorModel` as
 `importance_sampling` to `run_noisy_shots(...)` or
 `run_coalesced_noisy_shots(...)`.
+
+MPS Kraus probability contractions stay on the state's array backend, dtype,
+and device; only scalar probabilities are read out for the host sampler.
+Outcomes reuse the channel's base state norm. With `retain="none"`, independent
+replay aggregates quality diagnostics without storing a snapshot per shot.
+
+To check the complete small-system ensemble and distinguish compression bias
+from sampling error, run the integration references from the repository root
+in your activated development environment:
+
+```bash
+python -m pytest -q -o addopts='' tests/test_mps_trajectory_density_reference.py
+```
+
+These compare all two-qubit Pauli observables with explicit density-matrix
+evolution through successive channels, measurement and feed-forward. Ordinary
+and importance-sampled trajectories use fixed seeds and six standard errors
+computed from an independently enumerated proposal law. A four-qubit reference
+varies `chi`, cutoff and shots, reconstructing the compressed model's ensemble
+from branch probabilities separately from the random shot counts. This checks
+specific small circuits; convergence on a larger circuit still requires its
+own bond-dimension and sampling study.
 
 `max_branches` bounds live coalesced states and `max_branch_factor` bounds the
 number of nonempty children created by any one stochastic event. These are hard
