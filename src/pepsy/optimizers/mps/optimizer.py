@@ -58,7 +58,9 @@ their dense projector fallback so charge and dummy-mode metadata are preserved.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from collections.abc import Mapping
+from functools import wraps
 from numbers import Integral
 import math
 import time
@@ -112,6 +114,7 @@ from ...backends import (
     infer_backend_converter_from_sample,
     infer_backend_signature,
 )
+from ...backends.convert import _high_precision_matmul
 from ...fitting.local import FIT
 from ..._internal.cutoff import dtype_auto_cutoff, resolve_fit_rtol
 from ..._internal.random import fit_random_array
@@ -189,6 +192,17 @@ __all__ = [
 
 
 _EXACT_MODES = frozenset({"exact", "exact-batch"})
+
+
+def _with_mps_precision(function):
+    """Keep JAX replay and its canonical/readout contractions consistent."""
+    @wraps(function)
+    def wrapped(self, *args, **kwargs):
+        with _high_precision_matmul(self._state_backend_like()):
+            return function(self, *args, **kwargs)
+    return wrapped
+
+
 _NORM_INCLUDES_EXPONENT_CACHE = {}
 _SHOT_DEFAULT_MAX_BRANCHES = 128
 _SHOT_DEFAULT_AUTO_MAX_EXPECTED_FAULTS = 0.1
@@ -1886,6 +1900,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return apply_gate(p, gate, where, **kwargs)
         return self._timed_call("gate.apply", apply_gate, p, gate, where, **kwargs)
 
+    @_with_mps_precision
     def _init_canonicalization(self):
         """Initialize canonical form and orthogonality center."""
         if self.mode in _EXACT_MODES:
@@ -2085,6 +2100,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.info_c["cur_orthog"] = (site, site)
         return self.info_c["cur_orthog"]
 
+    @_with_mps_precision
     def normalize(self, eps=1e-15, insert=None):
         """Normalize current ``self.p`` in-place.
 
@@ -2339,6 +2355,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         return _layout_execution.remap_sample(self, config)
 
+    @_with_mps_precision
     def to_dense(self, logical_order=True, **kwargs):
         """Return the statevector with optional logical-site axis ordering.
 
@@ -2734,6 +2751,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             workers = parallel_workers
         if mpi_enabled:
             from ..mpi import MPIShotRunner  # pylint: disable=import-outside-toplevel
+            from ._trajectory_execution import _is_accelerator
+
+            if workers in {None, "auto"} and _is_accelerator(self.backend_info()):
+                workers = 1
 
             if strategy == "auto":
                 strategy = "independent"
@@ -2775,26 +2796,41 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 progress=progress,
             )
 
-        if workers in {None, "auto"}:
-            from ..mpi import _resolve_local_workers  # pylint: disable=import-outside-toplevel
-
-            workers = _resolve_local_workers(workers, shots=shots)
         from ..mpi import (  # pylint: disable=import-outside-toplevel
             _make_progress_bar,
             _validate_progress,
         )
         progress_strategy = strategy
-        if workers > 1 and strategy == "auto":
+        if strategy == "auto":
             from ..noise import _resolve_auto_parallel_strategy
 
             progress_strategy = _resolve_auto_parallel_strategy(
-                self._stream_plan.entries,
+                self._stream_plan.trajectory_plan if error_model is None
+                else self._stream_plan.entries,
                 shots,
                 error_model=error_model,
                 max_branches=max_branches,
                 max_branch_factor=max_branch_factor,
                 auto_max_expected_faults=auto_max_expected_faults,
+                importance_sampling=importance_sampling,
             )
+
+        from ..noise import _validate_parallel_backend, _validate_parallel_workers
+
+        parallel_backend = _validate_parallel_backend(parallel_backend)
+        execution_reason = "explicit worker override"
+        if workers in {None, "auto"}:
+            from ._trajectory_execution import _automatic_shot_workers
+
+            initial_state = self.p if self._initial_p is None else self._initial_p
+            workers, execution_reason = _automatic_shot_workers(
+                self._state_backend_info_for(initial_state), initial_state,
+                self._stream_plan.entries, shots, progress_strategy,
+            )
+        workers = _validate_parallel_workers(workers)
+        if parallel_backend == "serial":
+            workers = 1
+            execution_reason = "explicit serial execution backend"
 
         progress_mode = _validate_progress(progress)
         progress_bar = _make_progress_bar(
@@ -2848,6 +2884,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         finally:
             if progress_bar is not None:
                 progress_bar.close()
+        if raw.diagnostics is not None:
+            fallback = (
+                strategy == "auto" and progress_strategy == "coalesced"
+                and not raw.diagnostics.coalesced
+            )
+            raw = replace(raw, diagnostics=replace(
+                raw.diagnostics,
+                planned_strategy=progress_strategy,
+                workers=workers,
+                execution_reason=execution_reason,
+                fallback_reason="coalesced branch cap exceeded" if fallback else None,
+            ))
         return NoisyResult(raw)
 
     def set_gates(self, gates):
@@ -3432,8 +3480,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Run the shot ensemble collectively over MPI. ``True`` uses
             ``MPI.COMM_WORLD``; an explicit communicator can be supplied.
         workers : int | "auto" | None, default="auto"
-            Local shot workers. ``"auto"`` uses the process CPU allowance and
-            divides it across MPI ranks sharing a host. Use ``1`` to force
+            Local shot worker budget. ``"auto"`` uses one accelerator worker
+            and avoids threading small/shared-prefix CPU workloads. Large
+            independent NumPy/Torch CPU jobs use at most four workers within
+            the CPU and numerical-library thread budget. MPI CPU execution
+            divides the CPU allowance across local ranks. Use ``1`` to force
             serial local execution.
         progress : {"auto", True, False}, default="auto"
             Show one aggregate rank-zero shot progress bar for MPI runs.
@@ -3994,6 +4045,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         resolved.update(overrides or {})
         return resolved
 
+    @_with_mps_precision
     def _run_with_fit_copy_policy(self, executor, *, finite_check=False, **timing_options):
         """Scope copy capabilities and runtime validation to one replay.
 
@@ -4235,6 +4287,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     _apply_control_event_impl = _controls._apply_control_event_impl
 
+    @_with_mps_precision
     def _ensure_mps_state(self):
         """Ensure ``self.p`` is a :class:`qtn.MatrixProductState`.
 
@@ -4268,6 +4321,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             ar.shape(arr),
             site_ind_id=self.ind_id,
             site_tag_id=getattr(p, "site_tag_id", "I{}"),
+            cutoff=0.0,
         )
         self.p = self._install_represented_norm(mps)
         self.backend_info()
@@ -8624,6 +8678,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.p = self._install_represented_norm(p)
 
+    @_with_mps_precision
     def canonize_mps(self, p, where, *, info=None):
         """Update canonical form and optionally accumulate its wall time."""
         if self._timing_state is None:

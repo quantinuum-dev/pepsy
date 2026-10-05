@@ -65,6 +65,21 @@ opt = MpsOptimizer(state, gates, chi=64)  # mode="direct"
 opt.run()
 ```
 
+Use `complex128` as the standard initialization dtype. Pepsy's
+`pepsy.tensors.ps_to_mps(...)` already defaults to it. `MpsOptimizer` inherits
+the supplied state's dtype and device, so explicitly created `complex64`
+states remain complex64.
+
+`run()` defaults to `cutoff="auto"`, resolved from the live state precision:
+
+| State dtype | Automatic cutoff |
+| --- | ---: |
+| `complex128` (or `float64`) | `1e-12` |
+| `complex64` (or `float32`) | `1e-6` |
+
+An explicit numeric cutoff overrides this policy. The same resolution applies
+to trajectory replay; the bond cap `chi` remains independent of the cutoff.
+
 The previous constructor default was `"dmrg"`. Specify `mode="dmrg"` (or a
 named `dmrg2`/`dmrg3` schedule) to retain variational FIT replay.
 
@@ -179,7 +194,7 @@ initial MPS. For example:
 ```python
 import torch
 
-backend = pepsy.backend_torch(dtype=torch.complex64, device="cuda")
+backend = pepsy.backend_torch(dtype=torch.complex128, device="cuda")
 state.apply_to_arrays(backend)
 opt = pepsy.MpsOptimizer(
     state,
@@ -189,6 +204,11 @@ opt = pepsy.MpsOptimizer(
     to_backend=backend,
 )
 ```
+
+For CuPy, the corresponding converter is
+`pepsy.backends.backend_cupy(device=0, dtype="complex128")`.
+Select complex64 explicitly when its accuracy and performance fit the workload;
+`cutoff="auto"` then uses `1e-6` instead of `1e-12`.
 
 Optional logical-qubit roles can travel with the stream without changing gate
 semantics. Supply a site-to-role mapping (or one role per site), then request a
@@ -399,8 +419,15 @@ blocks. Dense payloads cannot be promoted to native Symmray gates because that
 would lose charge and fermionic metadata; construct those gates with the
 matching Symmray convention instead.
 
+Dense JAX replay, canonicalization, normalization and dense readout use scoped
+`highest` matrix-product precision. This avoids reduced-precision accumulation
+in Born probabilities and canonical transformations while keeping the state
+dtype/device and restoring the caller's JAX setting on every exit.
+
 Rebuilding an MPS after exact replay, including before a control event,
-preserves its dense backend, dtype, device, and physical index names. Dense
+uses zero truncation cutoff and preserves its dense backend, dtype, device,
+and physical index names. Coalesced controls prepare this MPS before reading
+their branch probabilities, including under `strategy="auto"`. Dense
 measurement/reset replay prepares fixed Pauli/Clifford constants once per
 backend/device/dtype and builds projectors and bond-two MPO tensors with
 Autoray operations on that backend. Constants are copied on-device before
@@ -418,6 +445,14 @@ arithmetic, matching the previous Python ledger, except Torch on Apple Metal
 uses float32 because that device does not support float64. JAX respects its
 configured precision. Native Symmray states benefit when their norm reductions return
 one of these backend scalars.
+
+Double-precision ledger arithmetic does not remove roundoff already introduced
+by complex64 contractions and decompositions. Replay respects the registered
+`TorchLinalgConfig`; it does not install a global SVD policy during batching.
+That public configuration defaults to the non-approximate CUDA `gesvd` driver,
+while an unconfigured Torch environment can use Torch's native driver choice.
+See the [CUDA driver comparison](../../development/notes/2026-10-05-mps-gpu-frontier-research.md)
+for the measured complex64 discrepancy and remaining regression failures.
 
 Optional checks and profiling are disabled by default: `finite_check=False`,
 `fit_overlap_diagnostics=False`, `quality_check_every=False`, `timing=False`,
@@ -517,6 +552,62 @@ when passed directly to `run`. `run_kwargs={...}` remains supported and its
 explicit values override the corresponding top-level per-trajectory options.
 Mode selection and the shot RNG remain parent-level controls.
 
+The defaults `strategy="auto", workers="auto"` select execution from the
+stream, shot count, initial state and backend without trial runs:
+
+| Workload | Automatic execution |
+| --- | --- |
+| Branch histories fit `max_branches` | Share prefixes with coalesced replay |
+| Fixed mixtures dominated by one outcome | Also try coalescing when the expected occupied-history upper bound uses at most half the branch budget |
+| Many possible state-dependent branches or broad mixtures | Independent replay |
+| CUDA, CuPy, or another accelerator device | One local worker |
+| Coalesced or small CPU workload | One local worker |
+| Large independent NumPy/Torch CPU workload | Up to four workers within the available CPU and numerical-library thread budget |
+
+The CPU parallel heuristic requires at least four shots, eight stream entries
+and an initial bond dimension of 64. Unknown CPU thread budgets/backends use
+one worker. These are conservative scheduling heuristics, not a guarantee of
+the fastest setting for every circuit. They do not change the backend, device,
+dtype, compression mode, `chi`, cutoff, or retention policy. Numeric `workers`
+and an explicit `strategy` remain overrides; `parallel_backend="serial"`
+forces one worker.
+
+Importance-sampled streams use structural branch bounds rather than physical
+mixture probabilities. Planning does not evaluate proposal callbacks. Dynamic
+controls and Kraus probabilities are also treated conservatively. If an
+automatic coalesced run exceeds either branch cap, it restarts independently
+with the original seed; no branches are pruned. Changing representation can
+change the sampled ensemble for a given seed, while preserving its law.
+
+For local MPS runs, `result.diagnostics` includes `planned_strategy`, `workers`
+(the selected worker budget), `execution_reason` and `fallback_reason`.
+`result.coalesced` reports the representation actually returned. These extra
+diagnostic fields are optional and may be `None` for other runners.
+
+Dense Kraus probability evaluation reuses one canonical amplitude block and
+batches outcomes through Autoray on the MPS backend, including Torch CUDA and
+CuPy. Outcome batches are bounded to limit temporary array growth; the state
+and projected tensors stay on-device. Sampling reads the small outcome norm
+vector and the existing base-norm scalar. See the
+[trajectory probability contract](noise.md) for rare-weight and normalization
+semantics. This applies to both independent and coalesced replay.
+
+Coalesced replay also automatically batches one-site Kraus probabilities across
+compatible live branches on Torch CUDA and CuPy. Branches must share backend,
+device, dtype and prepared block shape. Batches use at most 32 parents and a
+conservative 32 MiB temporary-workspace target; larger or incompatible blocks
+use the existing per-parent path. This target excludes retained MPS states,
+operator caches, allocator reserves and autograd storage. Total retained-state
+memory still depends on `max_branches`, `shots` and `retain`.
+
+The sampler reads one small parent-by-outcome norm array per batch, plus the
+existing per-parent state-norm guards. Branch application and adaptive SVDs
+keep their normal execution paths. State-dependent proposal callbacks use
+per-parent evaluation to preserve their ordering. Exact/native-symmetry,
+multi-site and CPU probabilities retain their existing implementations.
+`result.diagnostics.max_kraus_parent_batch` reports the largest parent batch
+used, defaulting to one for per-parent execution.
+
 With `stabilize_unitary=True`, trajectory replay stabilizes unitary gate
 segments and disables that restoration only while applying a selected Kraus
 operator. The Kraus branch retains its physical norm for compression
@@ -540,9 +631,11 @@ still requires a fresh identity-order optimizer for an already-permuted `perm`
 state.
 
 For MPI, use the same optimizer-level API by passing `mpi=True` (or an
-explicit communicator). `workers="auto"` divides the available CPU allowance
-across local MPI ranks, while `workers=1` forces serial execution inside each
-rank. `progress="auto"` shows one aggregate rank-zero shot bar only in an
+explicit communicator). On CPU, `workers="auto"` divides the available CPU
+allowance across local MPI ranks; accelerator states use one local worker per
+rank. MPI keeps `strategy="auto"` as independent replay for rank-invariant shot
+seeds. `workers=1` forces serial execution inside each rank.
+`progress="auto"` shows one aggregate rank-zero shot bar only in an
 interactive terminal; child optimizer bars are suppressed during distributed
 execution:
 

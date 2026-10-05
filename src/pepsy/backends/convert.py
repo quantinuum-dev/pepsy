@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import numpy as np
 import autoray as ar
 
@@ -16,6 +18,32 @@ _NUMPY_DTYPE_MAP = {
     "int64": np.int64,
     "int32": np.int32,
 }
+
+
+@contextmanager
+def _high_precision_matmul(like):
+    """Scope accurate JAX dot accumulation without changing array precision."""
+    if ar.infer_backend(like) != "jax":
+        yield
+        return
+    import jax  # Imported only for an existing JAX array.
+
+    with jax.default_matmul_precision("highest"):
+        yield
+
+
+def _real_if_compatible(array, like):
+    """Keep exactly real NumPy constants compatible with a real state.
+
+    Generated operators commonly use complex storage even when their values
+    are real. Inspect only those host constants, never download a device array
+    or silently discard a nonzero imaginary component.
+    """
+    if (isinstance(array, np.ndarray) and np.iscomplexobj(array)
+            and "complex" not in ar.get_dtype_name(like)
+            and not np.any(array.imag)):
+        return array.real
+    return array
 
 
 def _array_namespace(like):

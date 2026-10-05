@@ -247,6 +247,33 @@ def test_backend_ledger_matches_cpu_and_preserves_state_dtype(convert, restore):
     assert event["local_infidelity"] == pytest.approx(0., abs=3e-6)
 
 
+@pytest.mark.parametrize("restore", [False, True])
+def test_cuda_ledger_matches_cpu_with_public_svd_policy(restore):
+    """The exact gesvd policy avoids this circuit's native Jacobi norm drift."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from pepsy.backends import TorchLinalgConfig, get_torch_linalg_config
+
+    previous = get_torch_linalg_config()
+    initial = qtn.MPS_rand_state(4, 3, seed=19, dtype="complex64")
+    cpu = MpsOptimizer(initial, [(np.array(qu.CNOT()), (0, 3))] * 3, chi=2)
+    cpu.run(progbar=False, cutoff=0., stabilize_unitary=restore)
+    state = initial.copy()
+    state.apply_to_arrays(lambda x: torch.tensor(np.array(x), device="cuda", dtype=torch.complex64))
+    gate = torch.tensor(np.array(qu.CNOT()), device="cuda", dtype=torch.complex64)
+    with TorchLinalgConfig(stabilized=False).activated():
+        opt = MpsOptimizer(state, [(gate, (0, 3))] * 3, chi=2)
+        opt.run(progbar=False, cutoff=0., stabilize_unitary=restore)
+        np.testing.assert_allclose(ar.to_numpy(opt.to_dense()), cpu.to_dense(), atol=1e-5)
+        assert opt.norm_diagnostics()["infidelity"] == pytest.approx(
+            cpu.norm_diagnostics()["infidelity"], abs=3e-6,
+        )
+        assert all(t.data.dtype == torch.complex64 for t in opt.p.tensors)
+    # With no known prior policy, public reset installs Pepsy's native default.
+    assert get_torch_linalg_config() == (previous or TorchLinalgConfig())
+
+
 def test_device_diagnostic_history_is_detached_and_transactional():
     torch = pytest.importorskip("torch")
     state = qtn.MPS_computational_state("00", dtype="complex128")

@@ -12,7 +12,35 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Performance
+
+- Coalesced MPS trajectories automatically batch compatible one-site Kraus
+  parent states on Torch CUDA/CuPy through Autoray. Shape/dtype/device grouping,
+  a bounded temporary workspace and conservative fallbacks preserve sampling,
+  gradients and rare outcome weights. Diagnostics expose the largest parent
+  batch used.
+- MPS trajectory `workers="auto"` now uses one accelerator worker, avoids
+  threads for small/shared-prefix CPU jobs, and bounds large independent CPU
+  jobs by existing numerical-library thread settings. Stream-local automatic
+  coalescing recognizes rare fixed mixtures without trial runs. Local MPS
+  diagnostics report the planned strategy, worker budget and cap fallback.
+- Dense MPS trajectories prepare one amplitude block per Kraus channel and
+  batch outcome applications/reductions through Autoray on NumPy, Torch,
+  CuPy and JAX. Backend operator batches are cached and temporary batch sizes
+  are bounded. Scaled norms and host float64 squaring retain rare probabilities
+  while reducing device readbacks, without changing state dtype or device.
+
 ### Fixed
+
+- Automatic trajectory planning respects per-event branch caps without a
+  total cap and accounts conservatively for importance proposals and dynamic
+  controls. Conditional tuple-form resets and measure-resets retain their
+  event name when parsing support, fixing rejected feed-forward instructions.
+- MPS trajectories rebuild exact-mode states before coalesced controls, retain
+  rare multi-site Kraus weights using projected amplitudes, and accept real
+  Torch states for real-valued generated noise operators. Dense JAX MPS
+  operations use scoped high-precision accumulation without changing the
+  state dtype/device or the caller's global precision policy.
 
 - Dense `gate_simple(..., smudge=0)` preserves exact-zero external bond
   support during adjacent and routed updates without dividing by zero.

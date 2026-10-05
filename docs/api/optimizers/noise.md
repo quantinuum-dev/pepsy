@@ -255,8 +255,20 @@ entangled site also branches its hidden reset outcome before marking the
 placeholder leaked. Branch limits count all live leaves, including retained
 siblings and parents awaiting processing.
 
-Canonical MPS Kraus probabilities use local Gram-operator expectations with
-the optimizer's tracked center. Control norms use that center and the stored
+Dense MPS Kraus probabilities use projected amplitudes with the optimizer's
+tracked center, preserving rare positive outcomes without cancellation in a
+Gram expectation. Nonadjacent supports are gathered on a private MPS using
+untruncated swaps; only the selected physical legs are fused, in the channel's
+declared order. The normalized amplitude block is prepared once per channel,
+and compatible outcomes are applied in bounded batches through Autoray on the
+state's backend (including Torch CUDA and CuPy). Converted operator batches
+are cached by channel, backend, dtype and device. State tensors and projected
+amplitudes remain on that backend; only the outcome norm vector is transferred
+for host sampling, in addition to the existing base-norm scalar check.
+Scaled reductions and host float64 squaring preserve very small probabilities
+without promoting the state arrays. Native symmetric states retain their
+existing Gram route.
+Control norms use the tracked center and the stored
 exponent; exact and simple-update states retain their general norm paths.
 Ordinary tree Kraus probabilities likewise use exact local expectations of
 `K.conj().T @ K` on a private TTN wrapper. Probability evaluation does not
@@ -379,6 +391,26 @@ and device; only scalar probabilities are read out for the host sampler.
 Outcomes reuse the channel's base state norm. With `retain="none"`, independent
 replay aggregates quality diagnostics without storing a snapshot per shot.
 
+For coalesced dense Torch CUDA/CuPy states, compatible one-site channel parents
+also share a bounded probability batch. Shape, dtype and device are checked
+before stacking, and outcome weights keep the scaled-amplitude/host-float64
+rule. Sampling order, branch budgets and importance ratios remain unchanged.
+Callable proposals use the per-parent path. See the [MPS API](mps.md) for the
+workspace scope and `max_kraus_parent_batch` diagnostic.
+
+Library-generated NumPy operators with exactly zero imaginary components keep
+a real MPS dtype, including real Torch states with bit-flip or amplitude-damping
+noise. A genuinely complex operator on a real non-NumPy state raises a clear
+error: initialize that state with `complex64` or `complex128` to run it.
+Dense JAX MPS replay, canonicalization, readout and probability contractions
+use scoped `highest` matmul precision. State dtype/device and the caller's JAX
+precision setting are preserved when the operation returns or raises.
+
+Both `exact` and `exact-batch` support coalesced measurement/reset and `auto`
+selection. Their contracted states are rebuilt without truncation before
+coalesced control probabilities are evaluated. Exact Kraus probabilities act
+on full-state amplitudes and keep exact-mode canonical metadata separate.
+
 To check the complete small-system ensemble and distinguish compression bias
 from sampling error, run the integration references from the repository root
 in your activated development environment:
@@ -400,6 +432,21 @@ own bond-dimension and sampling study.
 number of nonempty children created by any one stochastic event. These are hard
 safety budgets: a bounded coalesced run raises (or `strategy="auto"` restarts
 independently) rather than pruning probability mass.
+
+For stream-local `strategy="auto"`, preflight uses a structural history bound.
+Fixed mixtures without importance sampling can additionally use a rare-event
+estimate: one dominant history plus the expected number of shots departing
+from it, bounded by the sum of per-event non-dominant probabilities. Coalescing
+is attempted when that bound uses at most half the total branch budget.
+Kraus channels, dynamic branching and proposal policies retain conservative
+structural selection. The per-event budget is checked even when
+`max_branches=None`; runtime caps remain authoritative. Planning never samples
+a state or invokes an importance proposal. The Pauli `error_model` convenience
+path retains its `auto_max_expected_faults` rule.
+
+Local `MpsOptimizer.run` also selects workers from backend and workload
+metadata; see [automatic MPS execution](mps.md). Explicit lower-level
+`parallel_workers` retains its existing behavior.
 
 ## Deterministic parallel trajectories
 

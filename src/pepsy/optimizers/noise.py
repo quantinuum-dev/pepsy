@@ -20,8 +20,14 @@ from typing import Any, Callable, Mapping, Optional
 
 import autoray as ar
 import numpy as np
+import quimb.tensor as qtn
 
 from ..backends import to_float as _backend_to_float
+from ..backends.convert import (
+    _array_namespace,
+    _high_precision_matmul,
+    _real_if_compatible,
+)
 from .._internal.quimb import quimb_callable_option_supported
 from .mps.optimizer import MpsOptimizer
 from ._stream_events import _resolve_conditional
@@ -413,6 +419,11 @@ class TrajectoryDiagnostics:
     that the channel or probability calculation needs attention.
     ``used_kraus_copy_fallback`` reports whether any local Kraus probability
     could not use the environment contraction fast path.
+    Local MPS replay additionally reports ``planned_strategy``, the selected
+    ``workers`` budget, ``execution_reason`` and any ``fallback_reason``.
+    These optional scheduling fields are unset by other runners.
+    ``max_kraus_parent_batch`` records the largest number of parent states
+    evaluated together; one denotes the ordinary per-parent path.
     """
 
     shots: int
@@ -425,6 +436,11 @@ class TrajectoryDiagnostics:
     max_live_branches: int = 0
     max_kraus_probability_residual: float = 0.0
     used_kraus_copy_fallback: bool = False
+    planned_strategy: str | None = None
+    workers: int | None = None
+    execution_reason: str | None = None
+    fallback_reason: str | None = None
+    max_kraus_parent_batch: int = 1
 
 
 @dataclass(frozen=True)
@@ -1344,9 +1360,11 @@ def _trajectory_diagnostics(
 
     max_residual = 0.0
     used_fallback = False
+    max_parent_batch = 1
     for state in states:
         optimizer = getattr(state, "optimizer", state)
         info = getattr(optimizer, "_trajectory_diagnostics", None) or {}
+        max_parent_batch = max(max_parent_batch, int(info.get("max_kraus_parent_batch", 1)))
         max_residual = max(
             max_residual,
             abs(float(info.get("max_kraus_probability_residual", 0.0))),
@@ -1355,6 +1373,7 @@ def _trajectory_diagnostics(
             used_fallback or info.get("used_kraus_copy_fallback", False)
         )
     for info in diagnostic_infos:
+        max_parent_batch = max(max_parent_batch, int(info.get("max_kraus_parent_batch", 1)))
         max_residual = max(
             max_residual,
             abs(float(info.get("max_kraus_probability_residual", 0.0))),
@@ -1379,6 +1398,7 @@ def _trajectory_diagnostics(
         ),
         max_kraus_probability_residual=float(max_residual),
         used_kraus_copy_fallback=bool(used_fallback),
+        max_kraus_parent_batch=max_parent_batch,
     )
 
 
@@ -2135,6 +2155,7 @@ def _resolve_auto_parallel_strategy(
     max_branches=None,
     max_branch_factor=None,
     auto_max_expected_faults=0.1,
+    importance_sampling=None,
 ):
     """Resolve ``auto`` before dispatching work to local workers.
 
@@ -2159,44 +2180,75 @@ def _resolve_auto_parallel_strategy(
     return (
         "coalesced"
         if _trajectory_coalescing_fits_cap(
-            plan, shots, max_branches, max_branch_factor
+            plan, shots, max_branches, max_branch_factor,
+            importance_sampling=importance_sampling,
         )
         else "independent"
     )
 
 
-def _trajectory_coalescing_fits_cap(plan, shots, max_branches, max_branch_factor):
-    """Conservatively avoid an auto-coalesced run that must restart.
+def _trajectory_coalescing_fits_cap(
+    plan, shots, max_branches, max_branch_factor, *, importance_sampling=None,
+):
+    """Select prefix sharing from structure and fixed mixture probabilities.
 
-    This is only an upper-bound preflight. It may choose independent replay
-    earlier than necessary, but it never drops probability mass and prevents
-    the expensive deterministic-prefix restart when a stream has obviously
-    more possible leaves than the configured cap.
+    The rare-mixture estimate bounds expected occupied histories by one plus
+    the expected number of shots leaving the dominant history (union bound).
+    Reserve half the branch budget as headroom. This is a scheduling heuristic,
+    never a truncation: runtime caps still trigger a fresh independent replay.
+    Unknown/state-dependent branches and importance proposals use structural
+    bounds only; planning never evaluates a proposal or samples a state.
     """
-    if max_branches is None:
-        return True
     possible = 1
+    fixed_mixtures_only = importance_sampling is None
+    departure_bound = 0.0
     for entry in plan.entries:
         event_factor = 1
         if isinstance(entry, TrajectoryEvent):
             event_factor = len(entry.channel.outcomes)
+            if entry.channel.mode == "mixture" and importance_sampling is None:
+                probabilities = [float(x.probability) for x in entry.channel.outcomes]
+                total = sum(probabilities)
+                event_factor = sum(p > 0.0 for p in probabilities)
+                # Sum the small probabilities directly to preserve rare events.
+                dominant = max(range(len(probabilities)), key=probabilities.__getitem__)
+                departure_bound += sum(
+                    p for i, p in enumerate(probabilities) if i != dominant
+                ) / total
+            else:
+                fixed_mixtures_only = False
         else:
             parts = MpsOptimizer.control_event_parts(entry)
             if parts is None:
+                # Leakage events can branch during hidden resets.
+                if _leakage_event_parts(entry) is not None:
+                    event_factor = max(1, int(shots))
+                    fixed_mixtures_only = False
+                if max_branch_factor is not None and event_factor > max_branch_factor:
+                    return False
+                possible = min(max(1, int(shots)), possible * event_factor)
                 continue
             name, payload, where = parts
             if name == "measure" and payload.get("outcome") is None:
+                event_factor = 2
+            elif name == "reset":
                 event_factor = 2 ** len(where)
             elif name == "measure_reset":
                 event_factor = 2 ** sum(
                     outcome is None for outcome in payload.get("outcomes", ())
                 )
+            elif name == "conditional":
+                event_factor = max(1, int(shots))
+                fixed_mixtures_only = False
+            if event_factor > 1:
+                fixed_mixtures_only = False
         if max_branch_factor is not None and event_factor > max_branch_factor:
             return False
-        possible *= event_factor
-        if min(possible, int(shots)) > max_branches:
-            return False
-    return min(int(shots), possible) <= max_branches
+        possible = min(max(1, int(shots)), possible * event_factor)
+    if max_branches is None or min(int(shots), possible) <= max_branches:
+        return True
+    expected_bound = min(int(shots), 1.0 + int(shots) * departure_bound)
+    return fixed_mixtures_only and expected_bound <= max_branches / 2
 
 
 def _tree_layout_stream(gate_stream):
@@ -3011,28 +3063,210 @@ def _trajectory_norm_squared(optimizer) -> float:
     return value * value
 
 
+def _mps_kraus_amplitude_block(optimizer, where):
+    """Prepare one normalized dense block for all outcomes of a channel.
+
+    Nonadjacent supports are gathered on a private MPS with untruncated swaps.
+    Only the selected sites are fused, so memory does not grow exponentially
+    with their separation. Physical legs are fused in the operator's order.
+    """
+    state = optimizer.p
+    support = tuple(int(site) for site in where)
+    if optimizer.mode in {"exact", "exact-batch"}:
+        # Exact replay already owns the full state. Keep its amplitudes and
+        # omit represented scale, which cancels from the probability ratio.
+        state = state.copy()
+        state.exponent = 0.
+        block = state.contract(all, preserve_tensor=True, optimize=optimizer.contraction_opt)
+        physical_inds = tuple(optimizer._format_ind(site) for site in support)
+    else:
+        first, last = min(support), max(support)
+        info = optimizer.info_c
+        if last - first + 1 != len(support):
+            state = state.copy()
+            info = dict(info)
+            order = list(range(state.L))
+            for position, site in enumerate(sorted(support), first):
+                current = order.index(site)
+                state.swap_site_to_(current, position, info=info,
+                                    max_bond=None, cutoff=0., cutoff_mode="abs")
+                order.insert(position, order.pop(current))
+            support = tuple(order.index(site) for site in support)
+            last = first + len(support) - 1
+        optimizer.canonize_mps(state, (first, last), info=info)
+        block = state[first] if first == last else qtn.tensor_contract(
+            *(state[site] for site in range(first, last + 1)),
+            preserve_tensor=True, optimize=optimizer.contraction_opt,
+        )
+        physical_inds = tuple(state.site_ind(site) for site in support)
+    if len(physical_inds) > 1:
+        block = block.fuse({physical_inds[0]: physical_inds})
+    return block / block.norm(), physical_inds[0]
+
+
+def _mps_projected_kraus_probability(optimizer, matrix, where):
+    """Read one dense projected amplitude without a cancellation-prone Gram."""
+    block, physical_ind = _mps_kraus_amplitude_block(optimizer, where)
+    projected = block.gate(matrix, physical_ind)
+    amplitude = _trajectory_real_scalar(projected.norm(), label="local Kraus amplitude")
+    return amplitude * amplitude
+
+
+# Bound stacked operators plus projected amplitudes, in array elements. A
+# single outcome can exceed this budget; never truncate its amplitude block.
+_KRAUS_BATCH_MAX_ELEMENTS = 1 << 20
+# Conservative temporary workspace target, independent of retained MPS memory.
+_KRAUS_FRONTIER_MAX_BYTES = 32 << 20
+_KRAUS_FRONTIER_MAX_STATES = 32
+
+
+def _mps_kraus_operators(optimizer, channel, start, stop, xp):
+    """Reuse the shared immutable backend payload cache for either batch axis."""
+    def prepare():
+        return xp.stack(tuple(
+            _to_trajectory_backend(outcome.gate, optimizer)
+            for outcome in channel.outcomes[start:stop]
+        ), axis=0)
+
+    cache = optimizer._backend_cache_plan
+    key = (
+        "trajectory-kraus-batch", id(channel), start, stop,
+        repr(optimizer.backend), repr(optimizer.backend_dtype),
+        repr(optimizer.backend_device),
+    )
+    return prepare() if cache is None else cache.get_or_create_backend_payload(key, channel, prepare)
+
+
+def _projected_kraus_norms(xp, operators, amplitudes):
+    """Reduce projected amplitudes over the last two axes, preserving batches."""
+    projected = xp.matmul(operators, amplitudes)
+    projected = xp.reshape(projected, (*projected.shape[:-2], -1))
+    # Scaling before squaring preserves very rare complex64 outcomes.
+    scale = xp.max(xp.abs(projected), axis=-1, keepdims=True)
+    safe_scale = xp.where(scale == 0, 1, scale)
+    return (xp.linalg.norm(projected / safe_scale, axis=-1)
+            * xp.reshape(scale, projected.shape[:-1]))
+
+
+def _mps_batched_kraus_probabilities(optimizer, channel, where):
+    """Evaluate dense outcomes on-device, downloading only their norm vector."""
+    physical_where = tuple(optimizer._logical_to_physical_where(where))
+    block, physical_ind = _mps_kraus_amplitude_block(optimizer, physical_where)
+    block = block.transpose(
+        physical_ind, *(ind for ind in block.inds if ind != physical_ind)
+    )
+    xp = _array_namespace(block.data)
+    dim = block.ind_size(physical_ind)
+    amplitudes = xp.reshape(block.data, (dim, -1))
+    batch_size = max(1, _KRAUS_BATCH_MAX_ELEMENTS // (dim * dim + ar.size(amplitudes)))
+    norms = []
+    for start in range(0, len(channel.outcomes), batch_size):
+        stop = min(start + batch_size, len(channel.outcomes))
+
+        operators = _mps_kraus_operators(optimizer, channel, start, stop, xp)
+        norms.append(_projected_kraus_norms(xp, operators, amplitudes))
+    amplitudes = norms[0] if len(norms) == 1 else xp.concatenate(norms)
+    # Sampling and importance weights already live on the host. Square there
+    # in float64, preserving probabilities below the array dtype's range.
+    return np.asarray(ar.to_numpy(amplitudes), dtype=float) ** 2
+
+
+def _kraus_frontier_key(optimizer, channel, where):
+    """Admit bounded one-site dense accelerator blocks using metadata only."""
+    if (not isinstance(optimizer, MpsOptimizer) or len(where) != 1
+            or optimizer.mode in {"exact", "exact-batch"}
+            or optimizer._replay_has_symmray_data(optimizer.p)
+            or getattr(optimizer.p, "cyclic", False)):
+        return None
+    backend = optimizer.backend
+    if backend != "cupy" and not (
+        backend == "torch" and "cuda" in str(optimizer.backend_device)
+    ):
+        return None
+    site, = optimizer._logical_to_physical_where(where)
+    data = optimizer.p[site].data
+    itemsize = np.dtype(ar.get_dtype_name(data)).itemsize
+    dim = optimizer.p[site].ind_size(optimizer.p.site_ind(site))
+    # Include prepared/stacked amplitudes and conservative reduction temporaries.
+    cost = itemsize * (ar.size(data) * (4 + 6 * len(channel.outcomes))
+                       + dim * dim * len(channel.outcomes))
+    if 2 * cost > _KRAUS_FRONTIER_MAX_BYTES:
+        return None
+    return backend, str(optimizer.backend_dtype), str(optimizer.backend_device)
+
+
+def _coalesced_kraus_probabilities(nodes, channel, where, *, batch=True):
+    """Yield parent distributions in order, batching compatible GPU blocks.
+
+    Only probabilities are batched. Gate application, adaptive decompositions,
+    canonical metadata, RNG draws and branch caps retain their existing owners.
+    Prepared work is bounded independently of the number of live branches.
+    """
+    index = 0
+    while index < len(nodes):
+        optimizer = nodes[index].optimizer
+        key = (_kraus_frontier_key(optimizer, channel, where)
+               if batch and len(nodes) - index > 1 else None)
+        if key is None:
+            yield _kraus_probabilities(optimizer, channel, where)
+            index += 1
+            continue
+        parents, blocks = [], []
+        cost = 0
+        for node in nodes[index:index + _KRAUS_FRONTIER_MAX_STATES]:
+            opt = node.optimizer
+            if _kraus_frontier_key(opt, channel, where) != key:
+                break
+            site, = opt._logical_to_physical_where(where)
+            tensor = opt.p[site]
+            dim = tensor.ind_size(opt.p.site_ind(site))
+            itemsize = np.dtype(ar.get_dtype_name(tensor.data)).itemsize
+            estimate = itemsize * (ar.size(tensor.data) * (4 + 6 * len(channel.outcomes))
+                                   + dim * dim * len(channel.outcomes))
+            if cost + estimate > _KRAUS_FRONTIER_MAX_BYTES:
+                break
+            # Preserve the existing zero/invalid raw-state norm guard.
+            _trajectory_norm_squared(opt)
+            block, physical_ind = _mps_kraus_amplitude_block(opt, (site,))
+            block = block.transpose(physical_ind, *(i for i in block.inds if i != physical_ind))
+            xp = _array_namespace(block.data)
+            amplitudes = xp.reshape(block.data, (dim, -1))
+            if blocks and amplitudes.shape != blocks[0].shape:
+                # The next parent can be re-prepared safely on the next chunk.
+                break
+            parents.append(opt)
+            blocks.append(amplitudes)
+            cost += estimate
+        xp = _array_namespace(blocks[0])
+        operators = _mps_kraus_operators(parents[0], channel, 0, len(channel.outcomes), xp)
+        amplitudes = xp.reshape(xp.stack(blocks, axis=0), (len(blocks), 1, dim, -1))
+        operators = xp.reshape(operators, (1, len(channel.outcomes), dim, dim))
+        norms = _projected_kraus_norms(xp, operators, amplitudes)
+        probabilities = np.asarray(ar.to_numpy(norms), dtype=float) ** 2
+        for opt, row in zip(parents, probabilities):
+            info = _trajectory_diagnostic_state(opt)
+            info["max_kraus_parent_batch"] = max(
+                int(info.get("max_kraus_parent_batch", 1)), len(parents),
+            )
+            yield _normalize_kraus_probabilities(opt, row)
+        index += len(parents)
+
+
 def _mps_local_kraus_norm_squared(optimizer, matrix, where):
-    """Evaluate ``<psi|K^dagger K|psi>`` without copying the MPS.
+    """Evaluate a normalized local outcome without compressing a trial branch.
 
     Canonical MPS replay reuses and updates the live center metadata. Quimb's
     environment contraction remains available for noncanonical MPS lookalikes;
     returning ``None`` retains the conservative copied-state fallback.
     """
     p = getattr(optimizer, "p", None)
+    if (isinstance(optimizer, MpsOptimizer)
+            and not optimizer._replay_has_symmray_data(p)):
+        return _mps_projected_kraus_probability(optimizer, matrix, where)
     compute = getattr(p, "compute_local_expectation", None)
     if not callable(compute):
         return None
     try:
-        if (isinstance(optimizer, MpsOptimizer)
-                and optimizer.mode not in {"exact", "exact-batch", "su"}
-                and len(where) == 1 and not optimizer._replay_has_symmray_data(p)):
-            site = int(where[0])
-            optimizer.canonize_mps(p, site)
-            tensor = p[site]
-            normalized = tensor / tensor.norm()
-            projected = normalized.gate(matrix, p.site_ind(site))
-            amplitude = _trajectory_real_scalar(projected.norm(), label="local Kraus amplitude")
-            return amplitude * amplitude
         gram = matrix.conj().T @ matrix
         support = tuple(int(site) for site in where)
         canonical = getattr(p, "local_expectation_canonical", None)
@@ -3204,6 +3438,17 @@ def _to_trajectory_backend(matrix, optimizer):
 
 def _to_trajectory_backend_uncached(matrix, optimizer):
     """Convert one generated matrix without consulting the shared cache."""
+    if isinstance(optimizer, MpsOptimizer):
+        like = optimizer._state_backend_like()
+        if not optimizer._is_symmray_array(like):
+            matrix = _real_if_compatible(matrix, like)
+            if (isinstance(matrix, np.ndarray) and np.iscomplexobj(matrix)
+                    and ar.infer_backend(like) != "numpy"
+                    and "complex" not in ar.get_dtype_name(like)):
+                raise TypeError(
+                    "A complex trajectory operator requires a complex MPS dtype; "
+                    "initialize the state with complex64 or complex128."
+                )
     converter = getattr(optimizer, "_to_state_backend", None)
     if callable(converter):
         return converter(matrix)
@@ -3215,7 +3460,21 @@ def _to_trajectory_backend_uncached(matrix, optimizer):
 
 def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.ndarray:
     """Compute normalized state-dependent probabilities for a local channel."""
+    like = (optimizer._state_backend_like()
+            if isinstance(optimizer, MpsOptimizer) else None)
+    with _high_precision_matmul(like):
+        return _kraus_probabilities_impl(optimizer, channel, where)
+
+
+def _kraus_probabilities_impl(optimizer, channel, where):
     base_norm_squared = _trajectory_norm_squared(optimizer)
+    if (isinstance(optimizer, MpsOptimizer)
+            and not optimizer._replay_has_symmray_data(optimizer.p)):
+        # The prepared block is normalized; avoid multiplying by the base
+        # norm only to divide it out again (which can underflow rare weights).
+        return _normalize_kraus_probabilities(
+            optimizer, _mps_batched_kraus_probabilities(optimizer, channel, where)
+        )
     if _is_stabilizer_trajectory_optimizer(optimizer):
         # Both STN frontends already expose the exact local Gram-norm path
         # used by their non-unitary dense-gate implementation.  Evaluating
@@ -3258,7 +3517,11 @@ def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.nda
             ],
             dtype=float,
         )
-    probabilities = branch_norm_squared / base_norm_squared
+    return _normalize_kraus_probabilities(optimizer, branch_norm_squared / base_norm_squared)
+
+
+def _normalize_kraus_probabilities(optimizer, probabilities):
+    """Validate the host sampling distribution and retain its norm residual."""
     if not np.all(np.isfinite(probabilities)) or np.any(probabilities < -1e-10):
         raise ValueError("Kraus channel produced invalid trajectory probabilities.")
     probabilities = np.maximum(probabilities, 0.0)
@@ -4383,9 +4646,12 @@ def _coalesced_leakage_event(
 def _coalesced_measurement_probabilities(optimizer, pauli, where):
     """Use both backend Born weights without subtractive cancellation."""
     if isinstance(optimizer, MpsOptimizer):
-        return optimizer._measurement_probabilities(
-            pauli, optimizer._logical_to_physical_where(where),
-        )
+        with _high_precision_matmul(optimizer._state_backend_like()):
+            optimizer._ensure_mps_state()
+            optimizer._ensure_tracked_center()
+            return optimizer._measurement_probabilities(
+                pauli, optimizer._logical_to_physical_where(where),
+            )
     probabilities = getattr(optimizer, "_measurement_probabilities", None)
     if callable(probabilities):
         return probabilities(pauli, where)
@@ -4969,6 +5235,7 @@ def run_trajectory_shots(
                 shots,
                 max_branches=max_branches,
                 max_branch_factor=max_branch_factor,
+                importance_sampling=policy,
             )
             if str(magic_strategy).strip().lower().replace("-", "_") != "direct":
                 strategy = "independent"
@@ -5116,7 +5383,7 @@ def run_trajectory_shots(
             retain=retain,
         )
     if strategy == "auto" and _trajectory_coalescing_fits_cap(
-        plan, shots, max_branches, max_branch_factor
+        plan, shots, max_branches, max_branch_factor, importance_sampling=policy,
     ):
         try:
             return run_coalesced_trajectory_shots(
@@ -5611,15 +5878,19 @@ def run_coalesced_trajectory_shots(
             )
         else:
             split = []
+            distributions = (
+                _coalesced_kraus_probabilities(
+                    nodes, entry.channel, entry.where,
+                    batch=policy is None or not callable(policy.proposal),
+                ) if entry.channel.mode == "kraus" else None
+            )
             for index, node in enumerate(nodes):
                 # Callable mixture proposals may depend on each parent's
                 # current state, just like state-dependent Kraus proposals.
                 probabilities = (
                     [outcome.probability for outcome in entry.channel.outcomes]
                     if entry.channel.mode == "mixture"
-                    else _kraus_probabilities(
-                        node.optimizer, entry.channel, entry.where
-                    )
+                    else next(distributions)
                 )
                 target, proposal, ratios = _importance_distribution(
                     policy,
@@ -5665,6 +5936,10 @@ def run_coalesced_trajectory_shots(
                         parallel_backend=parallel_backend,
                     )
                 )
+            if distributions is not None:
+                # The last next() leaves a generator suspended at its final
+                # yield. Release its parent/workspace references before gates.
+                distributions.close()
             nodes = split
     flush()
     return _coalesced_result(nodes, plan=plan, retain=retain)
