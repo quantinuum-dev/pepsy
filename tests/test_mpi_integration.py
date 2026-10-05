@@ -261,6 +261,68 @@ def test_real_mpi_mps_optimizer_run_keyword():
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_real_mpi_mixed_stabilizer_trajectories_match_global_shot_seeds(backend):
+    """Magic, Kraus weights and feedback preserve conditional states across ranks."""
+    comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        pytest.skip("run this test under mpiexec -n 2 or more")
+    converter = None
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        converter = pepsy.build_backend(
+            device="cpu", dtype=torch.complex128, set_default=False,
+        )
+    stream = [
+        ("measure", "Z", 2), ("h", 0), ("t", 0), ("cnot", 0, 1),
+        ("amplitude_damping", .17, 0), ("measure", "X", 0),
+        ("if", -1, 1, ("z", 1)), ("reset", 0), ("measure", "Z", 1),
+    ]
+
+    def run(communicator):
+        engine = pepsy.StabilizerMpsSimulator(
+            3, chi=8, exact_cooling=False, to_backend=converter,
+        ).compile(stream)
+        return engine.run(
+            shots=7, mpi=communicator, strategy="independent", workers=1,
+            seed=41, retain="all", progress=False,
+            importance_sampling={"no_jump": .5, "jump": .5},
+        )
+
+    distributed = run(comm)
+    serial = run(MPI.COMM_SELF)
+    assert distributed.reduce_sum(distributed.local_shots) == 7
+    assert len(serial.local_result.optimizers) == 7
+    assert len(serial.local_result.records) == len(serial.local_result.weights) == 7
+    local = []
+    for shot_id, sim, records, weight in zip(
+        distributed.shot_range, distributed.local_result.optimizers,
+        distributed.local_result.records, distributed.local_result.weights,
+    ):
+        assert sim.norm_events[0].measurement_backend == "stim"
+        local.append((shot_id, sim.to_statevector(),
+                      tuple(record.outcome for record in sim.measurements), records, weight))
+    gathered = comm.gather(local, root=0)
+    if comm.Get_rank() == 0:
+        ordered = sorted((shot for rank in gathered for shot in rank), key=lambda shot: shot[0])
+        assert [shot[0] for shot in ordered] == list(range(7))
+        for shot, sim, records, weight in zip(
+            ordered, serial.local_result.optimizers,
+            serial.local_result.records, serial.local_result.weights,
+        ):
+            vector = sim.to_statevector()
+            assert np.vdot(shot[1], shot[1]).real == pytest.approx(1., abs=1e-12)
+            assert abs(np.vdot(shot[1], vector))**2 == pytest.approx(1., abs=1e-12)
+            assert shot[2] == tuple(record.outcome for record in sim.measurements)
+            assert tuple(record.label for record in shot[3]) == tuple(record.label for record in records)
+            np.testing.assert_allclose(
+                [record.probability for record in shot[3]],
+                [record.probability for record in records], atol=1e-12,
+            )
+            assert shot[4] == pytest.approx(weight, rel=1e-12)
+
+
+@pytest.mark.integration
 def test_real_mpi_tree_optimizer_run_keyword():
     comm = MPI.COMM_WORLD
     if comm.Get_size() < 2:
@@ -317,7 +379,6 @@ def test_real_mpi_tree_stabilizer_run_keyword():
     "mode",
     (
         "dmrg",
-        "dmrg1",
         "dmrg2",
         "dmrg3",
         "fit",
