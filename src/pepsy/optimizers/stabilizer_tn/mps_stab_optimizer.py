@@ -1643,15 +1643,19 @@ class StabilizerMpsSimulator:
         checkpoint_sync=True,
         collect_diagnostics=False,
         checkpoint_id=None,
+        memory_budget="auto",
     ):
         """Dispatch noisy replay through the shared MPS/STN runner."""
-        from ..noise import (  # pylint: disable=import-outside-toplevel
-            NoisyResult,
-            run_noisy_shots,
-            run_trajectory_shots,
-        )
+        from ..noise import NoisyResult
 
+        if error_model is not None and self._has_trajectory_events:
+            raise ValueError(
+                "do not combine stream-local trajectory events with error_model; "
+                "use one noise representation per stream."
+            )
         mpi_enabled = mpi is not None and mpi is not False
+        if mpi_enabled and memory_budget not in {None, "auto"}:
+            raise ValueError("Explicit memory_budget is currently supported only for local shots.")
         if not mpi_enabled and any(
             value is not None for value in (observable, checkpoint_path)
         ):
@@ -1680,6 +1684,10 @@ class StabilizerMpsSimulator:
         if mpi_enabled:
             from ..mpi import MPIShotRunner  # pylint: disable=import-outside-toplevel
 
+            from ..mps._trajectory_execution import _is_accelerator
+
+            if workers in {None, "auto"} and _is_accelerator(self.backend_info()):
+                workers = 1
             if strategy == "auto":
                 strategy = "independent"
             child_kwargs = dict(run_kwargs or {})
@@ -1719,34 +1727,67 @@ class StabilizerMpsSimulator:
                 checkpoint_id=checkpoint_id,
                 progress=progress,
             )
+        from ..mps._trajectory_execution import (
+            _annotate_trajectory_execution,
+            _automatic_shot_workers,
+            _trajectory_memory_plan,
+        )
+        from ..noise import (
+            _validate_max_branches, _validate_retain, _validate_strategy,
+            compile_trajectory_stream, _resolve_auto_parallel_strategy,
+        )
+        from ..mpi import _make_progress_bar, _validate_progress
         from ._backend import shot_parallelism
 
-        workers, parallel_backend = shot_parallelism(
-            infer_backend_signature(self._state_backend_like()),
-            workers=workers,
-            shots=shots,
-            parallel_backend=parallel_backend,
+        strategy = _validate_strategy(strategy)
+        retain = _validate_retain(retain)
+        max_branches = _validate_max_branches(max_branches)
+        plan = self._trajectory_plan
+        if plan is None and error_model is None:
+            plan = compile_trajectory_stream(self._gate_stream)
+        initial_state = getattr(self, "_initial_state", self.state)
+        # Reserve tableau storage and classical record slots as well as |p>.
+        # Two packed 2n-by-(2n+1) tableaus, with a conservative byte allowance.
+        extra_bytes = 2 * self.n * (2 * self.n + 1) + 64 * len(self._gate_stream)
+        replay_mode = (run_kwargs or {}).get("mode") or self.mode
+        memory = _trajectory_memory_plan(
+            initial_state.p, self.chi, replay_mode, memory_budget,
+            extra_state_bytes=extra_bytes,
         )
-        if workers > 1 and parallel_backend != "serial":
-            # Match TreeStab: initialize Stim's NumPy bridge before worker
-            # threads can race its first import/matrix conversion.
-            _tableau_from_exact_unitary(np.eye(2, dtype=complex))
-        from ..mpi import (  # pylint: disable=import-outside-toplevel
-            _make_progress_bar,
-            _validate_progress,
-        )
+        if shots and memory.capacity is not None:
+            memory.check_independent(1, "none", 1)
+            max_branches = (min(max_branches, memory.capacity)
+                            if max_branches is not None else memory.capacity)
         progress_strategy = strategy
-        if workers > 1 and strategy == "auto":
-            from ..noise import _resolve_auto_parallel_strategy
-
+        if strategy == "auto":
             progress_strategy = _resolve_auto_parallel_strategy(
-                self._trajectory_plan if error_model is None else self._gate_stream,
-                shots,
-                error_model=error_model,
-                max_branches=max_branches,
+                plan if error_model is None else self._gate_stream,
+                shots, error_model=error_model, max_branches=max_branches,
                 max_branch_factor=max_branch_factor,
                 auto_max_expected_faults=auto_max_expected_faults,
+                importance_sampling=importance_sampling,
             )
+        execution_reason = "explicit worker override"
+        if workers in {None, "auto"}:
+            workers, execution_reason = _automatic_shot_workers(
+                backend_infer(initial_state.p), initial_state.p,
+                self._gate_stream, shots, progress_strategy,
+            )
+            if memory.capacity is not None and shots:
+                workers = min(workers, memory.capacity)
+        explicit_serial = str(parallel_backend).strip().lower() == "serial"
+        workers, parallel_backend = shot_parallelism(
+            infer_backend_signature(self._state_backend_like()),
+            workers=workers, shots=shots, parallel_backend=parallel_backend,
+        )
+        if parallel_backend == "serial":
+            workers = 1
+            if explicit_serial:
+                execution_reason = "explicit serial execution backend"
+        if memory.capacity is not None and progress_strategy == "independent":
+            memory.check_independent(shots, retain, workers)
+        if workers > 1 and parallel_backend != "serial":
+            _tableau_from_exact_unitary(np.eye(2, dtype=complex))
 
         progress_mode = _validate_progress(progress)
         progress_bar = _make_progress_bar(
@@ -1773,42 +1814,26 @@ class StabilizerMpsSimulator:
             "parallel_backend": parallel_backend,
             "retain": retain,
         }
-        try:
-            if error_model is None:
-                plan = self._trajectory_plan
-                if plan is None:
-                    from ..noise import compile_trajectory_stream
+        if strategy == "auto":
+            common["strategy"] = progress_strategy
 
-                    plan = compile_trajectory_stream(self._gate_stream)
-                raw = run_trajectory_shots(
-                    self._shot_factory(),
-                    plan,
-                    shots,
-                    _progress=(
-                        update_progress if progress_bar is not None else None
-                    ),
-                    **common,
-                )
-            else:
-                if self._has_trajectory_events:
-                    raise ValueError(
-                        "do not combine stream-local trajectory events with "
-                        "error_model; use one noise representation per stream."
-                    )
-                raw = run_noisy_shots(
-                    self._shot_factory(),
-                    self._gate_stream,
-                    error_model,
-                    shots,
-                    auto_max_expected_faults=auto_max_expected_faults,
-                    _progress=(
-                        update_progress if progress_bar is not None else None
-                    ),
-                    **common,
-                )
+        from ..noise import _execute_local_shots
+
+        try:
+            raw = _execute_local_shots(
+                self._shot_factory(), plan if error_model is None else self._gate_stream,
+                shots, strategy=strategy, common=common, error_model=error_model,
+                auto_max_expected_faults=auto_max_expected_faults,
+                check_independent=lambda count: memory.check_independent(shots, retain, count),
+                progress=update_progress if progress_bar is not None else None,
+            )
         finally:
             if progress_bar is not None:
                 progress_bar.close()
+        raw = _annotate_trajectory_execution(
+            raw, strategy=strategy, planned_strategy=progress_strategy,
+            workers=workers, execution_reason=execution_reason, memory=memory,
+        )
         return NoisyResult(raw)
 
     def _execution_snapshot(self):
@@ -2156,6 +2181,7 @@ class StabilizerMpsSimulator:
         checkpoint_sync=True,
         collect_diagnostics=False,
         checkpoint_id=None,
+        memory_budget="auto",
         timing: bool = False,
         transactional: bool = False,
         atomic=None,
@@ -2198,8 +2224,15 @@ class StabilizerMpsSimulator:
             Run the shot ensemble collectively over MPI. ``True`` uses
             ``MPI.COMM_WORLD``.
         workers : int | "auto" | None
-            Local shot workers. ``"auto"`` divides the process CPU allowance
-            across MPI ranks sharing a host.
+            Local shot workers. ``"auto"`` uses the shared MPS workload and
+            numerical-thread budget; accelerators default to one worker.
+            MPI workers share the host CPU allowance across ranks.
+        memory_budget : "auto" | int | None
+            Local shot storage budget in bytes. Auto queries the coefficient
+            device allocator when supported; None disables planning. Estimates
+            include coefficient growth, tableau and record storage. Retained
+            states must fit, including branch-cap continuation. Explicit byte
+            budgets are not supported for MPI shots.
         progress : {"auto", True, False}
             Show one aggregate rank-zero progress bar for MPI runs.
         timing : bool
@@ -2295,6 +2328,7 @@ class StabilizerMpsSimulator:
             or workers not in {None, "auto"}
             or observable is not None
             or checkpoint_path is not None
+            or memory_budget != "auto"
         )
         if shot_requested:
             started = time.perf_counter() if timing else None
@@ -2322,6 +2356,7 @@ class StabilizerMpsSimulator:
                 checkpoint_sync=checkpoint_sync,
                 collect_diagnostics=collect_diagnostics,
                 checkpoint_id=checkpoint_id,
+                memory_budget=memory_budget,
             )
             if timing:
                 self._last_run_timing = {
@@ -3136,6 +3171,10 @@ class StabilizerMpsSimulator:
             valid=bool(self._infidelity_valid),
             branch_probability=branch_probability,
             projector_branch_probability=projector_branch_probability,
+            measurement_backend="mps" if kind in {
+                "measure", "measure_absorb", "reset", "sample_measure_absorb",
+                "sample_measure_projector",
+            } else None,
         )
         if not self._infidelity_valid:
             return event
@@ -3235,6 +3274,24 @@ class StabilizerMpsSimulator:
             self._norm_log_survival = -math.inf
         elif np.isfinite(self._norm_log_survival):
             self._norm_log_survival += math.log(survival)
+
+    def measurement_routing_diagnostics(self) -> dict:
+        """Count successful collapse events and conservative MPS fallback reasons.
+
+        Derived from this optimizer's norm ledger, including hidden reset
+        collapse and sampling branches. Probability probes, identity no-ops
+        and failed operations are excluded; trajectory leaves are unweighted.
+        """
+        counts = dict.fromkeys(("stim", "stim_region", "mps"), 0)
+        reasons = {}
+        for event in self.norm_events:
+            backend = event.get("measurement_backend")
+            if backend in counts:
+                counts[backend] += 1
+                reason = event.get("measurement_fallback_reason")
+                if backend == "mps" and reason is not None:
+                    reasons[reason] = reasons.get(reason, 0) + 1
+        return {"counts": counts, "fallback_reasons": reasons, "total": sum(counts.values())}
 
     def norm_diagnostics(self, *, include_current: bool = True) -> dict:
         """Summarize segmented unitary norm-loss diagnostics.
@@ -3354,6 +3411,7 @@ class StabilizerMpsSimulator:
             "current_valid": bool(self._infidelity_valid),
             "events": len(self.norm_events),
             "norm_events_count": len(self.norm_events),
+            "measurement_routing": self.measurement_routing_diagnostics(),
             "completed_events": len(completed),
             "completed_segments": len(completed),
             "segments_including_current": len(survivals),
@@ -3504,16 +3562,17 @@ class StabilizerMpsSimulator:
         info["cur_orthog"] = (site, site)
         return site
 
-    def _renorm_p_at(self, site) -> float:
+    def _renorm_p_at(self, site, *, min_norm=1e-12) -> float:
         """Rescale the canonical centre tensor at ``site`` to unit norm.
 
         Raises when the centre norm is ~0, which means a projective collapse hit
         a ~0-probability (e.g. forced / post-selected) outcome. Returns the
         represented norm immediately before the normalization.
+        Sampled Kraus branches use min_norm=0 after validating their support.
         """
         center = self.state.p[self.state.p.site_tag(int(site))]
         nrm = float(abs(self._to_scalar(center.norm())))
-        if nrm < 1e-12:
+        if not np.isfinite(nrm) or nrm <= 0.0 or nrm < min_norm:
             raise ValueError(
                 "projective collapse produced a ~0-norm coefficient state; the "
                 f"measured/forced outcome has ~0 probability (centre norm={nrm:.2e})."
@@ -4165,6 +4224,7 @@ class StabilizerMpsSimulator:
             branch_probability=probability,
             projector_branch_probability=probability,
         )
+        norm_event.measurement_fallback_reason = "fixed_frame_sampling"
         self._apply_projector(terms, sign, outcome, norm_event=norm_event)
         return probability
 
@@ -4495,7 +4555,7 @@ class StabilizerMpsSimulator:
                     # ("measure", pauli, where[, outcome[, absorb_basis]])
                     pauli, where = entry[1], entry[2]
                     outcome = entry[3] if len(entry) > 3 else None
-                    absorb = bool(entry[4]) if len(entry) > 4 else False
+                    absorb = bool(entry[4]) if len(entry) > 4 else None
                     self.measure(pauli, where, outcome=outcome, absorb_basis=absorb)
                     return
                 if name == "reset" or name in _RESET_AXIS_ALIASES:
@@ -4512,6 +4572,8 @@ class StabilizerMpsSimulator:
                         entry[1:],
                         default_axis=_MR_AXIS_ALIASES.get(name),
                     )
+                    if name in _MR_ALIASES and len(entry) < 5:
+                        absorb = None
                     self.measure_reset(
                         "".join(axes),
                         where,
@@ -5423,6 +5485,16 @@ class StabilizerMpsSimulator:
         num = self._to_scalar(p.H @ m_p)
         return float(sign * np.real(num / den))
 
+    def _measurement_probabilities(self, pauli, where):
+        from . import _tableau_measurement
+
+        weights = _tableau_measurement.probabilities(self, self._phys_pauli(pauli, where))
+        if weights is not None:
+            return weights
+        terms, sign = self._frame_terms(pauli, where)
+        plus = self._outcome_probability(self._pauli_expectation(terms, sign), +1)
+        return plus, 1.0 - plus
+
     def expectation(self, pauli, where=None) -> float:
         """Return the expectation ``<psi|O|psi>`` of a Pauli observable (no collapse).
 
@@ -5440,6 +5512,11 @@ class StabilizerMpsSimulator:
                     f"got {len(str(pauli))}."
                 )
             where = tuple(range(self.n))
+        from . import _tableau_measurement
+
+        weights = _tableau_measurement.probabilities(self, self._phys_pauli(pauli, where))
+        if weights is not None:
+            return weights[0] - weights[1]
         terms, sign = self._frame_terms(pauli, where)
         return self._pauli_expectation(terms, sign)
 
@@ -5698,11 +5775,10 @@ class StabilizerMpsSimulator:
         Use ``order="input"`` to preserve the supplied order, or pass an
         explicit permutation of batch indices/target qubits.
         """
-        absorb_basis = _resolve_measurement_disentangle(
-            absorb_basis,
-            disentangle,
-            default=False,
-        )
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis, disentangle, default=False,
+            )
         operations = self._normalize_measurement_batch(measurements)
         result = self._run_measurement_batch(
             operations,
@@ -5731,7 +5807,7 @@ class StabilizerMpsSimulator:
         outcome : int | None
             If given (``+1`` or ``-1``), force this outcome (post-selection);
             otherwise sample according to the Born rule.
-        absorb_basis : bool
+        absorb_basis : bool, optional
             If ``True``, use the **basis-updating** (canonical Lemma-3) form: a
             Clifford ``V`` localises the frame image ``M = C^dagger O C`` onto a
             single coefficient qubit ``k`` (``V M V^dagger = +/-Z_k``), ``V`` is
@@ -5740,8 +5816,10 @@ class StabilizerMpsSimulator:
             computational value.  The measured qubit is thereby disentangled from
             ``|nu>``, so its support/entanglement leaves the coefficient state —
             the key primitive for magic-state injection (see :meth:`inject_t`).
-            The default (``False``) keeps the cheaper fixed-basis projector
-            ``(I +- M)/2`` applied directly to ``|nu>``.
+            When omitted, an exact live certificate enables native Stim
+            collapse for a factorized Pauli-eigenstate coefficient state or
+            separated Pauli-eigenstate support region; otherwise use the fixed-basis MPS
+            projector. Explicit ``False`` always preserves the fixed basis.
         disentangle : bool, optional
             User-facing alias for ``absorb_basis``. If both names are supplied,
             they must agree.
@@ -5751,6 +5829,20 @@ class StabilizerMpsSimulator:
         int
             The measured eigenvalue ``+1`` or ``-1``.
         """
+        requested_basis = (
+            _resolve_measurement_disentangle(absorb_basis, disentangle, default=False)
+            if absorb_basis is not None or disentangle is not None else None
+        )
+        if requested_basis is not False:
+            from . import _tableau_measurement
+
+            native = _tableau_measurement.measure(
+                self, self._phys_pauli(pauli, where), outcome,
+                kind="measure_absorb" if requested_basis else "measure",
+            )
+            if native is not None:
+                self.measurements.append(MeasurementRecord(pauli, where, int(native)))
+                return native
         absorb_basis = _resolve_measurement_disentangle(
             absorb_basis,
             disentangle,
@@ -5765,6 +5857,12 @@ class StabilizerMpsSimulator:
             )
             self.measurements.append(MeasurementRecord(pauli, where, int(m)))
             return m
+        from . import _tableau_measurement
+
+        fallback_reason = (
+            "explicit_fixed_basis" if requested_basis is False else
+            _tableau_measurement.fallback_reason(self, self._phys_pauli(pauli, where))
+        )
         terms, sign = self._frame_terms(pauli, where)
         forced = self._validate_outcome(outcome)
         if forced is None:
@@ -5788,6 +5886,8 @@ class StabilizerMpsSimulator:
             if terms
             else None
         )
+        if norm_event is not None:
+            norm_event.measurement_fallback_reason = fallback_reason
         self._apply_projector(terms, sign, m, norm_event=norm_event)
         self.measurements.append(MeasurementRecord(pauli, where, int(m)))
         return m
@@ -5839,18 +5939,18 @@ class StabilizerMpsSimulator:
 
         ``pauli`` is one X/Y/Z axis per target, or one axis broadcast across all
         targets.  Unlike :meth:`reset`, the measurement outcomes are appended to
-        :attr:`measurements`.  The default uses the fixed-basis projector; pass
+        :attr:`measurements`.  The default selects certified native Stim
+        collapse, falling back to the fixed-basis MPS projector; pass
         ``disentangle=True`` to use the basis-updating path so each reset target
         leaves the coefficient MPS compactly.  Separate targets are processed
         with the metadata-only ``min_span`` scheduler by default; use
         ``order="input"`` to preserve their supplied order.  Returned outcomes
         remain aligned with the input target order.
         """
-        absorb_basis = _resolve_measurement_disentangle(
-            absorb_basis,
-            disentangle,
-            default=False,
-        )
+        if absorb_basis is not None or disentangle is not None:
+            absorb_basis = _resolve_measurement_disentangle(
+                absorb_basis, disentangle, default=False,
+            )
         where = _normalize_sites(where)
         axes = _normalize_pauli_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")
@@ -6065,6 +6165,13 @@ class StabilizerMpsSimulator:
         ``m_pauli`` is the signed :class:`stim.PauliString` image
         ``M = C^dagger O C`` of the physical observable on the coefficient qubits.
         """
+        from . import _tableau_measurement
+
+        observable = self.state._sim.current_inverse_tableau().inverse()(m_pauli)
+        native = _tableau_measurement.measure(self, observable, outcome, kind=norm_event_kind)
+        if native is not None:
+            return native
+        fallback_reason = _tableau_measurement.fallback_reason(self, observable)
         self._require_nonzero_state("measure")
         terms, sign = hermitian_pauli_terms(m_pauli)
         forced = self._validate_outcome(outcome)
@@ -6127,6 +6234,7 @@ class StabilizerMpsSimulator:
             branch_probability=branch_probability,
             projector_branch_probability=projector_branch_probability,
         )
+        norm_event.measurement_fallback_reason = fallback_reason
         zval = m * s  # required Z_k eigenvalue (+1 -> |0>, -1 -> |1>)
         self._project_computational_site(
             k,
@@ -6956,7 +7064,23 @@ class StabilizerMpsSimulator:
     # ------------------------------------------------------------------ #
     # Explicit gate matrices
     # ------------------------------------------------------------------ #
-    def _dense_gate_target_norm(self, gate: np.ndarray, where) -> float:
+    def _trajectory_kraus_probabilities(self, outcomes, where):
+        """Reuse frame expectations across outcomes of one physical channel.
+
+        Expectations are normalized already. Avoid multiplying by the parent
+        norm and dividing it back out, which can underflow rare outcomes.
+        The cache is local to this state/channel, never shared across branches.
+        """
+        expectations = {}
+        return np.asarray([
+            self._dense_gate_target_norm(
+                outcome.gate, where, _parent_norm_squared=1.0,
+                _expectations=expectations,
+            ) ** 2 for outcome in outcomes
+        ], dtype=float)
+
+    def _dense_gate_target_norm(self, gate: np.ndarray, where, *,
+                                _parent_norm_squared=None, _expectations=None) -> float:
         """Evaluate ``||G|psi>||`` from the local physical ``G^dagger G``.
 
         The Gram operator is Pauli-decomposed and each physical Pauli is
@@ -6970,7 +7094,8 @@ class StabilizerMpsSimulator:
             else tuple(int(site) for site in where)
         )
         k = len(where)
-        norm_squared = self._norm_squared()
+        norm_squared = (self._norm_squared() if _parent_norm_squared is None
+                        else _parent_norm_squared)
         if not np.isfinite(norm_squared):
             raise ValueError(
                 "Cannot evaluate a non-unitary gate target norm from an invalid "
@@ -6982,7 +7107,9 @@ class StabilizerMpsSimulator:
         gram = gate.conj().T @ gate
         expectation = 0.0 + 0.0j
         for term_index, (labels, coefficient) in enumerate(
-            pauli_decomposition(gram, k, tol=self.operator_tol), start=1
+            pauli_decomposition(
+                gram, k, tol=0.0 if _expectations is not None else self.operator_tol,
+            ), start=1
         ):
             if (
                 self.max_pauli_terms is not None
@@ -6992,13 +7119,17 @@ class StabilizerMpsSimulator:
                     f"G^dagger G retained more than max_pauli_terms="
                     f"{self.max_pauli_terms}; increase the explicit term budget."
                 )
-            physical = pauli_string(labels, where, self.n)
-            frame_terms, sign = hermitian_pauli_terms(
-                self.state.frame_pauli(physical)
-            )
-            expectation += complex(coefficient) * self._pauli_expectation(
-                frame_terms, sign
-            )
+            if _expectations is None or labels not in _expectations:
+                physical = pauli_string(labels, where, self.n)
+                frame_terms, sign = hermitian_pauli_terms(
+                    self.state.frame_pauli(physical)
+                )
+                value = self._pauli_expectation(frame_terms, sign)
+                if _expectations is not None:
+                    _expectations[labels] = value
+            else:
+                value = _expectations[labels]
+            expectation += complex(coefficient) * value
         target_squared = float(np.real(expectation)) * norm_squared
         if target_squared < 0.0:
             if target_squared > -1.0e-10:

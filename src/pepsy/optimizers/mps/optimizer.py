@@ -58,7 +58,6 @@ their dense projector fallback so charge and dummy-mode metadata are preserved.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
 from collections.abc import Mapping
 from functools import wraps
 from numbers import Integral
@@ -2718,11 +2717,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "use one noise representation per gate stream."
             )
 
-        from ..noise import (  # pylint: disable=import-outside-toplevel
-            NoisyResult,
-            run_noisy_shots,
-            run_trajectory_shots,
-        )
+        from ..noise import NoisyResult
 
         mpi_enabled = mpi is not None and mpi is not False
         if mpi_enabled and memory_budget not in {None, "auto"}:
@@ -2885,86 +2880,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if strategy == "auto":
             common["strategy"] = progress_strategy
 
-        def execute():
-            if strategy == "auto" and common["strategy"] == "coalesced":
-                from ..noise import run_coalesced_trajectory_shots, run_coalesced_noisy_shots
-
-                continuation = dict(common)
-                continuation.pop("strategy")
-                continuation.update(
-                    _continue_on_cap=True,
-                    _continuation_check=lambda: memory.check_independent(shots, retain, 1),
-                )
-                if error_model is None:
-                    return run_coalesced_trajectory_shots(
-                        self._shot_factory(), self._stream_plan.trajectory_plan,
-                        shots, **continuation,
-                    )
-                return run_coalesced_noisy_shots(
-                    self._shot_factory(), self._gate_stream, error_model,
-                    shots, **continuation,
-                )
-            if error_model is None:
-                shot_gates = (
-                    self._stream_plan.entries
-                    if workers > 1
-                    else self._stream_plan.trajectory_plan
-                )
-                return run_trajectory_shots(
-                    self._shot_factory(),
-                    shot_gates,
-                    shots,
-                    _progress=update_progress if progress_bar is not None else None,
-                    **common,
-                )
-            else:
-                return run_noisy_shots(
-                    self._shot_factory(),
-                    self._gate_stream,
-                    error_model,
-                    shots,
-                    auto_max_expected_faults=auto_max_expected_faults,
-                    _progress=update_progress if progress_bar is not None else None,
-                    **common,
-                )
+        from ..noise import _execute_local_shots
 
         try:
-            from ..noise import _CoalescedBranchCapExceeded
-
-            retry = False
-            try:
-                raw = execute()
-            except _CoalescedBranchCapExceeded:
-                if strategy != "auto":
-                    raise
-                retry = True
-            # Leave the exception scope before retrying: its traceback owns
-            # the failed frontier and otherwise keeps GPU states alive.
-            if retry:
-                memory.check_independent(shots, retain, workers)
-                common["strategy"] = "independent"
-                raw = execute()
+            raw = _execute_local_shots(
+                self._shot_factory(),
+                self._stream_plan.trajectory_plan if error_model is None else self._gate_stream,
+                shots, strategy=strategy, common=common, error_model=error_model,
+                auto_max_expected_faults=auto_max_expected_faults,
+                check_independent=lambda count: memory.check_independent(shots, retain, count),
+                progress=update_progress if progress_bar is not None else None,
+            )
         finally:
             if progress_bar is not None:
                 progress_bar.close()
-        if raw.diagnostics is not None:
-            fallback = (
-                strategy == "auto" and progress_strategy == "coalesced"
-                and not raw.diagnostics.coalesced
-            )
-            raw = replace(raw, diagnostics=replace(
-                raw.diagnostics,
-                planned_strategy=progress_strategy,
-                workers=workers,
-                execution_reason=execution_reason,
-                fallback_reason=("continued from shared prefixes at branch cap"
-                                 if raw.diagnostics.continued_from_cap else
-                                 "coalesced branch cap exceeded" if fallback else None),
-                memory_budget_bytes=memory.budget,
-                estimated_state_bytes=memory.state_bytes or None,
-                memory_max_branches=memory.capacity,
-                memory_reason=memory.reason,
-            ))
+        from ._trajectory_execution import _annotate_trajectory_execution
+
+        raw = _annotate_trajectory_execution(
+            raw, strategy=strategy, planned_strategy=progress_strategy,
+            workers=workers, execution_reason=execution_reason, memory=memory,
+        )
         return NoisyResult(raw)
 
     def set_gates(self, gates):

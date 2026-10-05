@@ -1,4 +1,4 @@
-"""Metadata-only scheduling for local MPS trajectory ensembles."""
+"""Shared metadata-only scheduling for MPS and stabilizer MPS ensembles."""
 
 import sys
 from dataclasses import dataclass
@@ -51,7 +51,7 @@ def _estimated_state_bytes(state, chi, mode):
     return max(current, projected * itemsize)
 
 
-def _trajectory_memory_plan(state, chi, mode, memory_budget):
+def _trajectory_memory_plan(state, chi, mode, memory_budget, *, extra_state_bytes=0):
     if memory_budget != "auto" and memory_budget is not None and (
         isinstance(memory_budget, bool) or not isinstance(memory_budget, Integral)
         or memory_budget <= 0
@@ -67,7 +67,7 @@ def _trajectory_memory_plan(state, chi, mode, memory_budget):
             return _TrajectoryMemoryPlan(None, 0, None, "allocator memory query unavailable")
         budget = available // 2
         reason = "half of available device allocator memory"
-    state_bytes = _estimated_state_bytes(state, chi, mode)
+    state_bytes = _estimated_state_bytes(state, chi, mode) + int(extra_state_bytes)
     # Reserve an active compression workspace and the probability-batch target.
     # Two state copies per slot cover a parent/child split before parent release.
     capacity = max(0, (int(budget) - 8 * state_bytes - (32 << 20)) // (2 * state_bytes))
@@ -121,3 +121,27 @@ def _automatic_shot_workers(info, state, entries, shots, strategy):
 
     workers = min(4, int(shots), max(1, _available_cpu_count() // inner_threads))
     return workers, "large independent CPU workload: respect numerical thread budget"
+
+
+def _annotate_trajectory_execution(raw, *, strategy, planned_strategy, workers,
+                                  execution_reason, memory):
+    """Keep MPS and stabilizer shot scheduling diagnostics consistent."""
+    from dataclasses import replace
+
+    if raw.diagnostics is None:
+        return raw
+    fallback = (strategy == "auto" and planned_strategy == "coalesced"
+                and not raw.diagnostics.coalesced)
+    return replace(raw, diagnostics=replace(
+        raw.diagnostics,
+        planned_strategy=planned_strategy,
+        workers=workers,
+        execution_reason=execution_reason,
+        fallback_reason=("continued from shared prefixes at branch cap"
+                         if raw.diagnostics.continued_from_cap else
+                         "coalesced branch cap exceeded" if fallback else None),
+        memory_budget_bytes=memory.budget,
+        estimated_state_bytes=memory.state_bytes or None,
+        memory_max_branches=memory.capacity,
+        memory_reason=memory.reason,
+    ))

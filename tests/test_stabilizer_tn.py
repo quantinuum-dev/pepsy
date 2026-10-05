@@ -1128,7 +1128,8 @@ def test_norm_events_mark_reset_boundaries():
 def test_norm_events_track_projector_compression_loss_separately():
     sim = StabilizerMpsSimulator(2, chi=1)
 
-    sim.measure("XX", (0, 1), outcome=+1)
+    # Explicit fixed basis exercises finite-chi coefficient projector loss.
+    sim.measure("XX", (0, 1), outcome=+1, absorb_basis=False)
 
     event = sim.norm_events[-1]
     assert event["kind"] == "measure"
@@ -2577,7 +2578,7 @@ def test_measure_absorb_localizer_uses_selected_dmrg_backend(mode):
 def test_measure_absorb_rejects_impossible_forced_identity_outcome():
     sim = StabilizerMpsSimulator(2)
 
-    with pytest.raises(ValueError, match="zero probability"):
+    with pytest.raises(ValueError, match="(?:zero|0) probability"):
         sim.measure("II", (0, 1), outcome=-1, absorb_basis=True)
 
     assert sim.measure("II", (0, 1), outcome=+1, absorb_basis=True) == 1

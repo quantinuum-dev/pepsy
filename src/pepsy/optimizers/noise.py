@@ -1211,6 +1211,32 @@ class NoisyResult:
         """Estimate an observable using the result's shot multiplicities."""
         return self.raw.estimate(values)
 
+    def measurement_routing_diagnostics(self) -> dict:
+        """Aggregate retained collapse histories using shot multiplicities.
+
+        These are logical per-shot counts, not unique shared-prefix operations
+        or importance-weighted estimates. Missing retained histories and engines
+        without this protocol are reported as unavailable shots.
+        """
+        counts = dict.fromkeys(("stim", "stim_region", "mps"), 0)
+        reasons = {}
+        represented = 0
+        for optimizer, count in zip(self.optimizers, self.counts):
+            inspect = getattr(optimizer, "measurement_routing_diagnostics", None)
+            if not callable(inspect):
+                continue
+            report = inspect()
+            represented += count
+            for backend in counts:
+                counts[backend] += count * report["counts"].get(backend, 0)
+            for reason, frequency in report["fallback_reasons"].items():
+                reasons[reason] = reasons.get(reason, 0) + count * frequency
+        return {
+            "counts": counts, "fallback_reasons": reasons,
+            "total": sum(counts.values()), "represented_shots": represented,
+            "unavailable_shots": max(0, self.shots - represented),
+        }
+
     @property
     def effective_sample_size(self) -> float:
         """Return the importance-weight effective sample size."""
@@ -3495,6 +3521,11 @@ def _kraus_probabilities_impl(optimizer, channel, where):
             optimizer, _mps_batched_kraus_probabilities(optimizer, channel, where)
         )
     if _is_stabilizer_trajectory_optimizer(optimizer):
+        probabilities = getattr(optimizer, "_trajectory_kraus_probabilities", None)
+        if callable(probabilities):
+            return _normalize_kraus_probabilities(
+                optimizer, probabilities(channel.outcomes, where),
+            )
         # Both STN frontends already expose the exact local Gram-norm path
         # used by their non-unitary dense-gate implementation.  Evaluating
         # ``<psi|K^dagger K|psi>`` through Pauli expectations avoids making a
@@ -3734,7 +3765,9 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
     if _is_mps_stabilizer_trajectory_optimizer(optimizer):
         site = optimizer._mps_site(_trajectory_where(where)[0])
         optimizer._canonize_p(site)
-        projected_norm = optimizer._renorm_p_at(site)
+        # Support was validated by the sampling distribution. A positive rare
+        # Kraus branch must not inherit the forced-projector tolerance floor.
+        projected_norm = optimizer._renorm_p_at(site, min_norm=0.0)
         # A selected Kraus outcome is a normalized quantum-trajectory branch:
         # close the preceding unitary segment without counting its Born weight
         # as compression loss, then establish the new unit-norm baseline.
@@ -4406,20 +4439,21 @@ def _run_coalesced_entries(
     return nodes
 
 
-def _coalesced_control_absorb_basis(entry, name) -> bool:
+def _coalesced_control_absorb_basis(entry, name) -> bool | None:
     """Preserve the optional STN basis-absorbing control-event flag."""
     if isinstance(entry, Mapping):
-        return bool(entry.get("absorb_basis", entry.get("absorb", False)))
+        value = entry.get("absorb_basis", entry.get("absorb", entry.get("disentangle")))
+        return None if value is None else bool(value)
     if not isinstance(entry, (tuple, list)):
-        return False
+        return None
     head = str(entry[0]).replace("-", "_").lower()
     if name == "measure":
-        return bool(entry[4]) if len(entry) > 4 else False
+        return bool(entry[4]) if len(entry) > 4 else None
     if name != "measure_reset":
-        return False
+        return None
     if head in {"mrx", "mry", "mrz"}:
-        return bool(entry[3]) if len(entry) > 3 else False
-    return bool(entry[4]) if len(entry) > 4 else False
+        return bool(entry[3]) if len(entry) > 3 else True
+    return bool(entry[4]) if len(entry) > 4 else None
 
 
 def _coalesced_leakage_measure_leaked(
@@ -4787,8 +4821,8 @@ def _apply_coalesced_measurement(
             entry = ("measure_reset", pauli, where[0], int(outcome))
         else:
             entry = ("measure", pauli, where, int(outcome))
-        if absorb_basis and not reset:
-            entry = (*entry, True)
+        if absorb_basis is not None and not reset:
+            entry = (*entry, bool(absorb_basis))
         _run_trajectory_entries(node.optimizer, (entry,), run_kwargs)
         node.gate_stream.append(entry)
         if reset:
@@ -4854,7 +4888,7 @@ def _coalesced_control_event(
     rng,
     *,
     entry=None,
-    absorb_basis=False,
+    absorb_basis=None,
     max_branches=None,
     max_branch_factor=None,
     parallel_workers=1,
@@ -5184,6 +5218,56 @@ def sample_coalesced_bits(
         if probabilities is not None:
             probabilities = probabilities[permutation]
     return CoalescedSampleResult(configs, leaf_indices, probabilities, lengths)
+
+
+def _execute_local_shots(optimizer_factory, gates, shots, *, strategy, common,
+                         error_model, auto_max_expected_faults,
+                         check_independent, progress=None):
+    """Shared MPS/STN local dispatch, continuation and retention-safe retry.
+
+    Frontends own memory estimates and worker planning. This boundary owns
+    replay so neither frontend can silently restart or prune capped prefixes.
+    """
+    options = dict(common)
+
+    def execute():
+        if strategy == "auto" and options["strategy"] == "coalesced":
+            continuation = dict(options)
+            continuation.pop("strategy")
+            continuation.update(
+                _continue_on_cap=True,
+                _continuation_check=lambda: check_independent(1),
+            )
+            if error_model is None:
+                return run_coalesced_trajectory_shots(
+                    optimizer_factory, gates, shots, **continuation,
+                )
+            return run_coalesced_noisy_shots(
+                optimizer_factory, gates, error_model, shots, **continuation,
+            )
+        if error_model is None:
+            return run_trajectory_shots(
+                optimizer_factory, gates, shots, _progress=progress, **options,
+            )
+        return run_noisy_shots(
+            optimizer_factory, gates, error_model, shots,
+            auto_max_expected_faults=auto_max_expected_faults,
+            _progress=progress, **options,
+        )
+
+    retry = False
+    try:
+        raw = execute()
+    except _CoalescedBranchCapExceeded:
+        if strategy != "auto":
+            raise
+        retry = True
+    # Drop the traceback owning the failed frontier before a possible retry.
+    if retry:
+        check_independent(options["parallel_workers"])
+        options["strategy"] = "independent"
+        raw = execute()
+    return raw
 
 
 def run_trajectory_shots(

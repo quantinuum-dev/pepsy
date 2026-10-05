@@ -175,6 +175,9 @@ def test_mps_stab_sampler_records_absorbed_localizer_events():
     nu = qtn.MPS_computational_state("000", dtype="complex128")
     for q in range(3):
         nu.gate_(H, q, contract=True)
+    # Keep this test on the general localizer path: an exact Pauli-eigenstate
+    # product now collapses natively without coefficient compression.
+    nu.gate_(np.diag([1., np.exp(.23j)]), 0, contract=True)
 
     sampler = pepsy.StabilizerMpsSampler(
         tableau,
@@ -204,6 +207,24 @@ def test_mps_stab_sampler_records_absorbed_localizer_events():
     )
     assert all(record["norm_events"] for record in first_readout)
     assert all(record["projector_infidelity"] is not None for record in first_readout)
+
+
+def test_absorbed_sampling_of_pauli_eigenstates_has_native_norm_events():
+    tableau = stim.TableauSimulator()
+    tableau.set_num_qubits(3)
+    tableau.cnot(0, 1)
+    nu = qtn.MPS_computational_state("000", dtype="complex128")
+    for q in range(3):
+        nu.gate_(H, q, contract=True)
+    sampler = pepsy.StabilizerMpsSampler(tableau, nu, chi=1, absorb_basis=True)
+    samples, _ = sampler.sample_arrays(32, seed=4, basis="Z", order=(1, 0, 2), shuffle=False)
+    assert samples.shape == (32, 3)
+    first = [r for r in sampler.get_sampling_diagnostics() if r["depth"] == 0]
+    assert first
+    assert all(not r["compression_events"] for r in first)
+    assert all(r["norm_events"] for r in first)
+    assert all(e["measurement_backend"] == "stim" for r in first for e in r["norm_events"])
+    assert all(r["projector_infidelity"] == pytest.approx(0., abs=1e-12) for r in first)
 
 
 def test_mps_stab_sampler_disentangle_alias():
