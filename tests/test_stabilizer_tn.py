@@ -410,6 +410,32 @@ def test_static_frame_layout_defaults_to_operator_schmidt_weights():
     ][0]["weight"]
 
 
+def test_static_frame_layout_preserves_control_lifetimes_and_frame_support():
+    sim = StabilizerMpsSimulator(4).set_gates([
+        ("cnot", 0, 2), ("rz", 0.31, 2),
+        ("measure", "Z", 2), ("reset", 2, "Z"),
+        ("measure_reset", "X", 1), ("rx", 0.23, 3),
+    ])
+    plan = sim.current_frame_layout(order="quality", refine_numba=False)
+    records = plan["frame_events"]
+    assert plan["frame_role_source"] == "coefficient_support_lifetimes"
+    assert plan["frame_lifetime_event_types"] == tuple(
+        r["kind"] if r["kind"] in {"measure", "reset", "measure_reset"}
+        else "submpo" for r in records
+    )
+    # Physical site 2's projector touches coefficient sites 0 and 2.
+    index = next(i for i, r in enumerate(records) if r["kind"] == "measure")
+    assert records[index]["support"] == (0, 2)
+    for site in (0, 2):
+        assert index in plan["site_usage"][site]["measurement_indices"]
+        assert plan["site_usage"][site]["lifetime_count"] > 1
+    assert any(v["reset_indices"] for v in plan["site_usage"].values())
+    assert plan["qubit_roles"]
+    assert plan["event_weights"] == tuple(r["weight"] for r in records)
+    assert sim.measurements == []
+    assert sim.logical_order == [0, 1, 2, 3]
+
+
 def test_static_frame_layout_operator_weight_tracks_rotation_entanglement():
     weak = StabilizerMpsSimulator(2).set_gates([("rzz", 0.1, 0, 1)])
     strong = StabilizerMpsSimulator(2).set_gates(

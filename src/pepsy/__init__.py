@@ -281,6 +281,8 @@ if TYPE_CHECKING:
         build_tree_operator,
         compile_stim_circuit,
         compile_trajectory_stream,
+        stim_plan_to_gate_stream,
+        stim_readout_parities,
         recommend_simulator,
         run_coalesced_noisy_shots,
         run_coalesced_stim_shots,

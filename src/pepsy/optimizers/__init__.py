@@ -93,6 +93,8 @@ _SYMBOL_MODULES = {
     "TrajectorySample": ".noise",
     "TrajectoryShotResult": ".noise",
     "compile_stim_circuit": ".noise",
+    "stim_plan_to_gate_stream": ".noise",
+    "stim_readout_parities": ".noise",
     "compile_trajectory_stream": ".noise",
     "run_coalesced_noisy_shots": ".noise",
     "run_coalesced_stim_shots": ".noise",

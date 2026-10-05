@@ -12,6 +12,14 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Added
+
+- Public `stim_plan_to_gate_stream` translates compiled Stim plans into
+  unsampled independent Pauli-noise streams; `stim_readout_parities` resolves
+  raw detector and indexed logical-observable parities. StabilizerMpsSimulator
+  exposes explicit `compile` preparation and `compiled_stream` access, while
+  retaining `set_gates`. Analysis recognizes trajectory channels and support.
+
 ### Performance
 
 - Local automatic MPS trajectories continue from completed shared prefixes
@@ -60,6 +68,19 @@ releases remain backwards-compatible. From 1.0 onward:
   Torch states for real-valued generated noise operators. Dense JAX MPS
   operations use scoped high-precision accumulation without changing the
   state dtype/device or the caller's global precision policy.
+- Coalesced trajectory branches preserve native measurement prefixes for
+  feed-forward and readout, including STN copies that reset public history.
+  StabilizerMpsSimulator automatic local dispatch uses host CPU budgets or one
+  automatic accelerator worker, preserving explicit worker/backend overrides.
+
+- STN frame-layout search retains measurement/reset lifetime hints for the
+  shared MPS finder's lifetime and role candidates without changing projector
+  operator costs. Queued STN advice reuses installed trajectory plans.
+
+- Threaded trajectory shots reuse prepared stream plans rather than reparsing
+  the complete stream per shot. Stim parsing supports grouped record-controlled
+  gates and empty readout annotations, and rejects unsupported readout-noise,
+  inverted measurement results and `MPAD` instead of discarding their effects.
 
 - Dense `gate_simple(..., smudge=0)` preserves exact-zero external bond
   support during adjacent and routed updates without dividing by zero.

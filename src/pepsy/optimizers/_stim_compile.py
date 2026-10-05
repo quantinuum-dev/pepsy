@@ -35,7 +35,6 @@ _STIM_NOISE_NAMES = frozenset(
 _STIM_IGNORED_NAMES = frozenset(
     {
         "DETECTOR",
-        "MPAD",
         "OBSERVABLE_INCLUDE",
         "QUBIT_COORDS",
         "SHIFT_COORDS",
@@ -138,8 +137,6 @@ def _stim_record_targets(instruction) -> tuple[tuple[int, bool], ...]:
                 f"Stim annotation {instruction!s} has a non-record target."
             )
         targets.append((int(target.value), bool(target.is_inverted_result_target)))
-    if not targets:
-        raise ValueError(f"Stim annotation {instruction!s} needs record targets.")
     return tuple(targets)
 
 
@@ -158,6 +155,19 @@ def _stim_unitary_matrix(name: str) -> np.ndarray:
 
 
 def _compile_stim_measurement(instruction, name: str) -> tuple[object, ...]:
+    # These change reported classical bits, not the measured physical state.
+    # Until the stream has readout-error/inversion events, reject them rather
+    # than silently deleting their effect on feed-forward and annotations.
+    if any(instruction.gate_args_copy()):
+        raise NotImplementedError(
+            f"Stim measurement readout noise is not supported: {instruction!s}. "
+            "Use explicit Pauli noise before an ideal measurement when that "
+            "physical noise model is intended."
+        )
+    if any(target.is_inverted_result_target for target in instruction.targets_copy()):
+        raise NotImplementedError(
+            f"Inverted Stim measurement results are not supported: {instruction!s}."
+        )
     if name in _STIM_SINGLE_MEASUREMENTS:
         axis = _STIM_SINGLE_MEASUREMENTS[name]
         return tuple(
@@ -235,7 +245,7 @@ def _compile_stim_unitary(instruction, name: str) -> tuple[object, ...]:
 
 
 def _compile_stim_classical_control(instruction, name: str):
-    """Lower one Stim measurement-record-controlled Pauli gate.
+    """Lower grouped Stim measurement-record-controlled Pauli gates.
 
     The supported form is CX/CY/CZ rec[k] q, including an inverted record
     target. It becomes the backend-independent ("if", k, bit, action) event.
@@ -243,27 +253,36 @@ def _compile_stim_classical_control(instruction, name: str):
     compiler so a record cannot be mistaken for a quantum wire.
     """
     targets = instruction.targets_copy()
-    records = [target for target in targets if target.is_measurement_record_target]
-    qubits = [target for target in targets if target.is_qubit_target]
-    if len(targets) != 2 or len(records) != 1 or len(qubits) != 1:
+    if len(targets) % 2:
         raise NotImplementedError(
-            f"Stim instruction {instruction!s} must contain exactly one "
-            "measurement-record control and one qubit target."
+            f"Stim instruction {instruction!s} needs control/target pairs."
         )
     if name not in {"CX", "CY", "CZ"}:
         raise NotImplementedError(
             f"Stim classical-record-controlled gate {name} is not supported."
         )
-    record = records[0]
-    # Stim's inverted record target means 'apply when the recorded bit is 0'.
-    expected_bit = 0 if record.is_inverted_result_target else 1
     axis = {"CX": "X", "CY": "Y", "CZ": "Z"}[name]
-    return (
-        "if",
-        int(record.value),
-        expected_bit,
-        (_stim_unitary_matrix(axis), int(qubits[0].value)),
-    )
+    entries = []
+    for offset in range(0, len(targets), 2):
+        pair = targets[offset:offset + 2]
+        records = [t for t in pair if t.is_measurement_record_target]
+        qubits = [t for t in pair if t.is_qubit_target]
+        if not records and len(qubits) == 2:
+            entries.append((_stim_unitary_matrix(name), tuple(int(t.value) for t in qubits)))
+        elif len(records) == len(qubits) == 1:
+            record = records[0]
+            # An inverted record means 'apply when the recorded bit is 0'.
+            expected_bit = 0 if record.is_inverted_result_target else 1
+            entries.append((
+                "if", int(record.value), expected_bit,
+                (_stim_unitary_matrix(axis), int(qubits[0].value)),
+            ))
+        else:
+            raise NotImplementedError(
+                f"Stim instruction {instruction!s} needs a qubit target for "
+                "each measurement-record control."
+            )
+    return tuple(entries)
 
 
 def compile_stim_circuit(circuit) -> StimCircuitPlan:
@@ -338,7 +357,7 @@ def compile_stim_circuit(circuit) -> StimCircuitPlan:
             target.is_measurement_record_target
             for target in instruction.targets_copy()
         ):
-            entries = (_compile_stim_classical_control(instruction, name),)
+            entries = _compile_stim_classical_control(instruction, name)
             operations.append(
                 _StimPlanOperation(instruction_index, name, args, (), entries)
             )
@@ -371,3 +390,75 @@ def compile_stim_circuit(circuit) -> StimCircuitPlan:
         tuple(detectors),
         tuple(observables),
     )
+
+
+def stim_plan_to_gate_stream(plan) -> tuple[object, ...]:
+    """Lower independent Stim Pauli channels without sampling any faults."""
+    from .noise import StimCircuitPlan
+
+    if not isinstance(plan, StimCircuitPlan):
+        raise TypeError("plan must be a StimCircuitPlan from compile_stim_circuit(...).")
+    single = {
+        "X_ERROR": "x_error", "Y_ERROR": "y_error", "Z_ERROR": "z_error",
+        "DEPOLARIZE1": "depolarize1", "PAULI_CHANNEL_1": "pauli_channel1",
+    }
+    double = {"DEPOLARIZE2": "depolarize2", "PAULI_CHANNEL_2": "pauli_channel2"}
+    stream = []
+    for operation in plan.operations:
+        if not operation.is_noise:
+            stream.extend(operation.entries)
+            continue
+        name = operation.name
+        sites = tuple(site for _axis, site in operation.targets)
+        if name in {"I_ERROR", "II_ERROR"}:
+            continue
+        if name in single:
+            probabilities = operation.args if name == "PAULI_CHANNEL_1" else operation.args[0]
+            stream.extend((single[name], probabilities, site) for site in sites)
+        elif name in double:
+            if len(sites) % 2:
+                raise ValueError(f"Stim {name} needs target pairs.")
+            probabilities = operation.args if name == "PAULI_CHANNEL_2" else operation.args[0]
+            stream.extend(
+                (double[name], probabilities, sites[index], sites[index + 1])
+                for index in range(0, len(sites), 2)
+            )
+        else:
+            raise NotImplementedError(
+                f"Stim {name} at instruction {operation.instruction_index} cannot "
+                "be lowered to independent gate-stream noise. Use run_stim_shots "
+                "or run_coalesced_stim_shots for correlated/heralded channels."
+            )
+    return tuple(stream)
+
+
+def stim_readout_parities(plan, measurement_records):
+    """Resolve raw detector and indexed observable parities from shot records."""
+    from .noise import StimCircuitPlan
+
+    if not isinstance(plan, StimCircuitPlan):
+        raise TypeError("plan must be a StimCircuitPlan from compile_stim_circuit(...).")
+    bits = tuple(
+        tuple(int(record.outcome < 0) for record in records
+              if not getattr(record, "reset", False))
+        for records in measurement_records
+    )
+
+    def resolve(annotations):
+        values = np.zeros((len(bits), len(annotations)), dtype=np.uint8)
+        for row, measurements in enumerate(bits):
+            for column, annotation in enumerate(annotations):
+                for offset, inverted in annotation.rec_targets:
+                    index = annotation.measurement_count + offset
+                    if not 0 <= index < len(measurements):
+                        raise ValueError("Stim annotation references an unavailable measurement.")
+                    values[row, column] ^= measurements[index] ^ int(inverted)
+        return values
+
+    detectors = resolve(plan.detectors)
+    annotations = resolve(plan.observables)
+    n_observables = max((a.observable_index for a in plan.observables), default=-1) + 1
+    observables = np.zeros((len(bits), n_observables), dtype=np.uint8)
+    for column, annotation in enumerate(plan.observables):
+        observables[:, annotation.observable_index] ^= annotations[:, column]
+    return detectors, observables

@@ -19,3 +19,19 @@ ranks sharing one GPU. These selections overlap and are not summed. Ruff,
 whitespace and documentation-link checks passed. The full-suite attempt still
 stops at the three previously reproduced baseline BP failures. See the linked
 handoffs for skips, commands, detailed evidence and implementation limits.
+
+## Upstream integration and publication checks
+
+The scoped implementation commit is `ad0d628`. Fetch found the new upstream
+commit `8f912a9` (reusable Stim streams and backend-aware stabilizer replay),
+which merged without conflicts. Only the unrelated changelog hunks were
+temporarily saved for the merge; all unrelated source edits stayed untouched.
+
+An exported staged-tree snapshot excluded every unrelated working-tree edit.
+Fresh checks on that combined snapshot passed **367 tests, 2 slow deselected**:
+MPS trajectory/continuation/memory/gate batching and precision, MPI backend
+fingerprinting, shared trajectory replay, upstream Stim stream coverage, and
+public API/package layout. All-source/test Ruff, staged whitespace, clean
+snapshot import-path checks and local documentation links also passed.
+The tests took 39.42 seconds; log: `/tmp/pepsy-mps-publication-check.log`.
+This is a focused post-merge check, not a fresh full-suite run.

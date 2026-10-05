@@ -11,7 +11,8 @@ sampling settings (`shots`, `seed`, independent/coalesced replay, and
 | --- | --- | --- |
 | Stochastic entries or custom channels | `run_trajectory_shots` | One state per shot for independent replay, or one per coalesced leaf |
 | Uniform post-gate Pauli faults | `run_noisy_shots` with `PauliErrorModel` | Independent shots |
-| Stim circuit input | `compile_stim_circuit`, then `run_stim_shots` | Independent shots with detector/observable records |
+| Stim circuit input | `compile_stim_circuit`, `stim_plan_to_gate_stream`, then `engine.compile` / `engine.run` | Unsampled independent Pauli noise in a reusable Pepsy stream |
+| Native correlated/heralded Stim noise | `compile_stim_circuit`, then `run_stim_shots` | Native Stim shot records |
 | Shared noisy prefixes | `run_coalesced_trajectory_shots` / `run_coalesced_stim_shots` | One state per leaf, with a shot count |
 | Existing prepared optimizer | Shot-aware `optimizer.run(shots=...)` | `NoisyResult` wraps independent or coalesced storage |
 
@@ -767,6 +768,83 @@ renormalization. The older `total_norm_proxy` key remains as a compatibility
 alias.
 
 ## Reading a Stim circuit
+
+### Translate, analyze, prepare, run
+
+For independent Pauli/depolarizing channels, keep one **unsampled** Pepsy
+stream and let the simulator own all shots:
+
+```python
+from pepsy.optimizers import (
+    StabilizerMpsSimulator, compile_stim_circuit, stim_plan_to_gate_stream,
+    stim_readout_parities,
+)
+
+stim_plan = compile_stim_circuit("""
+R 0 1
+H 0
+CX 0 1
+X_ERROR(0.02) 1
+M 0 1
+DETECTOR rec[-1] rec[-2]
+OBSERVABLE_INCLUDE(0) rec[-1]
+""")
+gate_stream = stim_plan_to_gate_stream(stim_plan)
+
+# Optional analysis: no state mutation, execution or random draws.
+analysis = StabilizerMpsSimulator.analyze_stream(
+    gate_stream, n_qubits=stim_plan.num_qubits,
+)
+engine = StabilizerMpsSimulator(stim_plan.num_qubits, chi=128, mode="direct")
+engine.compile(gate_stream)
+result = engine.run(shots=100, strategy="auto", workers=1, seed=7)
+detectors, observables = stim_readout_parities(stim_plan, result.measurements)
+counts = result.counts
+```
+
+The stages have distinct responsibilities:
+
+- `compile_stim_circuit` expands repeat blocks and parses Stim quantum
+  operations, noise and readout annotations into a `StimCircuitPlan`. Passing
+  an existing plan returns that same object. It does not sample or simulate.
+- `stim_plan_to_gate_stream` accepts that plan and returns an ordinary tuple
+  of Pepsy entries. Gates, resets, measurements and feed-forward retain their
+  order; independent noise remains stochastic. It does not draw faults.
+- `analyze_stream` is optional inspection. Its `trajectory_entries` and
+  `clifford_trajectory_entries` counts distinguish known stochastic channels
+  from opaque entries, including their touched qubits.
+- `engine.compile` prepares the execution queue and validates matrix
+  backend/dtype/device, returning the engine. `set_gates` remains equivalent.
+  For reuse across engines, first call `compile_trajectory_stream(gate_stream)`
+  and pass that `TrajectoryStreamPlan` to `engine.compile`; the plan is reused
+  by identity and is available as `engine.compiled_stream`. Threaded workers
+  reuse it too. This preparation does not mutate the quantum state or RNG.
+- `engine.run(shots=..., strategy=..., workers=...)` samples and executes
+  trajectories internally. Coalesced rows carry multiplicities in `counts`;
+  their count sum is the number of shots, not necessarily their row count.
+
+Translation generates NumPy complex128 ideal matrices. Explicitly convert
+matrix payloads, including nested feed-forward actions, before installing a
+stream on a different backend/dtype/device; preparation checks rather than
+silently converts user-provided streams.
+
+`stim_readout_parities` returns raw uint8 arrays with one row per retained
+shot/leaf. It excludes hidden reset records and XOR-combines repeated
+`OBSERVABLE_INCLUDE` entries into columns indexed by logical observable ID.
+These are raw parities, without Stim reference-sample subtraction or decoder
+correction. Use `result.counts` when averaging coalesced rows.
+
+The unsampled translation supports `X_ERROR`, `Y_ERROR`, `Z_ERROR`,
+`DEPOLARIZE1`, `DEPOLARIZE2`, `PAULI_CHANNEL_1`, `PAULI_CHANNEL_2`, and identity
+noise. Correlated-error chains and heralded channels raise explicitly at this
+translation stage; use the native Stim runners below for those channels.
+The compiler rejects nonzero measurement readout-error arguments, inverted
+measurement results and `MPAD`, whose classical semantics the current replay
+engines cannot represent. These features are never silently discarded.
+Empty detector/observable annotations are retained as zero parities, and
+grouped record-controlled Pauli gates are lowered pair by pair.
+
+### Native Stim shot runners
 
 `compile_stim_circuit(...)` accepts `stim.Circuit` or Stim source text. It
 compiles one- and two-qubit Clifford gates, Pauli measurements/resets, and
