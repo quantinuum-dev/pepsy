@@ -349,10 +349,9 @@ def test_ensemble_routing_counts_use_multiplicity_and_report_missing_history(str
 
 @pytest.mark.parametrize("strategy", ["independent", "coalesced"])
 @pytest.mark.parametrize("entry", [
-    ("measure", "Z", 0, None, None),
+    ("measure", "Z", 0, None, False),
     ("measure_reset", "Z", 0, None, False),
     ("mrz", 0, None, False),
-    ("measure_reset", "Z", 0, None, None),
 ])
 def test_replay_preserves_explicit_fixed_basis_controls(strategy, entry):
     engine = StabilizerMpsSimulator(1).compile([("h", 0), entry])
@@ -360,3 +359,56 @@ def test_replay_preserves_explicit_fixed_basis_controls(strategy, entry):
     for sim in result.optimizers:
         assert sim.norm_events[0].measurement_backend == "mps"
         assert sim.norm_events[0].measurement_fallback_reason == "explicit_fixed_basis"
+
+
+@pytest.mark.parametrize("strategy", ["independent", "coalesced"])
+@pytest.mark.parametrize("entry", [
+    ("measure", "Z", 0),
+    ("measure", "Z", 0, None, None),
+    ("measure_reset", "Z", 0),
+    ("measure_reset", "Z", 0, None, None),
+    ("mrz", 0),
+    ("mrz", 0, None, None),
+])
+def test_replay_defaults_to_native_disentangling(strategy, entry):
+    engine = StabilizerMpsSimulator(2).compile([("h", 0), entry])
+    result = engine.run(shots=8, seed=3, strategy=strategy, progress=False)
+    for sim in result.optimizers:
+        assert sim.norm_events[0].measurement_backend == "stim"
+        assert sim.state.max_bond() == 1
+
+
+@pytest.mark.parametrize("api", ["measure", "measure_many", "measure_reset"])
+@pytest.mark.parametrize("options", [{}, {"disentangle": None}, {"disentangle": True},
+                                     {"disentangle": False}, {"absorb_basis": False}])
+def test_measurement_default_updates_basis_after_native_fallback(converter, api, options):
+    sim = StabilizerMpsSimulator(2, chi=8, exact_cooling=False, to_backend=converter)
+    sim.apply([("h", 0), ("t", 0), ("cnot", 0, 1)])
+    before = sim.to_statevector()
+    tableau = sim.state._sim.current_inverse_tableau()
+    if api == "measure_many":
+        sim.measure_many([("Z", 1, +1)], **options)
+    else:
+        getattr(sim, api)("Z", 1, outcome=+1, **options)
+    _same_state(sim.to_statevector(), _project(before, "Z", 1, +1, 2))
+    enabled = options.get("disentangle", options.get("absorb_basis")) is not False
+    assert sim.norm_events[0].measurement_backend == "mps"
+    assert sim.norm_events[0].kind == ("measure_absorb" if enabled else "measure")
+    assert (sim.state._sim.current_inverse_tableau() != tableau) == enabled
+
+
+@pytest.mark.parametrize("strategy", ["independent", "coalesced"])
+@pytest.mark.parametrize("operation", ["measure", "measure_reset"])
+def test_tree_replay_retains_explicit_none_fixed_basis_policy(strategy, operation):
+    from pepsy import StabilizerTreeSimulator
+
+    gates = [("h", 0), ("cnot", 0, 1)]
+    reference = StabilizerTreeSimulator(2).apply(gates)
+    tableau = reference.state._sim.current_inverse_tableau()
+    engine = StabilizerTreeSimulator(2).set_gates([
+        *gates, (operation, "Z", 0, +1, None),
+    ])
+    result = engine.run(shots=2, strategy=strategy, seed=3, progress=False)
+    for sim in result.optimizers:
+        _same_state(sim.to_statevector(), np.array([1., 0., 0., 0.]))
+        assert sim.state._sim.current_inverse_tableau() == tableau

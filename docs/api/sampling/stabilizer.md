@@ -47,9 +47,11 @@ sampler = pepsy.StabilizerMpsSampler(
 )
 ```
 
-The default ``disentangle=False`` applies the frame projector directly as a
-sub-MPO. The legacy ``absorb_basis`` keyword remains accepted as an alias.
-With disentangling enabled, the frame changes independently on each
+The default is ``disentangle=True``: use certified native tableau collapse,
+falling back to basis-updating MPS collapse. ``None`` selects this default.
+Explicit ``disentangle=False`` applies the fixed-frame projector directly
+and disables native collapse. The legacy ``absorb_basis`` keyword remains
+accepted as an alias. With disentangling enabled, the frame changes independently on each
 collapsed branch, so later frame images are recomputed for that branch. In
 both modes the original optimizer, tableau, and coefficient MPS remain
 unchanged; ``chi`` is taken from the underlying optimizer.

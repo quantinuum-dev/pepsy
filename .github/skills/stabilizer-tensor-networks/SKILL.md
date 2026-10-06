@@ -207,9 +207,10 @@ This collapses all of Lemma 2/3's $I_x,I_y,I_z$ mask algebra into one call:
 - **Non-Clifford rotation** $\exp(-i\theta/2\,O) \to \exp(-i\theta/2\,M)$ on $|\nu\rangle$.
 - **Measurement** $\langle O\rangle = \langle\nu|M|\nu\rangle$; collapse projector
   $\tfrac{I\pm O}{2}\to\tfrac{I\pm M}{2}$ on $|\nu\rangle$ (basis fixed), then renormalize.
-  This fixed-basis collapse is `measure(pauli, where)` (the default), is self-consistent
+  This fixed-basis collapse is `measure(pauli, where, disentangle=False)`, is self-consistent
   (repeated measurement is deterministic), and does **not** absorb $O$ into the stabilizer
-  group. The **basis-updating** form is `measure(pauli, where, absorb_basis=True)`: a
+  group. The default is `disentangle=True` (`None` selects the default): first try
+  certified native tableau collapse; otherwise use the **basis-updating** form. A
   Clifford $V$ localizes $M=C^\dagger O C$ to $\pm Z_k$, is applied to $|\nu\rangle$ with
   $V^\dagger$ absorbed into the basis ($|\psi\rangle$ preserved), and qubit $k$ is projected
   out — so the measured qubit **disentangles from** $|\nu\rangle$.

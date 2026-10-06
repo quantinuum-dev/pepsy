@@ -401,6 +401,12 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Changed
 
+- `StabilizerMpsSimulator.measure`, `measure_many`, `measure_reset`, and
+  `StabilizerMpsSampler` now default to `disentangle=True`: certified native
+  tableau collapse followed by basis-updating MPS collapse when needed.
+  Omitted and `None` stream flags use the same default. Explicit `False`
+  retains the fixed-basis projector and disables native collapse.
+
 - Dense `TreeSampler` now defaults to the exact factor strategy, retaining
   compact factors and sharing repeated prefixes within each sampling call.
   Select `strategy="standard"` explicitly for the previous strategy, which

@@ -136,7 +136,7 @@ def test_mps_stab_sampler_records_projector_local_infidelity_per_branch():
         chi=1,
         exact_cooling=False,
     )
-    sampler = pepsy.StabilizerMpsSampler(optimizer)
+    sampler = pepsy.StabilizerMpsSampler(optimizer, disentangle=False)
     sampler.sample_batch(
         32,
         seed=4,
@@ -349,7 +349,7 @@ def test_mps_stab_sampler_accepts_tableau_and_coefficient_mps_directly():
     sampler = pepsy.StabilizerMpsSampler(tableau, nu)
     configs, probs = sampler.sample_arrays(11, seed=9, basis="X", chunk_size=3)
 
-    assert sampler.resolved_strategy == "frame_pauli"
+    assert sampler.resolved_strategy == "frame_pauli_absorb"
     assert sampler.native_backend == "numpy"
     assert configs.shape == (11, 2)
     np.testing.assert_allclose(probs, 0.5)

@@ -1087,7 +1087,7 @@ class StabilizerMpsSimulator:
             absorb_basis = _resolve_measurement_disentangle(
                 absorb_basis,
                 disentangle,
-                default=False,
+                default=True,
             )
         entry = ("measure", str(pauli), where)
         if absorb_basis is None:
@@ -1131,7 +1131,7 @@ class StabilizerMpsSimulator:
             absorb_basis = _resolve_measurement_disentangle(
                 absorb_basis,
                 disentangle,
-                default=False,
+                default=True,
             )
         entry = ("measure_reset", "".join(axes), where)
         value = None if outcome is None else (
@@ -4555,7 +4555,7 @@ class StabilizerMpsSimulator:
                     # ("measure", pauli, where[, outcome[, absorb_basis]])
                     pauli, where = entry[1], entry[2]
                     outcome = entry[3] if len(entry) > 3 else None
-                    absorb = bool(entry[4]) if len(entry) > 4 else None
+                    absorb = bool(entry[4]) if len(entry) > 4 and entry[4] is not None else None
                     self.measure(pauli, where, outcome=outcome, absorb_basis=absorb)
                     return
                 if name == "reset" or name in _RESET_AXIS_ALIASES:
@@ -4572,7 +4572,8 @@ class StabilizerMpsSimulator:
                         entry[1:],
                         default_axis=_MR_AXIS_ALIASES.get(name),
                     )
-                    if name in _MR_ALIASES and len(entry) < 5:
+                    flag_index = 3 if name in _MR_AXIS_ALIASES else 4
+                    if len(entry) <= flag_index or entry[flag_index] is None:
                         absorb = None
                     self.measure_reset(
                         "".join(axes),
@@ -5775,10 +5776,9 @@ class StabilizerMpsSimulator:
         Use ``order="input"`` to preserve the supplied order, or pass an
         explicit permutation of batch indices/target qubits.
         """
-        if absorb_basis is not None or disentangle is not None:
-            absorb_basis = _resolve_measurement_disentangle(
-                absorb_basis, disentangle, default=False,
-            )
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis, disentangle, default=True,
+        )
         operations = self._normalize_measurement_batch(measurements)
         result = self._run_measurement_batch(
             operations,
@@ -5816,10 +5816,12 @@ class StabilizerMpsSimulator:
             computational value.  The measured qubit is thereby disentangled from
             ``|nu>``, so its support/entanglement leaves the coefficient state —
             the key primitive for magic-state injection (see :meth:`inject_t`).
-            When omitted, an exact live certificate enables native Stim
+            Defaults to ``True``. An exact live certificate enables native Stim
             collapse for a factorized Pauli-eigenstate coefficient state or
-            separated Pauli-eigenstate support region; otherwise use the fixed-basis MPS
-            projector. Explicit ``False`` always preserves the fixed basis.
+            separated Pauli-eigenstate support region; otherwise localize the
+            observable and update the basis. Explicit ``False`` preserves the
+            fixed basis and disables native collapse. ``None`` selects the
+            default, retaining compatibility with the alias keyword.
         disentangle : bool, optional
             User-facing alias for ``absorb_basis``. If both names are supplied,
             they must agree.
@@ -5829,9 +5831,8 @@ class StabilizerMpsSimulator:
         int
             The measured eigenvalue ``+1`` or ``-1``.
         """
-        requested_basis = (
-            _resolve_measurement_disentangle(absorb_basis, disentangle, default=False)
-            if absorb_basis is not None or disentangle is not None else None
+        requested_basis = _resolve_measurement_disentangle(
+            absorb_basis, disentangle, default=True,
         )
         if requested_basis is not False:
             from . import _tableau_measurement
@@ -5846,7 +5847,7 @@ class StabilizerMpsSimulator:
         absorb_basis = _resolve_measurement_disentangle(
             absorb_basis,
             disentangle,
-            default=False,
+            default=True,
         )
         if absorb_basis:
             m_pauli = self.state.frame_pauli(self._phys_pauli(pauli, where))
@@ -5939,18 +5940,16 @@ class StabilizerMpsSimulator:
 
         ``pauli`` is one X/Y/Z axis per target, or one axis broadcast across all
         targets.  Unlike :meth:`reset`, the measurement outcomes are appended to
-        :attr:`measurements`.  The default selects certified native Stim
-        collapse, falling back to the fixed-basis MPS projector; pass
-        ``disentangle=True`` to use the basis-updating path so each reset target
-        leaves the coefficient MPS compactly.  Separate targets are processed
+        :attr:`measurements`. The default is ``disentangle=True``: certified
+        native Stim collapse, falling back to basis-updating localization.
+        Pass ``disentangle=False`` to preserve the fixed basis. Separate targets are processed
         with the metadata-only ``min_span`` scheduler by default; use
         ``order="input"`` to preserve their supplied order.  Returned outcomes
         remain aligned with the input target order.
         """
-        if absorb_basis is not None or disentangle is not None:
-            absorb_basis = _resolve_measurement_disentangle(
-                absorb_basis, disentangle, default=False,
-            )
+        absorb_basis = _resolve_measurement_disentangle(
+            absorb_basis, disentangle, default=True,
+        )
         where = _normalize_sites(where)
         axes = _normalize_pauli_axes(pauli, where, event="measure_reset")
         outcomes = _normalize_outcomes(outcome, where, event="measure_reset")

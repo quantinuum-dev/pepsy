@@ -368,10 +368,10 @@ outside the quantum replay contract.
 
 ## Measurement, reset, and magic-state injection
 
-- `measure(pauli, where, *, outcome=None, disentangle=None)` — automatically
-  use certified native Stim collapse, falling back to the fixed-basis MPS
-  projector `(I +- M)/2`; `disentangle=True` uses the basis-updating
-  (canonical Lemma-3) form that disentangles the measured qubit from `|nu>`.
+- `measure(pauli, where, *, outcome=None, disentangle=None)` — defaults to
+  `disentangle=True`: use certified native Stim collapse, falling back to the
+  basis-updating (canonical Lemma-3) form that disentangles the measured
+  coefficient pivot from `|nu>`. `None` selects this default.
   The legacy `absorb_basis` keyword remains accepted as an alias. Explicit
   `False` preserves the fixed-basis MPS path even when native collapse is eligible.
 - `reset(where, basis="Z", *, order="min_span")` — return qubit(s) to `|0>`
@@ -383,7 +383,7 @@ outside the quantum replay contract.
   order="min_span")` — record a Pauli measurement, then reset the same
   qubit(s) to the `+1` eigenstate of that basis. Separate targets use the
   metadata-only span scheduler by default. Pass `order="input"` to preserve
-  their supplied order and `disentangle=True` for the basis-updating path.
+  their supplied order. Disentangling defaults to `True`, as for `measure`.
   Returned outcomes remain aligned with the input target order. The legacy
   `absorb_basis` keyword remains accepted as an alias. Stream aliases `mrx`,
   `mry`, and `mrz` are accepted.
@@ -393,6 +393,10 @@ outside the quantum replay contract.
   MPS layout metadata only; it never performs trial MPS contractions or
   truncations. Outcomes are returned in input order and the selected schedule
   is available as `last_measurement_schedule`.
+
+Omitted or `None` measurement flags in streams also select `disentangle=True`.
+Pass `disentangle=False` (or the legacy `absorb_basis=False`) to apply the
+fixed-basis MPS projector `(I +- M)/2` and disable native collapse.
 
 Native collapse is a runtime decision; `compile` does not execute measurements
 or sample outcomes. For `|psi> = C|p>`, a live, exactly factorized product of

@@ -54,10 +54,11 @@ evolution or a finite `chi` for controlled compression.
 
 There are two measurement forms:
 
-- **Fixed basis (default for `measure` and `measure_reset`):** leave `C` unchanged, evaluate the Born rule from
+- **Fixed basis (`disentangle=False`):** leave `C` unchanged, evaluate the Born rule from
   `<p|M|p> / <p|p>`, then apply `(I + m M) / 2` to `p` and normalize. Repeating
   the same measurement is deterministic.
-- **Basis updating (`disentangle=True`, legacy `absorb_basis=True`):**
+- **Basis updating (default for `measure` and `measure_reset`, `disentangle=True`, legacy `absorb_basis=True`):**
+  try certified native tableau collapse first; otherwise
   construct a Clifford `V` that maps
   `M` to signed `Z_k`; apply `V` to `p`, absorb `V^dagger` into `C` so the
   physical state is preserved, then project coefficient site `k` to `|0>` or
@@ -351,12 +352,12 @@ Ordered by value/effort. Completed items remain here as implementation guidance.
 ### R3. Basis-updating (canonical Lemma-3) measurement
 - Reference `meas_tableau` + `P_k` projection: absorb the measured observable into
   the stabilizer group and project qubit `k` to `|0>`, keeping `|nu>` support
-  compact. Add as `measure(..., disentangle=True)` (keep fixed-basis default).
+  compact. Exposed as `measure(..., disentangle=True)`.
 - Impact: smaller `|nu>` after measurement-heavy circuits. Low/medium effort.
 - **STATUS: DONE** — `measure(..., disentangle=True)` localises `M` with a
   Clifford `V` (`_localizing_clifford`), applies `V` to `|nu>`, absorbs
   `V^dagger` into the basis (`STNState.absorb_basis_clifford`), and single-site
-  projects/disentangles the pivot qubit. Fixed-basis remains the default;
+  projects/disentangles the pivot qubit. Basis updating is now the default;
   `absorb_basis=True` remains a compatibility alias.
   Follow-ups: choose the pivot / CNOT-ladder to minimise the transient bond
   (currently the support median with nearest-first merging); reuse the R2

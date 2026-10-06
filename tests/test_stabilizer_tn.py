@@ -413,7 +413,7 @@ def test_static_frame_layout_defaults_to_operator_schmidt_weights():
 def test_static_frame_layout_preserves_control_lifetimes_and_frame_support():
     sim = StabilizerMpsSimulator(4).set_gates([
         ("cnot", 0, 2), ("rz", 0.31, 2),
-        ("measure", "Z", 2), ("reset", 2, "Z"),
+        ("measure", "Z", 2, None, False), ("reset", 2, "Z"),
         ("measure_reset", "X", 1), ("rx", 0.23, 3),
     ])
     plan = sim.current_frame_layout(order="quality", refine_numba=False)
@@ -1047,7 +1047,7 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
     pre_loss = sim.infidelities[-1]
     pre_norm = sim.norm()
 
-    sim.measure("Z", 0)
+    sim.measure("Z", 0, disentangle=False)
 
     assert sim.infidelities[-1] == pytest.approx(pre_loss)
     assert sim.norm() == pytest.approx(1.0, abs=1e-10)
@@ -2438,7 +2438,7 @@ def test_measure_absorb_matches_fixed_basis(seed, pauli, where, outcome):
     p_plus = 0.5 * (1 + ref.expectation(pauli, where))
     if (outcome > 0 and p_plus < 1e-6) or (outcome < 0 and (1 - p_plus) < 1e-6):
         pytest.skip("outcome has ~0 probability")
-    m_ref = ref.measure(pauli, where, outcome=outcome)          # fixed-basis
+    m_ref = ref.measure(pauli, where, outcome=outcome, disentangle=False)
     a = StabilizerMpsSimulator(n).apply(stream)
     m_abs = a.measure(pauli, where, outcome=outcome, absorb_basis=True)  # basis-updating
     assert m_abs == m_ref
@@ -2704,14 +2704,14 @@ def test_measure_reset_stream_entry_records_then_resets(axis, bits, outcome):
     assert sim.expectation(axis, 0) == pytest.approx(1.0, abs=1e-9)
 
 
-def test_measure_reset_defaults_to_fixed_basis():
+def test_measure_reset_defaults_to_basis_updating():
     sim = StabilizerMpsSimulator.from_bits("0")
 
     sim.measure_reset("Z", 0, outcome=+1)
 
     assert sim.measurements == [("Z", 0, +1)]
     assert sim.expectation("Z", 0) == pytest.approx(1.0, abs=1e-9)
-    assert all(event.kind == "measure" for event in sim.norm_events)
+    assert all(event.kind == "measure_absorb" for event in sim.norm_events)
 
 
 def test_measure_reset_defaults_to_span_order_and_keeps_input_result_order():
@@ -3054,14 +3054,14 @@ def test_absorb_measure_forced_impossible_raises():
 
 
 def test_fixed_basis_forced_impossible_raises():
-    # Same impossible post-selection via the default fixed-basis path: it must
+    # Impossible post-selection via the explicit fixed-basis path must
     # raise on the ~0-norm collapse rather than silently keep a garbage state.
     sim = StabilizerMpsSimulator(2).apply([("h", 0), ("cnot", 0, 1)])
-    sim.measure("Z", 0, outcome=+1)   # collapse to |00>
+    sim.measure("Z", 0, outcome=+1, disentangle=False)   # collapse to |00>
     before = sim.to_statevector()
     before_history = (len(sim.infidelities), len(sim.bond_history), len(sim.measurements))
     with pytest.raises(ValueError, match="0 probability"):
-        sim.measure("Z", 1, outcome=-1)
+        sim.measure("Z", 1, outcome=-1, disentangle=False)
     assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
     assert (len(sim.infidelities), len(sim.bond_history), len(sim.measurements)) == before_history
 

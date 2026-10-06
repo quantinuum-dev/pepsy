@@ -4429,7 +4429,9 @@ def _run_coalesced_entries(
             run_kwargs,
             rng,
             entry=entry,
-            absorb_basis=_coalesced_control_absorb_basis(entry, parts[0]),
+            absorb_basis=_coalesced_control_absorb_basis(
+                entry, parts[0], optimizer=nodes[0].optimizer,
+            ),
             max_branches=max_branches,
             max_branch_factor=max_branch_factor,
             parallel_workers=parallel_workers,
@@ -4439,7 +4441,7 @@ def _run_coalesced_entries(
     return nodes
 
 
-def _coalesced_control_absorb_basis(entry, name) -> bool | None:
+def _coalesced_control_absorb_basis(entry, name, *, optimizer=None) -> bool | None:
     """Preserve the optional STN basis-absorbing control-event flag."""
     if isinstance(entry, Mapping):
         value = entry.get("absorb_basis", entry.get("absorb", entry.get("disentangle")))
@@ -4448,12 +4450,20 @@ def _coalesced_control_absorb_basis(entry, name) -> bool | None:
         return None
     head = str(entry[0]).replace("-", "_").lower()
     if name == "measure":
-        return bool(entry[4]) if len(entry) > 4 else None
-    if name != "measure_reset":
+        flag_index = 4
+        if len(entry) <= flag_index:
+            return None
+    elif name == "measure_reset":
+        flag_index = 3 if head in {"mrx", "mry", "mrz"} else 4
+        if len(entry) <= flag_index:
+            return True if flag_index == 3 else None
+    else:
         return None
-    if head in {"mrx", "mry", "mrz"}:
-        return bool(entry[3]) if len(entry) > 3 else True
-    return bool(entry[4]) if len(entry) > 4 else None
+    if entry[flag_index] is None:
+        # Only the MPS stabilizer treats an explicit None stream flag as its
+        # default. Other optimizers retain their existing bool(None) policy.
+        return None if _is_mps_stabilizer_trajectory_optimizer(optimizer) else False
+    return bool(entry[flag_index])
 
 
 def _coalesced_leakage_measure_leaked(
