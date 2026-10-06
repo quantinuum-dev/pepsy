@@ -14,13 +14,13 @@ def shot_parallelism(signature, *, workers, shots, parallel_backend):
     worker and dispatcher choices remain authoritative.
     """
     from ..mpi import _resolve_local_workers
+    from ..mps._trajectory_execution import _is_accelerator
     from ..noise import _validate_parallel_backend
 
-    backend = signature[3] if len(signature) > 3 else signature[0]
-    device = str(signature[2] or "").lower()
-    accelerator = backend == "cupy" or any(
-        label in device for label in ("cuda", "gpu", "mps", "tpu")
-    )
+    info = {"backend": signature[0], "device": signature[2]}
+    if len(signature) > 3:
+        info["array_backend"] = signature[3]
+    accelerator = _is_accelerator(info)
     if workers in {None, "auto"} and accelerator:
         workers = 1
     workers = _resolve_local_workers(workers, shots=shots)

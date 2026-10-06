@@ -51,6 +51,20 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Performance
 
+- StabilizerMpsSimulator uses native Stim measurement/reset collapse when the
+  live coefficient state or mapped support region is certified exactly
+  as separated single-qubit Pauli eigenstates. Mixed magic support retains the MPS path;
+  explicit fixed-basis measurement remains available. Norm events report
+  the collapse backend and fallback reason. Simulator and shot-result routing
+  summaries preserve coalesced multiplicities and report omitted histories;
+  compilation remains free of state execution.
+
+- StabilizerMpsSimulator shares ordinary MPS trajectory CPU scheduling,
+  allocator-aware memory planning and execution diagnostics. Automatic local
+  replay continues from counted prefixes at branch caps. Frame Kraus outcomes
+  reuse normalized Pauli expectations without parent-norm underflow; sampled
+  positive rare branches normalize below the forced-projector tolerance.
+
 - Local automatic MPS trajectories continue from completed shared prefixes
   before a possible branch-cap overflow, preserving counts, weights and
   controls. Pauli error models and threaded local runs are supported;
@@ -462,6 +476,12 @@ releases remain backwards-compatible. From 1.0 onward:
   and JAX JIT gradients.
 
 ### Changed
+
+- `StabilizerMpsSimulator.measure`, `measure_many`, `measure_reset`, and
+  `StabilizerMpsSampler` now default to `disentangle=True`: certified native
+  tableau collapse followed by basis-updating MPS collapse when needed.
+  Omitted and `None` stream flags use the same default. Explicit `False`
+  retains the fixed-basis projector and disables native collapse.
 
 - Dense `TreeSampler` now defaults to the exact factor strategy, retaining
   compact factors and sharing repeated prefixes within each sampling call.

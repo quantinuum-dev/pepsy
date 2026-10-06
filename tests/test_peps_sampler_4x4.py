@@ -90,6 +90,8 @@ def test_peps_4x4_end_to_end(backend, dtype, engine, chi, chip, cutoff, repair, 
         context = torch.inference_mode()
     with context:
         start = time.perf_counter()
+        # Proposal caps remain approximate; this oracle requires exact
+        # amplitudes for the independently normalized importance estimates.
         sampler = PepsSampler(
             state, amplitude_mode="exact", chi=chi, chi_prime=chip, boundary_engine=engine, to_backend=convert,
             cutoff=cutoff, cutoff_mode="auto", rho_positivity=repair,
@@ -208,7 +210,7 @@ def test_peps_4x4_actual_row_cache_and_refresh(monkeypatch):
         row_cache_mode="dense",
     )
     cached = PepsSampler(state, amplitude_mode="exact", row_cache_max_bytes=64 * 2**20, **options)
-    reference = PepsSampler(state, amplitude_mode="exact", **options)
+    reference = PepsSampler(state, amplitude_mode="exact", row_cache_max_bytes=0, **options)
     builds, build = [], cached._build_row_transfer_cache
 
     def counted_build(y, phi):

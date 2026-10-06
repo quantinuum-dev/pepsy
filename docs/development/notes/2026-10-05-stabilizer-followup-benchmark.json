@@ -1,0 +1,274 @@
+[
+  {
+    "backend": "numpy",
+    "case": "clifford",
+    "routing": "auto",
+    "qubits": 6,
+    "shots": 16,
+    "chi": 64,
+    "mode": "direct",
+    "workers": 1,
+    "seed": 37,
+    "compile_seconds": 0.00010766700142994523,
+    "median_run_seconds": 0.1293919999989157,
+    "repetitions": 3,
+    "warmups": 1,
+    "run_seconds": [
+      0.13196558299750905,
+      0.12862266700176406,
+      0.1293919999989157
+    ],
+    "routing_counts": {
+      "counts": {
+        "stim": 576,
+        "stim_region": 0,
+        "mps": 0
+      },
+      "fallback_reasons": {},
+      "total": 576,
+      "represented_shots": 16,
+      "unavailable_shots": 0
+    },
+    "max_coefficient_bond": 1
+  },
+  {
+    "backend": "numpy",
+    "case": "clifford",
+    "routing": "fixed",
+    "qubits": 6,
+    "shots": 16,
+    "chi": 64,
+    "mode": "direct",
+    "workers": 1,
+    "seed": 37,
+    "compile_seconds": 0.00011495800208649598,
+    "median_run_seconds": 0.5158113329998741,
+    "repetitions": 3,
+    "warmups": 1,
+    "run_seconds": [
+      0.5125666249987262,
+      0.5443333330003952,
+      0.5158113329998741
+    ],
+    "routing_counts": {
+      "counts": {
+        "stim": 0,
+        "stim_region": 0,
+        "mps": 576
+      },
+      "fallback_reasons": {
+        "explicit_fixed_basis": 288,
+        "uncertified_entanglement": 288
+      },
+      "total": 576,
+      "represented_shots": 16,
+      "unavailable_shots": 0
+    },
+    "max_coefficient_bond": 8
+  },
+  {
+    "backend": "numpy",
+    "case": "mixed",
+    "routing": "auto",
+    "qubits": 6,
+    "shots": 16,
+    "chi": 64,
+    "mode": "direct",
+    "workers": 1,
+    "seed": 37,
+    "compile_seconds": 6.179100091685541e-05,
+    "median_run_seconds": 0.09861129099954269,
+    "repetitions": 3,
+    "warmups": 1,
+    "run_seconds": [
+      0.09752387499975157,
+      0.09861129099954269,
+      0.09912941700167721
+    ],
+    "routing_counts": {
+      "counts": {
+        "stim": 0,
+        "stim_region": 96,
+        "mps": 96
+      },
+      "fallback_reasons": {
+        "uncertified_entanglement": 96
+      },
+      "total": 192,
+      "represented_shots": 16,
+      "unavailable_shots": 0
+    },
+    "max_coefficient_bond": 2
+  },
+  {
+    "backend": "numpy",
+    "case": "mixed",
+    "routing": "fixed",
+    "qubits": 6,
+    "shots": 16,
+    "chi": 64,
+    "mode": "direct",
+    "workers": 1,
+    "seed": 37,
+    "compile_seconds": 6.133399801910855e-05,
+    "median_run_seconds": 0.15179725000052713,
+    "repetitions": 3,
+    "warmups": 1,
+    "run_seconds": [
+      0.15179725000052713,
+      0.15134416599903489,
+      0.1525341250016936
+    ],
+    "routing_counts": {
+      "counts": {
+        "stim": 0,
+        "stim_region": 16,
+        "mps": 176
+      },
+      "fallback_reasons": {
+        "explicit_fixed_basis": 96,
+        "uncertified_entanglement": 80
+      },
+      "total": 192,
+      "represented_shots": 16,
+      "unavailable_shots": 0
+    },
+    "max_coefficient_bond": 2
+  },
+  {
+    "backend": "torch",
+    "case": "clifford",
+    "routing": "auto",
+    "qubits": 6,
+    "shots": 16,
+    "chi": 64,
+    "mode": "direct",
+    "workers": 1,
+    "seed": 37,
+    "compile_seconds": 0.0001077919987437781,
+    "median_run_seconds": 0.16147945799821173,
+    "repetitions": 3,
+    "warmups": 1,
+    "run_seconds": [
+      0.16147945799821173,
+      0.16162637500019628,
+      0.16090695900129504
+    ],
+    "routing_counts": {
+      "counts": {
+        "stim": 576,
+        "stim_region": 0,
+        "mps": 0
+      },
+      "fallback_reasons": {},
+      "total": 576,
+      "represented_shots": 16,
+      "unavailable_shots": 0
+    },
+    "max_coefficient_bond": 1
+  },
+  {
+    "backend": "torch",
+    "case": "clifford",
+    "routing": "fixed",
+    "qubits": 6,
+    "shots": 16,
+    "chi": 64,
+    "mode": "direct",
+    "workers": 1,
+    "seed": 37,
+    "compile_seconds": 0.000103832997410791,
+    "median_run_seconds": 0.7716080829995917,
+    "repetitions": 3,
+    "warmups": 1,
+    "run_seconds": [
+      0.7716080829995917,
+      0.7554402090026997,
+      0.7934181249984249
+    ],
+    "routing_counts": {
+      "counts": {
+        "stim": 0,
+        "stim_region": 0,
+        "mps": 576
+      },
+      "fallback_reasons": {
+        "explicit_fixed_basis": 288,
+        "uncertified_entanglement": 288
+      },
+      "total": 576,
+      "represented_shots": 16,
+      "unavailable_shots": 0
+    },
+    "max_coefficient_bond": 8
+  },
+  {
+    "backend": "torch",
+    "case": "mixed",
+    "routing": "auto",
+    "qubits": 6,
+    "shots": 16,
+    "chi": 64,
+    "mode": "direct",
+    "workers": 1,
+    "seed": 37,
+    "compile_seconds": 6.19589991401881e-05,
+    "median_run_seconds": 0.11506908400042448,
+    "repetitions": 3,
+    "warmups": 1,
+    "run_seconds": [
+      0.11506908400042448,
+      0.11316145900127594,
+      0.1155347919993801
+    ],
+    "routing_counts": {
+      "counts": {
+        "stim": 0,
+        "stim_region": 96,
+        "mps": 96
+      },
+      "fallback_reasons": {
+        "uncertified_entanglement": 96
+      },
+      "total": 192,
+      "represented_shots": 16,
+      "unavailable_shots": 0
+    },
+    "max_coefficient_bond": 2
+  },
+  {
+    "backend": "torch",
+    "case": "mixed",
+    "routing": "fixed",
+    "qubits": 6,
+    "shots": 16,
+    "chi": 64,
+    "mode": "direct",
+    "workers": 1,
+    "seed": 37,
+    "compile_seconds": 5.833400064148009e-05,
+    "median_run_seconds": 0.19938908300173352,
+    "repetitions": 3,
+    "warmups": 1,
+    "run_seconds": [
+      0.19938908300173352,
+      0.20071933299914235,
+      0.1988420829984534
+    ],
+    "routing_counts": {
+      "counts": {
+        "stim": 0,
+        "stim_region": 16,
+        "mps": 176
+      },
+      "fallback_reasons": {
+        "explicit_fixed_basis": 96,
+        "uncertified_entanglement": 80
+      },
+      "total": 192,
+      "represented_shots": 16,
+      "unavailable_shots": 0
+    },
+    "max_coefficient_bond": 2
+  }
+]

@@ -36,6 +36,12 @@ retention settings can omit data. Use `retain="all"` when inspecting replay
 history. Terminal bit samples have a separate row per sampled shot; their
 `leaf_indices` identify the source branch.
 
+`NoisyResult.measurement_routing_diagnostics()` summarizes retained STN collapse
+backends and MPS fallback reasons, multiplying coalesced histories by their
+shot counts. It reports unavailable shots when retention omitted histories or
+the engine lacks routing diagnostics. Counts include hidden reset collapse;
+they are neither importance-weighted estimates nor unique shared-prefix work.
+
 Jump to [MPS shots](#shot-aware-mpsoptimizer-api),
 [coalesced ensembles](#exact-coalesced-ensembles-for-rare-noise),
 [MPI](#mpi-shot-ensembles), or
@@ -406,13 +412,18 @@ rule. Sampling order, branch budgets and importance ratios remain unchanged.
 Callable proposals use the per-parent path. See the [MPS API](mps.md) for the
 workspace scope and `max_kraus_parent_batch` diagnostic.
 
-The optimizer-level local MPS API also defaults to `memory_budget="auto"`,
+The optimizer-level local MPS and StabilizerMpsSimulator APIs default to `memory_budget="auto"`,
 which estimates retained-state storage and limits live branches using
 available GPU allocator memory. Independent retained results must fit the
 budget, including when automatic coalescing falls back. This preserves
 retention and sampling probabilities or raises a memory-budget error; it does
 not discard shots. Low-level factory runners retain their explicit branch
 limits and do not perform this optimizer-level memory planning.
+Stabilizer estimates also reserve tableau and classical record storage. Both
+frontends share worker scheduling, memory helpers and execution diagnostics;
+automatic stabilizer replay also continues from counted prefixes at branch
+caps. See the [stabilizer API](stabilizer_tn.md) for its frame-specific Kraus
+path and GPU batching limits.
 
 Library-generated NumPy operators with exactly zero imaginary components keep
 a real MPS dtype, including real Torch states with bit-flip or amplitude-damping

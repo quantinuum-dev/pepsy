@@ -8,6 +8,23 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def restore_torch_linalg_policy():
+    """Keep process-global registrations local to each numerical test.
+
+    Optimizers can install a real-only policy as well as explicit backend
+    tests. Do not import Torch or Pepsy in dependency-light test runs.
+    """
+    config = sys.modules.get("pepsy.backends.config")
+    previous = config.get_torch_linalg_config() if config is not None else None
+    yield
+    config = sys.modules.get("pepsy.backends.config")
+    if config is not None and "torch" in sys.modules:
+        config.reset_linalg_registrations(backend="torch")
+        if previous is not None:
+            previous.register()
+
+
+@pytest.fixture(autouse=True)
 def close_test_figures():
     """Release test-created figures without importing an optional backend."""
     yield

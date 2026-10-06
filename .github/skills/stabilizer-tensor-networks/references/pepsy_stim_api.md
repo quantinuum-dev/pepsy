@@ -57,8 +57,10 @@ The public simulator types are exported at top level (`import pepsy`); see
   - Denser Pauli sums copy/apply/weight branches, then combine them with a balanced,
     streaming MPS reduction and compress after additions.
 - **Observables and collapse**: use `sim.expectation`, `sim.expectation_pauli_sum`,
-  `sim.sample` (no collapse), and `sim.measure` (collapse). `absorb_basis=True` localizes
+  `sim.sample` (no collapse), and `sim.measure` (collapse). The default
+  `disentangle=True` tries certified native tableau collapse, then localizes
   the frame Pauli, updates both basis and MPS, and disentangles the projected pivot.
+  Explicit `disentangle=False` selects the fixed-frame MPS projector.
 - **Computational-basis probabilities**: `sim.probability_bits(bits)` and
   `sim.sample_bits(shots, seed=...)` use conditional measurements on copies and do not form
   the dense statevector. `sim.amplitude` / `sim.probability` reconstruct densely and are for

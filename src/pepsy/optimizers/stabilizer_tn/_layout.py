@@ -423,7 +423,7 @@ def _frame_layout_trace_entry(self, entry, records, *, weight_mode):
         return
     if name == "measure":
         pauli, where = entry[1], entry[2]
-        absorb = bool(entry[4]) if len(entry) > 4 else False
+        absorb = bool(entry[4]) if len(entry) > 4 and entry[4] is not None else True
         self._frame_layout_add_pauli(
             pauli,
             where,
@@ -455,6 +455,9 @@ def _frame_layout_trace_entry(self, entry, records, *, weight_mode):
             entry[1:],
             default_axis=_MR_AXIS_ALIASES.get(name),
         )
+        flag_index = 3 if name in _MR_AXIS_ALIASES else 4
+        if len(entry) <= flag_index or entry[flag_index] is None:
+            absorb = True
         for axis, q in zip(axes, where):
             self._frame_layout_add_pauli(
                 axis,

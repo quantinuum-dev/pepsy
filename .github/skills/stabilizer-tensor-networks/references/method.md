@@ -140,10 +140,11 @@ When $\hat n=0$ (measuring a stabilizer) the basis is unchanged and there is no 
 
 `StabilizerMpsSimulator` deliberately exposes two equivalent collapse representations:
 
-- **Fixed basis (default):** leave $C$ unchanged and apply $(I+mM)/2$ directly to $|p\rangle$.
+- **Fixed basis (`disentangle=False`):** leave $C$ unchanged and apply $(I+mM)/2$ directly to $|p\rangle$.
   Use a local 2x2 projector for one-site support or a windowed bond-dimension-2 sub-MPO for
   multi-site support, then normalize at the tracked canonical centre.
-- **Basis updating (`absorb_basis=True`):** choose a Clifford $V$ with
+- **Basis updating (default, `disentangle=True`, legacy `absorb_basis=True`):**
+  first try certified native tableau collapse; otherwise choose a Clifford $V$ with
   $VMV^\dagger=sZ_k$, apply $V$ to $|p\rangle$, replace $C$ by $CV^\dagger$, and project
   site $k$ onto the required computational value. Before projection,
   $(CV^\dagger)(V|p\rangle)=C|p\rangle$; afterward the pivot is disentangled. The

@@ -4,8 +4,9 @@ The Stabilizer Tensor Network (STN) simulator (Masot-Llima & Garcia-Saez, PRL
 133, 230601, 2024; arXiv:2403.08724). A state is stored as `|psi> = C |nu>`: a
 stim tableau Clifford `C` (the stabilizer basis `B(S, D)`) times a coefficient
 MPS `|nu>` (the paper's coefficient state, exposed as `.p`). Clifford gates
-update only the tableau (free, `|nu>` unchanged); non-Clifford gates and
-measurements update `|nu>`.
+update only the tableau (`|nu>` unchanged); non-Clifford gates update `|nu>`.
+Measurements use certified native tableau collapse when eligible and the
+coefficient-MPS projector otherwise.
 
 General physical matrices use the exact coefficient-frame Pauli mapping when
 their explicit budget is within the default three qubits. Set
@@ -320,14 +321,41 @@ After `compile`, `queued_stream_analysis()` and `queued_recommend_settings()`
 inspect the installed trajectory plan and reuse its prepared noise channels.
 
 Local shot replay accepts `parallel_backend="auto"` (the default).
-With `workers="auto"`, CPU arrays use the host worker budget, while CUDA,
-MPS, CuPy GPU and JAX GPU/TPU placements default to one worker to limit
-simultaneous device-state allocations. Explicit workers and dispatchers win.
+With `workers="auto"`, both ordinary MPS and stabilizer MPS replay use the
+same workload and numerical-thread policy: shared prefixes and small CPU
+workloads stay serial; large independent CPU workloads respect the existing
+numerical thread budget. CUDA, MPS, CuPy GPU and JAX GPU/TPU placements default
+to one worker to limit simultaneous device-state allocations. Explicit workers
+and dispatchers win.
 This does not move arrays or imply batched GPU execution. Replay
 `strategy="auto"` remains a separate branch-cap decision between independent
 and shared-prefix trajectories; backend alone does not predict branch growth.
 Coalesced copies preserve native visible measurement history for later feedback
 and raw readout. Weight each retained branch by its shot count.
+
+`memory_budget="auto"` shares ordinary MPS allocator-aware planning and caps
+live branches/workers. An integer supplies a byte budget; `None` disables the
+policy. Estimates include possible coefficient bond growth, tableau storage
+and classical records, with compression workspace reserved. CPU allocators
+without a public query leave auto budgeting inactive. The estimate is not a
+reservation or an OOM guarantee. Independent retained output must fit before
+shot allocation; a cap continuation also checks retention before expanding.
+Explicit byte budgets currently apply only to local shots.
+
+Automatic replay continues from counted shared prefixes before branch caps
+would overflow, preserving states, measurement history, faults and importance
+weights. Explicit `strategy="coalesced"` keeps strict caps. Diagnostics expose
+`planned_strategy`, `workers`, `execution_reason`, `continued_from_cap`,
+`fallback_reason`, `memory_budget_bytes`, `estimated_state_bytes`,
+`memory_max_branches` and `memory_reason`, using the same fields as MPS replay.
+
+Kraus probabilities reuse normalized coefficient-frame Pauli expectations
+across channel outcomes. Sampled positive rare branches do not inherit the
+forced-projector normalization tolerance. This does not turn physical STN
+gates into coefficient-frame local gates: ordinary MPS GPU gate/SVD and
+cross-parent Kraus batches retain their capability checks and STN uses its
+tableau/frame path. Batch diagnostics remain one on these fallback paths;
+there is no claim of equivalent GPU throughput.
 
 For measurement/feed-forward circuits, use
 `("if", record, bit, action)`. `record=-1` means the latest measurement,
@@ -340,29 +368,78 @@ outside the quantum replay contract.
 
 ## Measurement, reset, and magic-state injection
 
-- `measure(pauli, where, *, outcome=None, disentangle=False)` — fixed-basis
-  projector `(I +- M)/2` by default; `disentangle=True` uses the basis-updating
-  (canonical Lemma-3) form that disentangles the measured qubit from `|nu>`.
-  The legacy `absorb_basis` keyword remains accepted as an alias.
+- `measure(pauli, where, *, outcome=None, disentangle=None)` — defaults to
+  `disentangle=True`: use certified native Stim collapse, falling back to the
+  basis-updating (canonical Lemma-3) form that disentangles the measured
+  coefficient pivot from `|nu>`. `None` selects this default.
+  The legacy `absorb_basis` keyword remains accepted as an alias. Explicit
+  `False` preserves the fixed-basis MPS path even when native collapse is eligible.
 - `reset(where, basis="Z", *, order="min_span")` — return qubit(s) to `|0>`
   (measure-`Z` absorb + conditional `X`), disentangling them so ancillas can
   be recycled. Pass `basis="X"` or `"Y"` to reset to the corresponding `+1`
   Pauli eigenstate. Separate targets use the metadata-only span scheduler by
   default; pass `order="input"` to preserve the supplied order.
-- `measure_reset(pauli, where, *, outcome=None, disentangle=False,
+- `measure_reset(pauli, where, *, outcome=None, disentangle=None,
   order="min_span")` — record a Pauli measurement, then reset the same
   qubit(s) to the `+1` eigenstate of that basis. Separate targets use the
   metadata-only span scheduler by default. Pass `order="input"` to preserve
-  their supplied order and `disentangle=True` for the basis-updating path.
+  their supplied order. Disentangling defaults to `True`, as for `measure`.
   Returned outcomes remain aligned with the input target order. The legacy
   `absorb_basis` keyword remains accepted as an alias. Stream aliases `mrx`,
   `mry`, and `mrz` are accepted.
-- `measure_many(measurements, *, order="min_span", disentangle=False)` —
+- `measure_many(measurements, *, order="min_span", disentangle=None)` —
   measure independent single-qubit entries such as
   `[ ("Z", 1), ("X", 2) ]`. The span scheduler reads Tableau supports and
   MPS layout metadata only; it never performs trial MPS contractions or
   truncations. Outcomes are returned in input order and the selected schedule
   is available as `last_measurement_schedule`.
+
+Omitted or `None` measurement flags in streams also select `disentangle=True`.
+Pass `disentangle=False` (or the legacy `absorb_basis=False`) to apply the
+fixed-basis MPS projector `(I +- M)/2` and disable native collapse.
+
+Native collapse is a runtime decision; `compile` does not execute measurements
+or sample outcomes. For `|psi> = C|p>`, a live, exactly factorized product of
+single-qubit Pauli eigenstates in `|p>` certifies the whole physical state as
+a tableau. This includes the six X/Y/Z eigenstates, with arbitrary nonzero
+scalar phases and scales. Otherwise, the support
+of `C† O C` must consist entirely of exact Pauli eigenstates separated
+from their neighbors by dimension-one MPS bonds. Stim computes the Born
+probability and conditional tableau; Pepsy owns the outcome RNG, feedback,
+layout, normalization, and records. A regional basis update is checked to
+leave every uncertified coefficient site unchanged. These paths avoid MPS
+expectation/projector contractions and compression; they still inspect live
+arrays and maintain the canonical center and norm ledger.
+
+A T gate alone does not force subsequent measurements onto the MPS path.
+Measurements whose frame support touches magic or uncertified entanglement
+use the general MPS implementation. Certificates use exact zeros, reject
+trainable/traced or block arrays, and are rechecked after external tensor edits.
+There is no approximate stabilizer detection: amplitude relations must be
+exact (`b=0`, `a=0`, `b=±a`, or `b=±ia`, with a nonzero finite local state).
+Even a post-measurement stabilizer state may stay on the MPS path if its
+coefficient representation does not meet this conservative certificate.
+Local eigenstate preparations are absorbed into the tableau and their scalar
+amplitudes are retained at computational coefficient sites. Norm events expose
+`measurement_backend="stim"`, `"stim_region"`, or `"mps"` for collapse routing.
+
+`engine.measurement_routing_diagnostics()` returns successful collapse counts
+and MPS fallback reasons from its norm ledger. It includes hidden reset
+collapse and sampling branch events, but excludes probability probes, identity
+no-ops, and rejected operations. `norm_diagnostics()["measurement_routing"]`
+contains the same summary. MPS events also expose `measurement_fallback_reason`:
+`explicit_fixed_basis`, `fixed_frame_sampling`, `uncertified_entanglement`, `uncertified_local_state`,
+`trainable_coefficients`, `block_coefficients`, `cyclic_coefficients`, or
+`unsupported_array`. These describe failed conservative certificates, not a
+proof that the state is non-stabilizer.
+
+For `batch = engine.run(shots=...)`, use
+`batch.measurement_routing_diagnostics()` to aggregate retained histories.
+Coalesced leaf counts multiply each history by its shot multiplicity;
+importance weights are not used for execution counts. The report includes
+`represented_shots` and `unavailable_shots` so omitted retention or unsupported
+engines cannot appear as zero-cost measurements. These logical per-shot totals
+are distinct from the number of unique shared-prefix operations executed.
 - `reset_many(where, basis="Z", *, order="min_span")` — batch alias for
   `reset()` with the same span-ordering behavior.
 - `cap(where, vec, *, absorb="left")` — contract a physical qubit with `vec`

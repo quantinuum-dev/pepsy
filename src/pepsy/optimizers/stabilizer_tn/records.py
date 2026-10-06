@@ -92,6 +92,8 @@ class NormEventRecord(_TypedRecord):
     cumulative_infidelity: Optional[float] = None
     post_norm: Optional[float] = None
     post_norm_sq: Optional[float] = None
+    measurement_backend: Optional[str] = None
+    measurement_fallback_reason: Optional[str] = None
 
 
 @dataclass
