@@ -1932,6 +1932,7 @@ def _run_jax_solver(
     step_iter = _iter_steps(controls["max_steps"], progress=progress, opt_desc=opt_desc)
 
     for step in step_iter:
+        evaluated_params = params
         params, opt_state, loss, gnorm = _step(params, opt_state)
         loss_value = float(loss)
         gnorm_value = float(gnorm)
@@ -1959,7 +1960,8 @@ def _run_jax_solver(
             and (loss_value + controls["min_improve"] < best_loss)
         ):
             best_loss = loss_value
-            best_params = params
+            # _step returns the loss at its input, before the Optax update.
+            best_params = evaluated_params
             last_improve_step = step_num
 
         if progress:
@@ -1974,11 +1976,19 @@ def _run_jax_solver(
                 convergence_reason = "patience"
                 break
 
+    # The last update has not been evaluated by the next step. Score it once
+    # so final_loss matches the returned state and a one-step solve can improve.
+    n_evals = len(history) + 1
+    try:
+        final_loss = float(_loss_real(params))
+    except (FloatingPointError, RuntimeError, ValueError):
+        final_loss = float("nan")
+    if (np.isfinite(final_loss) and _accept_as_best(final_loss, controls)
+            and final_loss + controls["min_improve"] < best_loss):
+        best_loss, best_params = final_loss, params
     if controls["restore_best"] and np.isfinite(best_loss):
         params = best_params
         final_loss = best_loss
-    else:
-        final_loss = history[-1] if history else float("nan")
 
     if progress_callback is not None:
         progress_callback(max(1, len(history)), final_loss)
@@ -1986,7 +1996,7 @@ def _run_jax_solver(
     if not history:
         history.append(final_loss if np.isfinite(final_loss) else controls["penalty_on_bad"])
 
-    return dict(params), history, best_loss, final_loss, convergence_reason, len(history)
+    return dict(params), history, best_loss, final_loss, convergence_reason, n_evals
 
 
 def _optimize_dispatch(
@@ -2017,6 +2027,24 @@ def _optimize_dispatch(
         raise ValueError("lr must be finite and > 0")
 
     solver_name, _algo_override = _resolve_solver(solver)
+    # Native autodiff solvers must not silently convert arrays from the other
+    # backend: the supplied loss belongs to the original backend as well.
+    has_jax = any(_is_jax_array(value) for value in params_init.values())
+    has_torch = torch is not None and any(
+        isinstance(value, torch.Tensor) for value in params_init.values()
+    )
+    if has_jax and has_torch:
+        raise TypeError("Solver parameters cannot mix Torch and JAX arrays")
+    if solver_name.startswith("torch-") and has_jax:
+        raise TypeError(
+            f"solver={solver!r} cannot use JAX parameters; "
+            "choose a jax-* solver, lbfgs or LD_LBFGS"
+        )
+    if solver_name in _JAX_SOLVER_NAMES and has_torch:
+        raise TypeError(
+            f"solver={solver!r} cannot use Torch parameters; "
+            "choose a torch-* solver, lbfgs or LD_LBFGS"
+        )
     # Inject algorithm override when the caller did not supply one explicitly.
     # This allows compact forms like solver="nlopt-LD_VAR2" or solver="lbfgs"
     # without separately setting solver_options["algorithm"].
@@ -2052,9 +2080,7 @@ def _optimize_dispatch(
             progress_callback=progress_callback,
         )
 
-    if solver_name in {"scipy", "nlopt"} and any(
-        _is_jax_array(value) for value in params_init.values()
-    ):
+    if solver_name in {"scipy", "nlopt"} and has_jax:
         items = list(params_init.items())
     else:
         _require_torch()
@@ -2213,6 +2239,9 @@ class GradientOptimizer:
 
     The main entry point is :meth:`run`, which accepts ``params_init``,
     ``loss_fn`` and optional ``loss_kwargs``.
+    Omit ``options`` to use the selected solver's defaults, or supply only
+    overrides. SciPy/NLopt select native autodiff from the parameter arrays;
+    explicit Torch/JAX solvers reject parameters from the other backend.
     """
 
     def __init__(

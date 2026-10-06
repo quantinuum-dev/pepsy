@@ -119,6 +119,15 @@ releases remain backwards-compatible. From 1.0 onward:
   assuming one for nonunitary targets. Explicit normalization and diagnostic
   overrides remain supported.
 
+- Gradient solvers reject mixed Torch/JAX parameter mappings and native
+  solver/backend mismatches before array conversion or loss evaluation.
+  SciPy/NLopt still select native autodiff from the input arrays; NumPy/scalar
+  inputs retain their existing conversion behavior and solver defaults.
+- JAX/Optax solvers associate best losses with the evaluated parameters,
+  rather than the subsequent update. A final forward evaluation scores the
+  last update and makes the returned parameters and `final_loss` consistent;
+  this additional evaluation is included in `n_evals`.
+
 - Standalone PEPS fidelity evaluation recomputes both norms and can retry invalid
   estimates at larger, equal caps (two bounded, warned retries by default;
   disable with `evaluation_max_retries=0`). Effective caps and raw attempts

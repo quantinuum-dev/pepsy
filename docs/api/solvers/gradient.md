@@ -1,8 +1,16 @@
 # `pepsy.solvers.gradient`
 
 Use `GradientOptimizer` to optimize a dictionary of parameters against a
-scalar loss. Choose a solver through `solver=`, and pass its settings in
-`options`.
+scalar loss. Choose a solver through `solver=`. `options` is optional: Pepsy
+resolves solver aliases, chooses the autodiff backend from the input arrays
+for SciPy/NLopt, and applies the selected runner's defaults. Pass only settings
+you want to override; callers do not need a solver-specific `if` ladder.
+
+```python
+from pepsy.solvers import GradientOptimizer
+
+optimizer = GradientOptimizer(solver="lbfgs", n_steps=100, progress=True)
+```
 
 ```python
 import torch
@@ -24,6 +32,10 @@ For the gradient-based `scipy` family, `convergence_reason` contains SciPy's
 termination message, identifying convergence, budget exhaustion, or failure.
 Pepsy's callback stops retain the labels `"patience"` and `"bad_max"`.
 These messages are solver-specific strings, rather than a fixed enumeration.
+JAX/Optax solvers pair each measured loss with the parameters at which it was
+evaluated. Their final update receives one extra loss evaluation, included in
+`n_evals`, so `final_loss` describes the returned parameters with either value
+of `restore_best`. An invalid final update cannot replace a finite best state.
 `optimize_packed_params(...)` provides the function form, returning
 `(params, history)`.
 
@@ -52,4 +64,24 @@ scalar loss and flat gradient per evaluation. `n_steps` limits SciPy iterations
 or NLopt objective evaluations; the budgets have different meanings. Use
 `options={"assume_nonnegative": False}` for signed losses, including cluster
 infidelity approximations that can be negative. `torch-lbfgs` explicitly selects
-Torch's optimizer and accepts only Torch-compatible inputs.
+Torch's optimizer and accepts only Torch-compatible inputs. Native `torch-*`
+solvers reject JAX arrays, native `jax-*` solvers reject Torch tensors, and
+mixed Torch/JAX parameter mappings are rejected before conversion or loss
+evaluation. NumPy/scalar conversion remains supported. Choose `lbfgs` or
+`LD_LBFGS` when the same solver configuration should work with either backend.
+
+## Default options and overrides
+
+- SciPy L-BFGS-B uses Pepsy's `ftol=1e-9`, `gtol=1e-9`, and `maxls=40`.
+  Other unspecified L-BFGS-B controls use SciPy's defaults.
+- NLopt uses `ftol_rel=1e-9`, `ftol_abs=1e-9`, and `xtol_rel=1e-9`.
+- Torch/JAX iterative solvers use Pepsy's default `lr=0.01`, with other
+  unspecified algorithm controls supplied by Torch/Optax.
+
+These are numerical defaults, not automatic tuning to a particular objective.
+Removing explicit tolerances or learning rates can change a run's stopping
+point and convergence history. For example, a deliberately stricter SciPy run
+can still request `options={"ftol": 0.0, "gtol": 1e-12}`. NLopt's function and
+parameter tolerances are separate controls; they are not interchangeable with
+a gradient tolerance. Existing legacy option aliases remain supported.
+Constructor options are overridden by matching keys supplied to `run(options=...)`.

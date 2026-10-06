@@ -95,3 +95,85 @@ def test_jax_host_callbacks_reject_nonscalar_and_nonreal_losses():
     problem = gradient._host_problem([("x", initial)], lambda p: p["x"].sum() + 1j)
     with pytest.raises(ValueError, match="real scalar"):
         problem.value_and_grad(problem.x0)
+
+
+@pytest.mark.parametrize("solver", ["torch-lbfgs", "torch-adam", "adam", "jax-adam", "jax-sgd"])
+def test_native_solver_rejects_other_backend_before_conversion(solver, monkeypatch):
+    torch = pytest.importorskip("torch")
+    is_jax_solver = solver.startswith("jax-")
+    initial = (torch.tensor([2.], dtype=torch.float64, requires_grad=True)
+               if is_jax_solver else jnp.array([2.], dtype=jnp.float64))
+
+    def reject_execution(*args, **kwargs):
+        raise AssertionError("Backend mismatch must fail before conversion or loss evaluation")
+
+    monkeypatch.setattr(gradient, "_require_optax", reject_execution)
+    monkeypatch.setattr(gradient, "_as_trainable_tensor", reject_execution)
+    message = "cannot use Torch parameters" if is_jax_solver else "cannot use JAX parameters"
+    with pytest.raises(TypeError, match=message):
+        GradientOptimizer(solver=solver, n_steps=2).run(
+            params_init={"x": initial}, loss_fn=reject_execution,
+        )
+    np.testing.assert_array_equal(initial.detach().numpy() if is_jax_solver else initial, [2.])
+
+
+@pytest.mark.parametrize("solver", ["lbfgs", "LD_LBFGS", "torch-adam", "jax-adam"])
+def test_solver_rejects_mixed_backends_before_execution(solver):
+    torch = pytest.importorskip("torch")
+
+    def loss(params):
+        raise AssertionError("Mixed backend inputs must fail before loss evaluation")
+
+    with pytest.raises(TypeError, match="cannot mix Torch and JAX"):
+        GradientOptimizer(solver=solver, n_steps=2).run(
+            params_init={"x": jnp.array([2.]), "y": torch.tensor([3.])}, loss_fn=loss,
+        )
+
+
+@pytest.mark.parametrize("solver,lr", [("jax-sgd", 1.5), ("jax-adam", 3.)])
+@pytest.mark.parametrize("restore_best", [True, False])
+def test_jax_result_loss_matches_returned_parameters_after_overshoot(solver, lr, restore_best):
+    pytest.importorskip("optax")
+    initial = jnp.array([1.], dtype=jnp.float64)
+
+    def loss(params):
+        return (params["x"] ** 2).sum()
+
+    result = GradientOptimizer(
+        solver=solver, n_steps=1, options={"lr": lr, "restore_best": restore_best},
+    ).run(params_init={"x": initial}, loss_fn=loss)
+    assert result.history == pytest.approx([1.])
+    assert result.best_loss == pytest.approx(1.)
+    assert result.final_loss == pytest.approx(float(loss(result.params)))
+    assert result.n_evals == 2  # Initial value/gradient and final updated value.
+    if restore_best:
+        np.testing.assert_array_equal(result.params["x"], initial)
+    else:
+        assert result.final_loss > 3.9  # The deliberately oversized update overshoots.
+    np.testing.assert_array_equal(initial, [1.])
+
+
+def test_jax_best_result_includes_last_update():
+    pytest.importorskip("optax")
+    result = GradientOptimizer(solver="jax-sgd", n_steps=1, options={"lr": .1}).run(
+        params_init={"x": jnp.array([1.])}, loss_fn=lambda p: (p["x"] ** 2).sum(),
+    )
+    np.testing.assert_allclose(result.params["x"], [.8])
+    assert result.best_loss == pytest.approx(.64)
+    assert result.final_loss == pytest.approx(.64)
+    assert result.n_evals == 2
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), -float("inf")])
+def test_jax_invalid_final_update_preserves_finite_best(invalid):
+    pytest.importorskip("optax")
+
+    def loss(params):
+        x = params["x"][0]
+        return jnp.where(x >= 0, x ** 2, invalid)
+
+    result = GradientOptimizer(solver="jax-sgd", n_steps=1, options={"lr": 1.5}).run(
+        params_init={"x": jnp.array([1.])}, loss_fn=loss,
+    )
+    np.testing.assert_array_equal(result.params["x"], [1.])
+    assert result.best_loss == result.final_loss == 1.

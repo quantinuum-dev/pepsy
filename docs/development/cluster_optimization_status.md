@@ -1,10 +1,25 @@
 # Cluster PEPO backend and downstream optimization status
 
-Updated 2026-10-01. An earlier Pepsy `develop` publication at
+Updated 2026-10-06. An earlier Pepsy `develop` publication at
 **`b4c4631`** includes
 the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
+
+## Joint notebook solver defaults, 2026-10-06
+
+The joint Gaugy notebook now uses Pepsy's existing solver defaults without
+an option-selection ladder. Pepsy validates native Torch/JAX compatibility
+at dispatch. A default Adam check also exposed and corrected mismatched
+pre-update losses and post-update best parameters; final JAX results now
+include one final forward evaluation. The Pepsy fixes are included in the
+local solver commit recorded in the
+[commit handoff](../../history/2026-10-06-local-commits.md); the Gaugy notebook
+has separate commit status. Validation includes 78 focused Pepsy tests,
+28 earlier downstream notebook cases and bounded native solver checks.
+No new full-suite or CUDA claim. See the
+[handoff](../../history/2026-10-06-gradient-solver-defaults.md) and
+[solver API](../api/solvers/gradient.md).
 
 ## Public paired-factor registration, 2026-10-05
 
