@@ -35,16 +35,139 @@ Quimb environment controls with `boundary_options`. In particular,
 `cutoff="auto"` uses the shared dtype-aware policy and `cutoff_mode` is
 forwarded to Quimb's boundary SVD via `compress_opts`.
 
-Use `PepsOptimizer.run(k_2q_batch=N)` to absorb up to `N` sequential two-site
-gates, plus intervening one-site gates, into one PEPS target before truncating
-to `chi` and optionally running the sweep/global cleanup. Two-site targets use
-`cutoff=0`, no bond cap, and no path compression, even when `run(cutoff=...)`
-requests truncation for the warm start. Inherited final gate `chi` is disabled
+`PepsOptimizer.run()` now defaults to `k_2q_batch="auto"`. It absorbs gates
+in circuit order until the next two-site gate shares a site with an earlier
+two-site gate in the batch, or would make any target bond exceed its budget:
+`2*chi` for diagonal two-qubit gates such as RZZ, increasing to `4*chi` when
+another kind of two-site gate enters the batch.
+Disjoint endpoints alone are insufficient for long-range gates: their routes
+can share bonds, so the actual target bond dimensions are checked as well.
+The gate that ends a batch remains queued for the next batch.
+
+For dense NumPy/Torch/CuPy diagonal qubit gates on nearest-neighbor coordinate
+sites, the exact split uses the algebraic rank ceiling `2*current_bond`.
+This removes redundant SVD dimensions without an approximation cutoff; a
+diagonal qubit operator is a sum of at most two product operators. Other
+gates use unrestricted exact splits. Native symmetry arrays and JAX/traced
+or trainable gates conservatively use the `4*chi` budget; their zero entries
+are not used to infer a smaller rank. Routed and physical-index gate splits
+also retain the unrestricted exact path. These are upper thresholds, not
+requests to pad every bond to twice or four times `chi`.
+
+One-site gates inside an automatic batch are absorbed in their original order,
+including after its last two-site gate; they do not count toward the two-site
+limit. Leading one-site gates are applied directly. Gates are never reordered.
+Use `k_2q_batch=1` for the previous behavior, or `2`, `3`, etc. to absorb up to
+that many two-site gates plus intervening one-site gates. Integer batches may
+contain overlapping gates and do not impose the automatic target bond budget.
+
+A general two-qubit gate can require up to `4*chi`, and routed gates can grow
+several bonds. If even the first gate exceeds its budget, it is processed alone
+with its exact target intact. The batching budget never truncates a target.
+Step records expose `k_2q_batch`, `batch_stop_reason`, `batch_target_bond_limit`,
+`two_site_batch`, and `target_max_bond`, including this singleton exception.
+Integer batch sizes and the singleton fallback can therefore exceed that budget
+before compression. The retained state is still capped at `chi`.
+A candidate target is built to check its dimensions, so the budget is a batching
+threshold rather than a bound on peak temporary allocation.
+
+Each accepted batch is compressed to `chi` and optionally refined by the
+sweep/global optimizer. Two-site targets use
+`cutoff=0`, no approximation bond cap, and no path compression, even when `run(cutoff=...)`
+requests truncation for the warm start. Inherited `bond_dim` and final gate `chi` are disabled
 for exact targets. An explicit truncating value, including final `chi`, in
-`target_gate_kwargs` raises `ValueError`. Warm-start `compress_all` receives both
+`target_gate_kwargs` raises `ValueError`; this includes the `bond_dim` alias.
+Warm-start `compress_all` receives both
 the requested `cutoff` and `cutoff_mode`; one-site gates continue to use the
 run's gate options directly. Infidelity estimates must be finite; a
-substantially negative value raises rather than counting as a perfect update.
+substantially negative value is retried as described below, then raises if it
+remains invalid. Physical-index strings such as `("k0,0", "k0,1")` are
+supported without forwarding coordinate-routing options to the split routine.
+
+## Local solver defaults
+
+The default sweep solver is NLopt `LD_LBFGS` for dense and Torch-backed Symmray
+states. Torch supplies autograd derivatives for Torch parameters; NumPy
+parameters use finite differences. The optional NLopt dependency is provided
+by the `solvers` installation extra.
+
+```python
+from pepsy.optimizers import PepsOptimizer
+
+optimizer = PepsOptimizer(
+    state, gates, chi=32,
+    optimizer="nlopt",
+    optimizer_options={
+        "algorithm": "LD_LBFGS",
+        "maxeval": 50,
+        "ftol_rel": 1e-9,
+        "ftol_abs": 1e-9,
+        "xtol_rel": 1e-9,
+        "restore_best": True,
+    },
+)
+result = optimizer.run(k_2q_batch="auto")  # or 1, 2, 3, ...
+```
+
+`maxeval` limits optimizer objective evaluations per local slice solve.
+`ftol_rel` and `xtol_rel` set relative stopping tolerances for objective and
+parameters; `ftol_abs` sets an absolute objective-change tolerance.
+`restore_best` retains the best valid iterate. Finite-difference
+gradients require extra underlying contractions per objective callback.
+These limits do not bound the full gate stream. Sweep cleanup uses one global
+cycle over `y,x`, four round trips per axis, and ten boundary FIT iterations
+per move. Override the schedule with `sweep_optimize_kwargs`; override solver
+controls with `optimizer_options` or per-run
+`sweep_optimize_kwargs={"optimizer_options": {...}}`.
+
+## Fidelity evaluation
+
+For default unitary evolution, `run()` passes `norm_target=1` to every
+pre/post fidelity evaluation and to variational cleanup, avoiding the
+enlarged target's norm contraction. This assumes that the incoming retained
+PEPS is normalized and the gates are unitary. The compressed candidate's
+norm is still measured at `evaluation_chi`.
+
+Set `infidelity_kwargs={"norm_target": None}` to explicitly measure the
+target norm, or supply a known scalar/scaled norm. Constructor settings and
+per-run overrides are supported. `non_unitary=True` or
+`normalize_final=False` defaults to measuring target norms. If initial
+normalization is disabled, the caller must supply a normalized initial state
+for the unit-norm assumption. Direct `estimate_infidelity(state, target)`
+calls still measure both norms by default, since arbitrary input states need
+not be normalized. Known or measured target norms from the precheck are
+forwarded to variational cleanup.
+
+The delegated sweep's initial/final diagnostics reuse that same target norm,
+so default unitary optimization also avoids target norm contractions inside
+the sweep. Explicit diagnostic overrides and exact debug metrics remain
+available. With `measure_infidelity=False`, optimization still needs a valid
+objective: an unknown target norm is measured once using `evaluation_chi`
+and reused by sweep/global cleanup. A known norm, including the unitary
+default of one, avoids that measurement. Disabling both measurement and
+optimization needs no target norm contraction.
+
+An inconsistent finite-cap contraction can still produce a negative
+infidelity. By default `evaluation_max_retries=2` allows up to two retries,
+each using the same cap for both norms and overlap, twice the preceding
+maximum cap. Every retry warns. Use `evaluation_max_retries=0` to enforce
+strict caps. Exact contractions, nonfinite estimates and explicitly supplied
+norms do not trigger automatic cap growth. Persistent invalid estimates raise.
+The default unit-target-norm path likewise does not retry or silently enable
+target contraction. A negative estimate can indicate insufficient
+`normalize_chi`; increase normalization/evaluation accuracy or opt into
+target-norm measurement. Output normalization at finite chi is an
+approximation to exact unit norm.
+Only negative roundoff within the dtype cutoff scale (`1e-12` for double,
+`1e-6` for single precision) is cleaned to zero.
+
+`get_evaluation_records()` reports all attempted caps and raw errors. Step
+records retain the requested `evaluation_chi` plus `effective_evaluation_chi`.
+Candidate acceptance compares pre/post states at a common effective cap; if
+the postcheck needs a larger cap, the saved warm start is remeasured there
+without further retries. No automatic retry guarantees contraction accuracy,
+and positive finite-cap errors still need convergence checks when precision
+matters. Norm recomputation and retries increase diagnostic contraction cost.
 
 `run()` defaults to `cutoff="auto"`, `cutoff_mode="auto"`, and
 `infidelity_tol="auto"`. Each run resolves these from the current PEPS array
@@ -67,14 +190,85 @@ after `set_state`, and gate/batch step records include the resolved `cutoff`,
 The prior fixed settings remain available through
 `run(cutoff=1e-12, cutoff_mode="rsum2", infidelity_tol=1e-10)`.
 
-By default, the initial PEPS is normalized once on the first `run()`, and
-each newly generated gate/batch target is normalized before the bond-cap
-decision, warm-start compression, and infidelity precheck. Normalization does
-not depend on the infidelity threshold. Warm starts and optimized candidates
-are normalized as well. All these norm estimates use finite-cap contractions.
-Delegated sweep initialization also uses `normalize_chi`, independently of
-`boundary_chi`. An explicit `sweep_kwargs["renormalize_kwargs"]["chi"]`
-overrides only the sweep constructor's normalization cap.
+By default, the initial PEPS is normalized once on the first `run()` and
+evolution is assumed unitary (`non_unitary=False`). Exact gate targets are
+not rescaled. Warm starts and optimized candidates are normalized using
+`normalize_chi`; so are targets retained directly because they fit within
+`chi`, and the final output after standalone one-site gates. Rejected
+optimization restores the already normalized warm start. Thus the retained
+state has unit norm according to the selected finite-cap contraction, which
+does not guarantee an exactly unit dense norm at insufficient boundary chi.
+Increase `normalize_chi` to check convergence. `normalize_final=False` skips
+candidate/direct-output normalization; warm starts are always normalized.
+`normalize_target=None` follows `non_unitary`; set `non_unitary=True` for
+nonunitary evolution or explicitly override `normalize_target=True/False`.
+Default unitary fidelity evaluation uses target norm one without contracting
+or rescaling that target. Explicit target-norm measurement remains available
+to account for finite-boundary normalization error.
+The sweep receives an already normalized warm start and skips duplicate
+constructor normalization. Explicit `sweep_kwargs={"renormalize_state": True}`
+enables it, using `normalize_chi` independently of `boundary_chi` unless
+`sweep_kwargs["renormalize_kwargs"]["chi"]` overrides that initial cap.
+Standalone `SweepOptimizer` normalization and metric defaults are unchanged.
+
+If sweep cleanup reports an invalid initial boundary estimate, the driver
+retains the already-normalized warm start and records `reason="optimizer_failed"`
+and `optimized=False`, even with `accept_if_improved=False` or fidelity
+measurement disabled. `optimizer_result` includes the raw initial estimate
+and `termination_reason="invalid_initial_loss"`. The failed cleanup adds no
+postcheck or normalization contraction. This is a safeguard, not an automatic
+boundary-accuracy correction; requested caps, FIT iterations, and the known
+unitary target-norm policy remain unchanged.
+
+In `mode="global"`, the default optimizer is NLopt `LD_VAR2` with an evaluation
+budget of 1200, using Torch autodiff through Quimb MPS contractions. Override
+it via `global_optimize_kwargs` or the shared optimizer controls.
+Selecting JAX now supplies the JIT-compatible global loss defaults:
+
+```python
+optimizer = PepsOptimizer(
+    state, gates, chi=chi, mode="global",
+    global_optimize_kwargs={"autodiff_backend": "jax"},
+)
+```
+
+This selects `jit_fn=True`, global loss `cutoff=0.0`, and
+`strip_exponent=False`. Zero cutoff keeps SVD ranks independent of traced
+singular values while still applying the requested boundary bond caps.
+Exponent stripping is disabled because its current scalar conversion loses
+JAX gradients and cannot be traced. This also applies when selecting JAX
+through `optimizer_options` or per-run global options. Explicit
+`global_kwargs["loss_kwargs"]` / `loss_opt` values and `jit_fn` take
+precedence; positive cutoff with JIT or exponent stripping with JAX remain
+unsupported combinations. These defaults apply to the optimization loss;
+outer normalization and fidelity measurements retain their own settings.
+Without stripping, very large contractions can overflow or underflow.
+For complex128 calculations, enable JAX x64 before creating JAX arrays.
+
+Before global optimization constructs or traces its loss, the driver calls
+`register_jax_linalg(stabilized=True)` for JAX. This installs Pepsy's
+truncation-safe SVD backward rule in Autoray; QR retains native JAX autodiff.
+The SVD rule restores truncated cotangent shapes and delegates derivatives
+to JAX, so it does not provide Torch's relative regularization at degenerate
+singular values. Registration also runs for JAX with JIT disabled and for a
+JAX-selected fallback. These Autoray registrations affect the current process.
+Torch continues to use its existing `TorchLinalgConfig` SVD/QR policy.
+
+Returned candidates retain the input backend, dtype, and device. The PEPS
+driver owns final normalization: delegated global normalization is disabled,
+so `normalize_final=True` normalizes the candidate once and `False` skips it.
+Use the driver's `normalize_kwargs` and `normalize_chi` for this operation;
+delegated `global_kwargs["normalize_kwargs"]` does not control driver output
+normalization.
+
+Global NLopt cleanup restores its best finite evaluated vector. An early
+NLopt stop is reported in `optimizer_result`, including `stopped_early`,
+`best_restored`, and `returned_loss`. The raw evaluation history's endpoint
+remains in `loss_final`; `optimizer_infidelity` uses the returned state's
+score instead. If recovery has no valid iterate, the driver retains the warm
+start with `reason="optimizer_failed"`, including when acceptance checks are
+disabled. Outer postchecks continue to decide whether a recovered candidate
+improves on the warm start.
 
 The FIT controls can be supplied directly to `PepsOptimizer`, matching the
 `SweepOptimizer` names, for example `fit_mode`, `fit_layer_mode`,
@@ -242,15 +436,16 @@ SWAP routing. Use `route_opts` for routing controls such as `sequence`,
   `measure_final_infidelity=True`. If final measurement is disabled, the
   fallback optimizer loss can come from the coarser `boundary_chi` environment
   while the pre-check used `evaluation_chi`.
-- Sweep mode defaults to Torch Adam for Torch-backed Symmray states and to the
-  optional NLopt `LD_LBFGS` solver otherwise. Pass an explicit `optimizer` /
+- Sweep mode defaults to optional NLopt `LD_LBFGS` for dense and Torch-backed
+  Symmray states. Pass an explicit `optimizer` /
   `sweep_optimize_kwargs` value to override this choice.
-- Generated targets are normalized by default before infidelity estimates and
-  variational cleanup. Pass `normalize_target=False` only when that
-  normalization is handled externally. Passing `normalize_target=None` keeps
-  the legacy behavior of following `non_unitary`; this does not implement the
+- Unitary targets are not rescaled by default. `normalize_target=None` follows
+  `non_unitary=False`; use `non_unitary=True` to normalize nonunitary targets,
+  or override `normalize_target` explicitly. This does not implement the
   interval scheduling or norm-proxy machinery available in `MpsOptimizer`.
-- Step records and fidelity traces are per measured two-site update. One-site
+- `run(mode=...)` changes the backend for that call only; use `set_mode(...)`
+  to change the configured default.
+- Step records and fidelity traces are per measured two-site gate batch. One-site
   gates applied outside a two-site batch are not recorded as separate steps.
   For PEPS lattice gates, prefer coordinate-tuple sites such as
   `((x0, y0), (x1, y1))` over flat integer pairs.

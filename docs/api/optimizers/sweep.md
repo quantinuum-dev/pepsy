@@ -42,6 +42,19 @@ An explicit `renormalize_kwargs["chi"]` takes precedence for that initial call.
 The latest metric diagnostics are available as `optimizer.fit_diagnostics`,
 and sweep runs also return them under the `fit_diagnostics` result key.
 
+An initial infidelity estimate that is nonfinite or below `-1e-10` stops
+cleanup without changing the warm start. The result reports `success=False`,
+`converged=False`, and `termination_reason="invalid_initial_loss"`; the raw
+estimate remains in `loss_before`, while `loss_after` and `best_loss` are
+`None`. Negative roundoff within `1e-10` can count as zero for early
+convergence. These safeguards do not increase boundary caps or FIT budgets.
+
+Local solver output is checked before slice writeback. Nonfinite parameters,
+nonfinite losses, or losses below `-1e-10` are rejected with a warning and
+`invalid_loss=True`. The previous slice is retained. `loss_final` describes
+that retained slice; `candidate_loss` and `rejection_reason` describe the
+rejected result. Boundary accuracy remains the caller's responsibility.
+
 `SweepOptimizer.infidelity(...)` inherits constructor FIT controls when they
 are omitted. Passing `fit_rtol=None` explicitly disables adaptive stopping for
 that diagnostic; omitting `fit_rtol` inherits the constructor value. The same

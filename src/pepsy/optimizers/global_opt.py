@@ -9,9 +9,11 @@ from numbers import Integral
 from typing import Any
 
 import autoray as ar
+import numpy as np
 import quimb.tensor as qtn
 
 from .._internal.quimb import call_quimb_2d
+from ..backends import infer_backend_converter_from_sample
 from ..tensors.contractions import build_optimizer, contract_hypercompressed_tn
 
 __all__ = ["GlobalOptimizer"]
@@ -22,6 +24,31 @@ _DEFAULT_NLOPT_FTOL_REL = 1e-9
 _DEFAULT_NLOPT_FTOL_ABS = 0.0
 _DEFAULT_NLOPT_XTOL_REL = 1e-9
 _DEFAULT_NLOPT_XTOL_ABS = 0.0
+
+
+class _BestLossHistory(list):
+    """Observe Quimb's recorded evaluations without wrapping autodiff code.
+
+    Quimb's NLopt route does not invoke its public optimizer callback. It
+    appends each evaluated loss while the corresponding public vectorizer
+    still holds that trial. Capture only improving finite vectors here.
+    """
+
+    def __init__(self, values, vectorizer):
+        super().__init__(values)
+        self.vectorizer = vectorizer
+        self.best_loss = None
+        self.best_vector = None
+
+    def append(self, value):
+        super().append(value)
+        loss = float(value)
+        vector = self.vectorizer.vector
+        if (math.isfinite(loss) and loss >= -1e-10
+                and np.isfinite(vector).all()
+                and (self.best_loss is None or loss < self.best_loss)):
+            self.best_loss = max(0.0, loss)
+            self.best_vector = vector.copy()
 
 
 class GlobalOptimizer:
@@ -89,6 +116,8 @@ class GlobalOptimizer:
         self.state = state
         self.state_target = state_target
         self.losses: list[float] = []
+        self.final_loss = None
+        self.optimization_info = {}
         merged_loss_options = self._merge_opts(loss_kwargs, loss_opt)
         self.loss_opt = self._pick_known_keys(merged_loss_options, self._LOSS_KEYS)
         self.norm_kwargs = self._pick_known_keys(norm_kwargs, self._NORM_KEYS)
@@ -701,8 +730,19 @@ class GlobalOptimizer:
         """Normalize state in place with configured contraction options."""
         state = self.state if state is None else state
         if kwargs:
-            self.norm_kwargs.update(self._pick_known_keys(kwargs, self._NORM_KEYS, warn_unknown=False))
-        return self._normalize_state(state, **self.norm_kwargs)
+            self.normalize_kwargs.update(self._pick_known_keys(kwargs, self._NORM_KEYS, warn_unknown=False))
+        return self._normalize_state(state, **self.normalize_kwargs)
+
+    def _restore_output_backend(self, out):
+        """Restore each tensor's array placement, including native blocks."""
+        if not hasattr(out, "tensor_map"):
+            return out
+        for tid, tensor in out.tensor_map.items():
+            reference = self.state.tensor_map[tid].data
+            convert = infer_backend_converter_from_sample(reference)
+            if convert is not None:
+                tensor.modify(data=convert(tensor.data))
+        return out
 
     def loss(self, state=None, *, state_target=None, **kwargs):
         """Evaluate configured global loss against target PEPS."""
@@ -771,6 +811,7 @@ class GlobalOptimizer:
         jit_fn: bool = False,
         device: str = "cpu",
         return_losses: bool = False,
+        normalize: bool = True,
         **optimize_kwargs,
     ):
         """Run ``TNOptimizer.optimize``. Losses stored in ``self.losses``."""
@@ -793,9 +834,13 @@ class GlobalOptimizer:
             jit_fn=jit_fn,
             device=device,
         )
+        self.optimization_info = {}
+        self.final_loss = None
         out = tnopt.optimize(n=n, **optimize_kwargs)
+        out = self._restore_output_backend(out)
         self.losses = list(getattr(tnopt, "losses", ()))
-        if self.normalize_kwargs and hasattr(out, "add_tag"):
+        self.final_loss = self.losses[-1] if self.losses else None
+        if normalize and self.normalize_kwargs and hasattr(out, "add_tag"):
             out = self._normalize_state(out, **self.normalize_kwargs)
         self.state = out
         if return_losses:
@@ -823,6 +868,7 @@ class GlobalOptimizer:
         jit_fn: bool = False,
         device: str = "cpu",
         return_losses: bool = False,
+        normalize: bool = True,
         **tnopt_kwargs,
     ):
         """Run ``TNOptimizer.optimize_nlopt``. Losses stored in ``self.losses``."""
@@ -839,6 +885,16 @@ class GlobalOptimizer:
             device=device,
             **tnopt_kwargs,
         )
+        self.final_loss = None
+        self.optimization_info = {}
+        vectorizer = getattr(tnopt, "vectorizer", None)
+        history = None
+        # Capability-gated for upstream versions and lightweight adapters.
+        if (isinstance(getattr(vectorizer, "vector", None), np.ndarray)
+                and callable(getattr(tnopt, "get_tn_opt", None))):
+            history = _BestLossHistory(getattr(tnopt, "losses", ()), vectorizer)
+            tnopt.losses = history
+        stopped_error = None
         try:
             out = tnopt.optimize_nlopt(
                 n=n,
@@ -851,20 +907,45 @@ class GlobalOptimizer:
                 xtol_abs=xtol_abs,
             )
         except Exception as exc:
-            # nlopt raises nlopt.nlopt.runtime_error which does NOT inherit
-            # from Python's RuntimeError, so quimb's internal handler misses
-            # it.  Fall back to the best state found so far.
+            # Some NLopt exceptions do not inherit Python's RuntimeError.
             if "nlopt" in type(exc).__module__:
+                stopped_error = exc
                 warnings.warn(
                     f"NLopt optimization stopped early: {exc}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-                out = tnopt.get_tn_opt()
+                out = self.state.copy()
             else:
                 raise
         self.losses = list(getattr(tnopt, "losses", ()))
-        if self.normalize_kwargs and hasattr(out, "add_tag"):
+        if history is not None and history.best_vector is not None:
+            vectorizer.vector[:] = history.best_vector
+            out = tnopt.get_tn_opt()
+            self.final_loss = history.best_loss
+        elif stopped_error is not None or (history is not None and self.losses):
+            # Never return an unvalidated last trial when no finite best exists.
+            out = self.state.copy()
+            self.optimization_info["success"] = False
+        else:
+            self.final_loss = self.losses[-1] if self.losses else None
+        if history is not None:
+            tnopt.losses = list(self.losses)
+        self.optimization_info.update({
+            "stopped_early": stopped_error is not None,
+            "best_restored": history is not None and history.best_vector is not None,
+            "returned_loss": self.final_loss,
+            "termination_reason": (
+                "nlopt_error" if stopped_error is not None else
+                "no_valid_iterate" if self.optimization_info.get("success") is False else
+                "completed"
+            ),
+        })
+        if stopped_error is not None:
+            self.optimization_info["stop_error"] = str(stopped_error)
+            self.optimization_info["stop_error_type"] = type(stopped_error).__name__
+        out = self._restore_output_backend(out)
+        if normalize and self.normalize_kwargs and hasattr(out, "add_tag"):
             out = self._normalize_state(out, **self.normalize_kwargs)
         self.state = out
         if return_losses:

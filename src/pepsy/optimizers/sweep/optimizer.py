@@ -2279,7 +2279,17 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         # their last trial iterate. Re-evaluate the parameters that will
         # actually be applied so ``loss_final`` describes the returned state,
         # not a stale last callback value.
-        applied_loss = self._to_float_history([loss_fn(params_opt)])[0]
+        # Check native leaves before contraction: invalid parameters can make
+        # contraction/decomposition fail before a scalar loss is available.
+        # Reduce on the array backend and transfer only the combined boolean.
+        flat_params, _ = self._flatten_param_tree(params_opt)
+        finite_leaves = [ar.do("all", ar.do("isfinite", value))
+                         for value in flat_params.values()]
+        params_finite = not finite_leaves or bool(ar.do("all", ar.do("stack", finite_leaves)))
+        applied_loss = (
+            self._to_float_history([loss_fn(params_opt)])[0]
+            if params_finite else float("nan")
+        )
         observed_losses = [initial_loss, *history_values, applied_loss]
         best_history = []
         running_best = float("inf")
@@ -2290,6 +2300,30 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             # in the diagnostic minimum; carry the last valid minimum forward.
             best_history.append(running_best)
         best_loss = self._best_nonnegative_from_history(observed_losses)
+        if not math.isfinite(applied_loss) or applied_loss < -1.0e-10:
+            if not self._warned_invalid_local_loss:
+                warnings.warn(
+                    "Rejecting a local sweep result because its parameters or "
+                    "boundary infidelity are invalid; retaining the current slice.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._warned_invalid_local_loss = True
+            return {
+                "axis": axis,
+                "index": index,
+                "loss_initial": initial_loss,
+                "loss_final": initial_loss,
+                "loss_best": best_loss,
+                "candidate_loss": applied_loss,
+                "history": history_values,
+                "best_history": best_history,
+                "invalid_loss": True,
+                "rejection_reason": (
+                    "invalid_candidate_loss" if params_finite else "nonfinite_parameters"
+                ),
+                **metrics,
+            }
         params_opt_tree = _restore_params(params_opt)
         params_opt_tree = self._match_param_tree_backends(
             params_opt_tree,
@@ -2804,15 +2838,32 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         early_exit_tol = 1e-10
         early_exit = False
 
-        # Skip the entire optimization if the initial loss is already at /
-        # below the resolution floor (or a small negative artifact of finite
-        # boundary chi). The current state is already good enough.
-        if loss_before is not None and float(loss_before) < early_exit_tol:
-            self._maybe_store_best_state(float(loss_before))
+        # An invalid boundary estimate cannot establish convergence. Stop
+        # without changing the warm start or increasing any contraction cap.
+        invalid_initial_loss = loss_before is not None and (
+            not math.isfinite(float(loss_before))
+            or float(loss_before) < -early_exit_tol
+        )
+        if invalid_initial_loss or (
+            loss_before is not None and float(loss_before) < early_exit_tol
+        ):
+            if invalid_initial_loss:
+                warnings.warn(
+                    "Stopping sweep cleanup because the initial boundary "
+                    "infidelity is invalid; retaining the warm start.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                loss_after = None
+            else:
+                # Only roundoff within the existing local-loss tolerance is
+                # treated as zero; retain the raw estimate in loss_before.
+                loss_after = max(0.0, float(loss_before))
+                self._maybe_store_best_state(loss_after)
             return _AttrDict({
                 "runs": [],
                 "loss_before": loss_before,
-                "loss_after": loss_before,
+                "loss_after": loss_after,
                 "best_loss": (
                     None if not math.isfinite(float(self.best_loss))
                     else float(self.best_loss)
@@ -2830,7 +2881,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "fit_diagnostics": tuple(self.fit_diagnostics),
                 "bdy_norm": None,
                 "bdy_overlap_norm": None,
-                "converged": True,
+                "success": not invalid_initial_loss,
+                "termination_reason": (
+                    "invalid_initial_loss" if invalid_initial_loss else "converged"
+                ),
+                "converged": not invalid_initial_loss,
                 "early_exit": True,
             })
 

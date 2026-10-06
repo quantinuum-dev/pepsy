@@ -20,9 +20,11 @@ from ...boundary._fit_policy import (
     _canonical_fit_mode_selector,
 )
 from ...boundary.metrics import peps_infidelity as boundary_infidelity
+from ...boundary.metrics import peps_norm as boundary_norm
 from ...boundary.metrics import peps_normalize as boundary_normalize
 from ...backends import (
     TorchLinalgConfig,
+    register_jax_linalg,
     resolve_backend_sample_data_from_tn,
     to_float as _backend_to_float,
 )
@@ -58,6 +60,14 @@ _DEFAULT_SWEEP_OPTIMIZE_KWARGS = {
 }
 _DEFAULT_SWEEP_SOLVER = "nlopt"
 _DEFAULT_SWEEP_NLOPT_ALGORITHM = "LD_LBFGS"
+_DEFAULT_SWEEP_NLOPT_OPTIONS = {
+    "algorithm": _DEFAULT_SWEEP_NLOPT_ALGORITHM,
+    "maxeval": 50,
+    "ftol_rel": 1e-9,
+    "ftol_abs": 1e-9,
+    "xtol_rel": 1e-9,
+    "restore_best": True,
+}
 _DEFAULT_GLOBAL_OPTIMIZE_KWARGS = {
     "n": 1200,
     "optimizer": "LD_VAR2",
@@ -133,14 +143,16 @@ def _is_nlopt_optimizer(optimizer):
 class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     """Apply a PEPS/PEPO gate stream while keeping bonds capped at ``chi``.
 
-    ``PepsOptimizer`` is a gate-by-gate compression driver. One-site gates are
-    applied directly. For each two-site gate it first builds the exact
+    ``PepsOptimizer`` is a gate-stream compression driver. One-site gates are
+    applied directly or folded into an ordered batch. For each batch it builds the exact
     post-gate target. If that target already fits inside ``chi`` it is accepted
-    as-is. Otherwise a warm start is formed by compressing ``target.copy()`` to
+    after output normalization. Otherwise a warm start is formed by compressing ``target.copy()`` to
     ``chi``; this warm start is either accepted by a boundary-fidelity check or
     refined against the exact target with ``mode="sweep"`` or ``mode="global"``.
-    Use ``run(k_2q_batch=...)`` to absorb multiple sequential two-site gates
-    into one target before the truncation and optional variational cleanup.
+    By default ``run(k_2q_batch="auto")`` batches disjoint two-site gates while
+    the target bonds stay within ``2 * chi`` for diagonal qubit gates or
+    ``4 * chi`` for other gates. A larger exact single-gate target is processed
+    alone. Positive integers select a fixed two-site gate count.
 
     Boundary contractions use ``strip_exponent=True`` by default, so norm and
     overlap estimates are handled as ``(mantissa, exponent)`` pairs where the
@@ -173,13 +185,13 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     - Symmray PEPS inputs must be Torch-backed. Their sweep cleanup defaults
       to NLopt ``LD_LBFGS`` while obtaining gradients from Torch autograd;
       provide both the PEPS and gates with the same Torch Symmray backend.
-    - Generated targets are normalized by default before infidelity estimates
-      and variational cleanup. Pass ``normalize_target=False`` only when that
-      normalization is handled externally; ``non_unitary=True`` remains a
-      compatibility shorthand when ``normalize_target=None`` is supplied.
+    - Unitary evolution is assumed by default: generated targets are not
+      rescaled. ``non_unitary=True`` enables target normalization, and
+      ``normalize_target`` explicitly overrides that policy. Retained outputs
+      are normalized using ``normalize_chi`` by default.
       This does not implement the interval scheduling or norm-proxy machinery
       available in :class:`pepsy.optimizers.mps.MpsOptimizer`.
-    - Step records and fidelity traces are per measured two-site update.
+    - Step records and fidelity traces are per measured two-site gate batch.
       One-site gates applied outside a two-site batch are not recorded as
       separate steps. For PEPS lattice gates, prefer coordinate-tuple sites
       like ``((x0, y0), (x1, y1))`` over flat integer pairs.
@@ -207,8 +219,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Boundary bond dimension used for pre/post local infidelity estimates
         that decide whether the warm start or optimized candidate is accepted.
         This is the knob for stricter initial/final diagnostics. If ``None``,
-        the evaluation chi defaults to ``(4 * chi, 5 * chi)``. Both state norms
-        use the first entry; the overlap uses the second. A scalar sets both.
+        the evaluation chi defaults to ``(4 * chi, 5 * chi)``. Measured state
+        norms use the first entry; the overlap uses the second. A scalar sets
+        both. Unitary runs assume target norm one unless explicitly overridden.
+    evaluation_max_retries : int, default=2
+        Retry a substantially negative finite-cap infidelity with equal norm
+        and overlap caps twice the previous maximum, up to this many times.
+        Each retry warns and is recorded. Zero keeps the requested caps strict.
+        Supplied norms (including the unitary run's target norm one) and exact
+        contractions are never retried.
     mode : {"sweep", "global"}, default="sweep"
         Variational optimizer backend used when the warm start is not good
         enough.
@@ -271,8 +290,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``optimizer_options={"algorithm": "LD_VAR2"}`` routes to
         :meth:`GlobalOptimizer.optimize_nlopt`.
     optimizer_options : mapping, optional
-        Backend-specific optimizer controls. Sweep mode forwards this mapping
-        as ``optimizer_options``. Global mode accepts practical aliases such as
+        Backend-specific optimizer controls. Sweep NLopt defaults are
+        ``algorithm="LD_LBFGS"``, ``maxeval=50``, ``ftol_rel=ftol_abs=1e-9``,
+        ``xtol_rel=1e-9``, and ``restore_best=True``. These limits apply to
+        each local slice solve, not the complete circuit. Global mode accepts aliases such as
         ``algorithm``, ``maxeval``/``n_steps``, tolerance keys, ``device``, and
         ``progress``.
     sweep_kwargs : mapping, optional
@@ -289,6 +310,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     global_optimize_kwargs : mapping, optional
         Per-run global optimizer controls. The default global cleanup budget is
         ``n=1200``; pass ``{"n": ...}`` to tune this sensitive value.
+        Selecting ``autodiff_backend="jax"`` defaults to ``jit_fn=True`` and
+        global loss options ``cutoff=0``, ``strip_exponent=False``. Explicit
+        global optimizer and loss options take precedence. JAX global cleanup
+        registers Pepsy's truncation-safe SVD derivative before tracing;
+        QR continues to use native JAX autodiff.
     global_fallback_kwargs : mapping, optional
         Global fallback controls used if an optional NLopt run raises an NLopt
         runtime error. Defaults to one LBFGS step.
@@ -322,6 +348,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         boundary_chi=None,
         normalize_chi=None,
         evaluation_chi=None,
+        evaluation_max_retries=2,
         mode="sweep",
         contraction_opt="auto-hq",
         which=None,
@@ -388,6 +415,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             if evaluation_chi is None
             else self._validate_boundary_chi(evaluation_chi, name="evaluation_chi")
         )
+        self.evaluation_max_retries = self._validate_evaluation_retries(evaluation_max_retries)
         self.mode = self._normalize_mode(mode)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
         self.which = which
@@ -485,6 +513,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cls._validate_scalar_chi(chi[1], name=f"{name}[1]"),
             )
         return cls._validate_scalar_chi(chi, name=name)
+
+    @staticmethod
+    def _validate_evaluation_retries(value):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+            raise ValueError("evaluation_max_retries must be a non-negative integer.")
+        return int(value)
 
     @staticmethod
     def _require_torch_symmray_backend(*states, role="inputs"):
@@ -636,6 +670,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.step_records = []
         self.normalizations = []
         self.fit_diagnostics = []
+        self.evaluation_records = []
+        self._last_evaluation_chi = None
+        self._last_target_norm = 1.0
         self._fidelity_log_sum = 0.0
         self._fidelity_count = 0
         self.last_result = None
@@ -759,7 +796,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         opts.update(self.target_gate_kwargs)
         for key, exact_value in (
-            ("cutoff", 0.0), ("max_bond", None), ("path_compress", False), ("chi", None)
+            ("cutoff", 0.0), ("max_bond", None), ("bond_dim", None),
+            ("path_compress", False), ("chi", None),
         ):
             if key in self.target_gate_kwargs and self.target_gate_kwargs[key] != exact_value:
                 raise ValueError(
@@ -781,6 +819,18 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _apply_gate_entry(self, state, gate_payload, where, which, *, opts, inplace=False):
         which_local = self.which if which is None else which
+        if isinstance(where, str) or (
+            isinstance(where, (tuple, list)) and all(isinstance(site, str) for site in where)
+        ):
+            # Physical-index gates go directly to Quimb's split API. Coordinate
+            # routing controls are not decomposition arguments.
+            opts = {
+                key: value for key, value in opts.items()
+                if key != "sequence" and not key.startswith("path_")
+            }
+            bond_dim = opts.pop("bond_dim", None)
+            if opts.get("max_bond") is None and bond_dim is not None:
+                opts["max_bond"] = bond_dim
         return apply_gate(
             state,
             gate_payload,
@@ -789,6 +839,47 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             inplace=inplace,
             **opts,
         )
+
+    @staticmethod
+    def _gate_bond_factor(gate_payload):
+        """Use the exact diagonal-qubit rank bound; otherwise allow 4D.
+
+        Do not inspect native block arrays or traced/trainable gate values.
+        Zero entries of a trainable gate can have nonzero tangents.
+        """
+        if ar.infer_backend(gate_payload) not in {"numpy", "torch", "cupy"}:
+            return 4
+        if getattr(gate_payload, "requires_grad", False):
+            return 4
+        if tuple(getattr(gate_payload, "shape", ())) not in {(4, 4), (2, 2, 2, 2)}:
+            return 4
+        matrix = ar.do("reshape", gate_payload, (4, 4))
+        off_diagonal = matrix - ar.do("diag", ar.do("diagonal", matrix))
+        return 2 if int(ar.do("count_nonzero", off_diagonal)) == 0 else 4
+
+    def _exact_rank_gate_options(self, state, gate_payload, where, opts):
+        """Remove redundant split dimensions using an algebraic rank ceiling.
+
+        A diagonal two-qubit operator is a sum of at most two product
+        operators, hence rank <= 2D on a nearest-neighbor bond. This is not
+        an approximation cutoff. Routed SWAPs and native symmetry arrays
+        deliberately keep the unrestricted exact path.
+        """
+        if self._gate_bond_factor(gate_payload) != 2 or uses_symmray_arrays(state):
+            return opts
+        if opts.get("contract", "reduce-split") not in {"split", "reduce-split"}:
+            return opts
+        if not isinstance(where, (tuple, list)) or len(where) != 2:
+            return opts
+        if not all(isinstance(site, (tuple, list)) and len(site) == 2 for site in where):
+            return opts
+        a, b = where
+        if sum(abs(x - y) for x, y in zip(a, b)) != 1:
+            return opts
+        bond_size = getattr(state, "bond_size", None)
+        if not callable(bond_size):
+            return opts
+        return {**opts, "max_bond": 2 * bond_size(a, b)}
 
     def _build_target(self, state, gate_payload, where, which, *, cutoff, cutoff_mode, gate_kwargs):
         opts = self._target_gate_options(
@@ -802,7 +893,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             gate_payload,
             where,
             which,
-            opts=opts,
+            opts=self._exact_rank_gate_options(state_work, gate_payload, where, opts),
             inplace=True,
         )
 
@@ -820,7 +911,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 gate_payload,
                 where,
                 which,
-                opts=opts,
+                opts=self._exact_rank_gate_options(state_work, gate_payload, where, opts),
                 inplace=True,
             )
         return state_work
@@ -954,6 +1045,73 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return batch_entries, two_site_in_batch, idx
 
+    def _gate_site_keys(self, where, state):
+        """Identify physical sites consistently for coordinates and index names."""
+        sites = []
+        for site in where:
+            if isinstance(site, str):
+                tids = getattr(state, "ind_map", {}).get(site, ())
+            else:
+                site_tag = getattr(state, "site_tag", None)
+                tag = site_tag(*site) if callable(site_tag) else None
+                tids = getattr(state, "tag_map", {}).get(tag, ())
+            if tids:
+                sites.extend(("tensor", tid) for tid in tids)
+            else:
+                sites.append(("site", _freeze_where(site)))
+        return frozenset(sites)
+
+    def _collect_auto_batch_target(self, start_idx, *, cutoff, cutoff_mode, gate_kwargs):
+        """Grow an exact target until sites collide or bonds exceed its budget.
+
+        Diagonal qubit batches use 2D; batches with other gates use 4D.
+        A single exact routed gate may exceed this budget and is processed
+        alone, never truncated to meet a batching
+        budget. Candidate copies keep a rejected look-ahead gate out of the
+        accepted target and leave its queue position unchanged.
+        """
+        target = self.state
+        entries = []
+        occupied = set()
+        n_two_site = 0
+        idx = start_idx
+        stop_reason = "end_of_queue"
+        bond_factor = 2
+        while idx < len(self.gates):
+            entry = self.gates[idx]
+            gate_payload, where, which = entry
+            site_count = self._site_count(where, target)
+            if site_count not in (1, 2):
+                raise ValueError("PepsOptimizer supports one- and two-site gates only.")
+            sites = self._gate_site_keys(where, self.state) if site_count == 2 else ()
+            if occupied.intersection(sites):
+                stop_reason = "shared_site"
+                break
+            candidate_factor = (
+                max(bond_factor, self._gate_bond_factor(gate_payload))
+                if site_count == 2 else bond_factor
+            )
+            candidate = self._build_target(
+                target, gate_payload, where, which,
+                cutoff=cutoff, cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+            )
+            candidate_bond = self._max_bond(candidate)
+            exceeds_limit = candidate_bond is None or candidate_bond > candidate_factor * self.chi
+            if exceeds_limit and n_two_site:
+                stop_reason = "bond_limit"
+                break
+            target = candidate
+            bond_factor = candidate_factor
+            entries.append(entry)
+            idx += 1
+            if site_count == 2:
+                n_two_site += 1
+                occupied.update(sites)
+            if exceeds_limit:
+                stop_reason = "single_gate_exceeds_limit"
+                break
+        return entries, n_two_site, idx, target, stop_reason, bond_factor * self.chi
+
     @staticmethod
     def _batch_record_payload(batch_entries):
         if len(batch_entries) == 1:
@@ -990,7 +1148,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         return target_opt
 
     @staticmethod
-    def _clean_infidelity(value):
+    def _clean_infidelity(value, *, roundoff_tol=1.0e-12):
         if value is None:
             return None
         if isinstance(value, Mapping):
@@ -1000,7 +1158,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         value = _backend_to_float(value)
         if not math.isfinite(value):
             raise ValueError("PEPS infidelity must be finite.")
-        if value < 0.0 and abs(value) < 1.0e-12:
+        if value < 0.0 and abs(value) <= roundoff_tol:
             value = 0.0
         if value < 0.0:
             raise ValueError("PEPS infidelity is substantially negative.")
@@ -1048,6 +1206,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Retain boundary FIT diagnostics without retaining contraction TNs."""
         if result is None:
             return
+        if isinstance(result, (tuple, list)):
+            self.fit_diagnostics.extend(result)
+            return
         records = getattr(result, "fit_diagnostics", None)
         if records is not None:
             self.fit_diagnostics.extend(tuple(records))
@@ -1061,14 +1222,20 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     tuple(getattr(metric, "fit_diagnostics", ()))
                 )
 
-    def estimate_infidelity(self, state, target, *, evaluation_chi=None, **kwargs):
-        """Estimate local boundary infidelity between normalized states.
+    def estimate_infidelity(
+        self, state, target, *, evaluation_chi=None, evaluation_max_retries=None, **kwargs,
+    ):
+        """Estimate normalized boundary infidelity, recomputing both norms.
 
-        By default this assumes both inputs have norm one. Pass ``norm`` and
-        ``norm_target`` when measuring unnormalized states. ``evaluation_chi``
-        temporarily overrides the constructor-level diagnostic chi for this
-        call only.
+        Explicit ``norm`` and ``norm_target`` values remain supported. Invalid
+        finite-cap estimates retry at equal, doubled norm/overlap caps, at most
+        ``evaluation_max_retries`` times (default two). Each retry warns and
+        is recorded by :meth:`get_evaluation_records`; zero disables retries.
+        Persistent invalid estimates raise rather than being silently clipped.
         """
+        retries = self.evaluation_max_retries if evaluation_max_retries is None else (
+            self._validate_evaluation_retries(evaluation_max_retries)
+        )
         opts = _merge_opts(
             {
                 key: value
@@ -1081,12 +1248,64 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opts["chi"] = self._boundary_chi_for_infidelity(evaluation_chi, options=kwargs)
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
-        opts.setdefault("norm", 1.0)
-        opts.setdefault("norm_target", 1.0)
+        opts.setdefault("norm", None)
+        opts.setdefault("norm_target", None)
         _prefer_boundary_engine_mps(opts, self.boundary_engine, state, target)
-        result = boundary_infidelity(state, target, **opts)
+        record = {"requested_chi": opts["chi"], "attempts": []}
+        self.evaluation_records.append(record)
+        roundoff_tol = _resolve_gate_cutoff(state, "auto")
+        for attempt in range(retries + 1):
+            self._last_evaluation_chi = opts["chi"]
+            result = boundary_infidelity(state, target, **opts)
+            self._last_target_norm = (
+                result.get("norm_target", 1.0) if isinstance(result, Mapping) else 1.0
+            )
+            self._append_fit_diagnostics(result)
+            raw = result.get("infidelity") if isinstance(result, Mapping) else result
+            value = None if raw is None else _backend_to_float(raw)
+            record["attempts"].append({"chi": opts["chi"], "infidelity": value})
+            if value is None or not math.isfinite(value) or value >= -roundoff_tol:
+                record["effective_chi"] = opts["chi"]
+                return self._clean_infidelity(value, roundoff_tol=roundoff_tol)
+            if (
+                attempt == retries or opts["chi"] is None
+                or str(opts.get("method", "dmrg")).lower() == "exact"
+                or opts["norm"] is not None or opts["norm_target"] is not None
+            ):
+                raise ValueError(
+                    f"PEPS infidelity is substantially negative ({value:.3e}) "
+                    f"at evaluation chi={opts['chi']!r}; increase metric accuracy. "
+                    "When assuming unit target norm, increase normalize_chi "
+                    "as well, or set infidelity_kwargs={'norm_target': None} "
+                    "to measure the target norm explicitly."
+                )
+            cap = opts["chi"]
+            cap = 2 * (max(cap) if isinstance(cap, (tuple, list)) else cap)
+            warnings.warn(
+                f"Invalid PEPS boundary infidelity ({value:.3e}); retrying "
+                f"both norms and overlap with chi={cap}.",
+                RuntimeWarning, stacklevel=2,
+            )
+            opts["chi"] = cap
+
+    def _measure_target_norm(self, target, *, evaluation_chi, metric_kwargs):
+        """Resolve an unknown objective norm without an overlap contraction."""
+        opts = _merge_opts(self.boundary_kwargs, self.infidelity_kwargs, metric_kwargs)
+        target_boundary = opts.pop("bdy_target", None)
+        for key in ("balance_bonds", "norm", "norm_target", "bdy", "bdy_overlap",
+                    "evaluation_max_retries"):
+            opts.pop(key, None)
+        opts["bdy"] = target_boundary
+        # Norm-only contraction takes a scalar, unlike fidelity's cap pair.
+        opts["chi"] = evaluation_chi[0] if isinstance(evaluation_chi, (tuple, list)) else evaluation_chi
+        opts.setdefault("contraction_opt", self.contraction_opt)
+        opts.setdefault("progress", False)
+        if opts.get("fit_timing", False):
+            opts["return_info"] = True
+        _prefer_boundary_engine_mps(opts, self.boundary_engine, target)
+        result = boundary_norm(target, **opts)
         self._append_fit_diagnostics(result)
-        return self._clean_infidelity(result)
+        return getattr(result, "cost", result)
 
     def _sweep_boundary_kwargs(self, *, progress, sweep_progress=None):
         opts = _merge_opts(self.boundary_kwargs)
@@ -1123,11 +1342,13 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         if self.optimizer is not None:
             opt_kwargs.setdefault("optimizer", self.optimizer)
         if self.optimizer_options:
-            opt_kwargs.setdefault("optimizer_options", dict(self.optimizer_options))
+            opt_kwargs["optimizer_options"] = _merge_opts(
+                self.optimizer_options, opt_kwargs.get("optimizer_options"),
+            )
         opt_kwargs.setdefault("optimizer", _DEFAULT_SWEEP_SOLVER)
         if _optimizer_key(opt_kwargs.get("optimizer")) == "nlopt":
             opt_kwargs["optimizer_options"] = _merge_opts(
-                {"algorithm": _DEFAULT_SWEEP_NLOPT_ALGORITHM},
+                _DEFAULT_SWEEP_NLOPT_OPTIONS,
                 opt_kwargs.get("optimizer_options"),
             )
         return opt_kwargs
@@ -1268,6 +1489,16 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 stacklevel=3,
             )
 
+    def _configure_global_linalg(self, state, target, opt_kwargs):
+        """Install backend derivative rules before constructing/tracing the loss."""
+        backend = opt_kwargs.get("autodiff_backend", "torch")
+        if isinstance(backend, str) and backend.strip().lower() == "jax":
+            # The existing JAX rule restores truncated SVD cotangents, then
+            # delegates to native JAX differentiation. QR remains native.
+            register_jax_linalg(stabilized=True)
+        else:
+            self._maybe_configure_torch_linalg(state, target, opt_kwargs)
+
     def _record_fidelity_progress(self, infidelity):
         infidelity = self._clean_infidelity(infidelity)
         if infidelity is None:
@@ -1293,6 +1524,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         target,
         *,
         progress,
+        target_norm=1.0,
         sweep_progress=None,
         normalize_chi=_UNSET_METRIC_CHI,
         sweep_kwargs=None,
@@ -1305,9 +1537,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         init_kwargs = {
             "chi": self.boundary_chi,
-            "target_norm": 1.0,
+            "target_norm": target_norm,
             "contraction_opt": self.contraction_opt,
-            "renormalize_state": True,
+            # run() already normalized the compressed warm start.
+            "renormalize_state": False,
             "boundary_engine": self.boundary_engine,
             **boundary_init_kwargs,
         }
@@ -1359,6 +1592,13 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             sweep_optimize_kwargs,
         )
         opt_kwargs = self._apply_sweep_optimizer_options(opt_kwargs)
+        # Internal start/end diagnostics must use the same target norm as
+        # the local objective. Sweep's standalone diagnostic default measures
+        # it anew; its existing diagnostic options let this driver reuse it.
+        opt_kwargs["debug_loss_kwargs"] = _merge_opts(
+            {"norm_target": init_kwargs["target_norm"]},
+            opt_kwargs.get("debug_loss_kwargs"),
+        )
         if sweep_progress is not None:
             # A top-level explicit setting wins over legacy nested
             # ``sweep_optimize_kwargs={"progress": ...}`` values.
@@ -1391,6 +1631,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         progress,
         cutoff,
+        target_norm=1.0,
         normalize_chi=_UNSET_METRIC_CHI,
         global_kwargs=None,
         global_optimize_kwargs=None,
@@ -1399,6 +1640,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         init_kwargs = {"chi": self.boundary_chi}
         init_kwargs.update(self.global_kwargs)
         init_kwargs.update(dict(global_kwargs or {}))
+        opt_kwargs = _merge_opts(self.global_optimize_kwargs, global_optimize_kwargs)
+        opt_kwargs = self._apply_global_optimizer_options(opt_kwargs)
 
         norm_defaults = self._global_contraction_defaults(
             cutoff=cutoff,
@@ -1413,6 +1656,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             cutoff=cutoff,
             progress=False,
         )
+        if str(opt_kwargs.get("autodiff_backend", "torch")).lower() == "jax":
+            # JIT needs fixed SVD ranks. Exponent stripping currently converts
+            # JAX scalars to Python, losing gradients even without JIT.
+            loss_defaults.update(cutoff=0.0, strip_exponent=False)
+            opt_kwargs.setdefault("jit_fn", True)
+        loss_defaults["target_norm"] = target_norm
         init_kwargs["norm_kwargs"] = _merge_opts(
             norm_defaults,
             init_kwargs.get("norm_kwargs"),
@@ -1439,12 +1688,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             **init_kwargs,
         )
 
-        opt_kwargs = _merge_opts(self.global_optimize_kwargs, global_optimize_kwargs)
-        opt_kwargs = self._apply_global_optimizer_options(opt_kwargs)
+        # The driver owns final normalization, including its opt-out.
+        opt_kwargs["normalize"] = False
         opt_kwargs.setdefault("progbar", False)
         optimizer_name = opt_kwargs.get("optimizer", "adam")
         use_nlopt = _is_nlopt_optimizer(optimizer_name)
-        self._maybe_configure_torch_linalg(state, target_opt, opt_kwargs)
+        self._configure_global_linalg(state, target_opt, opt_kwargs)
         fallback_used = False
         fallback_error = None
         if use_nlopt:
@@ -1460,8 +1709,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     stacklevel=2,
                 )
                 fallback_kwargs = _merge_opts(self.global_fallback_kwargs)
+                fallback_kwargs["normalize"] = False
                 fallback_kwargs.setdefault("progbar", False)
-                self._maybe_configure_torch_linalg(
+                self._configure_global_linalg(
                     state,
                     target_opt,
                     fallback_kwargs,
@@ -1478,16 +1728,18 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             state_out = out
         if losses is None:
             losses = tuple(getattr(optimizer, "losses", ()))
-        final_infidelity = losses[-1] if losses else None
+        final_infidelity = getattr(optimizer, "final_loss", losses[-1] if losses else None)
+        summary = self._summarize_global_result(
+            opt_kwargs=opt_kwargs,
+            losses=losses,
+            fallback_used=fallback_used,
+            fallback_error=fallback_error,
+        )
+        summary.update(getattr(optimizer, "optimization_info", {}))
         return (
             state_out,
             self._clean_infidelity(final_infidelity),
-            self._summarize_global_result(
-                opt_kwargs=opt_kwargs,
-                losses=losses,
-                fallback_used=fallback_used,
-                fallback_error=fallback_error,
-            ),
+            summary,
         )
 
     def _summarize_sweep_result(self, result):
@@ -1495,6 +1747,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         summary = {"backend": "sweep"}
         if not isinstance(result, Mapping):
             return summary
+
+        for key in ("success", "termination_reason", "converged", "early_exit"):
+            if key in result:
+                summary[key] = result[key]
 
         for key in (
             "loss_before",
@@ -1598,6 +1854,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         target,
         *,
         mode,
+        target_norm,
         progress,
         sweep_progress,
         cutoff,
@@ -1617,6 +1874,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 state,
                 target,
                 progress=progress,
+                target_norm=target_norm,
                 sweep_progress=sweep_progress,
                 normalize_chi=normalize_chi,
                 sweep_kwargs=sweep_kwargs,
@@ -1627,6 +1885,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 state,
                 target,
                 progress=progress,
+                target_norm=target_norm,
                 normalize_chi=normalize_chi,
                 global_kwargs=global_kwargs,
                 global_optimize_kwargs=global_optimize_kwargs,
@@ -1724,9 +1983,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         progress=None,
         cutoff="auto",
         cutoff_mode="auto",
-        k_2q_batch=1,
+        k_2q_batch="auto",
         non_unitary=False,
-        normalize_target=True,
+        normalize_target=None,
         normalize_initial=None,
         normalize_chi=None,
         evaluation_chi=None,
@@ -1767,19 +2026,27 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             warm-start compression. Automatic cutoff follows the current PEPS
             dtype: 1e-12 for float64/complex128, 1e-6 for float32/complex64,
             and 1e-3 for 16-bit data. Automatic cutoff mode is "rsum2".
-        k_2q_batch : int, default=1
-            Number of sequential two-site gates to absorb into one target
-            before the warm-start truncation and optional sweep/global
-            optimization. One-site gates encountered while collecting the batch
-            are folded into the same target.
+        k_2q_batch : {"auto"} | int, default="auto"
+            Automatic batches stop before a two-site gate shares an endpoint
+            with an earlier two-site gate or makes any target bond exceed
+            ``2 * chi`` for diagonal qubit gates (including RZZ), or
+            ``4 * chi`` when other two-site gates enter the batch.
+            The first two-site gate is always included, even if
+            its exact target alone exceeds this budget. No target truncation
+            is used to satisfy the budget. Positive integers absorb up to that
+            many two-site gates, including overlapping ones, without a target
+            bond budget. One-site gates encountered inside a batch are applied
+            in circuit order and do not count toward the two-site limit.
+            Leading one-site gates are applied directly; trailing one-site
+            gates join an automatic batch until its next stopping condition.
         non_unitary : bool, default=False
             If ``True``, target states produced by gates are explicitly
             normalized before fidelity estimates and optimization.
-        normalize_target : bool | None, default=True
-            Normalize generated target states before compression and
-            infidelity measurement. Pass ``False`` only when target
-            normalization is managed externally. Passing ``None`` retains the
-            legacy behavior of following ``non_unitary``.
+        normalize_target : bool | None, default=None
+            Follow ``non_unitary`` by default: unitary gate targets are not
+            rescaled. True/False explicitly enables/disables target
+            normalization. Unitary runs assume target norm one by default;
+            use infidelity_kwargs={"norm_target": None} to measure it.
         normalize_initial : bool | None, optional
             Override the constructor's one-time initial normalization setting.
         normalize_chi : int | tuple[int, int] | None, optional
@@ -1791,7 +2058,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             This is the recommended way to judge acceptance with a larger chi
             than the optimizer environment uses.
         normalize_final : bool, default=True
-            Normalize an optimized candidate before measuring and accepting it.
+            Normalize optimized candidates before acceptance, retained targets
+            that already fit chi, and output after standalone one-site gates.
+            Truncated warm starts are always normalized before optimization.
+            When disabled, target norms are measured unless explicitly supplied.
         infidelity_tol : float | {"auto"}, default="auto"
             Accept the chi-truncated warm start without optimization when its
             estimated infidelity is at or below this threshold. Automatic
@@ -1800,7 +2070,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             refinement-entry threshold, not a guarantee on the final error.
         measure_infidelity : bool, default=True
             Measure the warm-start local infidelity before deciding whether to
-            optimize.
+            optimize. If disabled, optimization still resolves an unknown
+            target norm once for its objective; unitary targets use norm one.
         optimize : bool, default=True
             If ``False``, accept the warm start after the optional infidelity
             estimate.
@@ -1840,9 +2111,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         infidelity_tol = self._resolve_infidelity_tol(infidelity_tol)
         normalize_chi = self._boundary_chi_for_norm(normalize_chi, options=normalize_kwargs)
         evaluation_chi = self._boundary_chi_for_infidelity(evaluation_chi, options=infidelity_kwargs)
-        if mode is not None:
-            self.set_mode(mode)
-        run_mode = self.mode
+        run_mode = self.mode if mode is None else self._normalize_mode(mode)
         show_progress = bool(progbar if progress is None else progress)
         effective_sweep_progress = (
             self.sweep_progress
@@ -1850,12 +2119,22 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             else bool(sweep_progress)
         )
         normalize_target = bool(non_unitary) if normalize_target is None else bool(normalize_target)
+        metric_kwargs = dict(infidelity_kwargs or {})
+        default_target_norm = 1.0 if not non_unitary and normalize_final else None
+        metric_kwargs.setdefault(
+            "norm_target", self.infidelity_kwargs.get(
+                "norm_target", self.boundary_kwargs.get("norm_target", default_target_norm),
+            ),
+        )
         accept_if_improved = (
             self.accept_if_improved
             if accept_if_improved is None
             else bool(accept_if_improved)
         )
-        k_2q_batch = self._validate_scalar_chi(k_2q_batch, name="k_2q_batch")
+        if isinstance(k_2q_batch, str) and k_2q_batch.strip().lower() == "auto":
+            k_2q_batch = "auto"
+        else:
+            k_2q_batch = self._validate_scalar_chi(k_2q_batch, name="k_2q_batch")
         if reset_traces:
             self._reset_traces()
 
@@ -1883,6 +2162,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
 
         two_site_count = 0
+        needs_final_normalization = False
         idx = 0
         while idx < len(self.gates):
             step = idx + 1
@@ -1901,6 +2181,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             record_step = step
             record_where = where
             advanced = 1
+            step_evaluation_chi = evaluation_chi
+            target_norm = metric_kwargs["norm_target"]
 
             if site_count == 1:
                 opts = self._base_gate_options(
@@ -1926,13 +2208,28 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         normalize_kwargs=normalize_kwargs,
                         normalize_chi=normalize_chi,
                     )
+                needs_final_normalization = not normalize_target
                 final_state = self.state
                 idx += 1
             elif site_count == 2:
-                batch_entries, two_site_in_batch, next_idx = self._collect_gate_batch(
-                    idx,
-                    k_2q_batch,
-                )
+                state_before = self.state
+                if k_2q_batch == "auto":
+                    batch_entries, two_site_in_batch, next_idx, target, batch_stop, batch_bond_limit = (
+                        self._collect_auto_batch_target(
+                            idx, cutoff=cutoff, cutoff_mode=cutoff_mode,
+                            gate_kwargs=gate_kwargs,
+                        )
+                    )
+                else:
+                    batch_entries, two_site_in_batch, next_idx = self._collect_gate_batch(
+                        idx, k_2q_batch,
+                    )
+                    target = self._build_batch_target(
+                        state_before, batch_entries, cutoff=cutoff,
+                        cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                    )
+                    batch_stop = "gate_count" if next_idx < len(self.gates) else "end_of_queue"
+                    batch_bond_limit = None
                 if two_site_in_batch < 1:
                     raise RuntimeError("Gate batch unexpectedly contains no two-site gates.")
 
@@ -1947,14 +2244,6 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     record_which = self.which if record_which is None else record_which
                 record_step = next_idx
                 advanced = next_idx - idx
-                state_before = self.state
-                target = self._build_batch_target(
-                    state_before,
-                    batch_entries,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    gate_kwargs=gate_kwargs,
-                )
                 self._require_torch_symmray_backend(
                     state_before,
                     target,
@@ -1970,6 +2259,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
                 if target_max_bond is not None and target_max_bond <= self.chi:
                     self.state = target
+                    if normalize_final and not normalize_target:
+                        self._normalize_state(
+                            self.state, normalize_kwargs=normalize_kwargs,
+                            normalize_chi=normalize_chi,
+                        )
                     final_state = self.state
                     final_infidelity = 0.0
                     reason = "within_chi"
@@ -1993,8 +2287,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                             warmstart,
                             target,
                             evaluation_chi=evaluation_chi,
-                            **dict(infidelity_kwargs or {}),
+                            **metric_kwargs,
                         )
+                        step_evaluation_chi = self._last_evaluation_chi
+                        target_norm = self._last_target_norm
 
                     if pre_infidelity is not None and pre_infidelity <= infidelity_tol:
                         self.state = warmstart
@@ -2008,6 +2304,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         reason = "warmstart"
                     else:
                         optimizer_attempted = True
+                        if target_norm is None:
+                            target_norm = self._measure_target_norm(
+                                target, evaluation_chi=evaluation_chi,
+                                metric_kwargs=metric_kwargs,
+                            )
                         if pbar is not None:
                             pbar.set_postfix(self._progress_postfix(
                                 two_site_count=two_site_count,
@@ -2027,6 +2328,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                             warmstart,
                             target,
                             mode=run_mode,
+                            target_norm=target_norm,
                             progress=show_progress,
                             sweep_progress=effective_sweep_progress,
                             cutoff=cutoff,
@@ -2037,19 +2339,36 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                             global_optimize_kwargs=global_optimize_kwargs,
                         )
                         candidate_state = final_state
-                        if normalize_final:
+                        cleanup_failed = (
+                            isinstance(optimizer_result, Mapping)
+                            and optimizer_result.get("success") is False
+                        )
+                        if normalize_final and not cleanup_failed:
                             self._normalize_state(
                                 candidate_state,
                                 normalize_kwargs=normalize_kwargs,
                                 normalize_chi=normalize_chi,
                             )
-                        if measure_infidelity and measure_final_infidelity:
+                        if measure_infidelity and measure_final_infidelity and not cleanup_failed:
+                            # A retry must not compare candidates measured at
+                            # different caps. Use the precheck's effective cap,
+                            # and remeasure the snapshot if the postcheck grows it.
+                            comparison_opts = dict(metric_kwargs)
+                            comparison_opts["chi"] = step_evaluation_chi
                             post_infidelity = self.estimate_infidelity(
                                 candidate_state,
                                 target,
-                                evaluation_chi=evaluation_chi,
-                                **dict(infidelity_kwargs or {}),
+                                **comparison_opts,
                             )
+                            if self._last_evaluation_chi != step_evaluation_chi:
+                                step_evaluation_chi = self._last_evaluation_chi
+                                if warmstart_snapshot is not None:
+                                    comparison_opts["chi"] = step_evaluation_chi
+                                    comparison_opts.pop("evaluation_max_retries", None)
+                                    pre_infidelity = self.estimate_infidelity(
+                                        warmstart_snapshot, target,
+                                        evaluation_max_retries=0, **comparison_opts,
+                                    )
                         final_infidelity = (
                             post_infidelity
                             if post_infidelity is not None
@@ -2058,9 +2377,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         if final_infidelity is None:
                             final_infidelity = pre_infidelity
 
-                        should_accept = True
+                        should_accept = not cleanup_failed
                         if (
-                            accept_if_improved
+                            not cleanup_failed
+                            and accept_if_improved
                             and pre_infidelity is not None
                             and final_infidelity is not None
                         ):
@@ -2084,8 +2404,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                             # This was measured before optimization on the
                             # warm start snapshot that we just restored.
                             final_infidelity = pre_infidelity
-                            reason = "optimizer_rejected"
+                            reason = "optimizer_failed" if cleanup_failed else "optimizer_rejected"
 
+                needs_final_normalization = False
                 fidelity, geometric_fidelity = self._record_fidelity_progress(final_infidelity)
                 record = {
                     "step": int(record_step),
@@ -2094,10 +2415,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "which": record_which,
                     "batch_size": len(batch_entries),
                     "two_site_batch": int(two_site_in_batch),
+                    "k_2q_batch": k_2q_batch,
+                    "batch_stop_reason": batch_stop,
+                    "batch_target_bond_limit": batch_bond_limit,
                     "target_max_bond": target_max_bond,
                     "state_max_bond": self._max_bond(self.state),
                     "normalize_chi": normalize_chi,
                     "evaluation_chi": evaluation_chi,
+                    "effective_evaluation_chi": step_evaluation_chi,
                     "cutoff": cutoff,
                     "cutoff_mode": cutoff_mode,
                     "infidelity_tol": infidelity_tol,
@@ -2136,12 +2461,17 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         if pbar is not None:
             pbar.close()
 
+        if normalize_final and needs_final_normalization:
+            self._normalize_state(
+                self.state, normalize_kwargs=normalize_kwargs,
+                normalize_chi=normalize_chi,
+            )
         return self.state
 
     def get_fidelities(self):
         """Return the running geometric mean of measured local fidelities.
 
-        This is a per-two-site-gate monitor, not an exact global fidelity. For
+        This is a per-gate-batch monitor, not an exact global fidelity. For
         small systems, use a direct overlap with a high-chi or dense reference
         when you need the true state-vs-ideal fidelity.
 
@@ -2152,7 +2482,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         return list(self.losses)
 
     def get_infidelities(self):
-        """Return ``1 - prod(F_local)`` for measured two-site gate fidelities.
+        """Return ``1 - prod(F_local)`` for measured gate-batch fidelities.
 
         This cumulative trace is a local-fidelity proxy, not an exact global
         state-vs-ideal infidelity. It can overestimate the true global
@@ -2165,11 +2495,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         return list(self.infidelities)
 
     def get_local_infidelities(self):
-        """Return measured per-two-site-gate infidelities."""
+        """Return measured local infidelities, one per gate batch."""
         return list(self.local_infidelities)
 
     def get_step_records(self):
-        """Return lightweight per-two-site-gate bookkeeping records."""
+        """Return gate-batch records, stopping reasons and effective metric caps."""
         return list(self.step_records)
 
     def get_normalizations(self):
@@ -2183,3 +2513,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``boundary_kwargs`` or a per-call normalization/infidelity mapping.
         """
         return list(self.fit_diagnostics)
+
+    def get_evaluation_records(self):
+        """Return metric attempts, including requested and retry boundary caps."""
+        return [
+            {**record, "attempts": [dict(attempt) for attempt in record["attempts"]]}
+            for record in self.evaluation_records
+        ]

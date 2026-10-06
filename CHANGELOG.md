@@ -14,6 +14,31 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- `PepsOptimizer(mode="global")` now defaults to `jit_fn=True` and loss
+  options `cutoff=0`, `strip_exponent=False` when JAX autodiff is selected.
+  Explicit global overrides take precedence. Boundary bond caps and outer
+  normalization settings retain their existing behavior.
+  Global JAX optimization also registers Pepsy's truncation-safe SVD
+  derivative before loss construction/JIT tracing; QR uses native JAX.
+
+- `PepsOptimizer.run(k_2q_batch="auto")` now defaults to ordered batches of
+  disjoint two-site gates, absorbing one-site gates in place and limiting
+  multi-gate target bonds to `2*chi` for diagonal qubit gates such as RZZ,
+  or `4*chi` for other gates. Exact single-gate targets may exceed
+  that budget; integer batch sizes retain count-based behavior. Batch records
+  expose stopping reasons and target caps. NLopt local defaults are explicit:
+  `LD_LBFGS`, 50 evaluations, objective/parameter tolerances `1e-9`,
+  and best-iterate restoration.
+  Dense nearest-neighbor diagonal gates use their exact `2*current_bond`
+  rank ceiling. Unitary targets are no longer rescaled by default; retained
+  outputs use `normalize_chi` for normalization, including direct targets
+  and standalone one-site output. `non_unitary=True` enables target
+  normalization, with explicit `normalize_target` overrides supported.
+  Default unitary fidelity checks assume target norm one and skip the target
+  norm contraction. Explicit `infidelity_kwargs={"norm_target": None}`
+  restores measurement; nonunitary runs and runs without final normalization
+  measure target norms by default.
+
 - Export `pepsy.backends.register_projector_split` for custom dense boundary
   algorithms to reuse the existing paired-factor Quimb split registration.
   The decomposition and its derivative contracts are unchanged.
@@ -57,6 +82,36 @@ releases remain backwards-compatible. From 1.0 onward:
   while reducing device readbacks, without changing state dtype or device.
 
 ### Fixed
+
+- Global PEPS optimization restores the input array backend, dtype, and device
+  before normalization and fidelity checks, including native Symmray blocks.
+  The PEPS driver now owns final normalization and honors its opt-out without
+  a duplicate delegated contraction. NLopt cleanup restores the best finite
+  evaluated vector and reports early-stop/recovery status separately from the
+  raw loss history. Standalone `GlobalOptimizer.normalize()` now honors its
+  independently configured normalization options.
+
+- PEPS sweep cleanup no longer treats a substantially negative or nonfinite
+  initial infidelity as convergence. Failed cleanup retains the warm start
+  with explicit diagnostics. Invalid local solver parameters or losses are
+  rejected before slice writeback, preserving the previous tensors without
+  changing boundary caps or measuring the unitary target norm.
+
+- `PepsOptimizer` now reuses the known target norm in delegated sweep
+  diagnostics, eliminating the two internal target-norm contractions still
+  present in unitary runs. Already-normalized warm starts skip duplicate
+  sweep-constructor normalization. When fidelity measurement is disabled,
+  optimization measures an unknown target norm once instead of silently
+  assuming one for nonunitary targets. Explicit normalization and diagnostic
+  overrides remain supported.
+
+- Standalone PEPS fidelity evaluation recomputes both norms and can retry invalid
+  estimates at larger, equal caps (two bounded, warned retries by default;
+  disable with `evaluation_max_retries=0`). Effective caps and raw attempts
+  are recorded, acceptance uses common caps, and the measured target norm
+  reaches variational cleanup. Exact-target protection now covers `bond_dim`;
+  physical-index gates, sweep FIT diagnostic collection, and temporary
+  `run(mode=...)` overrides follow their documented behavior.
 
 - Small dense MPS gate-to-MPO factorizations use a bounded double-precision
   operator workspace and cast factors back before applying them. This resolves
