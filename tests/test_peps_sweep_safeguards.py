@@ -57,6 +57,54 @@ def test_initial_roundoff_still_allows_valid_convergence(monkeypatch, loss):
     assert result["best_loss"] == max(0., loss)
 
 
+def test_small_initial_contraction_error_warns_and_returns_bounded_loss(monkeypatch):
+    sweep = _sweep()
+    monkeypatch.setattr(sweep, "_approx_infidelity_loss", lambda **kw: -6.86e-10)
+    with pytest.warns(RuntimeWarning, match="Small negative approximate sweep"):
+        result = sweep.run(progress=False, renormalize=False)
+    assert result["success"]
+    assert result["loss_before"] == -6.86e-10
+    assert result["loss_after"] == result["best_loss"] == 0.
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_autoray_fidelity_clip_preserves_backend_and_bounds(backend):
+    values = np.array([-1e-10, .4, 1. + 6.86e-10], dtype="float64")
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        values = torch.tensor(values, requires_grad=True)
+    clipped = SweepOptimizer._clip_fidelity(values)
+    assert type(clipped) is type(values)
+    assert clipped.dtype == values.dtype
+    if backend == "torch":
+        assert clipped.device == values.device
+        clipped.sum().backward()
+        np.testing.assert_array_equal(values.grad.numpy(), [0., 1., 0.])
+        clipped = clipped.detach().numpy()
+    np.testing.assert_array_equal(clipped, [0., .4, 1.])
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_small_local_overshoot_keeps_raw_objective_and_bounds_diagnostics(monkeypatch, backend):
+    sweep = _sweep(backend)
+    sweep._refresh_right_boundaries_once("y", env_n_iter=10)
+    raw_losses = []
+
+    def solver(params, loss_fn, **kwargs):
+        monkeypatch.setattr(sweep, "_scaled_overlap_fidelity", lambda *a: 1. + 6.86e-10)
+        raw_losses.append(float(loss_fn(params)))
+        return params, raw_losses
+
+    monkeypatch.setattr(sweep, "_optimize_packed_params", solver)
+    with pytest.warns(RuntimeWarning, match="Small negative approximate sweep"):
+        result = sweep._optimize_axis_slice_with_current_env(0, axis="y")
+    assert not result.get("invalid_loss", False)
+    assert raw_losses[0] < 0.
+    assert result["history"] == raw_losses
+    assert result["raw_loss_final"] == raw_losses[0]
+    assert result["loss_final"] == result["loss_best"] == sweep.best_loss == 0.
+
+
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
 @pytest.mark.parametrize("bad_output", ["nan", "inf", "negative_loss", "nan_loss"])
 def test_invalid_local_result_preserves_every_tensor(monkeypatch, backend, bad_output):

@@ -84,6 +84,42 @@ substantially negative value is retried as described below, then raises if it
 remains invalid. Physical-index strings such as `("k0,0", "k0,1")` are
 supported without forwarding coordinate-routing options to the split routine.
 
+## Profiling
+
+When the driver performs a final acceptance check, the sweep's duplicate final
+diagnostic is skipped unless custom debug diagnostics are requested. For
+direct boundary compression with matching caps and the default metric policy,
+the sweep also reuses the outer initial infidelity. Customized metrics,
+different caps, and iterative boundary fitting keep separate initial checks.
+The outer postcheck after candidate normalization remains authoritative.
+Sweep summaries mark `initial_loss_reused` and `final_loss_measured`; a skipped
+internal diagnostic is not reported as a fresh fidelity measurement.
+
+Use `run(timing=True)` to profile target construction (`target`), warm-start
+compression (`compression`), normalization, fidelity checks (`fidelity`), and
+variational cleanup (`sweep` or `global`). `get_timing()` returns the latest
+run's `seconds`, `calls`, `total_seconds`, `status`, and `synchronized` flag,
+including work completed before an exception. Each gate-batch record includes
+its own `timing` phase deltas. Run totals also include normalization outside
+gate batches; unclassified orchestration and one-site gates are included in
+`total_seconds`, so phase sums need not equal the total.
+`run(step_callback=callback)` sends a detached scalar record to the callback
+after each completed two-site batch, so long runs can stream diagnostics before
+the whole gate queue finishes. Callback errors propagate to the caller.
+
+With timing enabled, each sweep `optimizer_result` includes a `timing` summary
+with `boundary_seconds`, `optimize_seconds`, and scalar per-slice records.
+These reuse SweepOptimizer's existing timers: boundary updates and local
+objective/solver work are subsets of the outer sweep time and exclude setup,
+whole-state diagnostics, and some environment preparation. Do not add these
+inner totals to the outer phase totals.
+
+`timing_sync_device=True` synchronizes supported accelerators at outer phase
+boundaries, only when `timing=True`. This can affect runtime and is intended
+for profiling. Inner slice timers remain unsynchronized host wall times and
+are explicitly marked as such. Timing off adds no accelerator barriers and
+does not enable extra contractions or alter optimization settings.
+
 ## Local solver defaults
 
 The default sweep solver is NLopt `LD_LBFGS` for dense and Torch-backed Symmray
@@ -158,11 +194,26 @@ target contraction. A negative estimate can indicate insufficient
 `normalize_chi`; increase normalization/evaluation accuracy or opt into
 target-norm measurement. Output normalization at finite chi is an
 approximation to exact unit norm.
-Only negative roundoff within the dtype cutoff scale (`1e-12` for double,
-`1e-6` for single precision) is cleaned to zero.
+Small negative approximate estimates within `evaluation_negative_tol=1e-8`
+are instead accepted immediately with a warning and treated as zero for
+decisions and fidelity bookkeeping. This tolerance is absolute and does not
+certify a perfect overlap. It avoids retries and stopping for small boundary
+contraction discrepancies, including when the target norm is supplied as one.
+The dtype roundoff scale (`1e-12` for double, `1e-6` for single precision)
+remains a lower bound and is cleaned silently. Set `evaluation_negative_tol=0`
+on `PepsOptimizer` for the previous roundoff-only policy. Exact contractions
+always use that stricter policy. Larger invalid values retain the retry/error
+behavior above; nonfinite values still raise.
 
-`get_evaluation_records()` reports all attempted caps and raw errors. Step
-records retain the requested `evaluation_chi` plus `effective_evaluation_chi`.
+`get_evaluation_records()` reports all attempted caps and raw errors, including
+`clipped_negative`, `raw_infidelity`, and `negative_tolerance` when the new
+allowance is used. Step records also embed their `evaluation_records`, so
+streamed/saved batch diagnostics preserve these raw values. They retain the
+requested `evaluation_chi` plus `effective_evaluation_chi`.
+The tolerance is also forwarded to `SweepOptimizer` unless explicitly
+overridden in `sweep_kwargs`. Sweep summaries retain `clipped_loss_records`
+with raw and bounded local losses. Fidelity bookkeeping uses Autoray clipping
+to `[0, 1]`; the differentiable sweep objective remains unclipped.
 Candidate acceptance compares pre/post states at a common effective cap; if
 the postcheck needs a larger cap, the saved warm start is remeasured there
 without further retries. No automatic retry guarantees contraction accuracy,

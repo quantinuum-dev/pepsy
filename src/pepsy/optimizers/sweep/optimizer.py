@@ -82,6 +82,15 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         fidelity objectives. Pass either a scalar or a ``(mantissa, exponent)``
         pair such that ``norm = mantissa * 10**exponent``. The default keeps
         the historical normalized-target assumption.
+    evaluation_negative_tol : float, default=1e-8
+        Allow small negative approximate diagnostic losses, warning and clipping
+        them to zero. Raw losses and differentiable objectives are preserved.
+        The existing 1e-10 roundoff allowance remains a lower bound.
+    collect_contraction_metrics : bool, default=False
+        Compute optional local FLOP/peak-size diagnostics.
+    cache_contraction_paths : bool, default=True
+        Reuse paths within a fixed local environment when topology/shapes
+        match and the optimizer is a string preset. Never cache tensor values.
     chi : int | tuple[int, int] | None, default=None
         Boundary bond dimension used when ``bdy``/``bdy_overlap`` are not
         supplied.  Pass a single ``int`` to use the same dimension for both
@@ -223,6 +232,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "normalize_boundaries",
         "boundary_engine",
         "boundary_options",
+        "initial_loss",
+        "compute_final_loss",
+        "collect_boundary_norms",
     })
     _DEFAULT_SOLVER_OPTIONS = {
         "algorithm": "LBFGS",
@@ -461,6 +473,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         state_target,
         *,
         target_norm=1.0,
+        evaluation_negative_tol=1.0e-8,
+        collect_contraction_metrics=False,
+        cache_contraction_paths=True,
         chi=None,
         bdy=None,
         bdy_overlap=None,
@@ -498,6 +513,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         progress: bool | None = None,
         track_boundary_fidelity: bool | None = None,
     ):
+        self.evaluation_negative_tol = float(evaluation_negative_tol)
+        self.collect_contraction_metrics = bool(collect_contraction_metrics)
+        self.cache_contraction_paths = bool(cache_contraction_paths)
+        if not math.isfinite(self.evaluation_negative_tol) or self.evaluation_negative_tol < 0:
+            raise ValueError("evaluation_negative_tol must be finite and non-negative.")
         self._ensure_no_common_internal_indices(state, state_target)
         self._validate_symmray_input_backends(state, state_target)
         # Canonicalize before boundary construction because the mode decides
@@ -601,6 +621,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     if block_fit and self.boundary_engine == "dmrg"
                     else None
                 ),
+                lazy=fit_mode == "direct",
             )
 
         self.state = state
@@ -758,6 +779,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         boundary_engine="dmrg",
         boundary_options=None,
         initial_bond=None,
+        lazy=False,
     ):
         """Construct norm and overlap boundary MPS containers."""
         chi_bdy, chi_overlap = SweepOptimizer._unpack_chi(chi)
@@ -782,11 +804,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             tn_double=state_norm,
             chi=chi_bdy,
             single_layer=single_layer,
+            lazy=lazy,
         )
         bdy_overlap = BdyMPS(
             tn_double=overlap_norm,
             chi=chi_overlap,
             single_layer=single_layer,
+            lazy=lazy,
         )
         return bdy, bdy_overlap
 
@@ -829,6 +853,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.best_state = None
         self.best_loss = float("inf")
         self._warned_invalid_local_loss = False
+        self._warned_small_negative_loss = False
 
     def _append_fit_diagnostics(self, records):
         """Append typed boundary-fit diagnostics from a worker or metric."""
@@ -1514,14 +1539,32 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         return values
 
     @staticmethod
-    def _fidelity_to_infidelity(value):
+    def _clip_fidelity(value):
+        """Bound a real diagnostic on its array backend, outside the objective."""
+        return ar.do("clip", ar.do("real", value), 0.0, 1.0)
+
+    def _diagnostic_infidelity(self, value):
+        """Bound valid diagnostic losses, retaining invalid values for guards."""
+        if value is None or not math.isfinite(float(value)):
+            return value
+        tolerance = max(1.0e-10, self.evaluation_negative_tol)
+        if float(value) < -tolerance:
+            return value
+        if float(value) < -1.0e-10 and not self._warned_small_negative_loss:
+            warnings.warn(
+                f"Small negative approximate sweep infidelity ({float(value):.3e}); "
+                "continuing with zero for diagnostics. Raw losses retained.",
+                RuntimeWarning, stacklevel=2,
+            )
+            self._warned_small_negative_loss = True
+        return float(self._clip_fidelity(value))
+
+    @classmethod
+    def _fidelity_to_infidelity(cls, value):
         """Convert fidelity scalar to non-negative infidelity."""
         if value is None:
             return None
-        infid = 1.0 - float(complex(value).real)
-        if infid < 0.0 and abs(infid) < 1e-12:
-            infid = 0.0
-        return infid
+        return 1.0 - float(cls._clip_fidelity(value))
 
     def _collect_axis_run_traces(self, axis_runs, *, cycle, axis):
         """Collect per-step traces from axis run records."""
@@ -2163,7 +2206,22 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             slice_target=slice_target,
             right_key=right_key,
             left_key=left_key,
-        )
+        ) if self.collect_contraction_metrics else {}
+
+        # Cache paths only for this fixed local environment. Compare the
+        # ordered topology and shapes before reuse; never cache tensor values.
+        contraction_paths = {}
+
+        def contract_local(network, role):
+            optimize = self.contraction_opt
+            if self.cache_contraction_paths and isinstance(optimize, str):
+                signature = tuple((tensor.inds, tensor.shape) for tensor in network)
+                cached = contraction_paths.get(role)
+                if cached is None or cached[0] != signature:
+                    path = network.contraction_path(optimize=optimize, output_inds=())
+                    contraction_paths[role] = (signature, path)
+                optimize = contraction_paths[role][1]
+            return network.contract(all, optimize=optimize, strip_exponent=True)
 
         def loss_fn(params_in):
             params_tree = _restore_params(params_in)
@@ -2204,16 +2262,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 overlap_net = overlap_net.full_simplify(seq="R", split_method="svd", inplace=False)
 
 
-            overlap_val = overlap_net.contract(
-                all,
-                optimize=self.contraction_opt,
-                strip_exponent=True,
-            )
-            norm_val = norm_net.contract(
-                all,
-                optimize=self.contraction_opt,
-                strip_exponent=True,
-            )
+            overlap_val = contract_local(overlap_net, "overlap")
+            norm_val = contract_local(norm_net, "norm")
             overlap_val = self._shift_scaled_exponent(
                 overlap_val,
                 self._local_overlap_exponent(),
@@ -2227,16 +2277,16 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 norm_val,
                 self.target_norm,
             )
-            #infid = ar.do("clip", 1.0 - fid, 0.0, None)
+            # Keep the objective unclipped to preserve its gradient. Bounds
+            # apply only to diagnostics after evaluation and validity checks.
             infid = 1. - fid
             return infid
 
-        initial_loss = float(loss_fn(params_init_opt))
+        raw_initial_loss = float(loss_fn(params_init_opt))
+        initial_loss = self._diagnostic_infidelity(raw_initial_loss)
 
-        # A negative normalized infidelity means the local boundary estimate
-        # is numerically invalid (fidelity > 1), not that this slice is a
-        # genuinely better state. Never let such a value enter a solver or
-        # the best-state tracker.
+        # Small negative contraction errors are bounded for diagnostics.
+        # Larger invalid values must not enter the solver or best-state tracker.
         if (not math.isfinite(initial_loss)) or initial_loss < -1.0e-10:
             if not self._warned_invalid_local_loss:
                 warnings.warn(
@@ -2291,6 +2341,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             if params_finite else float("nan")
         )
         observed_losses = [initial_loss, *history_values, applied_loss]
+        observed_losses = [self._diagnostic_infidelity(v) for v in observed_losses]
         best_history = []
         running_best = float("inf")
         for value in observed_losses:
@@ -2300,7 +2351,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             # in the diagnostic minimum; carry the last valid minimum forward.
             best_history.append(running_best)
         best_loss = self._best_nonnegative_from_history(observed_losses)
-        if not math.isfinite(applied_loss) or applied_loss < -1.0e-10:
+        if not math.isfinite(applied_loss) or applied_loss < -max(1.0e-10, self.evaluation_negative_tol):
             if not self._warned_invalid_local_loss:
                 warnings.warn(
                     "Rejecting a local sweep result because its parameters or "
@@ -2333,12 +2384,16 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self._apply_slice_update(index, params_opt_tree, skeleton, axis)
         # Track the state that was actually applied, rather than a trial loss
         # from an iterate that may have been discarded by restore_best.
+        raw_applied_loss = applied_loss
+        applied_loss = self._diagnostic_infidelity(applied_loss)
         self._maybe_store_best_state(applied_loss)
         return {
             "axis": axis,
             "index": index,
             "loss_initial": initial_loss,
             "loss_final": applied_loss,
+            "raw_loss_initial": raw_initial_loss,
+            "raw_loss_final": raw_applied_loss,
             "loss_best": best_loss,
             "history": history_values,
             "best_history": best_history,
@@ -2486,6 +2541,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         debug=False,
         debug_loss_mode="exact",
         debug_loss_kwargs=None,
+        collect_boundary_norms=False,
     ):
         """Run a single forward or backward half-sweep over *indices*."""
         indices = tuple(indices)
@@ -2625,14 +2681,16 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                 except (AttributeError, TypeError, ValueError):
                     run_info["exact_loss_after"] = None
-            try:
-                run_info["bdy_norm"] = float(abs(self.bdy.norm))
-            except Exception:
-                run_info["bdy_norm"] = None
-            try:
-                run_info["bdy_overlap_norm"] = float(abs(self.bdy_overlap.norm))
-            except Exception:
-                run_info["bdy_overlap_norm"] = None
+            run_info["bdy_norm"] = run_info["bdy_overlap_norm"] = None
+            if collect_boundary_norms:
+                try:
+                    run_info["bdy_norm"] = float(abs(self.bdy.norm))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+                try:
+                    run_info["bdy_overlap_norm"] = float(abs(self.bdy_overlap.norm))
+                except (AttributeError, TypeError, ValueError):
+                    pass
             runs.append(run_info)
             if run_callback is not None:
                 run_callback(run_info)
@@ -2654,6 +2712,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         debug_loss_kwargs=None,
         renormalize=True,
         normalize_boundaries=None,
+        collect_boundary_norms=False,
     ):
         """Run one axis with forward + round-trip sweeps.
 
@@ -2670,6 +2729,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             Extra backend-specific options for the selected ``solver``.
         env_n_iter : int, default=4
             Local boundary-fit iterations per boundary move.
+        collect_boundary_norms : bool, default=False
+            Collect optional per-slice and final boundary-MPS norm reports.
         run_callback : callable | None, default=None
             Optional callback called once per local slice update.
         track_boundary_fidelity : bool, default=False
@@ -2717,6 +2778,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             debug=debug,
             debug_loss_mode=debug_loss_mode,
             debug_loss_kwargs=debug_loss_kwargs,
+            collect_boundary_norms=collect_boundary_norms,
         )
 
         all_runs.extend(
@@ -2771,11 +2833,22 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         track_boundary_fidelity=None,
         renormalize=True,
         normalize_boundaries=None,
+        initial_loss=None,
+        compute_final_loss=True,
+        collect_boundary_norms=False,
     ):
         """Run alternating axis sweeps and return a result dict.
 
         Parameters
         ----------
+        initial_loss : float | None, default=None
+            Previously measured initial infidelity for identical state, target,
+            caps and metric policy. None performs the usual initial check.
+        compute_final_loss : bool, default=True
+            Measure the final global diagnostic. False reports loss_after=None
+            unless the initial check already establishes convergence.
+        collect_boundary_norms : bool, default=False
+            Collect optional per-slice and final boundary-MPS norm reports.
         chi : int | None, default=None
             If provided, expand stored boundaries to this bond dimension before
             running sweeps.
@@ -2819,7 +2892,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         else:
             track_boundary_fidelity = bool(track_boundary_fidelity)
         loss_mode = debug_loss_mode if debug else "infidelity"
-        if (not debug) and (debug_loss_kwargs is None):
+        if initial_loss is not None:
+            loss_before = float(initial_loss)
+        elif (not debug) and (debug_loss_kwargs is None):
             loss_before = self._approx_infidelity_loss(env_n_iter=env_n_iter)
         else:
             try:
@@ -2842,7 +2917,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         # without changing the warm start or increasing any contraction cap.
         invalid_initial_loss = loss_before is not None and (
             not math.isfinite(float(loss_before))
-            or float(loss_before) < -early_exit_tol
+            or float(loss_before) < -max(early_exit_tol, self.evaluation_negative_tol)
         )
         if invalid_initial_loss or (
             loss_before is not None and float(loss_before) < early_exit_tol
@@ -2856,14 +2931,15 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
                 loss_after = None
             else:
-                # Only roundoff within the existing local-loss tolerance is
-                # treated as zero; retain the raw estimate in loss_before.
-                loss_after = max(0.0, float(loss_before))
+                # Retain the raw estimate in loss_before.
+                loss_after = self._diagnostic_infidelity(loss_before)
                 self._maybe_store_best_state(loss_after)
             return _AttrDict({
                 "runs": [],
                 "loss_before": loss_before,
                 "loss_after": loss_after,
+                "initial_loss_reused": initial_loss is not None,
+                "final_loss_measured": False,
                 "best_loss": (
                     None if not math.isfinite(float(self.best_loss))
                     else float(self.best_loss)
@@ -2969,6 +3045,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     debug_loss_kwargs=debug_loss_kwargs,
                     renormalize=renormalize,
                     normalize_boundaries=normalize_boundaries,
+                    collect_boundary_norms=collect_boundary_norms,
                 )
                 all_runs.extend(axis_runs)
                 self._collect_axis_run_traces(
@@ -2998,6 +3075,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     single_layer=getattr(self, "single_layer", False),
                     boundary_engine=getattr(self, "boundary_engine", "dmrg"),
                     boundary_options=getattr(self, "boundary_options", None),
+                    lazy=self.fit_mode == "direct",
                 )
             )
 
@@ -3008,7 +3086,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             old_norm = self._normalize_state(env_n_iter=env_n_iter)
             self.norm_trace.append({"state_norm": float(abs(complex(old_norm)))})
 
-        if (not debug) and (debug_loss_kwargs is None):
+        if not compute_final_loss:
+            loss_after = None
+        elif (not debug) and (debug_loss_kwargs is None):
             loss_after = self._approx_infidelity_loss(env_n_iter=env_n_iter)
         else:
             try:
@@ -3020,21 +3100,27 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             except (AttributeError, TypeError, ValueError):
                 loss_after = None
 
+        raw_loss_after = loss_after
+        loss_after = self._diagnostic_infidelity(loss_after)
         bdy_norm = None
         bdy_overlap_norm = None
-        try:
-            bdy_norm = float(abs(self.bdy.norm))
-        except (AttributeError, TypeError, ValueError):
-            bdy_norm = None
-        try:
-            bdy_overlap_norm = float(abs(self.bdy_overlap.norm))
-        except (AttributeError, TypeError, ValueError):
-            bdy_overlap_norm = None
+        if collect_boundary_norms:
+            try:
+                bdy_norm = float(abs(self.bdy.norm))
+            except (AttributeError, TypeError, ValueError):
+                pass
+            try:
+                bdy_overlap_norm = float(abs(self.bdy_overlap.norm))
+            except (AttributeError, TypeError, ValueError):
+                pass
 
         return _AttrDict({
             "runs": all_runs,
             "loss_before": loss_before,
             "loss_after": loss_after,
+            "raw_loss_after": raw_loss_after,
+            "initial_loss_reused": initial_loss is not None,
+            "final_loss_measured": bool(compute_final_loss),
             "best_loss": None if not math.isfinite(float(self.best_loss)) else float(self.best_loss),
             "best_state": None if self.best_state is None else self.best_state.copy(),
             "loss": list(self.loss),
@@ -3120,4 +3206,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "normalize_boundaries", self.normalize_boundaries
             ),
             track_boundary_fidelity=opts.get("track_boundary_fidelity", False),
+            initial_loss=opts.get("initial_loss"),
+            compute_final_loss=opts.get("compute_final_loss", True),
+            collect_boundary_norms=opts.get("collect_boundary_norms", False),
         )
