@@ -164,7 +164,7 @@ def test_compression_must_be_an_explicit_follow_up_operation():
 
 
 def test_backend_delinearization_preserves_torch_gradients():
-    """Torch rank reduction stays native and keeps gradients finite."""
+    """Trainable Torch builds retain exact channels and their derivatives."""
     torch = pytest.importorskip("torch")
     x = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
     z = torch.diag(torch.tensor([1.0, -1.0], dtype=torch.float64))
@@ -185,7 +185,8 @@ def test_backend_delinearization_preserves_torch_gradients():
     raw_gradient = torch.autograd.grad(raw.to_dense()[0, 0], theta, retain_graph=True)[0]
     reduced_gradient = torch.autograd.grad(reduced.to_dense()[0, 0], theta)[0]
 
-    assert reduced.max_bond() == 2
+    assert reduced.max_bond() == raw.max_bond()
+    assert "trainable" in reduced.pepsy_delinearization["skipped_reason"]
     assert torch.isfinite(reduced_gradient)
     torch.testing.assert_close(reduced_gradient, raw_gradient)
 

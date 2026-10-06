@@ -1695,8 +1695,12 @@ class MPOAutomaton:
         ``mpo.compress(...)`` separately when approximation is intended.
         By default, NumPy, Torch, CuPy, and JAX arrays receive two
         roundoff-safe structural sweeps before constructing the Quimb MPO.
-        Set ``delinearize=False`` to skip them or ``True`` to require them;
+        Set ``delinearize=False`` to skip them or ``True`` to enable them
+        for eligible arrays;
         they do not truncate singular values.
+        Trainable Torch arrays, JAX tracers, and decomposition dtypes other
+        than float32/float64/complex64/complex128 retain their original
+        channels. The reduction report records ``skipped_reason``.
         """
         if compress:
             raise ValueError(

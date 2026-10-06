@@ -73,8 +73,15 @@ and bond reductions in `.pepsy_delinearization`. With a builder-level
 `to_backend`, the automaton builder runs the sweep on converted tensors before
 the final numerical compression. NumPy, Torch, CuPy, and JAX dense arrays are
 supported; the rank decision is discrete and reads scalar diagnostics on the
-host. When JAX is tracing a function, the data-dependent rank reductions are
-skipped so gradients flow through the unreduced MPO. Structured Symmray arrays
+host. Trainable Torch arrays and JAX tracers skip the numerical rank reductions
+so the original channels preserve parameter derivatives, including coefficients
+initialized at zero. Dtypes other than float32/float64/complex64/complex128 also
+skip these reductions; a Torch float16 MPO remains float16 without requiring
+an unsupported SVD. The report includes `skipped_reason` and zero `sweeps` for
+these cases. Untraced, nontrainable supported arrays still receive the two
+passes. Accepted reductions check reconstruction separately for each bond
+channel and account for the opposing tensor's scale. These local roundoff
+safeguards do not certify a global MPO error bound. Structured Symmray arrays
 keep their backend-specific compression path. NumPy rank-
 revealing QR uses optional SciPy; without it, exactly proportional channels
 are still removed.

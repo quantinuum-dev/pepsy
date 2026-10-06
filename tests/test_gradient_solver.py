@@ -31,6 +31,21 @@ def test_supported_solvers_exports_expected_backends():
     }
 
 
+@pytest.mark.parametrize("solver", ["lbfgs", "scipy-lbfgs", "LD_LBFGS"])
+def test_lbfgs_aliases_use_host_solver_with_torch(solver):
+    pytest.importorskip("nlopt" if solver == "LD_LBFGS" else "scipy")
+    initial = torch.tensor([2., -3.], dtype=torch.float64)
+    result = GradientOptimizer(solver=solver, n_steps=30).run(
+        params_init={"x": initial.clone()}, loss_fn=_loss_quadratic,
+    )
+    assert result.solver == ("nlopt" if solver == "LD_LBFGS" else "scipy")
+    assert isinstance(result.params["x"], torch.Tensor)
+    assert result.params["x"].device == initial.device
+    assert result.params["x"].dtype == initial.dtype
+    torch.testing.assert_close(result.params["x"], torch.zeros_like(initial), atol=1e-8, rtol=0.)
+    torch.testing.assert_close(initial, torch.tensor([2., -3.], dtype=torch.float64))
+
+
 def test_fdsolver_default_reduces_quadratic():
     """FDSolver should default to fd-adam and reduce a simple quadratic."""
     runner = FDSolver(

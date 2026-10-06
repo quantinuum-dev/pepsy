@@ -11,7 +11,10 @@ The implementation is deliberately private and conservative:
 * NumPy, Torch, CuPy, and JAX dense tensors are supported;
 * proportional columns are detected exactly;
 * the optional linear-dependence pass only accepts a reconstruction whose
-  residual is at floating-point roundoff;
+  residual is at floating-point roundoff, with per-channel and opposing-tensor
+  checks before replacing a bond;
+* trainable/traced arrays and unsupported decomposition dtypes retain their
+  channels rather than selecting a numerical rank;
 * tensor-network indices are replaced in place, so the operation preserves
   the represented operator without introducing a public compression API.
 
@@ -85,17 +88,65 @@ def _array_epsilon(data):
     return np.finfo(real_dtype).eps
 
 
+def _factorization_skip_reason(arrays):
+    """Keep discrete rank decisions out of gradients and unsupported dtypes."""
+    for array in arrays:
+        if getattr(array, "requires_grad", False):
+            return "trainable tensors require parameter-independent channel dependencies"
+        if _backend_name(array) == "jax":
+            import jax  # pylint: disable=import-outside-toplevel
+
+            if isinstance(array, jax.core.Tracer):
+                return "JAX tracing requires fixed channel shapes"
+        if ar.get_dtype_name(array) not in {
+            "float32", "float64", "complex64", "complex128",
+        }:
+            return "dtype has no supported rank-revealing decomposition"
+    return None
+
+
+def _bond_reconstruction_safe(matrix, reconstructed, other):
+    """Bound reconstruction error after absorption into the opposing tensor.
+
+    ``matrix`` has the bond on columns and ``other`` on rows. Channel maxima
+    bound the contracted residual without allocating a two-site dense tensor.
+    Check each channel before weighting by the opposing endpoint, so small
+    channels are protected even before a distant tensor's scale is absorbed.
+    Normalize both endpoints separately to keep the bound in range. This is
+    a local roundoff safeguard, not a global MPO error certificate.
+    """
+    eps = _array_epsilon(matrix)
+    if eps is None:
+        return bool(_host_scalar(ar.do("all", matrix == reconstructed)))
+    matrix_scale = float(_host_scalar(ar.do("max", ar.do("abs", matrix))))
+    other_scale = float(_host_scalar(ar.do("max", ar.do("abs", other))))
+    if not math.isfinite(matrix_scale) or not math.isfinite(other_scale):
+        return False
+    if matrix_scale == 0.0 or other_scale == 0.0:
+        return bool(_host_scalar(ar.do("all", matrix == reconstructed)))
+    # A subnormal divisor can overflow its reciprocal on array backends.
+    tiny = np.finfo(np.dtype(ar.get_dtype_name(matrix))).tiny
+    if min(matrix_scale, other_scale) < tiny:
+        return False
+    channel_scale = ar.do("max", ar.do("abs", matrix), axis=0) / matrix_scale
+    channel_error = ar.do("max", ar.do("abs", matrix - reconstructed), axis=0) / matrix_scale
+    relative_bound = 256.0 * eps * max(*matrix.shape, *other.shape)
+    # Small bond channels can be amplified by tensors farther along the MPO,
+    # even when the adjacent endpoint has not absorbed that scale yet.
+    if not bool(_host_scalar(ar.do("all", channel_error <= relative_bound * channel_scale))):
+        return False
+    weights = ar.do("max", ar.do("abs", other), axis=1) / other_scale
+    error = float(_host_scalar(ar.do("sum", channel_error * weights)))
+    scale = float(_host_scalar(ar.do("sum", channel_scale * weights)))
+    allowed = relative_bound * scale
+    return math.isfinite(error) and math.isfinite(scale) and scale > 0.0 and error <= allowed
+
+
 def _backend_linear_factor(matrix):
     """Find a roundoff-safe low-rank factorization on a dense backend."""
     backend = _backend_name(matrix)
-    if backend == "jax":
-        import jax  # pylint: disable=import-outside-toplevel
-
-        if isinstance(matrix, jax.core.Tracer):
-            # A data-dependent rank changes static tensor shapes and cannot be
-            # selected while JAX is tracing. Keep the exact unreduced edge;
-            # its surrounding MPO construction remains differentiable.
-            return matrix, None, False
+    if _factorization_skip_reason((matrix,)) is not None:
+        return matrix, None, False
     if matrix.shape[1] <= 1:
         return matrix, None, False
     eps = _array_epsilon(matrix)
@@ -370,6 +421,8 @@ def _factor_edge_from_child(
         and _is_supported_dense_array(parent_tensor.data)
     ):
         return False, None
+    if _factorization_skip_reason((child_tensor.data, parent_tensor.data)) is not None:
+        return False, None
 
     child_axis = child_tensor.inds.index(bond)
     child_data = _moveaxis(child_tensor.data, child_axis, -1)
@@ -384,6 +437,9 @@ def _factor_edge_from_child(
         # rank directly with the old bond size.
         if basis.shape[1] >= old_dim:
             return False, None
+        if transfer is None:
+            return False, None
+        reconstructed = _transpose(ar.do("matmul", basis, transfer), (1, 0))
         parent_transform = _transpose(basis, (1, 0))
         child_data = _reshape(transfer, (basis.shape[1], *child_data.shape[:-1]))
         child_data = _moveaxis(child_data, 0, -1)
@@ -392,11 +448,15 @@ def _factor_edge_from_child(
         basis, transfer, changed = _factor_columns(matrix, method=method)
         if not changed:
             return False, None
+        reconstructed = ar.do("matmul", basis, transfer)
         parent_transform = transfer
         child_data = _reshape(basis, (*child_data.shape[:-1], basis.shape[1]))
         child_data = _moveaxis(child_data, -1, child_axis)
 
     parent_axis = parent_tensor.inds.index(bond)
+    other = _reshape(_moveaxis(parent_tensor.data, parent_axis, 0), (old_dim, -1))
+    if not _bond_reconstruction_safe(matrix, reconstructed, other):
+        return False, None
     parent_data = _transform_axis(parent_tensor.data, parent_transform, parent_axis)
     new_bond = qtn.rand_uuid()
     _replace_bond(child_tensor, bond, new_bond, child_data)
@@ -469,6 +529,10 @@ def _delinearize_mpo(mpo):
     tensors = tuple(mpo)
     if not tensors or any(not _is_supported_dense_array(tensor.data) for tensor in tensors):
         raise TypeError("delinearize=True requires dense NumPy, Torch, CuPy, or JAX MPO tensors.")
+    skip_reason = _factorization_skip_reason(tensor.data for tensor in tensors)
+    if skip_reason is not None:
+        return {"changed": False, "sweeps": 0, "reductions": (),
+                "method": "delinearize", "skipped_reason": skip_reason}
 
     reductions = []
     for direction, indices in (
@@ -523,6 +587,11 @@ def _delinearize_mpo_arrays(arrays):
             "method": "delinearize",
         }
 
+    skip_reason = _factorization_skip_reason(arrays)
+    if skip_reason is not None:
+        return arrays, {"changed": False, "sweeps": 0, "reductions": (),
+                        "method": "delinearize", "skipped_reason": skip_reason}
+
     phys_dim = arrays[0].shape[-1]
     standard = []
     standard.append(
@@ -554,6 +623,12 @@ def _delinearize_mpo_arrays(arrays):
         new_dim = basis.shape[1]
         if new_dim >= old_dim:
             continue
+        reconstructed = ar.do("matmul", basis, transfer)
+        if not _bond_reconstruction_safe(
+            _transpose(matrix, (1, 0)), reconstructed,
+            _transpose(_reshape(left, (-1, old_dim)), (1, 0)),
+        ):
+            continue
         standard[site] = _reshape(
             _transpose(basis, (1, 0)),
             (new_dim, right.shape[1], right.shape[2]),
@@ -578,6 +653,10 @@ def _delinearize_mpo_arrays(arrays):
         )
         new_dim = basis.shape[1]
         if new_dim >= old_dim:
+            continue
+        if not _bond_reconstruction_safe(
+            matrix, ar.do("matmul", basis, transfer), _reshape(right, (old_dim, -1)),
+        ):
             continue
         standard[site] = _reshape(basis, (left.shape[0], left.shape[1], new_dim))
         standard[site + 1] = ar.do(

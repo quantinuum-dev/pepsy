@@ -1,10 +1,18 @@
 # Cluster PEPO backend and downstream optimization status
 
-Updated 2026-09-30. An earlier Pepsy `develop` publication at
+Updated 2026-10-01. An earlier Pepsy `develop` publication at
 **`b4c4631`** includes
 the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
+
+## Public paired-factor registration, 2026-10-05
+
+The existing paired-factor primitive is now exposed as
+`pepsy.backends.register_projector_split` for downstream cube algorithms.
+This adds a public lazy export, not a change to Pepsy's decompositions or
+boundary defaults. See the [export validation](../../history/2026-10-05-projector-export.md)
+and [factorization contract](../api/boundary/metrics.md#differentiating-rank-deficient-boundary-mps-contractions).
 
 ## Dense zero-weight simple update, 2026-10-05
 
@@ -15,6 +23,19 @@ builder and loss now use this public adapter. This does not extend native
 Symmray or rank-changing derivative support. See the
 [gate contract](../api/operators/gates.md#gauge-scale-extraction) and
 [validation record](../../history/2026-10-05-zero-weight-simple-update.md).
+
+## Working-tree JAX/Torch host solvers, 2026-10-01
+
+Pepsy's `GradientOptimizer` now accepts native JAX or Torch parameters for
+SciPy L-BFGS-B (`lbfgs` / `scipy-lbfgs`) and NLopt `LD_LBFGS`. Loss/gradients
+stay on the selected device; the host solver exchanges a packed iterate and
+derivatives. The joint Gaugy notebook exposes these choices for local/global
+costs. Validation: 116 Pepsy solver/API/import checks, 28 downstream CPU checks
+covering both backends and all three trace closures, and ten bounded CUDA
+Run All notebooks passed, including the saved L=12 JAX settings with a two-step
+budget for both solvers. Working-tree edits only; no full-suite or publication
+claim. See the [solver API](../api/solvers/gradient.md) and
+[handoff](../../history/2026-10-01-jax-host-solvers.md).
 
 ## Local cluster integration, 2026-09-30
 

@@ -2,6 +2,7 @@
 
 Run explicitly: pytest -s -q -o addopts='' tests/test_peps_sampler_4x4.py
 Statistical checks use fixed seeds and six estimated standard errors.
+Boundary proposal caps remain independent of the exact amplitude oracle.
 """
 from contextlib import nullcontext
 from functools import lru_cache
@@ -121,6 +122,8 @@ def test_peps_4x4_end_to_end(backend, dtype, engine, chi, chip, cutoff, repair, 
         start = time.perf_counter()
         for offset in range(0, shots, 128):
             batch = sampler.sample_batch(128, seed=290 + offset // 128)
+            assert batch.amplitude_mode == "exact"
+            assert not batch.weight_diagnostics["weights_are_approximate"]
             configs = np.asarray(batch.configs, dtype=int)
             indices = configs @ _BITS
             amplitude = np.array([m * 10.0**e for m, e in zip(*batch.ps)])

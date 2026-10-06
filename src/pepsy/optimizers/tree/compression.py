@@ -9,7 +9,6 @@ never truncate an already materialized target tree.
 
 import math
 import warnings
-from contextlib import contextmanager
 from functools import lru_cache
 from types import MappingProxyType
 
@@ -18,27 +17,13 @@ import quimb.tensor as qtn
 
 from ..._internal.random import backend_random_array
 from ..._internal.quimb import quimb_callable_option_supported
+from ...backends.convert import _high_precision_matmul
 
 
 _SUCCESSIVE_COMPRESSION_MODES = frozenset({
     "src", "src_oversample", "sdc", "sdc_oversample", "sdcr",
     "sdcr_oversample",
 })
-
-@contextmanager
-def _high_precision_matmul(like):
-    """Use accurate accumulation for JAX complex64 compression contractions."""
-    if ar.infer_backend(like) != "jax":
-        yield
-        return
-    try:
-        import jax  # pragma: no cover - imported only for JAX-backed calls
-    except ImportError:  # pragma: no cover - backend check normally prevents this
-        yield
-        return
-    with jax.default_matmul_precision("highest"):
-        yield
-
 
 def _tensor_contract(*tensors, **kwargs):
     """Contract through Quimb, with scoped JAX accumulation precision."""

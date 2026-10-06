@@ -14,6 +14,10 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Export `pepsy.backends.register_projector_split` for custom dense boundary
+  algorithms to reuse the existing paired-factor Quimb split registration.
+  The decomposition and its derivative contracts are unchanged.
+
 - Public `stim_plan_to_gate_stream` translates compiled Stim plans into
   unsampled independent Pauli-noise streams; `stim_readout_parities` resolves
   raw detector and indexed logical-observable parities. StabilizerMpsSimulator
@@ -128,6 +132,13 @@ releases remain backwards-compatible. From 1.0 onward:
   `compression_opts` controls, with shot propagation and per-run restoration.
   Legacy STN `dmrg1` retains its previous growth schedule.
 
+- MPO structural reductions check individual bond-channel reconstruction and
+  opposing tensor scales, preserving order-one terms carried by unbalanced
+  local factors. Delinearization retains trainable Torch/JAX-traced channels
+  so zero-initialized coefficients keep their derivatives, and skips
+  unsupported decomposition dtypes such as Torch float16 without changing
+  the MPO's dtype. Skipped passes report their reason.
+
 - Dense TreeSampler normalizes its accumulated conditional CDF endpoint,
   preventing draws near one from selecting trailing zero-weight physical
   codes when cumulative probabilities round below one. Applies to both
@@ -137,6 +148,11 @@ releases remain backwards-compatible. From 1.0 onward:
   unwrapping only tensor-network containers. Native normalization and scoring
   keep their backend graphs; canonical capture normalizes its graded root
   directly and clears an extracted positive global scale.
+
+- Gradient solver shorthand resolution uses a separate table from SciPy method
+  normalization: `lbfgs` now selects SciPy L-BFGS-B as documented. Use
+  `torch-lbfgs` to select Torch's optimizer explicitly. Returning JAX results
+  works when the optional Torch dependency is unavailable.
 
 - TreeSampler rescales dense conditional messages to prevent long-tree
   complex64 sampling bias and scores probabilities with float64 scale
@@ -162,6 +178,11 @@ releases remain backwards-compatible. From 1.0 onward:
   density across chunks when its cache budget admits it. Cache growth merges
   sorted keys by direct scatter, avoiding full density concatenation and
   permutation copies; cache-disabled and exhausted paths remain exact.
+
+- `GradientOptimizer` SciPy/NLopt callbacks support native JAX parameters and
+  autodiff, preserving shape, dtype and device, including complex parameters.
+  `lbfgs`, `scipy-lbfgs`, and `LD_LBFGS` work with Torch or JAX scalar losses.
+  SciPy Hessian and Hessian-vector callbacks also support JAX.
 
 - Exact `TreeSampler(strategy="factor")` retains compact mixed
   factors, groups repeated prefixes/subtree messages and caches child densities
