@@ -12,6 +12,13 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Fixed
+
+- Torch-backed gradient and finite-difference solvers now own their parameter
+  storage, preserving caller tensors and NumPy inputs during in-place trial
+  updates. Rejected PEPS sweeps therefore restore the unchanged normalized
+  warm start instead of a snapshot contaminated by solver writes.
+
 ### Added
 
 - PEPS sweeps reuse matching direct-boundary prechecks and avoid duplicate

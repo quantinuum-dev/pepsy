@@ -171,6 +171,61 @@ def test_real_coarse_boundary_failure_returns_warm_start(measure, accept_if_impr
     assert np.vdot(vector, vector).real == pytest.approx(1., abs=1e-12)
 
 
+def test_rejected_scipy_fit_restores_unchanged_normalized_warmstart(monkeypatch):
+    """Real solver trial writes must not contaminate the driver's rollback."""
+    torch = pytest.importorskip("torch")
+    from pepsy.boundary.metrics import peps_infidelity
+
+    state = qtn.PEPS.rand(2, 3, bond_dim=2, dtype="complex128", seed=391)
+    state.apply_to_arrays(lambda a: torch.tensor(a, dtype=torch.complex128))
+    gate = torch.diag(torch.exp(-.2j * torch.tensor([1., -1., -1., 1.], dtype=torch.float64)))
+    optimizer = PepsOptimizer(
+        state, [(gate, ((0, 0), (0, 1)))], chi=2, boundary_chi=32,
+        contraction_opt="greedy", fit_mode="direct", optimizer="scipy",
+        optimizer_options={"n_steps": 2},
+        sweep_optimize_kwargs={"n_round_trips": 0},
+        normalize_kwargs={"method": "exact"},
+        infidelity_kwargs={"method": "exact"},
+    )
+    original_fit = optimizer._optimize_state
+    saved = {}
+
+    def copy_arrays(tn):
+        out = tn.copy()
+        out.apply_to_arrays(lambda a: a.detach().clone())
+        return out
+
+    def fit(warmstart, target, **kwargs):
+        saved["warmstart"] = copy_arrays(warmstart)
+        saved["target"] = copy_arrays(target)
+        result = original_fit(warmstart, target, **kwargs)
+        saved["candidate"] = copy_arrays(result[0])
+        return result
+
+    monkeypatch.setattr(optimizer, "_optimize_state", fit)
+    # Force the outer acceptance rule to exercise rollback after a real fit.
+    output = optimizer.run(infidelity_tol=0., improvement_tol=1., progress=False)
+    record = optimizer.get_step_records()[0]
+    assert record["reason"] == "optimizer_rejected"
+    assert record["optimizer_attempted"]
+    assert any(not torch.equal(a.data, b.data) for a, b in zip(
+        saved["candidate"].tensors, saved["warmstart"].tensors,
+    ))
+    for actual, expected in zip(output.tensors, saved["warmstart"].tensors):
+        torch.testing.assert_close(actual.data, expected.data, atol=0., rtol=0.)
+    assert output.exponent == saved["warmstart"].exponent
+    dense = output.to_dense().reshape(-1)
+    assert float(torch.vdot(dense, dense).real) == pytest.approx(1., abs=1e-12)
+    measured = peps_infidelity(output, saved["target"], method="exact", contraction_opt="greedy")
+    assert measured["infidelity"] == pytest.approx(record["final_infidelity"], abs=1e-12)
+    # The next exact unitary target must inherit a normalized retained state.
+    next_target = optimizer._build_batch_target(
+        output, [(gate, ((0, 0), (0, 1)), None)], cutoff=1e-12,
+        cutoff_mode="rsum2", gate_kwargs=None,
+    ).to_dense().reshape(-1)
+    assert float(torch.vdot(next_target, next_target).real) == pytest.approx(1., abs=1e-12)
+
+
 @pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
 def test_nonfinite_native_blocks_do_not_change_fermionic_state(monkeypatch, symmetry, backend):

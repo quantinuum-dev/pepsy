@@ -21,6 +21,53 @@ def _loss_with_target(params, *, target):
     return (diff.conj() * diff).real.sum()
 
 
+@pytest.mark.parametrize("solver", ["scipy", "nlopt", "torch-lbfgs", "torch-adam", "fd-scipy"])
+@pytest.mark.parametrize("backend", ["torch", "numpy"])
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+@pytest.mark.parametrize("strided", [False, True])
+def test_solver_owns_parameters_without_mutating_inputs(solver, backend, dtype, strided):
+    """Trial iterates must not write through views into caller/rollback data."""
+    if solver == "nlopt":
+        pytest.importorskip("nlopt")
+    base = np.array([2 + .5j, -3 + .2j, 1 - .3j, 4 + .1j], dtype=dtype)
+    if backend == "torch":
+        base = torch.tensor(base, requires_grad=True)
+        before = base.detach().clone()
+    else:
+        before = base.copy()
+    initial = base[::2] if strided else base
+
+    def assert_input_unchanged():
+        if backend == "torch":
+            torch.testing.assert_close(base, before, atol=0., rtol=0.)
+            assert base.requires_grad
+            assert base.grad is None
+        else:
+            np.testing.assert_array_equal(base, before)
+
+    def loss(params):
+        assert_input_unchanged()
+        return _loss_quadratic(params)
+
+    options = {"lr": .1} if solver.startswith("torch-") else {}
+    if solver == "nlopt":
+        options["algorithm"] = "LD_LBFGS"
+    if solver == "fd-scipy":
+        options["fd_eps"] = 1e-3
+    result = GradientOptimizer(solver=solver, n_steps=10, options=options).run(
+        params_init={"x": initial}, loss_fn=loss,
+    )
+    assert_input_unchanged()
+    out = result.params["x"]
+    reference = torch.as_tensor(initial).detach()
+    assert out.dtype == reference.dtype
+    assert out.device == reference.device
+    assert out.shape == reference.shape
+    assert _loss_quadratic({"x": out}) < _loss_quadratic({"x": reference})
+    out.zero_()
+    assert_input_unchanged()
+
+
 def test_supported_solvers_exports_expected_backends():
     """Supported solver list should expose only canonical names."""
     assert set(SUPPORTED_SOLVERS) == {
