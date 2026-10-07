@@ -14,6 +14,10 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- CuPy exact-vector sampling also uses float64 inverse-CDF accumulation
+  and uniforms, avoiding float32 interval loss in `RandomState.choice`.
+  State precision, returned Born weights, and device placement are preserved.
+
 - Large Torch exact-vector sampling uses float64 inverse-CDF accumulation
   and random draws, avoiding biased low-order bits for complex64 states.
   The CDF uses its accumulated total for normalization. Historical shots

@@ -675,9 +675,15 @@ class VecSampler:
         elif self.backend == "cupy":
             import cupy as cp  # pylint: disable=import-outside-toplevel
 
-            indices = cp.asarray(
-                rng.choice(len(probabilities), size=n_samples, p=probabilities),
-                dtype=cp.int64,
+            # RandomState.choice accumulates in the input dtype. For
+            # complex64 states its float32 CDF loses small intervals and
+            # biases low-order bits. Accumulate directly into float64 to
+            # avoid a separate promoted copy of the probability vector.
+            cdf = cp.cumsum(probabilities, dtype=cp.float64)
+            cdf /= cdf[-1].copy()
+            draws = rng.random_sample(n_samples, dtype=cp.float64)
+            indices = cp.searchsorted(cdf, draws, side="right").astype(
+                cp.int64, copy=False
             )
             bit_positions = cp.arange(self._L - 1, -1, -1, dtype=cp.int64)
             configs = ((indices[:, None] >> bit_positions) & 1).astype(

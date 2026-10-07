@@ -2003,6 +2003,54 @@ def test_vec_sampler_torch_large_uniform_vector_has_unbiased_low_bits():
     assert torch.all(torch.abs(means - 0.5) < 0.03), means
 
 
+def test_vec_sampler_cupy_cdf_resolves_small_probability_intervals(monkeypatch):
+    """Exercise a deterministic interval lost by CuPy's float32 choice CDF."""
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CUDA unavailable")
+    except cp.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(str(exc))
+    probability = 2.0**-26
+    state = cp.sqrt(cp.asarray(
+        [0.5, probability, probability, 0.5 - 2 * probability], dtype=cp.float32
+    )).astype(cp.complex64)
+    original = state.copy()
+    sampler = sampler_mod.VecSampler(state)
+    weights = sampler.probability_vector().astype(cp.float64)
+    draw = float((weights[0] + weights[1] / 2) / weights.sum())
+
+    class FixedRng:
+        def random_sample(self, size, dtype=float):
+            return cp.full(size, draw, dtype=dtype)
+
+    monkeypatch.setattr(sampler, "_new_rng", lambda seed: FixedRng())
+    batch = sampler.sample_batch(3, seed=5, chunk_size=2)
+    cp.testing.assert_array_equal(batch.configs, cp.asarray([[0, 1]] * 3))
+    cp.testing.assert_allclose(batch.probs, sampler.probability_vector()[1])
+    cp.testing.assert_array_equal(state, original)
+    assert batch.probs.dtype == cp.float32
+    assert batch.configs.device == state.device
+
+
+@pytest.mark.slow
+@pytest.mark.integration
+@pytest.mark.parametrize("n_qubits", [16, 20, 25])
+def test_vec_sampler_cupy_uniform_vector_has_unbiased_bits(n_qubits):
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CUDA unavailable")
+    except cp.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(str(exc))
+    sampler = sampler_mod.VecSampler(cp.ones(2**n_qubits, dtype=cp.complex64))
+    batch = sampler.sample_batch(8192, seed=62, chunk_size=1200)
+    means = batch.configs.astype(cp.float64).mean(axis=0)
+    assert bool(cp.all(cp.abs(means - 0.5) < 0.03)), means
+    assert batch.probs.dtype == cp.float32
+    cp.testing.assert_allclose(batch.probs, 2.0**-n_qubits)
+
+
 def test_vec_sampler_native_cupy_keeps_vector_and_batch_on_cupy():
     """Exact-vector sampling should preserve a CuPy state backend."""
     cupy = pytest.importorskip("cupy")
