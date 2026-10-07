@@ -283,16 +283,32 @@ def test_unit_target_norm_identity_requires_accurate_normalization(accurate):
 
 
 @pytest.mark.parametrize("mode", ["sweep", "global"])
-def test_default_policy_continues_real_coarse_identity_contraction(mode):
+def test_default_policy_continues_real_coarse_identity_contraction(mode, monkeypatch):
     state = qtn.PEPS.rand(4, 4, bond_dim=2, dtype="complex128", seed=17)
     opt = PepsOptimizer(state, [(np.eye(4), ((1, 1), (1, 2)))], chi=2,
                         mode=mode, contraction_opt="greedy")
+    attempted = []
+
+    def reject_refinement(warmstart, target, **kwargs):
+        attempted.append(True)
+        return warmstart, None, {"success": False}
+
+    # Exercise the real coarse precheck and rollback, without making this
+    # policy regression an unbounded variational fit of an identity gate.
+    monkeypatch.setattr(opt, "_optimize_state", reject_refinement)
     with pytest.warns(RuntimeWarning, match="continuing with zero"):
         out = opt.run()
     before, after = state.to_dense().reshape(-1), out.to_dense().reshape(-1)
     fidelity = abs(np.vdot(before, after)) ** 2 / (np.vdot(before, before).real * np.vdot(after, after).real)
     assert fidelity == pytest.approx(1., abs=1e-12)
-    assert opt.step_records[0]["reason"] == "below_tol"
+    record = opt.step_records[0]
+    if mode == "sweep":
+        assert attempted == [True]
+        assert record["optimizer_attempted"]
+        assert record["reason"] == "optimizer_failed"
+    else:
+        assert attempted == []
+        assert record["reason"] == "below_tol"
     metric = opt.get_evaluation_records()[0]
     assert -1e-3 < metric["raw_infidelity"] < -1e-5
     assert metric["infidelity"] == 0.
@@ -488,6 +504,11 @@ def test_small_negative_metric_continues_gate_stream_and_preserves_raw_error(mon
 
     monkeypatch.setattr(peps_mod, "boundary_infidelity", metric)
     opt = PepsOptimizer(_product(2, 2), gates, chi=1, contraction_opt="greedy")
+    # A clipped initial score requests refinement. If refinement fails, the
+    # gate stream still continues from the warm start with raw diagnostics.
+    monkeypatch.setattr(opt, "_optimize_state", lambda warmstart, target, **kw: (
+        warmstart, None, {"success": False},
+    ))
     streamed = []
     with pytest.warns(RuntimeWarning, match="Small negative approximate PEPS infidelity"):
         output = opt.run(k_2q_batch=1, step_callback=streamed.append)
@@ -499,7 +520,8 @@ def test_small_negative_metric_continues_gate_stream_and_preserves_raw_error(mon
     assert diagnostic["clipped_negative"]
     assert diagnostic["raw_infidelity"] == raw_error
     assert diagnostic["attempts"] == [{"chi": (4, 5), "infidelity": raw_error}]
-    assert not any(r["optimizer_attempted"] for r in streamed)
+    assert [r["optimizer_attempted"] for r in streamed] == [True, False]
+    assert streamed[0]["reason"] == "optimizer_failed"
     assert opt.get_evaluation_records()[0] == diagnostic
     json.dumps(streamed)
     np.testing.assert_allclose(output.to_dense(), expected.to_dense(), atol=1e-12)

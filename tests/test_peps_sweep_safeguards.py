@@ -5,7 +5,9 @@ import pytest
 import quimb.tensor as qtn
 
 from pepsy.optimizers.peps import PepsOptimizer
+from pepsy.optimizers.peps import optimizer as peps_mod
 from pepsy.optimizers.sweep import SweepOptimizer
+from pepsy.tensors.contractions import build_optimizer
 
 
 def _sweep(backend="numpy"):
@@ -20,6 +22,7 @@ def _sweep(backend="numpy"):
     states[1].mangle_inner_("_target")
     return SweepOptimizer(
         *states, chi=16, contraction_opt="greedy", fit_init_strategy="guess-src",
+        local_contraction_opt=build_optimizer(max_repeats=2, parallel=False),
     )
 
 
@@ -58,14 +61,21 @@ def test_initial_roundoff_still_allows_valid_convergence(monkeypatch, loss):
 
 
 @pytest.mark.parametrize("loss", [-6.86e-10, -3.267e-6, -5e-4])
-def test_small_initial_contraction_error_warns_and_returns_bounded_loss(monkeypatch, loss):
+def test_small_initial_contraction_error_continues_without_false_convergence(monkeypatch, loss):
     sweep = _sweep()
+    sweep.set_optimize_kwargs(
+        n_round_trips=0, optimizer="scipy", optimizer_options={"maxiter": 3},
+    )
     monkeypatch.setattr(sweep, "_approx_infidelity_loss", lambda **kw: loss)
     with pytest.warns(RuntimeWarning, match="Small negative approximate sweep"):
         result = sweep.run(progress=False, renormalize=False)
     assert result["success"]
     assert result["loss_before"] == loss
-    assert result["loss_after"] == result["best_loss"] == 0.
+    assert result["loss_after"] == 0.
+    assert result["runs"]
+    assert result["best_loss"] > 0.
+    assert not result["converged"]
+    assert not result["early_exit"]
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
@@ -104,7 +114,121 @@ def test_small_local_overshoot_keeps_raw_objective_and_bounds_diagnostics(monkey
     assert raw_losses[0] < 0.
     assert result["history"] == raw_losses
     assert result["raw_loss_final"] == raw_losses[0]
-    assert result["loss_final"] == result["loss_best"] == sweep.best_loss == 0.
+    assert result["loss_final"] == 0.
+    assert result["loss_best"] == result["loss_initial"] > 0.
+    assert sweep.best_state is None
+    assert sweep.best_loss == float("inf")
+    assert result["update_applied"]
+
+
+def test_all_skipped_local_updates_are_reported_as_failure(monkeypatch):
+    sweep = _sweep()
+    original = [t.data.copy() for t in sweep.state]
+    monkeypatch.setattr(sweep, "_scaled_overlap_fidelity", lambda *args: 1.25)
+    sweep.set_optimize_kwargs(compute_initial_loss=False, compute_final_loss=False)
+    with pytest.warns(UserWarning, match="Skipping a local sweep update"):
+        result = sweep.run(
+            renormalize=False, progress=False,
+        )
+    assert result["runs"]
+    assert not result["success"]
+    assert not result["converged"]
+    assert result["termination_reason"] == "no_valid_local_updates"
+    assert result["applied_local_updates"] == 0
+    assert result["invalid_local_updates"] == len(result["runs"])
+    for run in result["runs"]:
+        assert run["raw_loss_initial"] == -.25
+        assert not run["update_applied"]
+        assert run["rejection_reason"] == "invalid_initial_loss"
+    for tensor, before in zip(sweep.state, original):
+        np.testing.assert_array_equal(tensor.data, before)
+
+
+def test_driver_does_not_label_all_skipped_objective_only_sweep_optimized(monkeypatch):
+    state = qtn.PEPS.rand(2, 2, bond_dim=1, dtype="complex128", seed=7)
+    gate = np.diag(np.exp(-.2j * np.array([1., -1., -1., 1.])))
+    kwargs = dict(
+        chi=1, boundary_chi=4, fit_mode="direct", contraction_opt="greedy",
+        normalize_kwargs={"method": "exact"},
+        sweep_optimize_kwargs={"n_round_trips": 0},
+    )
+    reference = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], **kwargs)
+    warm = reference.run(optimize=False, measure_infidelity=False, progress=False)
+    optimizer = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], **kwargs)
+    monkeypatch.setattr(SweepOptimizer, "_scaled_overlap_fidelity", lambda *args: 1.25)
+    with pytest.warns(UserWarning, match="Skipping a local sweep update"):
+        output = optimizer.run(measure_infidelity=False, progress=False)
+    record = optimizer.get_step_records()[0]
+    assert record["optimizer_attempted"]
+    assert not record["optimized"]
+    assert record["reason"] == "optimizer_failed"
+    summary = record["optimizer_result"]
+    assert summary["termination_reason"] == "no_valid_local_updates"
+    assert len(summary["invalid_loss_records"]) == summary["n_runs"]
+    assert all(r["raw_loss_initial"] == -.25 for r in summary["invalid_loss_records"])
+    np.testing.assert_allclose(output.to_dense(), warm.to_dense(), atol=1e-12, rtol=1e-12)
+
+
+def test_clipped_outer_precheck_still_invokes_sweep(monkeypatch):
+    state = qtn.PEPS.rand(2, 2, bond_dim=1, dtype="complex128", seed=7)
+    gate = np.diag(np.exp(-.2j * np.array([1., -1., -1., 1.])))
+    values = iter([-.0005, .01])
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", lambda *a, **kw: {
+        "infidelity": next(values), "norm_target": 1.,
+    })
+    optimizer = PepsOptimizer(
+        state, [(gate, ((0, 0), (0, 1)))], chi=1, fit_mode="direct",
+        boundary_chi=4, evaluation_chi=4, contraction_opt="greedy",
+    )
+    calls = []
+
+    def refine(warmstart, target, **kwargs):
+        calls.append(kwargs)
+        return warmstart, .01, {"success": True}
+
+    monkeypatch.setattr(optimizer, "_optimize_state", refine)
+    with pytest.warns(RuntimeWarning, match="Small negative approximate PEPS"):
+        optimizer.run(progress=False)
+    record = optimizer.get_step_records()[0]
+    assert record["pre_infidelity"] == 0.  # Display-only clipping is preserved.
+    assert record["post_infidelity"] == .01
+    assert record["optimizer_attempted"] and record["optimized"]
+    assert len(calls) == 1
+    assert calls[0]["sweep_optimize_kwargs"]["initial_loss"] == -.0005
+
+
+@pytest.mark.parametrize("remeasured_pre,accepted", [(.02, False), (.06, True)])
+def test_retried_postcheck_restores_reliable_warmstart_comparison(
+    monkeypatch, remeasured_pre, accepted,
+):
+    state = qtn.PEPS.rand(2, 2, bond_dim=1, dtype="complex128", seed=7)
+    gate = np.diag(np.exp(-.2j * np.array([1., -1., -1., 1.])))
+    # Initially clipped precheck; invalid postcheck retries at chi=8, then
+    # the warm start is remeasured at that same cap and becomes admissible.
+    values = iter([-.0005, -.02, .04, remeasured_pre])
+    caps = []
+
+    def metric(*args, **kwargs):
+        caps.append(kwargs["chi"])
+        return {"infidelity": next(values), "norm_target": 1.}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", metric)
+    optimizer = PepsOptimizer(
+        state, [(gate, ((0, 0), (0, 1)))], chi=1, fit_mode="direct",
+        boundary_chi=4, evaluation_chi=4, contraction_opt="greedy",
+        infidelity_kwargs={"norm_target": None},
+    )
+    monkeypatch.setattr(optimizer, "_optimize_state", lambda warmstart, target, **kw: (
+        warmstart, .01, {"success": True},
+    ))
+    with pytest.warns(RuntimeWarning):
+        optimizer.run(progress=False)
+    record = optimizer.get_step_records()[0]
+    assert caps == [4, 4, 8, 8]
+    assert record["pre_infidelity"] == remeasured_pre
+    assert record["post_infidelity"] == .04
+    assert record["optimized"] is accepted
+    assert record["reason"] == ("optimized" if accepted else "optimizer_rejected")
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch"])

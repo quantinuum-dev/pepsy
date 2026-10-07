@@ -14,6 +14,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- PEPS sweep clipping no longer turns negative approximate losses into
+  perfect-fit convergence or best-state scores. Clipped outer prechecks still
+  invoke refinement. Sweeps with every local update rejected report failure
+  and preserve raw invalid-slice diagnostics instead of claiming optimization.
+
 - CuPy exact-vector sampling also uses float64 inverse-CDF accumulation
   and uniforms, avoiding float32 interval loss in `RandomState.choice`.
   State precision, returned Born weights, and device placement are preserved.

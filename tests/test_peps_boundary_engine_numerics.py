@@ -6,6 +6,66 @@ import quimb.tensor as qtn
 
 from pepsy.boundary import peps_infidelity, peps_norm
 from pepsy.optimizers.peps import PepsOptimizer
+from pepsy.optimizers.sweep import SweepOptimizer
+from pepsy.tensors.contractions import build_optimizer
+
+
+@pytest.mark.parametrize("engine", ["dmrg", "quimb-mps"])
+def test_moving_slice_losses_and_gradients_match_exact_statevector(monkeypatch, engine):
+    """Check both sweep directions after real slice changes, without truncation."""
+    torch = pytest.importorskip("torch")
+    policy = build_optimizer(max_repeats=2, parallel=False, progbar=False)
+    state = qtn.PEPS.rand(3, 3, bond_dim=2, dtype="complex128", seed=317)
+    state.multiply_(1 / np.linalg.norm(state.to_dense(optimize=policy)))
+    target = state.copy(deep=True)
+    target.gate_(np.diag(np.exp(-.31j * np.array([1., -1., -1., 1.]))),
+                 ((1, 1), (1, 2)), contract="split", cutoff=0.)
+    for tn in (state, target):
+        tn.apply_to_arrays(lambda data: torch.tensor(data, dtype=torch.complex128))
+    target.mangle_inner_("_target")
+    sweep = SweepOptimizer(
+        state, target, chi=(64, 64), fit_mode="direct", cutoff=0.,
+        boundary_engine=engine, contraction_opt=policy, local_contraction_opt=policy,
+    )
+    target_vector = target.to_dense(optimize=policy).reshape(-1).detach()
+    context = {}
+    visited = []
+    original_local = sweep._optimize_axis_slice_with_current_env
+
+    def local(index, *, axis, **kwargs):
+        context.update(index=index, axis=axis)
+        return original_local(index, axis=axis, **kwargs)
+
+    def check_objective(params, loss_fn, **kwargs):
+        trial = {key: value.detach().clone().requires_grad_(True)
+                 for key, value in params.items()}
+        key = next(iter(trial))
+        trial[key] = trial[key] * (1 + .001j) + .0001
+        loss = loss_fn(trial)
+        axis, index = context["axis"], context["index"]
+        _, skeleton = qtn.pack(sweep.state.select(axis.upper() + str(index), "any"))
+        local_state = qtn.unpack(trial, skeleton)
+        full_state = sweep.state.copy()
+        for tag in sweep._site_tensor_tags(axis, index):
+            full_state[tag].modify(data=local_state[tag].data)
+        vector = full_state.to_dense(optimize=policy).reshape(-1)
+        exact_loss = 1 - torch.vdot(vector, target_vector).abs() ** 2 / (
+            torch.vdot(vector, vector).real * torch.vdot(target_vector, target_vector).real
+        )
+        torch.testing.assert_close(loss, exact_loss, atol=1e-10, rtol=1e-10)
+        grads = torch.autograd.grad(loss, tuple(trial.values()), retain_graph=True)
+        exact_grads = torch.autograd.grad(exact_loss, tuple(trial.values()))
+        for actual, expected in zip(grads, exact_grads):
+            torch.testing.assert_close(actual, expected, atol=1e-9, rtol=1e-9)
+        visited.append((axis, index))
+        return {key: value.detach() for key, value in trial.items()}, [float(loss.detach())]
+
+    monkeypatch.setattr(sweep, "_optimize_axis_slice_with_current_env", local)
+    monkeypatch.setattr(sweep, "_optimize_packed_params", check_objective)
+    for axis in ("y", "x"):
+        sweep.optimize_axis(axis=axis, n_round_trips=1, renormalize=False)
+    assert visited == [(axis, index) for axis in ("y", "x")
+                       for index in (0, 1, 2, 1, 0, 1, 2)]
 
 
 @pytest.mark.parametrize(

@@ -208,6 +208,14 @@ decisions and fidelity bookkeeping. The historical option name now covers
 both ends of the interval. This absolute allowance is 0.1 percentage point and does not
 certify a perfect overlap. It avoids retries and stopping for small boundary
 contraction discrepancies, including when the target norm is supplied as one.
+In sweep mode, a precheck clipped beyond ordinary dtype roundoff does not
+satisfy `infidelity_tol` or become a zero baseline for improvement comparisons.
+Its raw value is passed into delegated sweep diagnostics when reused; local
+sweeps continue and choose best states from physically admissible raw losses.
+This does not establish accuracy of the finite-chi metric or an improvement
+over an unreliable precheck. A sweep with all local updates rejected reports
+`optimizer_failed`, preserves the compressed warm start, and retains the
+individual invalid-loss records; it does not abort gate-stream evolution.
 The dtype roundoff scale (`1e-12` for double, `1e-6` for single precision)
 remains a lower bound and is cleaned silently. Set `evaluation_negative_tol=0`
 on `PepsOptimizer` for the previous roundoff-only policy. Exact contractions

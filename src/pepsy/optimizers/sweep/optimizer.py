@@ -906,9 +906,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         loss_value = float(loss_value)
         if not math.isfinite(loss_value):
             return
-        # Infidelity/loss should be non-negative; ignore negative artifacts.
-        if loss_value < 0.0:
+        # A clipped contraction estimate is not a perfect fit. Only ordinary
+        # roundoff can enter best-state/convergence bookkeeping as zero.
+        if loss_value < -1.0e-10 or loss_value > 1.0:
             return
+        loss_value = max(0.0, loss_value)
         if loss_value < float(self.best_loss):
             state = getattr(self, "state", None)
             if state is None:
@@ -2327,11 +2329,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "axis": axis,
                 "index": index,
                 "loss_initial": initial_loss,
+                "raw_loss_initial": raw_initial_loss,
                 "loss_final": None,
                 "loss_best": None,
                 "history": [],
                 "best_history": [],
                 "invalid_loss": True,
+                "rejection_reason": "invalid_initial_loss",
+                "update_applied": False,
                 **metrics,
             }
 
@@ -2366,8 +2371,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             self._to_float_history([loss_fn(params_opt)])[0]
             if params_finite else float("nan")
         )
-        observed_losses = [initial_loss, *history_values, applied_loss]
-        observed_losses = [self._diagnostic_infidelity(v) for v in observed_losses]
+        observed_losses = [raw_initial_loss, *history_values, applied_loss]
+        # Keep clipping for display separate from selection: an approximate
+        # negative trial must not become a winning zero-loss iterate.
+        observed_losses = [
+            max(0.0, v) if math.isfinite(v) and -1.0e-10 <= v <= 1.0
+            else float("nan") for v in observed_losses
+        ]
         best_history = []
         running_best = float("inf")
         for value in observed_losses:
@@ -2391,12 +2401,15 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "axis": axis,
                 "index": index,
                 "loss_initial": initial_loss,
+                "raw_loss_initial": raw_initial_loss,
                 "loss_final": initial_loss,
+                "raw_loss_final": raw_initial_loss,
                 "loss_best": best_loss,
                 "candidate_loss": applied_loss,
                 "history": history_values,
                 "best_history": best_history,
                 "invalid_loss": True,
+                "update_applied": False,
                 "rejection_reason": (
                     "invalid_candidate_loss" if params_finite else "nonfinite_parameters"
                 ),
@@ -2413,7 +2426,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         # from an iterate that may have been discarded by restore_best.
         raw_applied_loss = applied_loss
         applied_loss = self._diagnostic_infidelity(applied_loss)
-        self._maybe_store_best_state(applied_loss)
+        self._maybe_store_best_state(raw_applied_loss)
         return {
             "axis": axis,
             "index": index,
@@ -2421,6 +2434,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "loss_final": applied_loss,
             "raw_loss_initial": raw_initial_loss,
             "raw_loss_final": raw_applied_loss,
+            "update_applied": True,
             "loss_best": best_loss,
             "history": history_values,
             "best_history": best_history,
@@ -2955,7 +2969,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             or float(loss_before) > 1.0 + max(early_exit_tol, self.evaluation_negative_tol)
         )
         if invalid_initial_loss or (
-            loss_before is not None and float(loss_before) < early_exit_tol
+            loss_before is not None
+            and -early_exit_tol <= float(loss_before) < early_exit_tol
         ):
             if invalid_initial_loss:
                 warnings.warn(
@@ -3149,8 +3164,25 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             except (AttributeError, TypeError, ValueError):
                 pass
 
+        invalid_runs = sum(bool(run.get("invalid_loss")) for run in all_runs)
+        applied_runs = sum(
+            bool(run.get("update_applied", not run.get("invalid_loss", False)))
+            for run in all_runs
+        )
         return _AttrDict({
             "runs": all_runs,
+            # Zero requested cycles is an intentional no-op. Failure means
+            # attempted updates were all rejected, not that none were asked for.
+            "success": not all_runs or applied_runs > 0,
+            "termination_reason": (
+                "no_valid_local_updates" if all_runs and not applied_runs else
+                "partial_local_updates" if invalid_runs else
+                "converged" if early_exit else "completed"
+            ),
+            "converged": bool(early_exit and not invalid_runs),
+            "early_exit": early_exit,
+            "applied_local_updates": applied_runs,
+            "invalid_local_updates": invalid_runs,
             "loss_before": loss_before,
             "loss_after": loss_after,
             "raw_loss_after": raw_loss_after,

@@ -691,6 +691,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.fit_diagnostics = []
         self.evaluation_records = []
         self._last_evaluation_chi = None
+        self._last_evaluation_raw_infidelity = None
         self._last_target_norm = 1.0
         self._fidelity_log_sum = 0.0
         self._fidelity_count = 0
@@ -1286,6 +1287,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._append_fit_diagnostics(result)
             raw = result.get("infidelity") if isinstance(result, Mapping) else result
             value = None if raw is None else _backend_to_float(raw)
+            self._last_evaluation_raw_infidelity = value
             record["attempts"].append({"chi": opts["chi"], "infidelity": value})
             if (value is not None and math.isfinite(value)
                     and -negative_tol <= value <= 1.0 + negative_tol
@@ -1798,7 +1800,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             return summary
 
         for key in ("success", "termination_reason", "converged", "early_exit",
-                    "initial_loss_reused", "final_loss_measured"):
+                    "initial_loss_reused", "final_loss_measured",
+                    "applied_local_updates", "invalid_local_updates"):
             if key in result:
                 summary[key] = result[key]
 
@@ -1816,6 +1819,13 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         runs = result.get("runs")
         if runs is not None:
             summary["n_runs"] = len(runs)
+            summary["invalid_loss_records"] = [
+                {key: run[key] for key in (
+                    "axis", "index", "sweep", "raw_loss_initial", "raw_loss_final",
+                    "candidate_loss", "rejection_reason", "update_applied",
+                ) if key in run}
+                for run in runs if run.get("invalid_loss")
+            ]
             summary["clipped_loss_records"] = [
                 {key: run[key] for key in (
                     "axis", "index", "raw_loss_initial", "raw_loss_final",
@@ -2377,7 +2387,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         normalize_chi=normalize_chi,
                     )
 
+                    precheck_reliable = True
+                    raw_pre_infidelity = None
                     if measure_infidelity:
+                        self._last_evaluation_raw_infidelity = None
                         pre_infidelity = self.estimate_infidelity(
                             warmstart,
                             target,
@@ -2386,8 +2399,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         )
                         step_evaluation_chi = self._last_evaluation_chi
                         target_norm = self._last_target_norm
+                        raw_pre_infidelity = self._last_evaluation_raw_infidelity
+                        if run_mode == "sweep" and raw_pre_infidelity is not None:
+                            roundoff = _resolve_gate_cutoff(warmstart, "auto")
+                            precheck_reliable = (
+                                -roundoff <= raw_pre_infidelity <= 1.0 + roundoff
+                            )
 
-                    if pre_infidelity is not None and pre_infidelity <= infidelity_tol:
+                    if (precheck_reliable and pre_infidelity is not None
+                            and pre_infidelity <= infidelity_tol):
                         self.state = warmstart
                         final_state = self.state
                         final_infidelity = pre_infidelity
@@ -2449,7 +2469,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 and not effective_sweep_options.get("normalize_boundaries", False)
                                 and "chi" not in effective_sweep_options
                             ):
-                                effective_sweep_options.setdefault("initial_loss", pre_infidelity)
+                                effective_sweep_options.setdefault(
+                                    "initial_loss", pre_infidelity if precheck_reliable
+                                    else raw_pre_infidelity,
+                                )
                         final_state, opt_infidelity, optimizer_result = self._optimize_state(
                             warmstart,
                             target,
@@ -2491,10 +2514,18 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 if warmstart_snapshot is not None:
                                     comparison_opts["chi"] = step_evaluation_chi
                                     comparison_opts.pop("evaluation_max_retries", None)
+                                    self._last_evaluation_raw_infidelity = None
                                     pre_infidelity = self.estimate_infidelity(
                                         warmstart_snapshot, target,
                                         evaluation_max_retries=0, **comparison_opts,
                                     )
+                                    if run_mode == "sweep":
+                                        raw_pre = self._last_evaluation_raw_infidelity
+                                        roundoff = _resolve_gate_cutoff(warmstart, "auto")
+                                        precheck_reliable = (
+                                            raw_pre is None
+                                            or -roundoff <= raw_pre <= 1.0 + roundoff
+                                        )
                         final_infidelity = (
                             post_infidelity
                             if post_infidelity is not None
@@ -2507,6 +2538,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         if (
                             not cleanup_failed
                             and accept_if_improved
+                            and precheck_reliable
                             and pre_infidelity is not None
                             and final_infidelity is not None
                         ):

@@ -46,14 +46,16 @@ Fidelity diagnostics use Autoray `clip(real(value), 0, 1)` on their array
 backend. The differentiable local objective remains unclipped to preserve
 gradients. `evaluation_negative_tol=1e-3` allows approximate diagnostic losses
 outside [0,1] by up to 0.001: a warning is emitted once per sweep run and their
-values are clipped for convergence/best-state bookkeeping. The historical
+values are clipped for display and continuation. The historical
 option name covers both ends of the interval. The existing `1e-10`
 roundoff allowance is a lower bound; zero restores that older allowance.
 Raw local losses remain in `raw_loss_initial`, `raw_loss_final`, and solver
 `history`; whole-sweep raw values remain in `loss_before` and `raw_loss_after`.
-This is a continuation policy, not an accuracy bound: a negative approximate
-loss clipped to zero can satisfy convergence bookkeeping without establishing
-an accurate overlap. Compare raw losses while increasing normalization and
+This is a continuation policy, not an accuracy bound. Negative values below
+the ordinary `-1e-10` roundoff allowance cannot become winning zero-loss states
+or trigger early convergence. A small negative initial estimate continues
+through the requested sweeps instead of skipping refinement. Compare raw
+losses while increasing normalization and
 norm/overlap boundary caps, with exact small-system references where practical.
 PepsOptimizer's compact `clipped_loss_records` preserve initial/final local
 excursions on both sides of [0,1].
@@ -69,6 +71,18 @@ nonfinite losses, or losses outside [0,1] beyond the allowance are rejected with
 `invalid_loss=True`. The previous slice is retained. `loss_final` describes
 that retained slice; `candidate_loss` and `rejection_reason` describe the
 rejected result. Boundary accuracy remains the caller's responsibility.
+
+Every local result records `update_applied`. Skipped initial objectives retain
+`raw_loss_initial` and `rejection_reason="invalid_initial_loss"`; rejected
+candidates also retain their raw loss. Global results count
+`applied_local_updates` and `invalid_local_updates`. If every attempted update
+was rejected, `success=False` and
+`termination_reason="no_valid_local_updates"`; the PEPS driver retains its
+compressed warm start and does not label that step optimized. Partial sweeps
+report `partial_local_updates`, without claiming convergence. An explicitly
+requested zero-cycle run remains a successful no-op.
+Compact PEPS records retain `invalid_loss_records` with slice coordinates,
+raw values, rejection reasons, and writeback status.
 
 Sweep setup uses lazy boundary containers for direct compression, including
 after restoring the best state. Boundary values are constructed when needed;
