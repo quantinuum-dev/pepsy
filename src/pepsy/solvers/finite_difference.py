@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - optional dependency
     torch = None
 
 from .gradient import (
+    _LossContractError,
     _SCIPY_BOUNDS_METHODS,
     _SCIPY_HESS_METHODS,
     _SCIPY_HESSP_METHODS,
@@ -35,6 +36,7 @@ from .gradient import (
     _resolve_bounds_arrays,
     _scalar_real_loss,
     _normalize_scipy_method,
+    _nlopt_stop_reason,
 )
 
 def _evaluate_loss_only(
@@ -340,6 +342,16 @@ def _run_fd_adam(
                 convergence_reason = "patience"
                 break
 
+    try:
+        final_loss = _eval_loss(x)
+    except _LossContractError:
+        raise
+    except (FloatingPointError, RuntimeError, ValueError):
+        final_loss = float("nan")
+    if (np.isfinite(final_loss) and _accept_as_best(final_loss, controls)
+            and final_loss + controls["min_improve"] < best_loss):
+        best_loss = final_loss
+        best_vector = np.array(x, dtype=np.float64, copy=True)
     use_best = controls["restore_best"] and np.isfinite(best_loss)
     vector_out = best_vector if use_best else x
     _assign_flat_params(vector_out, specs)
@@ -350,7 +362,7 @@ def _run_fd_adam(
         except (RuntimeError, ValueError, FloatingPointError):
             history.append(controls["penalty_on_bad"])
 
-    final_loss = best_loss if use_best else history[-1]
+    final_loss = best_loss if use_best else final_loss
     if progress_callback is not None:
         progress_callback(max(1, len(history)), float(final_loss))
 
@@ -382,8 +394,6 @@ def _run_fd_scipy(
         return params_run, [], float("nan"), float("nan"), "empty_params", 0
 
     options = dict(solver_options)
-    # maxeval is an nlopt concept; discard it so it doesn't override n_steps for scipy.
-    options.pop("maxeval", None)
     controls = _pop_common_controls(
         options,
         default_steps=n_steps,
@@ -426,15 +436,20 @@ def _run_fd_scipy(
     if "maxls" in options and int(options["maxls"]) <= 0:
         raise ValueError("maxls must be >= 1")
 
-    options["maxiter"] = n_steps
+    if method == "TNC":
+        options.setdefault("maxfun", controls["max_steps"])
+    else:
+        options["maxiter"] = controls["max_steps"]
     if method in {"L-BFGS-B", "TNC", "SLSQP"}:
         options.setdefault("ftol", ftol)
     if method == "Newton-CG":
         options.setdefault("xtol", gtol)
-    else:
+    elif method != "SLSQP":
         options.setdefault("gtol", gtol)
-    if method in {"L-BFGS-B", "TNC"}:
+    if method == "L-BFGS-B":
         options.setdefault("maxls", 40)
+    options.pop("ftol_rel", None)
+    options.pop("xtol_rel", None)
 
     if bounds is None and (lower is not None or upper is not None):
         n_vars = int(x0.size)
@@ -472,7 +487,7 @@ def _run_fd_scipy(
         else:
             _pbar_desc = f"{opt_desc}[{method}]" if opt_desc else method
         pbar = tqdm(
-            total=n_steps,
+            total=controls["max_steps"],
             desc=_pbar_desc,
             leave=False,
             colour="CYAN",
@@ -487,6 +502,7 @@ def _run_fd_scipy(
 
     def objective(x):
         x_vec = np.asarray(x, dtype=np.float64)
+        loss_value = float("nan")
         try:
             grad_value, f0 = _evaluate_fd_gradient(
                 x_vec,
@@ -498,7 +514,12 @@ def _run_fd_scipy(
             loss_value = float(f0)
             if not np.isfinite(loss_value) or not np.isfinite(grad_value).all():
                 raise FloatingPointError("non-finite objective or gradient")
-        except (FloatingPointError, RuntimeError, ValueError):
+        except _LossContractError:
+            raise
+        except (FloatingPointError, RuntimeError, ValueError) as exc:
+            state["last_error"] = str(exc)
+            state["last_bad_x"] = np.array(x_vec, copy=True)
+            state["last_bad_loss"] = loss_value
             state["bad_consecutive"] += 1
             loss_value = controls["penalty_on_bad"]
             grad_value = np.zeros_like(x_vec)
@@ -530,10 +551,11 @@ def _run_fd_scipy(
             ))
         return loss_value, grad_value
 
-    def callback(xk):
+    def callback(xk, intermediate_result=None):
         step_counter["value"] += 1
         step_num = step_counter["value"]
-        loss_value = state["last_loss"]
+        loss_value = (intermediate_result.fun if intermediate_result is not None
+                      else state["last_loss"])
         if loss_value is None:
             try:
                 loss_value = _eval_loss(np.asarray(xk, dtype=np.float64))
@@ -578,6 +600,14 @@ def _run_fd_scipy(
     except StopIteration:
         pass
 
+    if result is not None and state["convergence_reason"] == "maxiter":
+        state["convergence_reason"] = str(result.message)
+        if state["bad_consecutive"] and np.array_equal(result.x, state["last_bad_x"]):
+            state["convergence_reason"] = "invalid_objective"
+            warnings.warn(
+                f"SciPy stopped at an invalid objective or gradient: {state['last_error']}",
+                RuntimeWarning, stacklevel=3,
+            )
     if pbar is not None:
         pbar.close()
 
@@ -591,17 +621,15 @@ def _run_fd_scipy(
         best_x = np.asarray(x0, dtype=np.float64)
     _assign_flat_params(best_x, specs)
 
-    if not history:
-        try:
-            history.append(_eval_loss(best_x))
-        except (RuntimeError, ValueError, FloatingPointError):
-            history.append(controls["penalty_on_bad"])
-
     best_loss = state["best_loss"]
-    if controls["restore_best"] and state["best_x"] is not None:
+    if state["best_x"] is not None and (controls["restore_best"] or result is None):
         final_loss = best_loss
+    elif result is not None and state["bad_consecutive"] and np.array_equal(result.x, state["last_bad_x"]):
+        final_loss = state["last_bad_loss"]
     else:
-        final_loss = history[-1] if history else float("nan")
+        final_loss = float(result.fun) if result is not None else state["last_loss"]
+    if not history:
+        history.append(final_loss)
     return params_run, history, best_loss, final_loss, state["convergence_reason"], eval_counter["value"]
 
 def _run_fd_nlopt(
@@ -663,8 +691,8 @@ def _run_fd_nlopt(
         raise ValueError("fd_eps must be finite and > 0")
     if ema_alpha is not None and not 0.0 < float(ema_alpha) <= 1.0:
         raise ValueError("ema_alpha must be in (0, 1] when set")
-    if max_step is not None and float(max_step) <= 0.0:
-        raise ValueError("max_step must be > 0 when set")
+    if max_step is not None:
+        raise ValueError("NLopt does not support max_step; use a solver with explicit update clipping")
     if grad_clip_norm is not None and float(grad_clip_norm) <= 0.0:
         raise ValueError("grad_clip_norm must be > 0 when set")
 
@@ -746,7 +774,7 @@ def _run_fd_nlopt(
         "last_improve_eval": 0,
         "evals": 0,
         "bad_consecutive": 0,
-        "prev_x": None,
+        "valid_evals": 0,
         "stopped_reason": "maxeval",
         "step": 0,
         "last_loss_evals": 0,
@@ -804,15 +832,6 @@ def _run_fd_nlopt(
                 ))
             return controls["penalty_on_bad"]
 
-        if max_step is not None:
-            if eval_state["prev_x"] is not None:
-                delta = x_vec - eval_state["prev_x"]
-                delta_norm = float(np.linalg.norm(delta))
-                step_limit = float(max_step)
-                if delta_norm > step_limit:
-                    x_vec = eval_state["prev_x"] + delta * (step_limit / (delta_norm + 1e-12))
-            eval_state["prev_x"] = np.array(x_vec, dtype=np.float64, copy=True)
-
         try:
             grad_value, f0 = _evaluate_fd_gradient(
                 x_vec,
@@ -824,6 +843,8 @@ def _run_fd_nlopt(
             loss_value = float(f0)
             if not np.isfinite(loss_value) or not np.isfinite(grad_value).all():
                 raise FloatingPointError("non-finite objective or gradient")
+        except _LossContractError:
+            raise
         except (FloatingPointError, RuntimeError, ValueError):
             eval_state["bad_consecutive"] += 1
             loss_value = controls["penalty_on_bad"]
@@ -836,6 +857,7 @@ def _run_fd_nlopt(
                 eval_state["stopped_reason"] = "bad_max"
                 opt.force_stop()
         else:
+            eval_state["valid_evals"] += 1
             eval_state["bad_consecutive"] = 0
             grad_norm = float(np.linalg.norm(grad_value)) if need_grad_norm else float("nan")
             eval_state["last_gnorm"] = grad_norm
@@ -896,11 +918,12 @@ def _run_fd_nlopt(
     try:
         x_opt = opt.optimize(x0)
     except BaseException as exc:  # pylint: disable=broad-except
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, _LossContractError)):
             if pbar is not None:
                 pbar.close()
             raise
-        eval_state["stopped_reason"] = f"nlopt_error:{type(exc).__name__}"
+        if eval_state["stopped_reason"] == "maxeval":
+            eval_state["stopped_reason"] = f"nlopt_error:{type(exc).__name__}"
         warnings.warn(
             f"NLopt terminated with {type(exc).__name__}: {exc}. "
             f"Returning best params found after {eval_state['evals']} objective calls.",
@@ -911,6 +934,8 @@ def _run_fd_nlopt(
         if pbar is not None:
             pbar.close()
 
+    if x_opt is not None:
+        eval_state["stopped_reason"] = _nlopt_stop_reason(opt.last_optimize_result())
     if controls["restore_best"] and eval_state["best_x_true"] is not None and np.isfinite(eval_state["best_true"]):
         best_x = eval_state["best_x_true"]
     elif controls["restore_best"] and eval_state["best_x_sel"] is not None:
@@ -921,16 +946,21 @@ def _run_fd_nlopt(
         best_x = np.asarray(x0, dtype=np.float64)
     _assign_flat_params(best_x, specs)
 
-    if not history:
-        try:
-            history.append(_eval_loss(best_x))
-        except (RuntimeError, ValueError, FloatingPointError):
-            history.append(controls["penalty_on_bad"])
-
     best_loss = eval_state["best_true"]
     convergence_reason = eval_state["stopped_reason"]
     if controls["restore_best"] and eval_state["best_x_true"] is not None:
         final_loss = best_loss
     else:
-        final_loss = history[-1] if history else float("nan")
+        try:
+            final_loss = _eval_loss(best_x)
+        except _LossContractError:
+            raise
+        except (RuntimeError, ValueError, FloatingPointError):
+            final_loss = float("nan")
+    if not eval_state["valid_evals"]:
+        convergence_reason = "invalid_objective"
+        warnings.warn("NLopt encountered only invalid objective/gradient evaluations",
+                      RuntimeWarning, stacklevel=3)
+    if not history:
+        history.append(final_loss)
     return params_run, history, best_loss, final_loss, convergence_reason, loss_eval_counter["value"]

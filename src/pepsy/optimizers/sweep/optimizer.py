@@ -31,7 +31,7 @@ from ...boundary.states import BdyMPS
 from ...boundary.sweeps import CompBdy
 from ...boundary._lattice import infer_lattice_shape
 from ...tensors.observables import tn_fidelity
-from ...solvers.gradient import GradientOptimizer, SUPPORTED_SOLVERS
+from ...solvers.gradient import GradientOptimizer, SUPPORTED_SOLVERS, _resolve_solver
 from ...tensors.validation import _PHYS_IND_PATTERN
 from .environments import (
     QuimbMpsBoundaryStore,
@@ -2066,6 +2066,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver_options=None,
     ):
         opts = self._merge_solver_options(solver_options)
+        # The shared maxeval=100 default belongs to NLopt. Only an explicitly
+        # supplied maxeval should override the SciPy n_steps default.
+        solver_family, _ = _resolve_solver(solver)
+        if solver_family in {"scipy", "fd-scipy"} and "maxeval" not in (solver_options or {}):
+            opts.pop("maxeval", None)
         if getattr(self, "_active_local_requires_finite_differences", False):
             solver, opts = self._finite_difference_solver(solver, opts)
         elif (

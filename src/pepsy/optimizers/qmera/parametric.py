@@ -272,9 +272,13 @@ class QMeraEnergyOptimizer:
             )
             opts["compiled_chunks"] = self.compiled_chunks
 
+        solver_options = dict(options or {})
+        # Energies are signed; NLopt's default nonnegative-loss filter is
+        # appropriate for infidelity, but must not discard negative energies.
+        solver_options.setdefault("assume_nonnegative", False)
         runner = GradientOptimizer(
             solver=solver,
-            options=options,
+            options=solver_options,
             n_steps=n_steps,
             log_every=log_every,
             progress=progress,

@@ -8,6 +8,13 @@ These are development commits, not a new tagged package release.
 
 ## Joint notebook solver defaults, 2026-10-06
 
+The subsequent [optimizer review and publication](../../history/2026-10-06-gradient-publication.md)
+adds native complex-gradient correction, terminal-state bookkeeping, explicit
+invalid-cost handling, and SciPy budget/callback repairs. Gaugy's signed-cost
+window sweeps also receive the same reduction-aware best-state policy as its
+compiled adapter. That record distinguishes focused checks from the earlier
+full-suite BP failures and records the final commit/push status.
+
 The joint Gaugy notebook now uses Pepsy's existing solver defaults without
 an option-selection ladder. Pepsy validates native Torch/JAX compatibility
 at dispatch. A default Adam check also exposed and corrected mismatched

@@ -309,6 +309,10 @@ param_opt = builder.parametric_optimizer(
 result = param_opt.run(solver="torch-adam", n_steps=10, compiled=True)
 ```
 
+Energy optimization defaults to `assume_nonnegative=False` for every solver,
+including NLopt, so negative energies participate in best-state selection.
+An explicit `options={"assume_nonnegative": True}` overrides this policy.
+
 For dense spin gates, the same optimizer exposes the Torch-only cost through
 `param_opt.compiled_loss_fn(torch_fullgraph=True)`. Its
 `run(solver="torch-adam", compiled=True, torch_fullgraph=True)` path uses that

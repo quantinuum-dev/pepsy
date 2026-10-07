@@ -28,3 +28,18 @@ These solvers still use Torch tensors for parameters and loss evaluation,
 but do not backpropagate through the loss. SciPy and NLopt variants also
 require their respective optional dependencies. Results use the same
 [GradSolverResult fields](gradient.md) as `GradientOptimizer`.
+
+`fd-adam` evaluates the final update once before selecting the best parameters;
+that evaluation is included in `n_evals`. `final_loss` describes the returned
+parameters with either value of `restore_best`.
+
+`fd-scipy` uses the [SciPy budget aliases and stopping rules](gradient.md).
+Its `n_evals` counts individual loss calls, including finite-difference probes;
+SciPy's TNC `maxfun` counts complete objective/gradient estimates instead.
+`trust-constr` callbacks are supported. Invalid terminal objectives/gradients
+produce an `invalid_objective` warning/status; nonscalar or nonreal losses
+raise `ValueError`.
+
+`fd-nlopt` follows the NLopt error and termination policies in the gradient
+guide. It counts a final returned-point evaluation when no best-loss cache
+applies, and rejects `max_step` instead of altering callback coordinates.

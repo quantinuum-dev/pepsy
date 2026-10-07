@@ -10,6 +10,90 @@ from pepsy.solvers import GradientOptimizer
 from pepsy.solvers import gradient
 
 
+def test_native_jax_rejects_nonfinite_gradient():
+    pytest.importorskip("optax")
+    with pytest.raises(FloatingPointError, match="gradient"):
+        GradientOptimizer(solver="jax-sgd", n_steps=1).run(
+            params_init={"x": jnp.array(0.)}, loss_fn=lambda p: jnp.sqrt(p["x"]),
+        )
+
+
+def test_native_jax_invalid_loss_does_not_update_parameters():
+    pytest.importorskip("optax")
+    result = GradientOptimizer(
+        solver="jax-adam", n_steps=2, options={"restore_best": False},
+    ).run(params_init={"x": jnp.array(1.)}, loss_fn=lambda p: p["x"] * jnp.nan)
+    assert float(result.params["x"]) == 1.
+    assert np.isnan(result.final_loss)
+
+
+@pytest.mark.parametrize("solver", ["jax-sgd", "jax-adam", "jax-adamw", "jax-rmsprop"])
+def test_native_complex_gradient_descends(solver):
+    pytest.importorskip("optax")
+    initial = {"x": jnp.array([1j], dtype=jnp.complex128), "r": jnp.array([1.])}
+    def loss(p):
+        return jnp.vdot(p["x"], p["x"]).real + jnp.sum(p["r"] ** 2)
+    result = GradientOptimizer(
+        solver=solver, n_steps=1, options={"lr": .1, "restore_best": False},
+    ).run(params_init=initial, loss_fn=loss)
+    assert abs(result.params["x"][0]) < 1.
+    assert result.final_loss < 2.
+    assert result.final_loss == pytest.approx(float(loss(result.params)))
+    for key in initial:
+        assert result.params[key].dtype == initial[key].dtype
+        assert result.params[key].device == initial[key].device
+    if solver == "jax-sgd":
+        np.testing.assert_allclose(result.params["x"], [.8j])
+
+
+@pytest.mark.parametrize("options", [
+    {"bounds": [(-.1, .1)]}, {"lower_bounds": -.1}, {"upper_bounds": .1},
+    {"max_step": .1}, {"max_step_norm": .1}, {"angle_wrap": True},
+])
+def test_native_jax_rejects_unsupported_constraints_before_loss(options):
+    pytest.importorskip("optax")
+    def loss(p):
+        pytest.fail("unsupported constraints must be rejected before evaluating the loss")
+    with pytest.raises(ValueError, match="not support"):
+        GradientOptimizer(solver="jax-sgd", n_steps=1, options=options).run(
+            params_init={"x": jnp.array([1.])}, loss_fn=loss,
+        )
+
+
+@pytest.mark.parametrize("final_only", [False, True])
+def test_native_jax_rejects_nonreal_loss(final_only):
+    pytest.importorskip("optax")
+    def loss(p):
+        x = p["x"]
+        imag = jnp.where(x < .95, 1., 0.) if final_only else 1.
+        return x ** 2 + 1j * imag
+    with pytest.raises(ValueError, match="complex loss"):
+        GradientOptimizer(solver="jax-sgd", n_steps=1, options={"lr": .1}).run(
+            params_init={"x": jnp.array(1.)}, loss_fn=loss,
+        )
+
+
+def test_native_jax_accepts_roundoff_imaginary_loss():
+    pytest.importorskip("optax")
+    result = GradientOptimizer(solver="jax-sgd", n_steps=1, options={"lr": .1}).run(
+        params_init={"x": jnp.array(1.)}, loss_fn=lambda p: p["x"] ** 2 + 1e-12j,
+    )
+    assert result.final_loss == pytest.approx(.64)
+
+
+def test_jax_host_trust_constr_and_invalid_gradient():
+    pytest.importorskip("scipy")
+    result = GradientOptimizer(
+        solver="scipy", n_steps=5, options={"algorithm": "trust-constr"},
+    ).run(params_init={"x": jnp.array(2.)}, loss_fn=lambda p: p["x"] ** 2)
+    assert result.final_loss < 1e-12
+    with pytest.warns(RuntimeWarning, match="invalid objective"):
+        result = GradientOptimizer(solver="scipy", n_steps=1).run(
+            params_init={"x": jnp.array(0.)}, loss_fn=lambda p: jnp.sqrt(p["x"]),
+        )
+    assert result.convergence_reason == "invalid_objective"
+
+
 @pytest.fixture(autouse=True)
 def enable_x64():
     previous = jax.config.x64_enabled

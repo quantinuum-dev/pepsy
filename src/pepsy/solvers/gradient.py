@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import Any
 
+import autoray as ar
 import numpy as np
 from tqdm.auto import tqdm
 try:
@@ -269,18 +270,26 @@ def _as_trainable_tensor(value: Any) -> torch.Tensor:
     return tensor.clone(memory_format=torch.contiguous_format).requires_grad_(True)
 
 
+class _LossContractError(ValueError):
+    """An invalid loss interface, rather than a recoverable numerical trial."""
+
+
+def _validate_loss_imaginary(imag, imag_tol=1e-10):
+    imag_mag = abs(float(imag))
+    if not np.isfinite(imag_mag) or imag_mag > imag_tol:
+        raise _LossContractError(
+            f"loss_fn returned complex loss with imag={imag_mag:.3e}; expected near-real scalar."
+        )
+
+
 def _scalar_real_loss(loss: Any, imag_tol: float = 1e-10) -> torch.Tensor:
     """Convert scalar loss to a real-valued tensor, with complex safety checks."""
     if not isinstance(loss, torch.Tensor):
         loss = torch.as_tensor(loss)
     if loss.numel() != 1:
-        raise ValueError("loss_fn must return a scalar")
+        raise _LossContractError("loss_fn must return a scalar")
     if loss.is_complex():
-        imag_mag = float(abs(complex(loss.detach().cpu()).imag))
-        if imag_mag > imag_tol:
-            raise ValueError(
-                f"loss_fn returned complex loss with imag={imag_mag:.3e}; expected near-real scalar."
-            )
+        _validate_loss_imaginary(complex(loss.detach().cpu()).imag, imag_tol)
         loss = loss.real
     return loss
 
@@ -369,6 +378,15 @@ def _assign_flat_params(vector: np.ndarray | torch.Tensor, specs: list[dict[str,
 
 def _clone_param_state(params_run: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {name: tensor.detach().clone() for name, tensor in params_run.items()}
+
+
+def _check_finite_torch_gradients(parameters):
+    for parameter in parameters:
+        grad = parameter.grad
+        if grad is not None:
+            values = grad.coalesce().values() if grad.is_sparse else grad
+            if not torch.isfinite(values).all():
+                raise FloatingPointError("loss_fn produced a non-finite gradient")
 
 
 def _restore_param_state(params_run: dict[str, torch.Tensor], state: Mapping[str, torch.Tensor]) -> None:
@@ -641,14 +659,9 @@ def _format_pbar_postfix(
 
 
 def _pop_step_count(options: dict[str, Any], *, default: int) -> int:
-    if "maxiter" in options:
-        steps = int(options.pop("maxiter"))
-    elif "maxeval" in options:
-        steps = int(options.pop("maxeval"))
-    elif "its_max" in options:
-        steps = int(options.pop("its_max"))
-    else:
-        steps = int(default)
+    # Consume all aliases so lower-priority keys cannot leak to the backend.
+    counts = [options.pop(key) for key in ("maxiter", "maxeval", "its_max") if key in options]
+    steps = int(counts[0] if counts else default)
     if steps <= 0:
         raise ValueError("step count must be >= 1")
     return steps
@@ -712,6 +725,11 @@ def _accept_as_best(loss_value: float, controls: Mapping[str, Any]) -> bool:
     if controls["assume_nonnegative"] and loss_value < -controls["best_neg_tol"]:
         return False
     return True
+
+
+def _nlopt_stop_reason(code):
+    return {1: "success", 2: "stopval", 3: "ftol", 4: "xtol",
+            5: "maxeval", 6: "maxtime"}.get(code, f"nlopt_status:{code}")
 
 
 def _build_torch_scheduler(optimizer, options: dict[str, Any], *, max_steps: int):
@@ -845,7 +863,7 @@ def _run_torch_solver(
 
     optimizer_cls = _TORCH_SOLVERS[solver_name]
     param_list = list(params_run.values())
-    flat_size = int(_flatten_params_real_numpy(specs).size)
+    flat_size = sum(spec["numel"] * (2 if spec["is_complex"] else 1) for spec in specs)
     lower_arr, upper_arr = _resolve_bounds_arrays(
         bounds=bounds, lower=lower, upper=upper, size=flat_size,
     )
@@ -889,7 +907,7 @@ def _run_torch_solver(
 
     history: list[float] = []
     best_loss = float("inf")
-    best_vector = _flatten_params_real_numpy(specs)
+    best_params = _clone_param_state(params_run)
     convergence_reason = "maxiter"
     step_iter = _iter_steps(
         controls["max_steps"],
@@ -933,13 +951,14 @@ def _run_torch_solver(
             and (loss_value + controls["min_improve"] < best_loss)
         ):
             best_loss = loss_value
-            best_vector = _flatten_params_real_numpy(specs)
+            best_params = _clone_param_state(params_run)
             last_improve_step = step + 1
 
         if max_step_norm is not None:
             prev_flat = torch.nn.utils.parameters_to_vector(param_list).detach()
 
         loss.backward()
+        _check_finite_torch_gradients(param_list)
         if grad_clip_value is not None:
             torch.nn.utils.clip_grad_value_(param_list, float(grad_clip_value))
         if grad_clip_norm is not None:
@@ -955,6 +974,7 @@ def _run_torch_solver(
                 eval_counter["value"] += 1
                 _l = _scalar_real_loss(loss_fn(params_run))
                 _l.backward()
+                _check_finite_torch_gradients(param_list)
                 # Also fix inside closure for subsequent line-search evaluations.
                 for _p in param_list:
                     if isinstance(_p, torch.Tensor) and _p.grad is not None and not _p.grad.is_contiguous():
@@ -1010,11 +1030,22 @@ def _run_torch_solver(
                 convergence_reason = "patience"
                 break
 
-    if controls["restore_best"]:
-        _assign_flat_params(best_vector, specs)
+    # Score the terminal update, including the last LBFGS closure's update.
+    eval_counter["value"] += 1
+    try:
+        # A valid objective may itself use autograd (e.g. derivative penalties).
+        final_loss = float(_scalar_real_loss(loss_fn(params_run)).detach().cpu())
+    except _LossContractError:
+        raise
+    except (FloatingPointError, RuntimeError, ValueError):
+        final_loss = float("nan")
+    if (np.isfinite(final_loss) and _accept_as_best(final_loss, controls)
+            and final_loss + controls["min_improve"] < best_loss):
+        best_loss = final_loss
+        best_params = _clone_param_state(params_run)
+    if controls["restore_best"] and np.isfinite(best_loss):
+        _restore_param_state(params_run, best_params)
         final_loss = best_loss
-    else:
-        final_loss = history[-1] if history else float("nan")
     if progress_callback is not None:
         progress_callback(max(1, len(history)), final_loss)
 
@@ -1101,7 +1132,7 @@ class _JaxHostProblem:
         def loss_with_imag(vector):
             loss = jnp.asarray(loss_fn(unpack(vector)))
             if loss.ndim != 0:
-                raise ValueError("loss_fn must return a scalar")
+                raise _LossContractError("loss_fn must return a scalar")
             return loss.real, loss.imag
 
         self.evaluate = jax.jit(jax.value_and_grad(loss_with_imag, has_aux=True))
@@ -1120,8 +1151,7 @@ class _JaxHostProblem:
 
     def value_and_grad(self, vector):
         (loss, imag), grad = self.jax.device_get(self.evaluate(self._vector(vector)))
-        if not np.isfinite(imag) or abs(float(imag)) > 1e-10:
-            raise ValueError("loss_fn must return a real scalar")
+        _validate_loss_imaginary(imag)
         return float(loss), np.asarray(grad, dtype=np.float64)
 
     def assign(self, vector):
@@ -1171,8 +1201,6 @@ def _run_scipy_lbfgs(
         return params_run, [], float("nan"), float("nan"), "empty_params", 0
 
     options = dict(solver_options)
-    # maxeval is an nlopt concept; discard it so it doesn't override n_steps for scipy.
-    options.pop("maxeval", None)
     controls = _pop_common_controls(
         options,
         default_steps=n_steps,
@@ -1210,14 +1238,17 @@ def _run_scipy_lbfgs(
     else:
         gtol = _as_nonnegative_float(options.pop("xtol_rel", 1e-9), key="xtol_rel")
 
-    # SciPy line-search control alias (mostly useful for L-BFGS-B/TNC).
+    # SciPy line-search control alias for L-BFGS-B.
     if "line_search_max_steps" in options:
         options["maxls"] = int(options.pop("line_search_max_steps"))
     if "maxls" in options and int(options["maxls"]) <= 0:
         raise ValueError("maxls must be >= 1")
 
-    # n_steps is the canonical iteration limit for scipy (= maxiter).
-    options["maxiter"] = n_steps
+    # TNC exposes a function-call limit, not maxiter.
+    if method == "TNC":
+        options.setdefault("maxfun", controls["max_steps"])
+    else:
+        options["maxiter"] = controls["max_steps"]
     # ftol is accepted only by L-BFGS-B / TNC / SLSQP — other methods
     # (BFGS, CG, Newton-CG, trust-*) emit OptimizeWarning if it is passed.
     if method in {"L-BFGS-B", "TNC", "SLSQP"}:
@@ -1225,9 +1256,9 @@ def _run_scipy_lbfgs(
     # Newton-CG converges on relative step size (xtol); all others use gradient norm (gtol).
     if method == "Newton-CG":
         options.setdefault("xtol", gtol)
-    else:
+    elif method != "SLSQP":
         options.setdefault("gtol", gtol)
-    if method in {"L-BFGS-B", "TNC"}:
+    if method == "L-BFGS-B":
         options.setdefault("maxls", 40)
 
     # ``ftol_rel`` and ``xtol_rel`` are Pepsy/NLopt-style aliases. They were
@@ -1277,7 +1308,7 @@ def _run_scipy_lbfgs(
         else:
             _pbar_desc = f"{opt_desc}[{method}]" if opt_desc else method
         pbar = tqdm(
-            total=n_steps,
+            total=controls["max_steps"],
             desc=_pbar_desc,
             leave=False,
             colour="CYAN",
@@ -1288,11 +1319,17 @@ def _run_scipy_lbfgs(
 
     def objective(x):
         eval_counter["value"] += 1
+        loss_value = float("nan")
         try:
             loss_value, grad_value = problem.value_and_grad(x)
             if not np.isfinite(loss_value) or not np.isfinite(grad_value).all():
                 raise FloatingPointError("non-finite objective or gradient")
-        except (FloatingPointError, RuntimeError, ValueError):
+        except _LossContractError:
+            raise
+        except (FloatingPointError, RuntimeError, ValueError) as exc:
+            state["last_error"] = str(exc)
+            state["last_bad_x"] = np.array(x, copy=True)
+            state["last_bad_loss"] = loss_value
             state["bad_consecutive"] += 1
             loss_value = controls["penalty_on_bad"]
             grad_value = np.zeros_like(np.asarray(x, dtype=np.float64))
@@ -1325,10 +1362,11 @@ def _run_scipy_lbfgs(
             ))
         return loss_value, grad_value
 
-    def callback(_xk):
+    def callback(_xk, intermediate_result=None):
         step_counter["value"] += 1
         step_num = step_counter["value"]
-        loss_value = state["last_loss"]
+        loss_value = (intermediate_result.fun if intermediate_result is not None
+                      else state["last_loss"])
         if loss_value is None:
             loss_value, _grad = problem.value_and_grad(_xk)
         history.append(float(loss_value))
@@ -1382,6 +1420,12 @@ def _run_scipy_lbfgs(
     # (convergence, a resource limit, or failure) rather than the initial label.
     if result is not None and state["convergence_reason"] == "maxiter":
         state["convergence_reason"] = str(result.message)
+        if state["bad_consecutive"] and np.array_equal(result.x, state["last_bad_x"]):
+            state["convergence_reason"] = "invalid_objective"
+            warnings.warn(
+                f"SciPy stopped at an invalid objective or gradient: {state['last_error']}",
+                RuntimeWarning, stacklevel=3,
+            )
     if pbar is not None:
         pbar.close()
     if controls["restore_best"] and state["best_x"] is not None:
@@ -1394,18 +1438,15 @@ def _run_scipy_lbfgs(
         best_x = np.asarray(x0, dtype=np.float64)
     problem.assign(best_x)
 
-    if not history:
-        try:
-            fallback = problem.loss_value()
-        except (RuntimeError, ValueError, FloatingPointError):
-            fallback = controls["penalty_on_bad"]
-        history.append(fallback)
-
     best_loss = state["best_loss"]
-    if controls["restore_best"] and state["best_x"] is not None:
+    if state["best_x"] is not None and (controls["restore_best"] or result is None):
         final_loss = best_loss
+    elif result is not None and state["bad_consecutive"] and np.array_equal(result.x, state["last_bad_x"]):
+        final_loss = state["last_bad_loss"]
     else:
-        final_loss = history[-1] if history else float("nan")
+        final_loss = float(result.fun) if result is not None else state["last_loss"]
+    if not history:
+        history.append(final_loss)
     return params_run, history, best_loss, final_loss, state["convergence_reason"], eval_counter["value"]
 
 
@@ -1472,8 +1513,8 @@ def _run_nlopt_lbfgs(
 
     if ema_alpha is not None and not 0.0 < float(ema_alpha) <= 1.0:
         raise ValueError("ema_alpha must be in (0, 1] when set")
-    if max_step is not None and float(max_step) <= 0.0:
-        raise ValueError("max_step must be > 0 when set")
+    if max_step is not None:
+        raise ValueError("NLopt does not support max_step; use a solver with explicit update clipping")
     if grad_clip_norm is not None and float(grad_clip_norm) <= 0.0:
         raise ValueError("grad_clip_norm must be > 0 when set")
 
@@ -1567,7 +1608,7 @@ def _run_nlopt_lbfgs(
         "last_improve_eval": 0,
         "evals": 0,
         "bad_consecutive": 0,
-        "prev_x": None,
+        "valid_evals": 0,
         "stopped_reason": "maxeval",
         "step": 0,
     }
@@ -1614,19 +1655,12 @@ def _run_nlopt_lbfgs(
                 ))
             return controls["penalty_on_bad"]
 
-        if max_step is not None:
-            if eval_state["prev_x"] is not None:
-                delta = x_vec - eval_state["prev_x"]
-                delta_norm = float(np.linalg.norm(delta))
-                step_limit = float(max_step)
-                if delta_norm > step_limit:
-                    x_vec = eval_state["prev_x"] + delta * (step_limit / (delta_norm + 1e-12))
-            eval_state["prev_x"] = np.array(x_vec, dtype=np.float64, copy=True)
-
         try:
             loss_value, grad_value = problem.value_and_grad(x_vec)
             if not np.isfinite(loss_value) or not np.isfinite(grad_value).all():
                 raise FloatingPointError("non-finite objective or gradient")
+        except _LossContractError:
+            raise
         except (FloatingPointError, RuntimeError, ValueError):
             eval_state["bad_consecutive"] += 1
             loss_value = controls["penalty_on_bad"]
@@ -1639,6 +1673,7 @@ def _run_nlopt_lbfgs(
                 eval_state["stopped_reason"] = "bad_max"
                 opt.force_stop()
         else:
+            eval_state["valid_evals"] += 1
             eval_state["bad_consecutive"] = 0
             grad_norm = float(np.linalg.norm(grad_value))
             eval_state["last_gnorm"] = grad_norm
@@ -1680,10 +1715,8 @@ def _run_nlopt_lbfgs(
             advanced = _pbar_advance(eval_state["evals"])
             if advanced > 0:
                 eval_state["step"] += advanced
-            # NLopt LD_*/LN_* algorithms call the Python objective exactly once
-            # per gradient step — line searches happen in compiled C++ and never
-            # call back into Python.  So ev/it is trivially 1 for all nlopt
-            # gradient methods and we omit it (pass None) to avoid confusion.
+            # NLopt exposes objective calls, including line-search trials,
+            # rather than accepted iteration counts.
             pbar.set_postfix(_format_pbar_postfix(
                 step=eval_state["step"] if eval_state["step"] > 0 else 1,
                 evals=eval_state["evals"],
@@ -1706,11 +1739,12 @@ def _run_nlopt_lbfgs(
         # Catch broadly so we always return the best params found so far
         # rather than propagating the failure to the caller.
         # Re-raise KeyboardInterrupt / SystemExit so users can still abort.
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, _LossContractError)):
             if pbar is not None:
                 pbar.close()
             raise
-        eval_state["stopped_reason"] = f"nlopt_error:{type(exc).__name__}"
+        if eval_state["stopped_reason"] == "maxeval":
+            eval_state["stopped_reason"] = f"nlopt_error:{type(exc).__name__}"
         warnings.warn(
             f"NLopt terminated with {type(exc).__name__}: {exc}. "
             f"Returning best params found after {eval_state['evals']} evaluations.",
@@ -1721,6 +1755,8 @@ def _run_nlopt_lbfgs(
         if pbar is not None:
             pbar.close()
 
+    if x_opt is not None:
+        eval_state["stopped_reason"] = _nlopt_stop_reason(opt.last_optimize_result())
     if controls["restore_best"] and eval_state["best_x_true"] is not None and np.isfinite(eval_state["best_true"]):
         best_x = eval_state["best_x_true"]
     elif controls["restore_best"] and eval_state["best_x_sel"] is not None:
@@ -1730,19 +1766,25 @@ def _run_nlopt_lbfgs(
     else:
         best_x = np.asarray(x0, dtype=np.float64)
     problem.assign(best_x)
-    if not history:
-        try:
-            loss_fallback = problem.loss_value()
-        except (RuntimeError, ValueError, FloatingPointError):
-            loss_fallback = controls["penalty_on_bad"]
-        history.append(loss_fallback)
 
     best_loss = eval_state["best_true"]
     convergence_reason = eval_state["stopped_reason"]
     if controls["restore_best"] and eval_state["best_x_true"] is not None:
         final_loss = best_loss
     else:
-        final_loss = history[-1] if history else float("nan")
+        eval_state["evals"] += 1
+        try:
+            final_loss = problem.loss_value()
+        except _LossContractError:
+            raise
+        except (RuntimeError, ValueError, FloatingPointError):
+            final_loss = float("nan")
+    if not eval_state["valid_evals"]:
+        convergence_reason = "invalid_objective"
+        warnings.warn("NLopt encountered only invalid objective/gradient evaluations",
+                      RuntimeWarning, stacklevel=3)
+    if not history:
+        history.append(final_loss)
     return params_run, history, best_loss, final_loss, convergence_reason, eval_state["evals"]
 
 
@@ -1846,6 +1888,16 @@ def _run_jax_solver(
     optax = _require_optax()
 
     options = dict(solver_options)
+    unsupported = [key for key in (
+        "bounds", "lower_bounds", "upper_bounds", "max_step", "max_step_norm",
+    ) if options.get(key) is not None]
+    if options.get("angle_wrap", False):
+        unsupported.append("angle_wrap")
+    if unsupported:
+        raise ValueError(
+            "Native JAX solvers do not support " + ", ".join(unsupported)
+            + "; choose a solver that implements the requested controls."
+        )
     # Strip keys that belong to other backends.
     # NOTE: ``assume_nonnegative`` and ``best_neg_tol`` are common controls
     # (see ``_pop_common_controls``); they are popped below by that helper,
@@ -1908,22 +1960,22 @@ def _run_jax_solver(
 
     opt_state = optimizer.init(params)
 
-    def _scalar_real(loss):
-        # Take real part if the loss is complex; jax handles this fine under jit.
-        if jnp.iscomplexobj(loss):
-            loss = loss.real
-        return loss
-
-    def _loss_real(p):
-        return _scalar_real(loss_fn(p))
+    def _loss_with_imag(p):
+        loss = jnp.asarray(loss_fn(p))
+        if loss.ndim != 0:
+            raise _LossContractError("loss_fn must return a scalar")
+        return loss.real, loss.imag
 
     @jax.jit
     def _step(params, opt_state):
-        loss, grads = jax.value_and_grad(_loss_real)(params)
+        (loss, imag), grads = jax.value_and_grad(_loss_with_imag, has_aux=True)(params)
+        # JAX's real-loss complex derivative uses the conjugate convention
+        # relative to the Euclidean descent direction expected by Optax.
+        grads = jax.tree_util.tree_map(lambda g: ar.do("conj", g), grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         gnorm_sq = sum(jnp.vdot(g, g).real for g in jax.tree_util.tree_leaves(grads))
-        return params, opt_state, loss, jnp.sqrt(gnorm_sq)
+        return params, opt_state, loss, imag, jnp.sqrt(gnorm_sq)
 
     history: list[float] = []
     best_loss = float("inf")
@@ -1936,7 +1988,8 @@ def _run_jax_solver(
 
     for step in step_iter:
         evaluated_params = params
-        params, opt_state, loss, gnorm = _step(params, opt_state)
+        updated_params, updated_opt_state, loss, imag, gnorm = _step(params, opt_state)
+        _validate_loss_imaginary(imag)
         loss_value = float(loss)
         gnorm_value = float(gnorm)
         step_num = step + 1
@@ -1957,6 +2010,9 @@ def _run_jax_solver(
             continue
 
         bad_consecutive = 0
+        if not np.isfinite(gnorm_value):
+            raise FloatingPointError("loss_fn produced a non-finite gradient")
+        params, opt_state = updated_params, updated_opt_state
         history.append(loss_value)
         if (
             _accept_as_best(loss_value, controls)
@@ -1983,7 +2039,11 @@ def _run_jax_solver(
     # so final_loss matches the returned state and a one-step solve can improve.
     n_evals = len(history) + 1
     try:
-        final_loss = float(_loss_real(params))
+        final, imag = _loss_with_imag(params)
+        _validate_loss_imaginary(imag)
+        final_loss = float(final)
+    except _LossContractError:
+        raise
     except (FloatingPointError, RuntimeError, ValueError):
         final_loss = float("nan")
     if (np.isfinite(final_loss) and _accept_as_best(final_loss, controls)

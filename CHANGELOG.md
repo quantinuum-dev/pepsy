@@ -14,6 +14,20 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Native JAX optimizers use the correct complex-gradient descent direction,
+  validate near-real scalar losses, and reject unsupported constraints.
+  Torch and finite-difference Adam score the final update before restoration;
+  unbounded Torch best-state snapshots stay on their source device.
+- SciPy and finite-difference SciPy honor explicit iteration aliases, use TNC's
+  `maxfun` control, support `trust-constr` callbacks, and distinguish invalid
+  objectives from successful convergence. PEPS local sweeps retain explicit
+  SciPy limits. qMERA energy solves accept negative best energies by default.
+- Native solvers reject nonfinite gradients; JAX skips invalid-loss updates.
+  Torch terminal costs retain support for objectives using autograd internally.
+  NLopt variants propagate scalar/real loss errors, distinguish invalid
+  objectives and actual termination reasons, and report the returned state's
+  evaluated loss. Unsupported `max_step` callback clipping now raises explicitly.
+
 - Torch-backed gradient and finite-difference solvers now own their parameter
   storage, preserving caller tensors and NumPy inputs during in-place trial
   updates. Rejected PEPS sweeps therefore restore the unchanged normalized
