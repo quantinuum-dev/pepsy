@@ -28,12 +28,35 @@ releases remain backwards-compatible. From 1.0 onward:
   objectives and actual termination reasons, and report the returned state's
   evaluated loss. Unsupported `max_step` callback clipping now raises explicitly.
 
+- PEPS automatic batches stop on actual target bond growth, rather than
+  shared gate endpoints. A nearest-neighbor RZZ layer with one gate per bond
+  now builds one target within `2*chi` before compression/refinement. Gate
+  order, single-site gates, and exact look-ahead rollback remain preserved.
+
+- Compact PEPS sweep diagnostics retain raw initial/final losses clipped above
+  one as well as below zero. Document that clipping permits continuation and
+  can skip refinement; it is not evidence of boundary-contraction accuracy.
+
 - Torch-backed gradient and finite-difference solvers now own their parameter
   storage, preserving caller tensors and NumPy inputs during in-place trial
   updates. Rejected PEPS sweeps therefore restore the unchanged normalized
   warm start instead of a snapshot contaminated by solver writes.
 
 ### Added
+
+- Sweep optimization accepts `compute_initial_loss=False` to skip its separate
+  initial whole-state diagnostic. Combined with `compute_final_loss=False`,
+  this retains local objective checks without separate whole-state overlaps.
+  Defaults and explicitly supplied initial losses retain their existing checks.
+
+- PEPS row/column sweep objectives default to Pepsy's reusable Cotengra
+  `build_optimizer` helper (formerly `build_contraction`). One search cache is
+  shared across slices, gate batches, and successive driver runs. Explicit
+  `local_contraction_opt` overrides remain available; boundary presets are
+  configured independently.
+  PEPS and standalone sweep normalization/overlap/global defaults also use
+  this helper; boundary FIT inherits the selected optimizer instead of a
+  separate `auto-hq` fallback. Explicit overrides retain precedence.
 
 - Torch PEPS global norm/overlap contractions default to `cutoff=1e-10`,
   separately from gate/warm-start truncation. Explicit metric options win.

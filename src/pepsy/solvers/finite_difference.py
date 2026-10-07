@@ -926,7 +926,7 @@ def _run_fd_nlopt(
             eval_state["stopped_reason"] = f"nlopt_error:{type(exc).__name__}"
         warnings.warn(
             f"NLopt terminated with {type(exc).__name__}: {exc}. "
-            f"Returning best params found after {eval_state['evals']} objective calls.",
+            f"Recovering parameters after {eval_state['evals']} objective calls.",
             RuntimeWarning,
             stacklevel=2,
         )

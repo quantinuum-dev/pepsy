@@ -51,7 +51,12 @@ option name covers both ends of the interval. The existing `1e-10`
 roundoff allowance is a lower bound; zero restores that older allowance.
 Raw local losses remain in `raw_loss_initial`, `raw_loss_final`, and solver
 `history`; whole-sweep raw values remain in `loss_before` and `raw_loss_after`.
-This diagnostic tolerance does not establish exact unit fidelity.
+This is a continuation policy, not an accuracy bound: a negative approximate
+loss clipped to zero can satisfy convergence bookkeeping without establishing
+an accurate overlap. Compare raw losses while increasing normalization and
+norm/overlap boundary caps, with exact small-system references where practical.
+PepsOptimizer's compact `clipped_loss_records` preserve initial/final local
+excursions on both sides of [0,1].
 
 An initial infidelity estimate that is nonfinite or outside [0,1] beyond the allowance stops
 cleanup without changing the warm start. The result reports `success=False`,
@@ -73,6 +78,18 @@ Local objectives cache contraction paths within each fixed slice environment
 by ordered indices and shapes. Tensor values and gradients are recomputed.
 `cache_contraction_paths=False` disables this cache. Explicit optimizer/tree
 objects retain their original handling, including sliced contractions.
+By default, row/column norm and overlap objectives use Pepsy's reusable
+Cotengra `build_optimizer(progbar=False)` helper (`build_contraction` is its
+compatibility alias), independently of the boundary `contraction_opt` preset.
+The optimizer is created lazily and reused across slices; `PepsOptimizer`
+also shares it across gate batches and successive `run()` calls. Its own
+topology/shape search cache remains active independently of the per-slice
+string-path cache. Pass `local_contraction_opt` to customize this local search
+policy, including explicit optimizer/tree objects. Optional local cost
+estimates use the same optimizer as the objective.
+The default boundary/diagnostic `contraction_opt=None` also uses this helper
+and shares it with local objectives. Boundary FIT inherits that optimizer
+unless explicitly overridden, instead of falling back to a string preset.
 Contraction-cost estimates are opt-in with constructor
 `collect_contraction_metrics=True`; otherwise `flops`/`peak_*` are omitted.
 Average boundary-MPS norm reports are also opt-in through
@@ -87,6 +104,13 @@ sweeps retain their initial/final checks. A skipped final check returns
 `loss_after=None`; `best_loss` still describes the chosen sweep candidate.
 Result fields `initial_loss_reused` and `final_loss_measured` distinguish the
 two paths. Round-trip budgets are unchanged.
+
+For objective-only fitting, set `compute_initial_loss=False` and
+`compute_final_loss=False`. This skips both separate whole-state diagnostics;
+`loss_before` and `loss_after` are `None`, and no initial diagnostic can trigger
+early convergence. Local objectives and their safeguards remain active.
+An explicitly supplied `initial_loss` still takes precedence, including its
+early-exit check. Normalization is controlled independently by `renormalize`.
 
 `SweepOptimizer.infidelity(...)` inherits constructor FIT controls when they
 are omitted. Passing `fit_rtol=None` explicitly disables adaptive stopping for

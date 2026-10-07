@@ -36,12 +36,13 @@ Quimb environment controls with `boundary_options`. In particular,
 forwarded to Quimb's boundary SVD via `compress_opts`.
 
 `PepsOptimizer.run()` now defaults to `k_2q_batch="auto"`. It absorbs gates
-in circuit order until the next two-site gate shares a site with an earlier
-two-site gate in the batch, or would make any target bond exceed its budget:
+in circuit order until the next gate would make any target bond exceed its budget:
 `2*chi` for diagonal two-qubit gates such as RZZ, increasing to `4*chi` when
 another kind of two-site gate enters the batch.
-Disjoint endpoints alone are insufficient for long-range gates: their routes
-can share bonds, so the actual target bond dimensions are checked as well.
+Shared sites do not stop a batch. For a nearest-neighbor RZZ layer with one
+gate per edge, every bond grows by at most two, so the entire layer fits in
+one target within `2*chi`. Long-range routes or repeated gates can grow the
+same bond again; actual target bond dimensions determine the stopping point.
 The gate that ends a batch remains queued for the next batch.
 
 For dense NumPy/Torch/CuPy diagonal qubit gates on nearest-neighbor coordinate
@@ -92,6 +93,13 @@ direct boundary compression with matching caps and the default metric policy,
 the sweep also reuses the outer initial infidelity. Customized metrics,
 different caps, and iterative boundary fitting keep separate initial checks.
 The outer postcheck after candidate normalization remains authoritative.
+For objective-only sweeps, pass `measure_infidelity=False`,
+`measure_final_infidelity=False`, and `accept_if_improved=False` to `run`, plus
+`sweep_optimize_kwargs={"compute_initial_loss": False, "compute_final_loss": False}`.
+This disables independent whole-state overlap checks, retaining local fitting
+safeguards and the default output normalization. There is no independent
+comparison to the warm start or measured whole-state fidelity in this mode.
+
 Sweep summaries mark `initial_loss_reused` and `final_loss_measured`; a skipped
 internal diagnostic is not reported as a fresh fidelity measurement.
 
@@ -221,6 +229,29 @@ The tolerance is also forwarded to `SweepOptimizer` unless explicitly
 overridden in `sweep_kwargs`. Sweep summaries retain `clipped_loss_records`
 with raw and bounded local losses. Fidelity bookkeeping uses Autoray clipping
 to `[0, 1]`; the differentiable sweep objective remains unclipped.
+Records include excursions below zero and above one, at either the initial
+or final local evaluation.
+
+Row/column objectives use a shared reusable Cotengra optimizer from
+`pepsy.tensors.build_optimizer()` (the canonical name of `build_contraction`),
+rather than inheriting the boundary `contraction_opt` string preset. The same
+search cache serves successive gate batches and `run()` calls. Override it
+with `sweep_kwargs={"local_contraction_opt": optimizer}` when needed; boundary
+contractions can be configured separately. The default `contraction_opt=None`
+also builds this helper for normalization, overlap checks, boundary FIT, and
+global refinement. The default driver shares that object with its local sweep
+objectives; there is no `auto-hq` or `greedy` preset fallback in this policy.
+Explicit caller overrides still take precedence.
+
+**The clipping allowance is a continuation policy, not an accuracy bound.**
+A negative approximate precheck can become zero and satisfy `infidelity_tol`,
+skipping refinement; a clipped local loss can also satisfy sweep convergence
+bookkeeping. Neither outcome demonstrates a converged overlap. For accurate
+comparisons, inspect raw diagnostics and check convergence as both
+normalization and norm/overlap evaluation caps increase, using exact small
+systems as references where practical. Setting the clipping allowance to zero
+restores stricter validity checks but does not certify finite-cap accuracy.
+
 Candidate acceptance compares pre/post states at a common effective cap; if
 the postcheck needs a larger cap, the saved warm start is remeasured there
 without further retries. No automatic retry guarantees contraction accuracy,

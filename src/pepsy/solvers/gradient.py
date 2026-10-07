@@ -1736,8 +1736,7 @@ def _run_nlopt_lbfgs(
     except BaseException as exc:  # pylint: disable=broad-except
         # NLopt raises a SWIG-generated `nlopt.nlopt.runtime_error` (not a
         # Python RuntimeError subclass) when its internal line-search fails.
-        # Catch broadly so we always return the best params found so far
-        # rather than propagating the failure to the caller.
+        # Recover parameters according to restore_best after numerical failures.
         # Re-raise KeyboardInterrupt / SystemExit so users can still abort.
         if isinstance(exc, (KeyboardInterrupt, SystemExit, _LossContractError)):
             if pbar is not None:
@@ -1747,7 +1746,7 @@ def _run_nlopt_lbfgs(
             eval_state["stopped_reason"] = f"nlopt_error:{type(exc).__name__}"
         warnings.warn(
             f"NLopt terminated with {type(exc).__name__}: {exc}. "
-            f"Returning best params found after {eval_state['evals']} evaluations.",
+            f"Recovering parameters after {eval_state['evals']} evaluations.",
             RuntimeWarning,
             stacklevel=2,
         )
