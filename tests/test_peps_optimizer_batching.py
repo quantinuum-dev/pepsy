@@ -487,6 +487,48 @@ def test_above_one_metric_clips_without_retry_and_retains_raw_value(monkeypatch)
     assert len(record["attempts"]) == 1
 
 
+@pytest.mark.parametrize("raw_loss", [-5e-4, 1.0005])
+@pytest.mark.parametrize("phase", ["initial", "final"])
+def test_streamed_sweep_summary_preserves_both_clipping_bounds(monkeypatch, raw_loss, phase):
+    import json
+
+    clipped_run = {
+        "axis": "y", "index": 1,
+        f"raw_loss_{phase}": raw_loss,
+        f"loss_{phase}": float(np.clip(raw_loss, 0., 1.)),
+    }
+
+    class FakeSweep:
+        def __init__(self, state, **kwargs):
+            self.state = state
+
+        def set_optimize_kwargs(self, **kwargs):
+            pass
+
+        def run(self):
+            return {
+                "best_state": self.state, "best_loss": .05,
+                "runs": [
+                    {"axis": "x", "index": 0, "raw_loss_initial": .1, "raw_loss_final": .05},
+                    clipped_run,
+                    {"axis": "x", "index": 1},
+                ],
+            }
+
+    monkeypatch.setattr(peps_mod, "SweepOptimizer", FakeSweep)
+    estimates = iter([.1, .05])
+    monkeypatch.setattr(peps_mod, "boundary_infidelity",
+                        lambda *a, **kw: {"infidelity": next(estimates)})
+    opt = PepsOptimizer(_product(2, 2), [(_unitary(), ((0, 0), (0, 1)))],
+                        chi=1, contraction_opt="greedy")
+    streamed = []
+    opt.run(k_2q_batch=1, step_callback=streamed.append)
+    saved = json.loads(json.dumps(streamed))
+    assert saved[0]["optimizer_result"]["clipped_loss_records"] == [clipped_run]
+    assert saved[0]["optimized"]
+    assert saved[0]["final_infidelity"] == .05
+
+
 @pytest.mark.parametrize("mode", ["sweep", "global"])
 @pytest.mark.parametrize("raw_loss", [-3.267e-6, -5e-4, 1.0005])
 def test_inner_loss_clipping_keeps_gate_stream_and_outer_acceptance(monkeypatch, mode, raw_loss):

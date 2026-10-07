@@ -221,6 +221,29 @@ The tolerance is also forwarded to `SweepOptimizer` unless explicitly
 overridden in `sweep_kwargs`. Sweep summaries retain `clipped_loss_records`
 with raw and bounded local losses. Fidelity bookkeeping uses Autoray clipping
 to `[0, 1]`; the differentiable sweep objective remains unclipped.
+Records include excursions below zero and above one, at either the initial
+or final local evaluation.
+
+Row/column objectives use a shared reusable Cotengra optimizer from
+`pepsy.tensors.build_optimizer()` (the canonical name of `build_contraction`),
+rather than inheriting the boundary `contraction_opt` string preset. The same
+search cache serves successive gate batches and `run()` calls. Override it
+with `sweep_kwargs={"local_contraction_opt": optimizer}` when needed; boundary
+contractions can be configured separately. The default `contraction_opt=None`
+also builds this helper for normalization, overlap checks, boundary FIT, and
+global refinement. The default driver shares that object with its local sweep
+objectives; there is no `auto-hq` or `greedy` preset fallback in this policy.
+Explicit caller overrides still take precedence.
+
+**The clipping allowance is a continuation policy, not an accuracy bound.**
+A negative approximate precheck can become zero and satisfy `infidelity_tol`,
+skipping refinement; a clipped local loss can also satisfy sweep convergence
+bookkeeping. Neither outcome demonstrates a converged overlap. For accurate
+comparisons, inspect raw diagnostics and check convergence as both
+normalization and norm/overlap evaluation caps increase, using exact small
+systems as references where practical. Setting the clipping allowance to zero
+restores stricter validity checks but does not certify finite-cap accuracy.
+
 Candidate acceptance compares pre/post states at a common effective cap; if
 the postcheck needs a larger cap, the saved warm start is remeasured there
 without further retries. No automatic retry guarantees contraction accuracy,

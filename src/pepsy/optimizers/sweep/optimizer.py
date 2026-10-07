@@ -31,6 +31,7 @@ from ...boundary.states import BdyMPS
 from ...boundary.sweeps import CompBdy
 from ...boundary._lattice import infer_lattice_shape
 from ...tensors.observables import tn_fidelity
+from ...tensors.contractions import build_optimizer
 from ...solvers.gradient import GradientOptimizer, SUPPORTED_SOLVERS
 from ...tensors.validation import _PHYS_IND_PATTERN
 from .environments import (
@@ -102,8 +103,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         Optional boundary container for overlap contractions. A dict holder
         style ``{"bdy": <BdyMPS>}`` is also accepted and will be updated in
         place.
-    contraction_opt : object | str, default="auto-hq"
-        Contraction optimizer.
+    contraction_opt : object | str | None, default=None
+        Boundary and whole-state diagnostic contraction optimizer. None builds
+        Pepsy's reusable Cotengra optimizer, also shared with local objectives.
+    local_contraction_opt : object | str | None, default=None
+        Row/column objective optimizer. None lazily builds Pepsy's reusable
+        Cotengra optimizer (build_optimizer, formerly build_contraction).
+        Reused across local solves; explicit optimizer/tree objects are honored.
     fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm", "eff", "two-site", "dmrg", "dmrg1", "dmrg2", "global"}, default="eff"
         Backend mode passed to :class:`pepsy.boundary.sweeps.CompBdy`.
         Quimb modes, including supported ``*-first`` and ``*-oversample``
@@ -479,7 +485,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         chi=None,
         bdy=None,
         bdy_overlap=None,
-        contraction_opt="auto-hq",
+        contraction_opt=None,
+        local_contraction_opt=None,
         fit_mode="eff",
         fit_layer_mode="joint",
         fit_layer_order="input",
@@ -516,6 +523,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.evaluation_negative_tol = float(evaluation_negative_tol)
         self.collect_contraction_metrics = bool(collect_contraction_metrics)
         self.cache_contraction_paths = bool(cache_contraction_paths)
+        self.local_contraction_opt = local_contraction_opt
         if not math.isfinite(self.evaluation_negative_tol) or self.evaluation_negative_tol < 0:
             raise ValueError("evaluation_negative_tol must be finite and non-negative.")
         self._ensure_no_common_internal_indices(state, state_target)
@@ -628,7 +636,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.state_target = state_target
         self.set_target_norm(target_norm)
         self._set_boundary_pair(bdy_obj, bdy_overlap_obj)
-        self.contraction_opt = contraction_opt
+        self.contraction_opt = (
+            build_optimizer(progbar=False) if contraction_opt is None else contraction_opt
+        )
+        if contraction_opt is None and self.local_contraction_opt is None:
+            self.local_contraction_opt = self.contraction_opt
         self.fit_mode = fit_mode
         self.fit_layer_mode = fit_layer_mode
         self.fit_layer_order = fit_layer_order
@@ -1981,6 +1993,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             return tuple(cls._coerce_param_tree_numpy(val) for val in value)
         return cls._coerce_leaf_to_numpy(value)
 
+    def _get_local_contraction_opt(self):
+        """Reuse Pepsy's Cotengra search policy for row/column objectives."""
+        if self.local_contraction_opt is None:
+            self.local_contraction_opt = build_optimizer(progbar=False)
+        return self.local_contraction_opt
+
     def _estimate_slice_contraction_metrics(
         self,
         *,
@@ -2014,8 +2032,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             norm_net0 = norm_net0.full_simplify(seq="R", split_method="svd", inplace=False)
             overlap_net0 = overlap_net0.full_simplify(seq="R", split_method="svd", inplace=False)
 
-        tree_norm = norm_net0.contraction_tree(self.contraction_opt)
-        tree_overlap = overlap_net0.contraction_tree(self.contraction_opt)
+        optimize = self._get_local_contraction_opt()
+        tree_norm = norm_net0.contraction_tree(optimize)
+        tree_overlap = overlap_net0.contraction_tree(optimize)
         flops_norm = float(tree_norm.contraction_cost(log=10))
         peak_norm = float(tree_norm.peak_size(log=2))
         flops_overlap = float(tree_overlap.contraction_cost(log=10))
@@ -2214,7 +2233,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         contraction_paths = {}
 
         def contract_local(network, role):
-            optimize = self.contraction_opt
+            optimize = self._get_local_contraction_opt()
             if self.cache_contraction_paths and isinstance(optimize, str):
                 signature = tuple((tensor.inds, tensor.shape) for tensor in network)
                 cached = contraction_paths.get(role)

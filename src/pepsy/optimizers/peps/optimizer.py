@@ -36,6 +36,7 @@ from ...operators.gates import (
     gate as apply_gate,
 )
 from ..global_opt import GlobalOptimizer
+from ...tensors.contractions import build_optimizer
 from ..sweep import SweepOptimizer
 from ..sweep.environments import (
     canonical_boundary_engine_selector,
@@ -241,7 +242,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         enough.
     contraction_opt : str | object, optional
         Contraction path optimizer forwarded to boundary contractions and the
-        variational backend. Defaults to ``"auto-hq"``.
+        variational backend. None builds Pepsy's reusable Cotengra optimizer.
     which : {"upper", "lower"} | None, optional
         Default physical-index family passed to :func:`pepsy.operators.gate`.
         Per-entry ``which`` values override this.
@@ -362,7 +363,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         evaluation_max_retries=2,
         evaluation_negative_tol=1.0e-3,
         mode="sweep",
-        contraction_opt="auto-hq",
+        contraction_opt=None,
         which=None,
         inplace=False,
         normalize_initial=True,
@@ -432,7 +433,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not math.isfinite(self.evaluation_negative_tol) or self.evaluation_negative_tol < 0:
             raise ValueError("evaluation_negative_tol must be finite and non-negative.")
         self.mode = self._normalize_mode(mode)
-        self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
+        self.contraction_opt = (
+            build_optimizer(progbar=False) if contraction_opt is None else contraction_opt
+        )
         self.which = which
         self.inplace = bool(inplace)
         self.state = state if self.inplace else (state.copy() if hasattr(state, "copy") else state)
@@ -480,6 +483,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.optimizer_options = dict(optimizer_options or {})
         self.sweep_kwargs = dict(sweep_kwargs or {})
         self.sweep_optimize_kwargs = dict(sweep_optimize_kwargs or {})
+        self._sweep_local_contraction_opt = self.contraction_opt if contraction_opt is None else None
         self.sweep_progress = None if sweep_progress is None else bool(sweep_progress)
         self.global_kwargs = dict(global_kwargs or {})
         self.global_optimize_kwargs = dict(global_optimize_kwargs or {})
@@ -1608,6 +1612,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             init_kwargs["boundary_options"] = dict(self.boundary_options)
         init_kwargs.update(self.sweep_kwargs)
         init_kwargs.update(dict(sweep_kwargs or {}))
+        if init_kwargs.get("local_contraction_opt") is None:
+            # One reusable search cache across gate batches and run() calls.
+            # This plans local objectives only, never caches contraction values.
+            if self._sweep_local_contraction_opt is None:
+                self._sweep_local_contraction_opt = build_optimizer(progbar=False)
+            init_kwargs["local_contraction_opt"] = self._sweep_local_contraction_opt
         init_kwargs.setdefault("evaluation_negative_tol", self.evaluation_negative_tol)
         # ``full_simplify`` is not backend-safe for Symmray block trees. Make
         # the supported default explicit here so SweepOptimizer does not need
@@ -1832,7 +1842,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "loss_initial", "loss_final",
                 ) if key in run}
                 for run in runs
-                if any(run.get(key, 0.0) < 0 for key in ("raw_loss_initial", "raw_loss_final"))
+                if any(
+                    value is not None and (value < 0.0 or value > 1.0)
+                    for value in (run.get("raw_loss_initial"), run.get("raw_loss_final"))
+                )
             ]
             if getattr(self, "_phase_timer", None) is not None:
                 # Existing slice timers are host wall times, not CUDA events.
