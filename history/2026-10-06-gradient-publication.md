@@ -61,5 +61,10 @@ reference and installed status constants were additionally checked.
 - Gaugy follow-up: **90 sweep/reflection checks + 70 compiled solver/objective
   checks passed**; changed-file Pyflakes and whitespace checks pass.
 - Final Ruff, whitespace, staged-file scope, and unrelated-edit preservation
-  checks pass. Publication is prepared for `origin/develop`; verified remote
-  references are recorded after pushing.
+  checks pass.
+- Published to `origin/develop`: Pepsy code/integration merge **`9eb7ff1`**,
+  containing optimizer fix commit **`f459f5a`** and remote `6e9cef6`.
+  The push completed successfully. Gaugy's corresponding code fix
+  **`7b03053`** was also pushed successfully to its `origin/develop`.
+  This journal update records those verified code publications; no release
+  tag or unrelated working-tree changes were published.
