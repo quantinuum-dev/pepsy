@@ -21,19 +21,26 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Torch PEPS global norm/overlap contractions default to `cutoff=1e-10`,
+  separately from gate/warm-start truncation. Explicit metric options win.
+  JAX global objectives retain `cutoff=0`, JIT enabled, and Pepsy's registered
+  SVD derivative; Torch retains the registered stabilized SVD/QR policy.
+
 - PEPS sweeps reuse matching direct-boundary prechecks and avoid duplicate
   final diagnostics when the driver performs the acceptance check. Direct
   boundary containers initialize lazily; local contraction paths are reused
   within unchanged slice topology/shapes. Cost estimates and boundary-MPS norm
   reports are opt-in. Solver budgets and the final acceptance check are retained.
 
-- `PepsOptimizer(evaluation_negative_tol=1e-8)` warns and continues for small
-  negative approximate infidelity estimates, using zero for bookkeeping while
+- `PepsOptimizer(evaluation_negative_tol=1e-3)` warns and continues for small
+  out-of-range approximate infidelity estimates, clipping to [0,1] for bookkeeping while
   preserving raw values in evaluation and batch diagnostics. Set zero to
   restore roundoff-only handling. Exact metrics and larger invalid estimates
   keep their existing safeguards.
   Sweep diagnostics apply the same configurable allowance and backend-native
   Autoray clipping, retain raw local losses, and leave gradients unclipped.
+  Global and sweep optimizer return values use the same allowance before outer
+  acceptance checks; small inner errors no longer abort the gate stream.
 
 - `PepsOptimizer.run(timing=True)` records target construction, compression,
   normalization, fidelity checks, and sweep/global optimization phase times.

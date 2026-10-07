@@ -82,9 +82,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         fidelity objectives. Pass either a scalar or a ``(mantissa, exponent)``
         pair such that ``norm = mantissa * 10**exponent``. The default keeps
         the historical normalized-target assumption.
-    evaluation_negative_tol : float, default=1e-8
-        Allow small negative approximate diagnostic losses, warning and clipping
-        them to zero. Raw losses and differentiable objectives are preserved.
+    evaluation_negative_tol : float, default=1e-3
+        Allow approximate diagnostic losses outside [0, 1] by this amount,
+        warning and clipping them. Raw losses and objectives are preserved.
         The existing 1e-10 roundoff allowance remains a lower bound.
     collect_contraction_metrics : bool, default=False
         Compute optional local FLOP/peak-size diagnostics.
@@ -473,7 +473,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         state_target,
         *,
         target_norm=1.0,
-        evaluation_negative_tol=1.0e-8,
+        evaluation_negative_tol=1.0e-3,
         collect_contraction_metrics=False,
         cache_contraction_paths=True,
         chi=None,
@@ -1548,12 +1548,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if value is None or not math.isfinite(float(value)):
             return value
         tolerance = max(1.0e-10, self.evaluation_negative_tol)
-        if float(value) < -tolerance:
+        if float(value) < -tolerance or float(value) > 1.0 + tolerance:
             return value
-        if float(value) < -1.0e-10 and not self._warned_small_negative_loss:
+        if (float(value) < -1.0e-10 or float(value) > 1.0 + 1.0e-10) and not self._warned_small_negative_loss:
+            description = "Small negative" if float(value) < 0 else "Above-one"
             warnings.warn(
-                f"Small negative approximate sweep infidelity ({float(value):.3e}); "
-                "continuing with zero for diagnostics. Raw losses retained.",
+                f"{description} approximate sweep infidelity ({float(value):.3e}); "
+                "continuing with a value clipped to [0, 1] for diagnostics. Raw losses retained.",
                 RuntimeWarning, stacklevel=2,
             )
             self._warned_small_negative_loss = True
@@ -2287,7 +2288,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         # Small negative contraction errors are bounded for diagnostics.
         # Larger invalid values must not enter the solver or best-state tracker.
-        if (not math.isfinite(initial_loss)) or initial_loss < -1.0e-10:
+        if (not math.isfinite(initial_loss)) or not 0.0 <= initial_loss <= 1.0:
             if not self._warned_invalid_local_loss:
                 warnings.warn(
                     "Skipping a local sweep update because its boundary "
@@ -2351,7 +2352,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             # in the diagnostic minimum; carry the last valid minimum forward.
             best_history.append(running_best)
         best_loss = self._best_nonnegative_from_history(observed_losses)
-        if not math.isfinite(applied_loss) or applied_loss < -max(1.0e-10, self.evaluation_negative_tol):
+        diagnostic_applied_loss = self._diagnostic_infidelity(applied_loss)
+        if not math.isfinite(diagnostic_applied_loss) or not 0.0 <= diagnostic_applied_loss <= 1.0:
             if not self._warned_invalid_local_loss:
                 warnings.warn(
                     "Rejecting a local sweep result because its parameters or "
@@ -2918,6 +2920,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         invalid_initial_loss = loss_before is not None and (
             not math.isfinite(float(loss_before))
             or float(loss_before) < -max(early_exit_tol, self.evaluation_negative_tol)
+            or float(loss_before) > 1.0 + max(early_exit_tol, self.evaluation_negative_tol)
         )
         if invalid_initial_loss or (
             loss_before is not None and float(loss_before) < early_exit_tol

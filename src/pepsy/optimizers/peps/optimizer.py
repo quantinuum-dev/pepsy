@@ -230,9 +230,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Each retry warns and is recorded. Zero keeps the requested caps strict.
         Supplied norms (including the unitary run's target norm one) and exact
         contractions are never retried.
-    evaluation_negative_tol : float, default=1e-8
-        Small negative approximate infidelities within this absolute tolerance
-        warn and become zero for decisions and fidelity bookkeeping. Raw values
+    evaluation_negative_tol : float, default=1e-3
+        Approximate infidelities outside [0, 1] by at most this absolute tolerance
+        warn and are clipped for decisions and fidelity bookkeeping. Raw values
         remain in evaluation and batch records. The dtype roundoff allowance is
         a lower bound; zero restores roundoff-only handling. Exact contractions
         retain roundoff-only handling regardless of this setting.
@@ -315,6 +315,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``False`` hides it and ``True`` enables it.
     global_kwargs : mapping, optional
         Constructor options forwarded to :class:`GlobalOptimizer`.
+        Torch global norm/overlap contractions default to ``cutoff=1e-10``;
+        explicit ``norm_kwargs``, ``normalize_kwargs``, and ``loss_kwargs``
+        or ``loss_opt`` values take precedence.
     global_optimize_kwargs : mapping, optional
         Per-run global optimizer controls. The default global cleanup budget is
         ``n=1200``; pass ``{"n": ...}`` to tune this sensitive value.
@@ -357,7 +360,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_chi=None,
         evaluation_chi=None,
         evaluation_max_retries=2,
-        evaluation_negative_tol=1.0e-8,
+        evaluation_negative_tol=1.0e-3,
         mode="sweep",
         contraction_opt="auto-hq",
         which=None,
@@ -1174,11 +1177,30 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         value = _backend_to_float(value)
         if not math.isfinite(value):
             raise ValueError("PEPS infidelity must be finite.")
-        if value < 0.0 and abs(value) <= roundoff_tol:
-            value = 0.0
-        if value < 0.0:
+        if value < -roundoff_tol:
             raise ValueError("PEPS infidelity is substantially negative.")
-        return value
+        if value > 1.0 + roundoff_tol:
+            raise ValueError("PEPS infidelity is substantially above one.")
+        return PepsOptimizer._clip_fidelity(value)
+
+    def _clean_optimizer_infidelity(self, value, summary):
+        """Apply the approximate diagnostic policy at either optimizer exit."""
+        if value is None:
+            return None
+        raw = _backend_to_float(value)
+        clean = self._clean_infidelity(
+            raw, roundoff_tol=max(1.0e-12, self.evaluation_negative_tol),
+        )
+        summary.update(raw_infidelity=raw, infidelity=clean)
+        if raw != clean:
+            summary.update(clipped_infidelity=True,
+                           negative_tolerance=self.evaluation_negative_tol)
+            warnings.warn(
+                f"Approximate {summary['backend']} infidelity ({raw:.3e}) outside "
+                f"[0, 1]; continuing with {clean:g}. Raw estimate retained in diagnostics.",
+                RuntimeWarning, stacklevel=2,
+            )
+        return clean
 
     @staticmethod
     def _clip_fidelity(value):
@@ -1243,8 +1265,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         finite-cap estimates retry at equal, doubled norm/overlap caps, at most
         ``evaluation_max_retries`` times (default two). Each retry warns and
         is recorded by :meth:`get_evaluation_records`; zero disables retries.
-        Small negative approximate values within ``evaluation_negative_tol``
-        warn and become zero without retries; raw estimates remain recorded.
+        Approximate values outside [0, 1] within ``evaluation_negative_tol``
+        warn and are clipped without retries; raw estimates remain recorded.
         Larger persistent invalid estimates raise.
         """
         retries = self.evaluation_max_retries if evaluation_max_retries is None else (
@@ -1281,19 +1303,26 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             raw = result.get("infidelity") if isinstance(result, Mapping) else result
             value = None if raw is None else _backend_to_float(raw)
             record["attempts"].append({"chi": opts["chi"], "infidelity": value})
-            if value is not None and math.isfinite(value) and -negative_tol <= value < -roundoff_tol:
+            if (value is not None and math.isfinite(value)
+                    and -negative_tol <= value <= 1.0 + negative_tol
+                    and (value < -roundoff_tol or value > 1.0 + roundoff_tol)):
+                bounded = self._clip_fidelity(value)
                 record.update(
                     effective_chi=opts["chi"], raw_infidelity=value,
-                    infidelity=0.0, clipped_negative=True, negative_tolerance=negative_tol,
+                    infidelity=bounded, clipped_negative=value < 0,
+                    clipped_infidelity=True, negative_tolerance=negative_tol,
                 )
+                description = "Small negative" if value < 0 else "Above-one"
+                bound_label = "zero" if bounded == 0 else "one"
                 warnings.warn(
-                    f"Small negative approximate PEPS infidelity ({value:.3e}) "
-                    f"at evaluation chi={opts['chi']!r}; continuing with zero "
+                    f"{description} approximate PEPS infidelity ({value:.3e}) "
+                    f"at evaluation chi={opts['chi']!r}; continuing with {bound_label} "
                     f"within tolerance {negative_tol:.3e}. Raw estimate retained in diagnostics.",
                     RuntimeWarning, stacklevel=2,
                 )
-                return 0.0
-            if value is None or not math.isfinite(value) or value >= -roundoff_tol:
+                return bounded
+            if (value is None or not math.isfinite(value)
+                    or -roundoff_tol <= value <= 1.0 + roundoff_tol):
                 record["effective_chi"] = opts["chi"]
                 return self._clean_infidelity(value, roundoff_tol=roundoff_tol)
             if (
@@ -1301,8 +1330,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 or str(opts.get("method", "dmrg")).lower() == "exact"
                 or opts["norm"] is not None or opts["norm_target"] is not None
             ):
+                violation = "negative" if value < 0 else "above one"
                 raise ValueError(
-                    f"PEPS infidelity is substantially negative ({value:.3e}) "
+                    f"PEPS infidelity is substantially {violation} ({value:.3e}) "
                     f"at evaluation chi={opts['chi']!r}; increase metric accuracy. "
                     "When assuming unit target norm, increase normalize_chi "
                     "as well, or set infidelity_kwargs={'norm_target': None} "
@@ -1649,11 +1679,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             final_infidelity = result.get("best_loss")
             if final_infidelity is None:
                 final_infidelity = result.get("loss_after")
-        return (
-            state_out,
-            self._clean_infidelity(final_infidelity),
-            self._summarize_sweep_result(result),
-        )
+        summary = self._summarize_sweep_result(result)
+        return state_out, self._clean_optimizer_infidelity(final_infidelity, summary), summary
 
     @timed_phase("global")
     def _optimize_with_global(
@@ -1675,8 +1702,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opt_kwargs = _merge_opts(self.global_optimize_kwargs, global_optimize_kwargs)
         opt_kwargs = self._apply_global_optimizer_options(opt_kwargs)
 
+        autodiff_backend = str(opt_kwargs.get("autodiff_backend", "torch")).lower()
+        # Keep global boundary truncation separate from gate/warm-start cutoff.
+        # Explicit per-metric constructor options below retain precedence.
+        global_cutoff = 1.0e-10 if autodiff_backend == "torch" else cutoff
         norm_defaults = self._global_contraction_defaults(
-            cutoff=cutoff,
+            cutoff=global_cutoff,
             progress=False,
         )
         normalize_defaults = dict(norm_defaults)
@@ -1685,10 +1716,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             if normalize_chi is _UNSET_METRIC_CHI else normalize_chi
         )
         loss_defaults = self._global_loss_defaults(
-            cutoff=cutoff,
+            cutoff=global_cutoff,
             progress=False,
         )
-        if str(opt_kwargs.get("autodiff_backend", "torch")).lower() == "jax":
+        if autodiff_backend == "jax":
             # JIT needs fixed SVD ranks. Exponent stripping currently converts
             # JAX scalars to Python, losing gradients even without JIT.
             loss_defaults.update(cutoff=0.0, strip_exponent=False)
@@ -1768,11 +1799,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             fallback_error=fallback_error,
         )
         summary.update(getattr(optimizer, "optimization_info", {}))
-        return (
-            state_out,
-            self._clean_infidelity(final_infidelity),
-            summary,
-        )
+        return state_out, self._clean_optimizer_infidelity(final_infidelity, summary), summary
 
     def _summarize_sweep_result(self, result):
         """Return scalar sweep diagnostics without retaining TN objects."""

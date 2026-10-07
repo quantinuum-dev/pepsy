@@ -194,9 +194,10 @@ target contraction. A negative estimate can indicate insufficient
 `normalize_chi`; increase normalization/evaluation accuracy or opt into
 target-norm measurement. Output normalization at finite chi is an
 approximation to exact unit norm.
-Small negative approximate estimates within `evaluation_negative_tol=1e-8`
-are instead accepted immediately with a warning and treated as zero for
-decisions and fidelity bookkeeping. This tolerance is absolute and does not
+Approximate estimates outside [0,1] by at most `evaluation_negative_tol=1e-3`
+are accepted immediately with a warning and clipped to [0,1] for
+decisions and fidelity bookkeeping. The historical option name now covers
+both ends of the interval. This absolute allowance is 0.1 percentage point and does not
 certify a perfect overlap. It avoids retries and stopping for small boundary
 contraction discrepancies, including when the target norm is supplied as one.
 The dtype roundoff scale (`1e-12` for double, `1e-6` for single precision)
@@ -206,10 +207,16 @@ always use that stricter policy. Larger invalid values retain the retry/error
 behavior above; nonfinite values still raise.
 
 `get_evaluation_records()` reports all attempted caps and raw errors, including
-`clipped_negative`, `raw_infidelity`, and `negative_tolerance` when the new
+`clipped_negative`, `clipped_infidelity`, `raw_infidelity`, and `negative_tolerance` when the
 allowance is used. Step records also embed their `evaluation_records`, so
 streamed/saved batch diagnostics preserve these raw values. They retain the
 requested `evaluation_chi` plus `effective_evaluation_chi`.
+The same policy applies to the returned global and sweep optimizer losses,
+so a small negative inner diagnostic cannot abort the gate stream before the
+outer acceptance check. Optimizer summaries retain `raw_infidelity`, bounded
+`infidelity`, and `clipped_infidelity` when clipping occurs. Raw solver losses
+remain unchanged. This does not suppress solver errors or change solver
+convergence tolerances; valid best-iterate recovery and acceptance still apply.
 The tolerance is also forwarded to `SweepOptimizer` unless explicitly
 overridden in `sweep_kwargs`. Sweep summaries retain `clipped_loss_records`
 with raw and bounded local losses. Fidelity bookkeeping uses Autoray clipping
@@ -274,7 +281,14 @@ unitary target-norm policy remain unchanged.
 In `mode="global"`, the default optimizer is NLopt `LD_VAR2` with an evaluation
 budget of 1200, using Torch autodiff through Quimb MPS contractions. Override
 it via `global_optimize_kwargs` or the shared optimizer controls.
-Selecting JAX now supplies the JIT-compatible global loss defaults:
+Global norm/overlap evaluation uses Quimb MPS `contract_boundary` by default.
+With Torch autodiff, its global contraction cutoff is `1e-10`, independently
+of the gate/warm-start cutoff. Pepsy registers its stabilized Torch SVD/QR
+policy before optimization. Explicit global `norm_kwargs`, `normalize_kwargs`,
+`loss_kwargs`, or `loss_opt` cutoffs override these defaults. Outer acceptance
+and driver normalization retain their own configured contraction policies.
+
+Selecting JAX supplies the JIT-compatible global loss defaults:
 
 ```python
 optimizer = PepsOptimizer(

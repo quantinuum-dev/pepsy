@@ -90,10 +90,11 @@ def test_global_backend_defaults_respect_explicit_options(monkeypatch, backend, 
         global_optimize_kwargs={"jit_fn": False} if override else None,
     )
     loss = captured[override or "loss_kwargs"]
-    assert loss["cutoff"] == (1e-7 if override else 0. if backend == "jax" else 1e-12)
+    assert loss["cutoff"] == (1e-7 if override else 0. if backend == "jax" else 1e-10)
     assert loss["strip_exponent"] is (bool(override) or backend != "jax")
     assert captured["optimize"].get("jit_fn", False) is (backend == "jax" and not override)
-    assert captured["norm_kwargs"]["cutoff"] == 1e-12
+    assert captured["norm_kwargs"]["cutoff"] == (1e-10 if backend == "torch" else 1e-12)
+    assert captured["normalize_kwargs"]["cutoff"] == (1e-10 if backend == "torch" else 1e-12)
     assert captured["norm_kwargs"]["strip_exponent"] is True
     assert explicit_loss == {"cutoff": 1e-7, "strip_exponent": True}
 
@@ -1470,7 +1471,8 @@ def test_peps_optimizer_global_defaults_options_and_torch_svd(monkeypatch):
     assert init_kwargs["norm_kwargs"]["mode"] == "mps"
     assert init_kwargs["norm_kwargs"]["mode_"] == "mps"
     assert init_kwargs["norm_kwargs"]["max_separation"] == 1
-    assert init_kwargs["norm_kwargs"]["cutoff"] == pytest.approx(1.0e-12)
+    assert init_kwargs["norm_kwargs"]["cutoff"] == 1.0e-10
+    assert init_kwargs["loss_kwargs"]["cutoff"] == 1.0e-10
     assert init_kwargs["norm_kwargs"]["strip_exponent"] is True
     assert init_kwargs["loss_kwargs"]["sequence"] == ["xmax", "xmin", "ymin", "ymax"]
     assert init_kwargs["loss_kwargs"]["target_norm"] == 1.0

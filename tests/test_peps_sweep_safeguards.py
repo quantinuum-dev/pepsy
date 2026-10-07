@@ -23,7 +23,7 @@ def _sweep(backend="numpy"):
     )
 
 
-@pytest.mark.parametrize("loss", [-0.03, float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("loss", [-0.03, 1.03, float("nan"), float("inf"), -float("inf")])
 def test_invalid_initial_loss_stops_without_convergence_or_mutation(monkeypatch, loss):
     sweep = _sweep()
     original = [tensor.data.copy() for tensor in sweep.state]
@@ -57,13 +57,14 @@ def test_initial_roundoff_still_allows_valid_convergence(monkeypatch, loss):
     assert result["best_loss"] == max(0., loss)
 
 
-def test_small_initial_contraction_error_warns_and_returns_bounded_loss(monkeypatch):
+@pytest.mark.parametrize("loss", [-6.86e-10, -3.267e-6, -5e-4])
+def test_small_initial_contraction_error_warns_and_returns_bounded_loss(monkeypatch, loss):
     sweep = _sweep()
-    monkeypatch.setattr(sweep, "_approx_infidelity_loss", lambda **kw: -6.86e-10)
+    monkeypatch.setattr(sweep, "_approx_infidelity_loss", lambda **kw: loss)
     with pytest.warns(RuntimeWarning, match="Small negative approximate sweep"):
         result = sweep.run(progress=False, renormalize=False)
     assert result["success"]
-    assert result["loss_before"] == -6.86e-10
+    assert result["loss_before"] == loss
     assert result["loss_after"] == result["best_loss"] == 0.
 
 
@@ -85,13 +86,14 @@ def test_autoray_fidelity_clip_preserves_backend_and_bounds(backend):
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
-def test_small_local_overshoot_keeps_raw_objective_and_bounds_diagnostics(monkeypatch, backend):
+@pytest.mark.parametrize("overshoot", [6.86e-10, 3.267e-6, 5e-4])
+def test_small_local_overshoot_keeps_raw_objective_and_bounds_diagnostics(monkeypatch, backend, overshoot):
     sweep = _sweep(backend)
     sweep._refresh_right_boundaries_once("y", env_n_iter=10)
     raw_losses = []
 
     def solver(params, loss_fn, **kwargs):
-        monkeypatch.setattr(sweep, "_scaled_overlap_fidelity", lambda *a: 1. + 6.86e-10)
+        monkeypatch.setattr(sweep, "_scaled_overlap_fidelity", lambda *a: 1. + overshoot)
         raw_losses.append(float(loss_fn(params)))
         return params, raw_losses
 
@@ -106,7 +108,7 @@ def test_small_local_overshoot_keeps_raw_objective_and_bounds_diagnostics(monkey
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
-@pytest.mark.parametrize("bad_output", ["nan", "inf", "negative_loss", "nan_loss"])
+@pytest.mark.parametrize("bad_output", ["nan", "inf", "negative_loss", "above_one_loss", "nan_loss"])
 def test_invalid_local_result_preserves_every_tensor(monkeypatch, backend, bad_output):
     sweep = _sweep(backend)
     sweep._refresh_right_boundaries_once("y", env_n_iter=10)
@@ -119,7 +121,7 @@ def test_invalid_local_result_preserves_every_tensor(monkeypatch, backend, bad_o
             candidate[key] = candidate[key] * float(bad_output)
         else:
             # Inject an invalid boundary estimate for finite returned arrays.
-            fidelity = 1.25 if bad_output == "negative_loss" else float("nan")
+            fidelity = {"negative_loss": 1.25, "above_one_loss": -.25}.get(bad_output, float("nan"))
             monkeypatch.setattr(sweep, "_scaled_overlap_fidelity", lambda *args: fidelity)
         return candidate, [0.1]
 

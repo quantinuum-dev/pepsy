@@ -44,22 +44,23 @@ and sweep runs also return them under the `fit_diagnostics` result key.
 
 Fidelity diagnostics use Autoray `clip(real(value), 0, 1)` on their array
 backend. The differentiable local objective remains unclipped to preserve
-gradients. `evaluation_negative_tol=1e-8` allows small negative approximate
-diagnostic losses: a warning is emitted once per sweep run and their bounded
-value is zero for convergence/best-state bookkeeping. The existing `1e-10`
+gradients. `evaluation_negative_tol=1e-3` allows approximate diagnostic losses
+outside [0,1] by up to 0.001: a warning is emitted once per sweep run and their
+values are clipped for convergence/best-state bookkeeping. The historical
+option name covers both ends of the interval. The existing `1e-10`
 roundoff allowance is a lower bound; zero restores that older allowance.
 Raw local losses remain in `raw_loss_initial`, `raw_loss_final`, and solver
 `history`; whole-sweep raw values remain in `loss_before` and `raw_loss_after`.
 This diagnostic tolerance does not establish exact unit fidelity.
 
-An initial infidelity estimate that is nonfinite or below the negative allowance stops
+An initial infidelity estimate that is nonfinite or outside [0,1] beyond the allowance stops
 cleanup without changing the warm start. The result reports `success=False`,
 `converged=False`, and `termination_reason="invalid_initial_loss"`; the raw
 estimate remains in `loss_before`, while `loss_after` and `best_loss` are
 `None`. These safeguards do not increase boundary caps or FIT budgets.
 
 Local solver output is checked before slice writeback. Nonfinite parameters,
-nonfinite losses, or losses below the negative allowance are rejected with a warning and
+nonfinite losses, or losses outside [0,1] beyond the allowance are rejected with a warning and
 `invalid_loss=True`. The previous slice is retained. `loss_final` describes
 that retained slice; `candidate_loss` and `rejection_reason` describe the
 rejected result. Boundary accuracy remains the caller's responsibility.
