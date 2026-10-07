@@ -1959,6 +1959,50 @@ def test_vec_sampler_torch_large_category_fallback(monkeypatch):
     assert torch.all(batch.probs > 0)
 
 
+@pytest.mark.parametrize("track_grad", [False, True])
+def test_vec_sampler_torch_cdf_resolves_small_probability_intervals(monkeypatch, track_grad):
+    """A narrow Born interval must survive both accumulation and RNG dtype."""
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(vector_sampler_mod, "_TORCH_MULTINOMIAL_MAX_CATEGORIES", 2)
+    probability = 2.0**-26
+    state = torch.sqrt(torch.tensor(
+        [0.5, probability, probability, 0.5 - 2 * probability],
+        dtype=torch.float32,
+    )).to(torch.complex64).requires_grad_()
+    sampler = sampler_mod.VecSampler(state)
+    # Choose the interior of outcome 01's interval using the actual cached
+    # Born weights. A float32 draw or CDF rounds this interval away.
+    weights = sampler.probability_vector().to(torch.float64)
+    draw = float((weights[0] + weights[1] / 2) / weights.sum())
+
+    def fixed_draw(n_samples, *, dtype, device, generator):
+        return torch.full((n_samples,), draw, dtype=dtype, device=device)
+
+    monkeypatch.setattr(torch, "rand", fixed_draw)
+    batch = sampler.sample_batch(3, seed=5, chunk_size=2, track_grad=track_grad)
+    torch.testing.assert_close(
+        batch.configs, torch.tensor([[0, 1]] * 3, dtype=torch.int8)
+    )
+    assert batch.probs.dtype == torch.float32
+    assert batch.probs.requires_grad == track_grad
+    torch.testing.assert_close(batch.probs, sampler.probability_vector()[1].expand(3))
+    if track_grad:
+        batch.probs.sum().backward()
+        assert torch.isfinite(state.grad).all()
+        assert state.grad[1].abs() > 0
+
+
+@pytest.mark.slow
+@pytest.mark.integration
+def test_vec_sampler_torch_large_uniform_vector_has_unbiased_low_bits():
+    """Exercise the real >2**24-category route, where float32 draws bias bits."""
+    torch = pytest.importorskip("torch")
+    sampler = sampler_mod.VecSampler(torch.ones(2**25, dtype=torch.complex64))
+    batch = sampler.sample_batch(8192, seed=62, chunk_size=1200)
+    means = batch.configs.to(torch.float64).mean(dim=0)
+    assert torch.all(torch.abs(means - 0.5) < 0.03), means
+
+
 def test_vec_sampler_native_cupy_keeps_vector_and_batch_on_cupy():
     """Exact-vector sampling should preserve a CuPy state backend."""
     cupy = pytest.importorskip("cupy")

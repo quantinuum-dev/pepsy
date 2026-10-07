@@ -14,6 +14,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- Large Torch exact-vector sampling uses float64 inverse-CDF accumulation
+  and random draws, avoiding biased low-order bits for complex64 states.
+  The CDF uses its accumulated total for normalization. Historical shots
+  from the float32 route need resampling; seeded draw sequences change.
+
 - Native JAX optimizers use the correct complex-gradient descent direction,
   validate near-real scalar losses, and reject unsupported constraints.
   Torch and finite-difference Adam score the final update before restoration;

@@ -643,11 +643,15 @@ class VecSampler:
             # CDF sampling for the large-vector case.  The state vector and
             # probability distribution remain backend-native.
             if probabilities.numel() > _TORCH_MULTINOMIAL_MAX_CATEGORIES:
-                cdf = torch.cumsum(probabilities, dim=0)
-                cdf[-1] = 1.0
+                # Float32 CDF intervals and draws cannot resolve the many
+                # small Born weights here, biasing low-order output bits.
+                # Normalize the whole CDF with its own accumulated total;
+                # forcing only the final entry to one can create a false tail.
+                cdf = torch.cumsum(probabilities.detach(), dim=0, dtype=torch.float64)
+                cdf.div_(cdf[-1].clone())
                 draws = torch.rand(
                     n_samples,
-                    dtype=probabilities.dtype,
+                    dtype=torch.float64,
                     device=probabilities.device,
                     generator=rng,
                 )

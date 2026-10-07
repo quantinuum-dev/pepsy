@@ -732,6 +732,15 @@ are preserved. After changing the source, call `refresh()`; pass a replacement
 state to `refresh(state)` to reuse the site map with newly inferred backend
 and dtype. The number of sites stays fixed.
 
+For Torch distributions with more than `2**24` outcomes, inverse-CDF draws
+use float64 accumulation and random numbers even for a complex64 state.
+The CDF is normalized by its accumulated total; returned probabilities retain
+their original dtype and device. This temporary CDF needs eight bytes per
+outcome (8 GiB for 30 qubits), independently of the shot chunk size.
+Seeded draws on this route differ from versions using a float32 CDF, which
+could bias sampled bits. Previously saved shots require resampling from the
+state; changing the plotting code cannot repair them.
+
 | Method | Result | Default array location |
 | --- | --- | --- |
 | `sample_batch(n_samples, ...)` | Batch record: `configs` `(n_samples, L)`, `probs` and `weights` `(n_samples,)` | State backend/device |
