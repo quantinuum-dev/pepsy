@@ -94,10 +94,10 @@ def test_retained_output_is_normalized_without_rescaling_unitary_target(path, mo
             assert all(bond == 1 for bond, _ in normalized)
 
 
-@pytest.mark.parametrize("batch,counts", [("auto", [3, 1]), (1, [1, 1, 1, 1]),
+@pytest.mark.parametrize("batch,counts", [("auto", [4]), (1, [1, 1, 1, 1]),
                                          (2, [2, 2]), (3, [3, 1])])
 def test_batches_preserve_dense_circuit_and_single_gate_order(batch, counts):
-    """Disjoint gates batch together, without moving the intervening X gate."""
+    """Shared sites do not split a batch or move intervening one-site gates."""
     state = _product()
     gate = _unitary()
     x = np.array([[0., 1.], [1., 0.]], complex)
@@ -115,14 +115,14 @@ def test_batches_preserve_dense_circuit_and_single_gate_order(batch, counts):
     np.testing.assert_array_equal(state.to_dense().reshape(-1), original)
     assert [r["two_site_batch"] for r in opt.step_records] == counts
     if batch == "auto":
-        assert opt.step_records[0]["batch_size"] == 4
-        assert opt.step_records[0]["batch_stop_reason"] == "shared_site"
+        assert opt.step_records[0]["batch_size"] == 5
+        assert opt.step_records[0]["batch_stop_reason"] == "end_of_queue"
         assert all(r["target_max_bond"] <= 16 for r in opt.step_records)
 
 
 @pytest.mark.optional
 def test_auto_matches_index_and_coordinate_site_aliases_on_torch():
-    """The same physical site cannot evade collision detection via a string."""
+    """Shared sites specified by either alias preserve gate order in one target."""
     torch = pytest.importorskip("torch")
     state = _product(2, 2)
     state.apply_to_arrays(torch.as_tensor)
@@ -134,9 +134,70 @@ def test_auto_matches_index_and_coordinate_site_aliases_on_torch():
     vector[0] = 1
     vector = _dense_apply(_dense_apply(vector, gate.numpy(), (0, 1)), gate.numpy(), (0, 2))
     np.testing.assert_allclose(out.to_dense().numpy().reshape(-1), vector, atol=2e-12)
-    assert [r["two_site_batch"] for r in opt.step_records] == [1, 1]
-    assert opt.step_records[0]["batch_stop_reason"] == "shared_site"
+    assert [r["two_site_batch"] for r in opt.step_records] == [2]
+    assert opt.step_records[0]["batch_stop_reason"] == "end_of_queue"
     assert next(iter(out)).data.dtype == torch.complex128
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_auto_second_order_layer_builds_one_exact_target_before_refinement(monkeypatch, backend):
+    state = _product()
+    xhalf = np.array([[np.cos(.07), -1j*np.sin(.07)],
+                     [-1j*np.sin(.07), np.cos(.07)]])
+    zz = np.diag(np.exp(-.13j * np.array([1., -1., -1., 1.])))
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        state.apply_to_arrays(torch.as_tensor)
+        convert = torch.as_tensor
+    else:
+        convert = np.asarray
+    sites = [(i, j) for i in range(2) for j in range(3)]
+    edges = [(s, (s[0]+di, s[1]+dj)) for s in sites for di, dj in [(1, 0), (0, 1)]
+             if s[0]+di < 2 and s[1]+dj < 3]
+    gates = ([(convert(xhalf), s) for s in sites]
+             + [(convert(zz), edge) for edge in edges]
+             + [(convert(xhalf), s) for s in sites])
+    expected = np.zeros(64, complex)
+    expected[0] = 1
+    for gate, where in ([(xhalf, (i,)) for i in range(6)]
+                        + [(zz, tuple(sites.index(s) for s in e)) for e in edges]
+                        + [(xhalf, (i,)) for i in range(6)]):
+        expected = _dense_apply(expected, gate, where)
+    opt = PepsOptimizer(state, gates, chi=1, contraction_opt="greedy", fit_mode="direct")
+    targets = []
+
+    def capture(warmstart, target, **kwargs):
+        targets.append(target.copy())
+        return warmstart, None, {}
+
+    monkeypatch.setattr(opt, "_optimize_state", capture)
+    output = opt.run(measure_infidelity=False, measure_final_infidelity=False)
+    assert len(targets) == len(opt.step_records) == 1
+    assert opt.step_records[0]["two_site_batch"] == len(edges) == 7
+    assert opt.step_records[0]["step"] == len(gates)
+    vector = targets[0].to_dense().reshape(-1)
+    if backend == "torch":
+        vector = vector.numpy()
+    np.testing.assert_allclose(vector, expected, atol=2e-12)
+    assert targets[0].max_bond() <= 2
+    assert output.max_bond() == 1
+
+
+def test_auto_5x6_d4_zz_layer_stays_within_d8():
+    state = qtn.PEPS.rand(5, 6, bond_dim=4, dtype="complex128", seed=73)
+    original = [tensor.data.copy() for tensor in state]
+    gate = np.diag(np.exp(-.1j * np.array([1., -1., -1., 1.])))
+    gates = [(gate, ((i, j), (i+di, j+dj))) for i in range(5) for j in range(6)
+             for di, dj in [(1, 0), (0, 1)] if i+di < 5 and j+dj < 6]
+    opt = PepsOptimizer(state, gates, chi=4, normalize_initial=False, contraction_opt="greedy")
+    entries, count, next_idx, target, stop, limit = opt._collect_auto_batch_target(
+        0, cutoff=1e-12, cutoff_mode="rsum2", gate_kwargs=None,
+    )
+    assert len(entries) == count == next_idx == len(gates) == 49
+    assert stop == "end_of_queue"
+    assert target.max_bond() == limit == 8
+    for tensor, before in zip(state, original):
+        np.testing.assert_array_equal(tensor.data, before)
 
 
 def test_single_gate_can_exceed_auto_budget_without_truncating_target():

@@ -14,6 +14,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- PEPS automatic batches stop on actual target bond growth, rather than
+  shared gate endpoints. A nearest-neighbor RZZ layer with one gate per bond
+  now builds one target within `2*chi` before compression/refinement. Gate
+  order, single-site gates, and exact look-ahead rollback remain preserved.
+
 - Compact PEPS sweep diagnostics retain raw initial/final losses clipped above
   one as well as below zero. Document that clipping permits continuation and
   can skip refinement; it is not evidence of boundary-contraction accuracy.
@@ -24,6 +29,11 @@ releases remain backwards-compatible. From 1.0 onward:
   warm start instead of a snapshot contaminated by solver writes.
 
 ### Added
+
+- Sweep optimization accepts `compute_initial_loss=False` to skip its separate
+  initial whole-state diagnostic. Combined with `compute_final_loss=False`,
+  this retains local objective checks without separate whole-state overlaps.
+  Defaults and explicitly supplied initial losses retain their existing checks.
 
 - PEPS row/column sweep objectives default to Pepsy's reusable Cotengra
   `build_optimizer` helper (formerly `build_contraction`). One search cache is

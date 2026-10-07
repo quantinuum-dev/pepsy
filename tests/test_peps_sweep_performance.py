@@ -238,3 +238,27 @@ def test_boundary_norm_reporting_is_opt_in(monkeypatch, collect):
     assert result["runs"]
     assert (result["bdy_norm"] is not None) is collect
     assert result["loss_after"] is None
+
+
+@pytest.mark.parametrize("initial_loss", [None, 0.0])
+def test_initial_global_loss_can_be_disabled_without_faking_convergence(monkeypatch, initial_loss):
+    states = [qtn.PEPS.rand(2, 2, bond_dim=1, dtype="complex128", seed=s)
+              for s in (61, 63)]
+    for tn in states:
+        tn.multiply_(1 / np.linalg.norm(tn.to_dense()))
+    states[1].mangle_inner_("_target")
+    sweep = SweepOptimizer(*states, chi=4, fit_mode="direct", contraction_opt="greedy")
+
+    def unexpected(**kwargs):
+        pytest.fail("Independent global loss should not be contracted")
+
+    monkeypatch.setattr(sweep, "_approx_infidelity_loss", unexpected)
+    sweep.set_optimize_kwargs(
+        initial_loss=initial_loss, compute_initial_loss=False, compute_final_loss=False,
+        n_round_trips=0, optimizer="nlopt", optimizer_options={"maxeval": 4},
+    )
+    result = sweep.run(progress=False, renormalize=False)
+    assert result["loss_before"] == initial_loss
+    assert bool(result["runs"]) is (initial_loss is None)
+    assert bool(result["step_trace"]) is (initial_loss is None)
+    assert np.isfinite(sweep.state.to_dense()).all()

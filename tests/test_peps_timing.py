@@ -90,7 +90,7 @@ def test_failed_phase_is_retained_and_active_timer_is_cleared(monkeypatch):
 def test_callback_keeps_completed_batches_before_a_later_failure(monkeypatch):
     optimizer = make_optimizer()
     optimizer.set_gates(optimizer.gates * 2)
-    original = optimizer._build_target
+    original = optimizer._build_batch_target
     calls = 0
 
     def fail_second(*args, **kwargs):
@@ -100,10 +100,10 @@ def test_callback_keeps_completed_batches_before_a_later_failure(monkeypatch):
             raise RuntimeError("second batch failed")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(optimizer, "_build_target", fail_second)
+    monkeypatch.setattr(optimizer, "_build_batch_target", fail_second)
     streamed = []
     with pytest.raises(RuntimeError, match="second batch failed"):
-        optimizer.run(optimize=False, timing=True, step_callback=streamed.append)
+        optimizer.run(k_2q_batch=1, optimize=False, timing=True, step_callback=streamed.append)
     assert len(streamed) == len(optimizer.get_step_records()) == 1
     assert streamed[0]["timing"]["calls"]["target"] == 1
     assert optimizer.get_timing()["status"] == "failed"

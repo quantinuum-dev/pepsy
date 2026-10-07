@@ -36,12 +36,13 @@ Quimb environment controls with `boundary_options`. In particular,
 forwarded to Quimb's boundary SVD via `compress_opts`.
 
 `PepsOptimizer.run()` now defaults to `k_2q_batch="auto"`. It absorbs gates
-in circuit order until the next two-site gate shares a site with an earlier
-two-site gate in the batch, or would make any target bond exceed its budget:
+in circuit order until the next gate would make any target bond exceed its budget:
 `2*chi` for diagonal two-qubit gates such as RZZ, increasing to `4*chi` when
 another kind of two-site gate enters the batch.
-Disjoint endpoints alone are insufficient for long-range gates: their routes
-can share bonds, so the actual target bond dimensions are checked as well.
+Shared sites do not stop a batch. For a nearest-neighbor RZZ layer with one
+gate per edge, every bond grows by at most two, so the entire layer fits in
+one target within `2*chi`. Long-range routes or repeated gates can grow the
+same bond again; actual target bond dimensions determine the stopping point.
 The gate that ends a batch remains queued for the next batch.
 
 For dense NumPy/Torch/CuPy diagonal qubit gates on nearest-neighbor coordinate
@@ -92,6 +93,13 @@ direct boundary compression with matching caps and the default metric policy,
 the sweep also reuses the outer initial infidelity. Customized metrics,
 different caps, and iterative boundary fitting keep separate initial checks.
 The outer postcheck after candidate normalization remains authoritative.
+For objective-only sweeps, pass `measure_infidelity=False`,
+`measure_final_infidelity=False`, and `accept_if_improved=False` to `run`, plus
+`sweep_optimize_kwargs={"compute_initial_loss": False, "compute_final_loss": False}`.
+This disables independent whole-state overlap checks, retaining local fitting
+safeguards and the default output normalization. There is no independent
+comparison to the warm start or measured whole-state fidelity in this mode.
+
 Sweep summaries mark `initial_loss_reused` and `final_loss_measured`; a skipped
 internal diagnostic is not reported as a fresh fidelity measurement.
 

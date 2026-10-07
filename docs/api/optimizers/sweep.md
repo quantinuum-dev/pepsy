@@ -105,6 +105,13 @@ sweeps retain their initial/final checks. A skipped final check returns
 Result fields `initial_loss_reused` and `final_loss_measured` distinguish the
 two paths. Round-trip budgets are unchanged.
 
+For objective-only fitting, set `compute_initial_loss=False` and
+`compute_final_loss=False`. This skips both separate whole-state diagnostics;
+`loss_before` and `loss_after` are `None`, and no initial diagnostic can trigger
+early convergence. Local objectives and their safeguards remain active.
+An explicitly supplied `initial_loss` still takes precedence, including its
+early-exit check. Normalization is controlled independently by `renormalize`.
+
 `SweepOptimizer.infidelity(...)` inherits constructor FIT controls when they
 are omitted. Passing `fit_rtol=None` explicitly disables adaptive stopping for
 that diagnostic; omitting `fit_rtol` inherits the constructor value. The same

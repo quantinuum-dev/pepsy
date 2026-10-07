@@ -152,7 +152,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     after output normalization. Otherwise a warm start is formed by compressing ``target.copy()`` to
     ``chi``; this warm start is either accepted by a boundary-fidelity check or
     refined against the exact target with ``mode="sweep"`` or ``mode="global"``.
-    By default ``run(k_2q_batch="auto")`` batches disjoint two-site gates while
+    By default ``run(k_2q_batch="auto")`` batches gates in circuit order while
     the target bonds stay within ``2 * chi`` for diagonal qubit gates or
     ``4 * chi`` for other gates. A larger exact single-gate target is processed
     alone. Positive integers select a fixed two-site gate count.
@@ -1067,27 +1067,13 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return batch_entries, two_site_in_batch, idx
 
-    def _gate_site_keys(self, where, state):
-        """Identify physical sites consistently for coordinates and index names."""
-        sites = []
-        for site in where:
-            if isinstance(site, str):
-                tids = getattr(state, "ind_map", {}).get(site, ())
-            else:
-                site_tag = getattr(state, "site_tag", None)
-                tag = site_tag(*site) if callable(site_tag) else None
-                tids = getattr(state, "tag_map", {}).get(tag, ())
-            if tids:
-                sites.extend(("tensor", tid) for tid in tids)
-            else:
-                sites.append(("site", _freeze_where(site)))
-        return frozenset(sites)
-
     @timed_phase("target")
     def _collect_auto_batch_target(self, start_idx, *, cutoff, cutoff_mode, gate_kwargs):
-        """Grow an exact target until sites collide or bonds exceed its budget.
+        """Grow an ordered exact target until bonds exceed its budget.
 
         Diagonal qubit batches use 2D; batches with other gates use 4D.
+        Shared sites do not imply repeated bond growth: a nearest-neighbor
+        ZZ layer can double every bond once while staying inside 2D.
         A single exact routed gate may exceed this budget and is processed
         alone, never truncated to meet a batching
         budget. Candidate copies keep a rejected look-ahead gate out of the
@@ -1095,7 +1081,6 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         target = self.state
         entries = []
-        occupied = set()
         n_two_site = 0
         idx = start_idx
         stop_reason = "end_of_queue"
@@ -1106,10 +1091,6 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             site_count = self._site_count(where, target)
             if site_count not in (1, 2):
                 raise ValueError("PepsOptimizer supports one- and two-site gates only.")
-            sites = self._gate_site_keys(where, self.state) if site_count == 2 else ()
-            if occupied.intersection(sites):
-                stop_reason = "shared_site"
-                break
             candidate_factor = (
                 max(bond_factor, self._gate_bond_factor(gate_payload))
                 if site_count == 2 else bond_factor
@@ -1129,7 +1110,6 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             idx += 1
             if site_count == 2:
                 n_two_site += 1
-                occupied.update(sites)
             if exceeds_limit:
                 stop_reason = "single_gate_exceeds_limit"
                 break
@@ -2126,10 +2106,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             dtype: 1e-12 for float64/complex128, 1e-6 for float32/complex64,
             and 1e-3 for 16-bit data. Automatic cutoff mode is "rsum2".
         k_2q_batch : {"auto"} | int, default="auto"
-            Automatic batches stop before a two-site gate shares an endpoint
-            with an earlier two-site gate or makes any target bond exceed
+            Automatic batches stop before a gate makes any target bond exceed
             ``2 * chi`` for diagonal qubit gates (including RZZ), or
             ``4 * chi`` when other two-site gates enter the batch.
+            Gates may share sites; actual bond growth controls batching.
+            A nearest-neighbor RZZ layer acting once on each bond therefore
+            fits in one target within ``2 * chi``.
             The first two-site gate is always included, even if
             its exact target alone exceeds this budget. No target truncation
             is used to satisfy the budget. Positive integers absorb up to that

@@ -239,6 +239,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "boundary_engine",
         "boundary_options",
         "initial_loss",
+        "compute_initial_loss",
         "compute_final_loss",
         "collect_boundary_norms",
     })
@@ -2855,6 +2856,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         renormalize=True,
         normalize_boundaries=None,
         initial_loss=None,
+        compute_initial_loss=True,
         compute_final_loss=True,
         collect_boundary_norms=False,
     ):
@@ -2864,7 +2866,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         ----------
         initial_loss : float | None, default=None
             Previously measured initial infidelity for identical state, target,
-            caps and metric policy. None performs the usual initial check.
+            caps and metric policy. Takes precedence over compute_initial_loss.
+        compute_initial_loss : bool, default=True
+            Measure the initial global diagnostic when initial_loss is None.
+            False skips this contraction and its global early-exit check;
+            local fitting objectives and safeguards remain active.
         compute_final_loss : bool, default=True
             Measure the final global diagnostic. False reports loss_after=None
             unless the initial check already establishes convergence.
@@ -2915,6 +2921,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         loss_mode = debug_loss_mode if debug else "infidelity"
         if initial_loss is not None:
             loss_before = float(initial_loss)
+        elif not compute_initial_loss:
+            loss_before = None
         elif (not debug) and (debug_loss_kwargs is None):
             loss_before = self._approx_infidelity_loss(env_n_iter=env_n_iter)
         else:
@@ -3229,6 +3237,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             ),
             track_boundary_fidelity=opts.get("track_boundary_fidelity", False),
             initial_loss=opts.get("initial_loss"),
+            compute_initial_loss=opts.get("compute_initial_loss", True),
             compute_final_loss=opts.get("compute_final_loss", True),
             collect_boundary_norms=opts.get("collect_boundary_norms", False),
         )
