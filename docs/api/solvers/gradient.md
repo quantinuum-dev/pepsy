@@ -39,6 +39,12 @@ of `restore_best`. An invalid final update cannot replace a finite best state.
 `optimize_packed_params(...)` provides the function form, returning
 `(params, history)`.
 
+Solvers preserve the supplied parameter arrays. Torch-backed solves allocate
+independent, contiguous parameter storage once per solve on the original
+device; trial updates and returned parameters cannot overwrite the inputs or
+tensor-network snapshots sharing those inputs. This also applies to NumPy
+inputs converted to Torch. JAX follows its immutable-array semantics.
+
 | Solver family | Dependencies and behavior |
 | --- | --- |
 | `torch-*` | Torch; differentiable scalar loss, parameters stay on their device |

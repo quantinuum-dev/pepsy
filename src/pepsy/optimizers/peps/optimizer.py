@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from numbers import Integral
 from typing import Any
+from copy import deepcopy
 
 import autoray as ar
 
@@ -42,6 +43,7 @@ from ..sweep.environments import (
     symmray_array_backends,
     uses_symmray_arrays,
 )
+from ._timing import profile_run, timed_phase
 
 __all__ = ["PepsOptimizer"]
 
@@ -228,6 +230,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Each retry warns and is recorded. Zero keeps the requested caps strict.
         Supplied norms (including the unitary run's target norm one) and exact
         contractions are never retried.
+    evaluation_negative_tol : float, default=1e-3
+        Approximate infidelities outside [0, 1] by at most this absolute tolerance
+        warn and are clipped for decisions and fidelity bookkeeping. Raw values
+        remain in evaluation and batch records. The dtype roundoff allowance is
+        a lower bound; zero restores roundoff-only handling. Exact contractions
+        retain roundoff-only handling regardless of this setting.
     mode : {"sweep", "global"}, default="sweep"
         Variational optimizer backend used when the warm start is not good
         enough.
@@ -307,6 +315,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``False`` hides it and ``True`` enables it.
     global_kwargs : mapping, optional
         Constructor options forwarded to :class:`GlobalOptimizer`.
+        Torch global norm/overlap contractions default to ``cutoff=1e-10``;
+        explicit ``norm_kwargs``, ``normalize_kwargs``, and ``loss_kwargs``
+        or ``loss_opt`` values take precedence.
     global_optimize_kwargs : mapping, optional
         Per-run global optimizer controls. The default global cleanup budget is
         ``n=1200``; pass ``{"n": ...}`` to tune this sensitive value.
@@ -349,6 +360,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_chi=None,
         evaluation_chi=None,
         evaluation_max_retries=2,
+        evaluation_negative_tol=1.0e-3,
         mode="sweep",
         contraction_opt="auto-hq",
         which=None,
@@ -416,6 +428,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             else self._validate_boundary_chi(evaluation_chi, name="evaluation_chi")
         )
         self.evaluation_max_retries = self._validate_evaluation_retries(evaluation_max_retries)
+        self.evaluation_negative_tol = float(evaluation_negative_tol)
+        if not math.isfinite(self.evaluation_negative_tol) or self.evaluation_negative_tol < 0:
+            raise ValueError("evaluation_negative_tol must be finite and non-negative.")
         self.mode = self._normalize_mode(mode)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
         self.which = which
@@ -715,6 +730,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_chi=normalize_chi,
         )
 
+    @timed_phase("normalization")
     def _normalize_state(self, state, *, normalize_kwargs=None, normalize_chi=None):
         opts = _merge_opts(
             self.boundary_kwargs,
@@ -897,6 +913,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             inplace=True,
         )
 
+    @timed_phase("target")
     def _build_batch_target(self, state, batch_entries, *, cutoff, cutoff_mode, gate_kwargs):
         """Apply a collected gate batch onto a copy of ``state``."""
         opts = self._target_gate_options(
@@ -999,6 +1016,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             gate_kwargs=gate_kwargs,
         )
 
+    @timed_phase("compression")
     def _build_batch_warmstart(
         self,
         target,
@@ -1061,6 +1079,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 sites.append(("site", _freeze_where(site)))
         return frozenset(sites)
 
+    @timed_phase("target")
     def _collect_auto_batch_target(self, start_idx, *, cutoff, cutoff_mode, gate_kwargs):
         """Grow an exact target until sites collide or bonds exceed its budget.
 
@@ -1158,20 +1177,34 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         value = _backend_to_float(value)
         if not math.isfinite(value):
             raise ValueError("PEPS infidelity must be finite.")
-        if value < 0.0 and abs(value) <= roundoff_tol:
-            value = 0.0
-        if value < 0.0:
+        if value < -roundoff_tol:
             raise ValueError("PEPS infidelity is substantially negative.")
-        return value
+        if value > 1.0 + roundoff_tol:
+            raise ValueError("PEPS infidelity is substantially above one.")
+        return PepsOptimizer._clip_fidelity(value)
+
+    def _clean_optimizer_infidelity(self, value, summary):
+        """Apply the approximate diagnostic policy at either optimizer exit."""
+        if value is None:
+            return None
+        raw = _backend_to_float(value)
+        clean = self._clean_infidelity(
+            raw, roundoff_tol=max(1.0e-12, self.evaluation_negative_tol),
+        )
+        summary.update(raw_infidelity=raw, infidelity=clean)
+        if raw != clean:
+            summary.update(clipped_infidelity=True,
+                           negative_tolerance=self.evaluation_negative_tol)
+            warnings.warn(
+                f"Approximate {summary['backend']} infidelity ({raw:.3e}) outside "
+                f"[0, 1]; continuing with {clean:g}. Raw estimate retained in diagnostics.",
+                RuntimeWarning, stacklevel=2,
+            )
+        return clean
 
     @staticmethod
     def _clip_fidelity(value):
-        value = _backend_to_float(value)
-        if value < 0.0 and abs(value) < 1.0e-12:
-            value = 0.0
-        if value > 1.0 and abs(value - 1.0) < 1.0e-12:
-            value = 1.0
-        return min(1.0, max(0.0, value))
+        return _backend_to_float(ar.do("clip", ar.do("real", value), 0.0, 1.0))
 
     @staticmethod
     def _trace_scalar(value):
@@ -1222,6 +1255,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     tuple(getattr(metric, "fit_diagnostics", ()))
                 )
 
+    @timed_phase("fidelity")
     def estimate_infidelity(
         self, state, target, *, evaluation_chi=None, evaluation_max_retries=None, **kwargs,
     ):
@@ -1231,7 +1265,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         finite-cap estimates retry at equal, doubled norm/overlap caps, at most
         ``evaluation_max_retries`` times (default two). Each retry warns and
         is recorded by :meth:`get_evaluation_records`; zero disables retries.
-        Persistent invalid estimates raise rather than being silently clipped.
+        Approximate values outside [0, 1] within ``evaluation_negative_tol``
+        warn and are clipped without retries; raw estimates remain recorded.
+        Larger persistent invalid estimates raise.
         """
         retries = self.evaluation_max_retries if evaluation_max_retries is None else (
             self._validate_evaluation_retries(evaluation_max_retries)
@@ -1254,6 +1290,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         record = {"requested_chi": opts["chi"], "attempts": []}
         self.evaluation_records.append(record)
         roundoff_tol = _resolve_gate_cutoff(state, "auto")
+        negative_tol = roundoff_tol if str(opts.get("method", "dmrg")).lower() == "exact" else max(
+            roundoff_tol, self.evaluation_negative_tol,
+        )
         for attempt in range(retries + 1):
             self._last_evaluation_chi = opts["chi"]
             result = boundary_infidelity(state, target, **opts)
@@ -1264,7 +1303,26 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             raw = result.get("infidelity") if isinstance(result, Mapping) else result
             value = None if raw is None else _backend_to_float(raw)
             record["attempts"].append({"chi": opts["chi"], "infidelity": value})
-            if value is None or not math.isfinite(value) or value >= -roundoff_tol:
+            if (value is not None and math.isfinite(value)
+                    and -negative_tol <= value <= 1.0 + negative_tol
+                    and (value < -roundoff_tol or value > 1.0 + roundoff_tol)):
+                bounded = self._clip_fidelity(value)
+                record.update(
+                    effective_chi=opts["chi"], raw_infidelity=value,
+                    infidelity=bounded, clipped_negative=value < 0,
+                    clipped_infidelity=True, negative_tolerance=negative_tol,
+                )
+                description = "Small negative" if value < 0 else "Above-one"
+                bound_label = "zero" if bounded == 0 else "one"
+                warnings.warn(
+                    f"{description} approximate PEPS infidelity ({value:.3e}) "
+                    f"at evaluation chi={opts['chi']!r}; continuing with {bound_label} "
+                    f"within tolerance {negative_tol:.3e}. Raw estimate retained in diagnostics.",
+                    RuntimeWarning, stacklevel=2,
+                )
+                return bounded
+            if (value is None or not math.isfinite(value)
+                    or -roundoff_tol <= value <= 1.0 + roundoff_tol):
                 record["effective_chi"] = opts["chi"]
                 return self._clean_infidelity(value, roundoff_tol=roundoff_tol)
             if (
@@ -1272,8 +1330,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 or str(opts.get("method", "dmrg")).lower() == "exact"
                 or opts["norm"] is not None or opts["norm_target"] is not None
             ):
+                violation = "negative" if value < 0 else "above one"
                 raise ValueError(
-                    f"PEPS infidelity is substantially negative ({value:.3e}) "
+                    f"PEPS infidelity is substantially {violation} ({value:.3e}) "
                     f"at evaluation chi={opts['chi']!r}; increase metric accuracy. "
                     "When assuming unit target norm, increase normalize_chi "
                     "as well, or set infidelity_kwargs={'norm_target': None} "
@@ -1518,6 +1577,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.infidelities.append(float(1.0 - cumulative_fidelity))
         return float(fidelity), float(geometric_fidelity)
 
+    @timed_phase("sweep")
     def _optimize_with_sweep(
         self,
         state,
@@ -1548,6 +1608,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             init_kwargs["boundary_options"] = dict(self.boundary_options)
         init_kwargs.update(self.sweep_kwargs)
         init_kwargs.update(dict(sweep_kwargs or {}))
+        init_kwargs.setdefault("evaluation_negative_tol", self.evaluation_negative_tol)
         # ``full_simplify`` is not backend-safe for Symmray block trees. Make
         # the supported default explicit here so SweepOptimizer does not need
         # to correct it (and warn) during construction. An explicit
@@ -1618,12 +1679,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             final_infidelity = result.get("best_loss")
             if final_infidelity is None:
                 final_infidelity = result.get("loss_after")
-        return (
-            state_out,
-            self._clean_infidelity(final_infidelity),
-            self._summarize_sweep_result(result),
-        )
+        summary = self._summarize_sweep_result(result)
+        return state_out, self._clean_optimizer_infidelity(final_infidelity, summary), summary
 
+    @timed_phase("global")
     def _optimize_with_global(
         self,
         state,
@@ -1643,8 +1702,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opt_kwargs = _merge_opts(self.global_optimize_kwargs, global_optimize_kwargs)
         opt_kwargs = self._apply_global_optimizer_options(opt_kwargs)
 
+        autodiff_backend = str(opt_kwargs.get("autodiff_backend", "torch")).lower()
+        # Keep global boundary truncation separate from gate/warm-start cutoff.
+        # Explicit per-metric constructor options below retain precedence.
+        global_cutoff = 1.0e-10 if autodiff_backend == "torch" else cutoff
         norm_defaults = self._global_contraction_defaults(
-            cutoff=cutoff,
+            cutoff=global_cutoff,
             progress=False,
         )
         normalize_defaults = dict(norm_defaults)
@@ -1653,10 +1716,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             if normalize_chi is _UNSET_METRIC_CHI else normalize_chi
         )
         loss_defaults = self._global_loss_defaults(
-            cutoff=cutoff,
+            cutoff=global_cutoff,
             progress=False,
         )
-        if str(opt_kwargs.get("autodiff_backend", "torch")).lower() == "jax":
+        if autodiff_backend == "jax":
             # JIT needs fixed SVD ranks. Exponent stripping currently converts
             # JAX scalars to Python, losing gradients even without JIT.
             loss_defaults.update(cutoff=0.0, strip_exponent=False)
@@ -1736,11 +1799,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             fallback_error=fallback_error,
         )
         summary.update(getattr(optimizer, "optimization_info", {}))
-        return (
-            state_out,
-            self._clean_infidelity(final_infidelity),
-            summary,
-        )
+        return state_out, self._clean_optimizer_infidelity(final_infidelity, summary), summary
 
     def _summarize_sweep_result(self, result):
         """Return scalar sweep diagnostics without retaining TN objects."""
@@ -1748,13 +1807,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not isinstance(result, Mapping):
             return summary
 
-        for key in ("success", "termination_reason", "converged", "early_exit"):
+        for key in ("success", "termination_reason", "converged", "early_exit",
+                    "initial_loss_reused", "final_loss_measured"):
             if key in result:
                 summary[key] = result[key]
 
         for key in (
             "loss_before",
             "loss_after",
+            "raw_loss_after",
             "best_loss",
             "bdy_norm",
             "bdy_overlap_norm",
@@ -1765,6 +1826,27 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         runs = result.get("runs")
         if runs is not None:
             summary["n_runs"] = len(runs)
+            summary["clipped_loss_records"] = [
+                {key: run[key] for key in (
+                    "axis", "index", "raw_loss_initial", "raw_loss_final",
+                    "loss_initial", "loss_final",
+                ) if key in run}
+                for run in runs
+                if any(run.get(key, 0.0) < 0 for key in ("raw_loss_initial", "raw_loss_final"))
+            ]
+            if getattr(self, "_phase_timer", None) is not None:
+                # Existing slice timers are host wall times, not CUDA events.
+                # Their sum excludes sweep setup and whole-state diagnostics.
+                summary["timing"] = {
+                    "synchronized": False,
+                    "boundary_seconds": sum(float(r.get("time_boundary", 0.0)) for r in runs),
+                    "optimize_seconds": sum(float(r.get("time_optimize", 0.0)) for r in runs),
+                    "slices": [
+                        {k: r[k] for k in ("sweep", "axis", "index", "time_boundary", "time_optimize")
+                         if k in r}
+                        for r in runs
+                    ],
+                }
         for source_key, target_key in (
             ("loss", "loss_count"),
             ("step_loss_trace", "step_loss_count"),
@@ -1975,6 +2057,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
         return postfix
 
+    @profile_run
     def run(  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
         self,
         *,
@@ -2005,6 +2088,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         global_kwargs: Mapping[str, Any] | None = None,
         global_optimize_kwargs: Mapping[str, Any] | None = None,
         reset_traces=True,
+        timing=False,
+        timing_sync_device=False,
+        step_callback=None,
     ):
         """Run the queued gate stream and return the compressed state.
 
@@ -2102,10 +2188,22 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             ``run()`` again still applies the queued gates to the current
             state; this flag controls only the recorded losses, infidelities,
             step records, and normalization events.
+        timing : bool, default=False
+            Record per-batch and per-run target, compression, normalization,
+            fidelity, and optimizer phase wall times. Sweep summaries include
+            the existing boundary-update and local-solve slice timings.
+        timing_sync_device : bool, default=False
+            Synchronize at outer phase boundaries when timing is enabled.
+            Inner sweep slice times remain unsynchronized host wall times.
+        step_callback : callable | None, optional
+            Called after each completed two-site batch with a detached scalar
+            record. Allows incremental diagnostic output during long runs.
         """
         # Resolve on every run, before normalization or gate application. A
         # replacement state can have a different dtype. Quimb compress_all
         # and global cleanup must receive concrete numerical policies.
+        if step_callback is not None and not callable(step_callback):
+            raise TypeError("step_callback must be callable or None")
         cutoff = _resolve_gate_cutoff(self.state, cutoff)
         cutoff_mode = _resolve_gate_cutoff_mode(cutoff_mode)
         infidelity_tol = self._resolve_infidelity_tol(infidelity_tol)
@@ -2212,6 +2310,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 final_state = self.state
                 idx += 1
             elif site_count == 2:
+                timing_before = self._phase_timer.snapshot() if self._phase_timer else None
+                evaluation_start = len(self.evaluation_records)
                 state_before = self.state
                 if k_2q_batch == "auto":
                     batch_entries, two_site_in_batch, next_idx, target, batch_stop, batch_bond_limit = (
@@ -2324,6 +2424,37 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 if hasattr(warmstart, "copy")
                                 else warmstart
                             )
+                        effective_sweep_options = _merge_opts(
+                            self.sweep_optimize_kwargs, sweep_optimize_kwargs,
+                        )
+                        if run_mode == "sweep" and not effective_sweep_options.get("debug", False):
+                            # The outer postcheck evaluates the retained candidate
+                            # after normalization. Keep that authoritative check.
+                            if (measure_infidelity and measure_final_infidelity
+                                    and not effective_sweep_options.get("debug_loss_kwargs")):
+                                effective_sweep_options.setdefault("compute_final_loss", False)
+                            # Direct compression is independent of the boundary
+                            # warm start and iteration budget. Reuse a precheck
+                            # only for the identical default metric policy/caps;
+                            # customized metrics keep a separate sweep check.
+                            if (
+                                pre_infidelity is not None
+                                and self.boundary_kwargs == {
+                                    **_DEFAULT_BOUNDARY_KWARGS, "fit_mode": "direct",
+                                }
+                                and not self.infidelity_kwargs and not infidelity_kwargs
+                                and not self.sweep_kwargs and not sweep_kwargs
+                                and not self.boundary_options
+                                and normalize_boundary_engine(
+                                    self.boundary_engine, warmstart, target,
+                                ) == "dmrg"
+                                and step_evaluation_chi == self.boundary_chi
+                                and not effective_sweep_options.get("debug_loss_kwargs")
+                                and not effective_sweep_options.get("renormalize", False)
+                                and not effective_sweep_options.get("normalize_boundaries", False)
+                                and "chi" not in effective_sweep_options
+                            ):
+                                effective_sweep_options.setdefault("initial_loss", pre_infidelity)
                         final_state, opt_infidelity, optimizer_result = self._optimize_state(
                             warmstart,
                             target,
@@ -2334,7 +2465,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff=cutoff,
                             normalize_chi=normalize_chi,
                             sweep_kwargs=sweep_kwargs,
-                            sweep_optimize_kwargs=sweep_optimize_kwargs,
+                            sweep_optimize_kwargs=effective_sweep_options,
                             global_kwargs=global_kwargs,
                             global_optimize_kwargs=global_optimize_kwargs,
                         )
@@ -2423,6 +2554,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "normalize_chi": normalize_chi,
                     "evaluation_chi": evaluation_chi,
                     "effective_evaluation_chi": step_evaluation_chi,
+                    "evaluation_records": deepcopy(self.evaluation_records[evaluation_start:]),
                     "cutoff": cutoff,
                     "cutoff_mode": cutoff_mode,
                     "infidelity_tol": infidelity_tol,
@@ -2438,6 +2570,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "optimizer_result": optimizer_result,
                 }
                 self.step_records.append(record)
+                if timing_before is not None:
+                    record["timing"] = self._phase_timer.since(timing_before)
+                if step_callback is not None:
+                    step_callback(deepcopy(record))
                 idx = next_idx
             else:
                 raise ValueError("PepsOptimizer supports one- and two-site gates only.")
@@ -2501,6 +2637,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     def get_step_records(self):
         """Return gate-batch records, stopping reasons and effective metric caps."""
         return list(self.step_records)
+
+    def get_timing(self):
+        """Return detached phase totals for the last run, including failures."""
+        return deepcopy(getattr(self, "_last_timing", {}))
 
     def get_normalizations(self):
         """Return lightweight normalization events recorded by this optimizer."""

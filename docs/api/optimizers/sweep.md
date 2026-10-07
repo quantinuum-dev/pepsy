@@ -42,18 +42,51 @@ An explicit `renormalize_kwargs["chi"]` takes precedence for that initial call.
 The latest metric diagnostics are available as `optimizer.fit_diagnostics`,
 and sweep runs also return them under the `fit_diagnostics` result key.
 
-An initial infidelity estimate that is nonfinite or below `-1e-10` stops
+Fidelity diagnostics use Autoray `clip(real(value), 0, 1)` on their array
+backend. The differentiable local objective remains unclipped to preserve
+gradients. `evaluation_negative_tol=1e-3` allows approximate diagnostic losses
+outside [0,1] by up to 0.001: a warning is emitted once per sweep run and their
+values are clipped for convergence/best-state bookkeeping. The historical
+option name covers both ends of the interval. The existing `1e-10`
+roundoff allowance is a lower bound; zero restores that older allowance.
+Raw local losses remain in `raw_loss_initial`, `raw_loss_final`, and solver
+`history`; whole-sweep raw values remain in `loss_before` and `raw_loss_after`.
+This diagnostic tolerance does not establish exact unit fidelity.
+
+An initial infidelity estimate that is nonfinite or outside [0,1] beyond the allowance stops
 cleanup without changing the warm start. The result reports `success=False`,
 `converged=False`, and `termination_reason="invalid_initial_loss"`; the raw
 estimate remains in `loss_before`, while `loss_after` and `best_loss` are
-`None`. Negative roundoff within `1e-10` can count as zero for early
-convergence. These safeguards do not increase boundary caps or FIT budgets.
+`None`. These safeguards do not increase boundary caps or FIT budgets.
 
 Local solver output is checked before slice writeback. Nonfinite parameters,
-nonfinite losses, or losses below `-1e-10` are rejected with a warning and
+nonfinite losses, or losses outside [0,1] beyond the allowance are rejected with a warning and
 `invalid_loss=True`. The previous slice is retained. `loss_final` describes
 that retained slice; `candidate_loss` and `rejection_reason` describe the
 rejected result. Boundary accuracy remains the caller's responsibility.
+
+Sweep setup uses lazy boundary containers for direct compression, including
+after restoring the best state. Boundary values are constructed when needed;
+this does not reuse stale contraction values after a tensor update.
+
+Local objectives cache contraction paths within each fixed slice environment
+by ordered indices and shapes. Tensor values and gradients are recomputed.
+`cache_contraction_paths=False` disables this cache. Explicit optimizer/tree
+objects retain their original handling, including sliced contractions.
+Contraction-cost estimates are opt-in with constructor
+`collect_contraction_metrics=True`; otherwise `flops`/`peak_*` are omitted.
+Average boundary-MPS norm reports are also opt-in through
+`set_optimize_kwargs(collect_boundary_norms=True)`. Their default `None` values
+avoid extra per-slice contractions and unused boundary construction; this does
+not disable physical normalization or the norm in the local objective.
+
+An owning driver can use `set_optimize_kwargs(initial_loss=..., compute_final_loss=False)`
+when it already measured the initial loss for these exact inputs/policy and
+will perform its own final acceptance check. Without overrides, standalone
+sweeps retain their initial/final checks. A skipped final check returns
+`loss_after=None`; `best_loss` still describes the chosen sweep candidate.
+Result fields `initial_loss_reused` and `final_loss_measured` distinguish the
+two paths. Round-trip budgets are unchanged.
 
 `SweepOptimizer.infidelity(...)` inherits constructor FIT controls when they
 are omitted. Passing `fit_rtol=None` explicitly disables adaptive stopping for

@@ -190,7 +190,7 @@ def test_measured_target_norm_identity_update_retries_inconsistent_boundary_metr
     state = qtn.PEPS.rand(4, 4, bond_dim=2, dtype="complex128", seed=17)
     before = state.to_dense().reshape(-1)
     opt = PepsOptimizer(state, [(np.eye(4), ((1, 1), (1, 2)))], chi=2,
-                        contraction_opt="greedy")
+                        contraction_opt="greedy", evaluation_negative_tol=0)
     with pytest.warns(RuntimeWarning, match="Invalid PEPS boundary infidelity"):
         out = opt.run(infidelity_kwargs={"norm_target": None})
     after = out.to_dense().reshape(-1)
@@ -207,7 +207,7 @@ def test_measured_target_norm_identity_update_retries_inconsistent_boundary_metr
 def test_unit_target_norm_identity_requires_accurate_normalization(accurate):
     state = qtn.PEPS.rand(4, 4, bond_dim=2, dtype="complex128", seed=17)
     opt = PepsOptimizer(state, [(np.eye(4), ((1, 1), (1, 2)))], chi=2,
-                        contraction_opt="greedy",
+                        contraction_opt="greedy", evaluation_negative_tol=0,
                         **({"normalize_chi": 32, "evaluation_chi": 32} if accurate else {}))
     if not accurate:
         with pytest.raises(ValueError, match="increase normalize_chi"):
@@ -219,6 +219,23 @@ def test_unit_target_norm_identity_requires_accurate_normalization(accurate):
         expected /= np.linalg.norm(expected)
         np.testing.assert_allclose(vector, expected, atol=2e-12)
         assert opt.step_records[0]["final_infidelity"] == pytest.approx(0., abs=1e-12)
+
+
+@pytest.mark.parametrize("mode", ["sweep", "global"])
+def test_default_policy_continues_real_coarse_identity_contraction(mode):
+    state = qtn.PEPS.rand(4, 4, bond_dim=2, dtype="complex128", seed=17)
+    opt = PepsOptimizer(state, [(np.eye(4), ((1, 1), (1, 2)))], chi=2,
+                        mode=mode, contraction_opt="greedy")
+    with pytest.warns(RuntimeWarning, match="continuing with zero"):
+        out = opt.run()
+    before, after = state.to_dense().reshape(-1), out.to_dense().reshape(-1)
+    fidelity = abs(np.vdot(before, after)) ** 2 / (np.vdot(before, before).real * np.vdot(after, after).real)
+    assert fidelity == pytest.approx(1., abs=1e-12)
+    assert opt.step_records[0]["reason"] == "below_tol"
+    metric = opt.get_evaluation_records()[0]
+    assert -1e-3 < metric["raw_infidelity"] < -1e-5
+    assert metric["infidelity"] == 0.
+    assert len(metric["attempts"]) == 1
 
 
 @pytest.mark.parametrize("constructor_options,run_options,known", [
@@ -250,7 +267,10 @@ def test_run_target_norm_policy_skips_actual_target_contraction(
     assert all(result["norm_result"] is not None for result in results)
 
 
-def test_default_sweep_skips_all_target_contractions_and_duplicate_normalization(monkeypatch):
+@pytest.mark.parametrize("fit_mode,overlap_checks", [("eff", 3), ("direct", 2)])
+def test_default_sweep_skips_all_target_contractions_and_duplicate_normalization(
+    monkeypatch, fit_mode, overlap_checks,
+):
     contractions = []
     normalize_calls = []
     contract = boundary_metrics._contract_peps_double_layer
@@ -270,9 +290,11 @@ def test_default_sweep_skips_all_target_contractions_and_duplicate_normalization
     monkeypatch.setattr(peps_mod, "boundary_normalize", parent_norm)
     monkeypatch.setattr(sweep_mod, "peps_normalize", sweep_norm)
     opt = PepsOptimizer(_product(2, 2), [(_unitary(), ((0, 0), (0, 1)))],
-                        chi=1, contraction_opt="greedy")
+                        chi=1, contraction_opt="greedy", fit_mode=fit_mode)
     out = opt.run()
-    assert contractions.count("bdy_overlap") == 4  # Outer and sweep pre/post.
+    # Always retain outer pre/post checks. Only iterative FIT needs its own
+    # initial diagnostic; direct compression reuses the matching outer check.
+    assert contractions.count("bdy_overlap") == overlap_checks
     assert [owner for owner, _ in normalize_calls] == ["driver"] * 3
     assert opt.step_records[0]["optimizer_result"]["invalid_inner_loss_count"] == 0
     assert np.linalg.norm(out.to_dense()) == pytest.approx(1., abs=1e-12)
@@ -387,6 +409,118 @@ def test_metric_retries_are_bounded_and_can_be_disabled(monkeypatch):
     with pytest.raises(ValueError, match="substantially negative"):
         opt.estimate_infidelity(opt.state, opt.state, evaluation_max_retries=0)
     assert calls == [(4, 5)]
+
+
+@pytest.mark.parametrize("raw_error", [-6.86e-10, -3.267e-6, -5e-4])
+def test_small_negative_metric_continues_gate_stream_and_preserves_raw_error(monkeypatch, raw_error):
+    import json
+
+    gates = [(_unitary(), ((0, 0), (0, 1)))] * 2
+    reference = PepsOptimizer(_product(2, 2), gates, chi=1, contraction_opt="greedy")
+    expected = reference.run(optimize=False, measure_infidelity=False, k_2q_batch=1)
+    calls = []
+    values = iter([raw_error, 2e-10])
+
+    def metric(*args, **kwargs):
+        calls.append(kwargs)
+        return {"infidelity": next(values)}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", metric)
+    opt = PepsOptimizer(_product(2, 2), gates, chi=1, contraction_opt="greedy")
+    streamed = []
+    with pytest.warns(RuntimeWarning, match="Small negative approximate PEPS infidelity"):
+        output = opt.run(k_2q_batch=1, step_callback=streamed.append)
+    assert len(calls) == len(streamed) == 2
+    assert all(c["norm_target"] == 1.0 for c in calls)
+    assert streamed[0]["final_infidelity"] == 0.0
+    assert streamed[1]["final_infidelity"] == 2e-10
+    diagnostic = streamed[0]["evaluation_records"][0]
+    assert diagnostic["clipped_negative"]
+    assert diagnostic["raw_infidelity"] == raw_error
+    assert diagnostic["attempts"] == [{"chi": (4, 5), "infidelity": raw_error}]
+    assert not any(r["optimizer_attempted"] for r in streamed)
+    assert opt.get_evaluation_records()[0] == diagnostic
+    json.dumps(streamed)
+    np.testing.assert_allclose(output.to_dense(), expected.to_dense(), atol=1e-12)
+
+
+@pytest.mark.parametrize("value,options,metric_options", [
+    (-6.86e-10, {"evaluation_negative_tol": 0}, {}),
+    (-6.86e-10, {}, {"method": "exact"}),
+    (-1.01e-3, {}, {}),
+    (1.00101, {}, {}),
+    (1.0005, {}, {"method": "exact"}),
+    (float("nan"), {}, {}),
+    (float("inf"), {}, {}),
+])
+def test_negative_allowance_keeps_strict_and_nonfinite_guards(
+    monkeypatch, value, options, metric_options,
+):
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", lambda *a, **kw: {"infidelity": value})
+    opt = PepsOptimizer(_product(2, 2), chi=1, **options)
+    with pytest.raises(ValueError, match="negative|finite|above one"):
+        opt.estimate_infidelity(opt.state, opt.state, norm_target=1., **metric_options)
+
+
+@pytest.mark.parametrize("tolerance", [-1., float("nan"), float("inf")])
+def test_negative_allowance_requires_finite_nonnegative_tolerance(tolerance):
+    with pytest.raises(ValueError, match="evaluation_negative_tol"):
+        PepsOptimizer(_product(2, 2), chi=1, evaluation_negative_tol=tolerance)
+
+
+def test_negative_allowance_can_be_configured(monkeypatch):
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", lambda *a, **kw: {"infidelity": -2e-8})
+    opt = PepsOptimizer(_product(2, 2), chi=1, evaluation_negative_tol=3e-8)
+    with pytest.warns(RuntimeWarning, match="continuing with zero"):
+        assert opt.estimate_infidelity(opt.state, opt.state, norm_target=1.) == 0.
+    assert opt.get_evaluation_records()[0]["negative_tolerance"] == 3e-8
+
+
+def test_above_one_metric_clips_without_retry_and_retains_raw_value(monkeypatch):
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", lambda *a, **kw: {"infidelity": 1.0005})
+    opt = PepsOptimizer(_product(2, 2), chi=1)
+    with pytest.warns(RuntimeWarning, match="continuing with one"):
+        assert opt.estimate_infidelity(opt.state, opt.state, norm_target=1.) == 1.
+    record = opt.get_evaluation_records()[0]
+    assert record["raw_infidelity"] == 1.0005
+    assert record["clipped_infidelity"] and not record["clipped_negative"]
+    assert len(record["attempts"]) == 1
+
+
+@pytest.mark.parametrize("mode", ["sweep", "global"])
+@pytest.mark.parametrize("raw_loss", [-3.267e-6, -5e-4, 1.0005])
+def test_inner_loss_clipping_keeps_gate_stream_and_outer_acceptance(monkeypatch, mode, raw_loss):
+    class FakeOptimizer:
+        def __init__(self, state, **kwargs):
+            self.state = state
+            self.losses = [raw_loss]
+            self.final_loss = raw_loss
+
+        def set_optimize_kwargs(self, **kwargs):
+            pass
+
+        def run(self):
+            return {"best_state": self.state, "best_loss": raw_loss}
+
+        def optimize_nlopt(self, **kwargs):
+            return self.state
+
+    monkeypatch.setattr(peps_mod, "SweepOptimizer", FakeOptimizer)
+    monkeypatch.setattr(peps_mod, "GlobalOptimizer", FakeOptimizer)
+    estimates = iter([.1, .05, .1, .05])
+    monkeypatch.setattr(peps_mod, "boundary_infidelity",
+                        lambda *a, **kw: {"infidelity": next(estimates)})
+    opt = PepsOptimizer(_product(2, 2), [(_unitary(), ((0, 0), (0, 1)))] * 2,
+                        chi=1, mode=mode, contraction_opt="greedy", register_torch_svd=False)
+    with pytest.warns(RuntimeWarning, match="continuing with"):
+        opt.run(k_2q_batch=1)
+    assert len(opt.step_records) == 2
+    for record in opt.step_records:
+        assert record["optimized"]
+        assert record["post_infidelity"] == record["final_infidelity"] == .05
+        assert record["optimizer_infidelity"] == np.clip(raw_loss, 0., 1.)
+        assert record["optimizer_result"]["raw_infidelity"] == raw_loss
+        assert record["optimizer_result"]["clipped_infidelity"]
 
 
 def test_temporary_run_mode_does_not_change_configured_backend():

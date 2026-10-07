@@ -12,7 +12,42 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Fixed
+
+- Torch-backed gradient and finite-difference solvers now own their parameter
+  storage, preserving caller tensors and NumPy inputs during in-place trial
+  updates. Rejected PEPS sweeps therefore restore the unchanged normalized
+  warm start instead of a snapshot contaminated by solver writes.
+
 ### Added
+
+- Torch PEPS global norm/overlap contractions default to `cutoff=1e-10`,
+  separately from gate/warm-start truncation. Explicit metric options win.
+  JAX global objectives retain `cutoff=0`, JIT enabled, and Pepsy's registered
+  SVD derivative; Torch retains the registered stabilized SVD/QR policy.
+
+- PEPS sweeps reuse matching direct-boundary prechecks and avoid duplicate
+  final diagnostics when the driver performs the acceptance check. Direct
+  boundary containers initialize lazily; local contraction paths are reused
+  within unchanged slice topology/shapes. Cost estimates and boundary-MPS norm
+  reports are opt-in. Solver budgets and the final acceptance check are retained.
+
+- `PepsOptimizer(evaluation_negative_tol=1e-3)` warns and continues for small
+  out-of-range approximate infidelity estimates, clipping to [0,1] for bookkeeping while
+  preserving raw values in evaluation and batch diagnostics. Set zero to
+  restore roundoff-only handling. Exact metrics and larger invalid estimates
+  keep their existing safeguards.
+  Sweep diagnostics apply the same configurable allowance and backend-native
+  Autoray clipping, retain raw local losses, and leave gradients unclipped.
+  Global and sweep optimizer return values use the same allowance before outer
+  acceptance checks; small inner errors no longer abort the gate stream.
+
+- `PepsOptimizer.run(timing=True)` records target construction, compression,
+  normalization, fidelity checks, and sweep/global optimization phase times.
+  Batch records retain phase deltas and sweep summaries retain boundary/local
+  solve timings per slice. `get_timing()` reports the last run, including failed
+  runs; `timing_sync_device=True` adds opt-in outer-phase accelerator barriers.
+  An optional `step_callback` streams detached completed-batch diagnostics.
 
 - `PepsOptimizer(mode="global")` now defaults to `jit_fn=True` and loss
   options `cutoff=0`, `strip_exponent=False` when JAX autodiff is selected.

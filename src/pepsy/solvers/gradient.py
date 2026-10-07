@@ -261,9 +261,12 @@ def _as_trainable_tensor(value: Any) -> torch.Tensor:
         tensor = torch.as_tensor(value)
     if not (tensor.is_floating_point() or tensor.is_complex()):
         tensor = tensor.to(dtype=torch.float64)
-    # Ensure contiguous memory layout — torch.optim.LBFGS calls .view(-1) on
-    # gradients which fails on non-contiguous (e.g. strided complex) tensors.
-    return tensor.contiguous().requires_grad_(True)
+    # Solvers write trial iterates in place. Neither detach() nor contiguous()
+    # guarantees independent storage: caller tensors, NumPy arrays, and saved
+    # tensor-network rollback states could otherwise change during a solve.
+    # Clone once on the original device, also making strided inputs contiguous
+    # for torch.optim.LBFGS's gradient .view(-1).
+    return tensor.clone(memory_format=torch.contiguous_format).requires_grad_(True)
 
 
 def _scalar_real_loss(loss: Any, imag_tol: float = 1e-10) -> torch.Tensor:
@@ -2188,6 +2191,8 @@ def optimize_packed_params(
     params_init : dict[str, Any]
         Initial parameter values. SciPy/NLopt preserve native Torch or JAX
         arrays on their current device; NumPy inputs use Torch by default.
+        Solver parameters own their storage; trial updates and returned
+        parameters do not mutate the supplied arrays.
     loss_fn : callable
         ``loss_fn(params) -> scalar tensor``.  Must be differentiable when
         using autograd-based solvers.
