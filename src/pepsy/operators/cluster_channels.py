@@ -286,6 +286,7 @@ class ClusterChannelPlan:
         constants only; it never captures a parameter graph or input values.
         """
         namespace = _array_namespace(like)
+        einsum = namespace.einsum
         gathered, equations = self._projection_weights()
         # A real input needs a complex output if its reference basis is complex.
         complex_basis = any(np.iscomplexobj(w) and np.any(w.imag) for s in gathered for w in s)
@@ -299,7 +300,7 @@ class ClusterChannelPlan:
                 raise ValueError('packed blocks must contain one array per site.')
             # Torch einsum requires identical operand dtypes. Adding a scalar
             # zero promotes a real input when a frozen basis is complex.
-            return tuple(namespace.einsum(equation, *site, value + site[0][0, 0]*0 if site else value)
+            return tuple(einsum(equation, *site, value + site[0][0, 0]*0 if site else value)
                          for equation, site, value in zip(equations, weights, values))
 
         return project

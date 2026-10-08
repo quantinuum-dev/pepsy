@@ -133,6 +133,18 @@ def test_smart_scheduler_finishes_commuting_strips_despite_local_rotations():
     assert all(len(fixed_gate_sites(opt, entry)) == 2 for _, entry in ordered[:12])
 
 
+def test_smart_scheduler_unlocks_pairs_through_chained_local_dependencies():
+    a, b, c, d = (0, 0), (0, 1), (1, 0), (1, 1)
+    gates = [(rotation('ZZ'), (a, b)), (rotation('X'), b), (rotation('Z'), b),
+             (rotation('XX'), (b, d)), (rotation('Y'), d), (rotation('X'), d),
+             (rotation('ZZ'), (c, d)), (rotation('Y'), c), (rotation('ZZ'), (a, c))]
+    opt = queue(gates)
+    ordered = order_gates(opt, 'smart')
+    assert [i for i, _ in ordered] == list(range(len(gates)))
+    np.testing.assert_allclose(dense_circuit([e for _, e in ordered], [a, b, c, d]),
+                               dense_circuit(opt.gates, [a, b, c, d]), atol=1e-12)
+
+
 @pytest.mark.parametrize('backend', ['torch', pytest.param('cupy', marks=pytest.mark.optional)])
 def test_full_update_smart_refinement_spans_required_local_rotations(backend, monkeypatch):
     convert = converter(backend)
@@ -187,6 +199,42 @@ def test_failed_smart_run_restores_the_unfused_queue():
         opt.run(k_2q_batch=3)
     assert opt.gates is original and len(original) == 3
     assert opt.last_gate_order['original_step_groups'] == [[1, 2], [3]]
+
+
+def test_nonunitary_single_site_normalization_preserves_active_strip_target(monkeypatch):
+    torch = pytest.importorskip('torch')
+    state = qtn.PEPS.rand(2, 3, bond_dim=1, dtype='complex128', seed=24)
+    state.apply_to_arrays(torch.tensor)
+    state /= state.norm()
+    pair = torch.tensor(rotation('ZZ'))
+    single = torch.tensor(np.cosh(.2) * PAULI['I'] + np.sinh(.2) * PAULI['X'])
+    gates = [(pair, ((0, 0), (0, 1))), (single, (0, 1)),
+             (pair, ((0, 1), (0, 2)))]
+    opt = PepsOptimizer(
+        state, gates, chi=2, mode='full-update', gate_order='smart',
+        normalize_initial=False, contraction_opt='greedy', fit_mode='direct',
+        boundary_chi=16, normalize_chi=16, boundary_convergence=False,
+        full_update_kwargs={'refine_sweeps': 1, 'max_iterations': 4},
+    )
+    expected = dense_circuit(opt.gates[:2], list(state.gen_site_coos()), ar.to_numpy(state.to_dense()))
+    expected /= np.linalg.norm(expected)
+    build = opt._build_target
+    observed = []
+    def check_target(target, gate, where, *args, **kwargs):
+        if where == gates[-1][1]:
+            # Observe both states after the intervening nonunitary single and
+            # before the next pair can normalize or refine either one again.
+            observed.append(True)
+            np.testing.assert_allclose(ar.to_numpy(target.to_dense()), expected, atol=1e-11)
+            np.testing.assert_allclose(ar.to_numpy(opt.state.to_dense()), expected, atol=1e-11)
+        return build(target, gate, where, *args, **kwargs)
+    monkeypatch.setattr(opt, '_build_target', check_target)
+    out = opt.run(non_unitary=True, normalize_final=False, measure_infidelity=False,
+                  measure_final_infidelity=False, accept_if_improved=False)
+    assert observed == [True]
+    exact = dense_circuit(opt.gates, list(state.gen_site_coos()), ar.to_numpy(state.to_dense()))
+    exact /= np.linalg.norm(exact)
+    np.testing.assert_allclose(ar.to_numpy(out.to_dense()), exact, atol=1e-11)
 
 
 @pytest.mark.parametrize('shape', [(3, 4), (4, 3)])

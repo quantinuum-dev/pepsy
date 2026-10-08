@@ -259,6 +259,30 @@ def _strict_converged(max_mdiff: float, tol: float, tol_abs: float | None) -> bo
     return bool(np.isfinite(max_mdiff) and max_mdiff < threshold)
 
 
+def _run_bp_strict(bp, run_opts):
+    """Confirm scheduler convergence within the caller's iteration budget.
+
+    Quimb can stop on an empty pending queue after a large final update.
+    Running again checks all messages when that queue is empty. Preserve its
+    local schedule and explicitly requested rolling convergence policy.
+    """
+    options = dict(run_opts)
+    budget = options["max_iterations"]
+    info = options["info"]
+    iterations = 0
+    while iterations < budget:
+        options["max_iterations"] = budget - iterations
+        bp.run(**_quimb_bp_run_options(bp, options))
+        count = int(info.get("iterations", 0))
+        iterations += count
+        if (count <= 0 or not info.get("converged", False)
+                or options.get("tol_rolling_diff") != 0.0
+                or _strict_converged(float(info.get("max_mdiff", float("nan"))),
+                                     options["tol"], options.get("tol_abs"))):
+            break
+    info["iterations"] = iterations
+
+
 def _relay_message_sources(bp, method_key: str) -> dict:
     """Map each relay message key to the tensor/site that sends it.
 
@@ -614,7 +638,7 @@ def one_norm_bp(
         "info": info,
         **_run_options(tol_abs, tol_rolling_diff),
     }
-    bp.run(**_quimb_bp_run_options(bp, run_opts))
+    _run_bp_strict(bp, run_opts)
     max_mdiff = float(info.get("max_mdiff", float("nan")))
     return RelayBPResult(
         bp=bp,
@@ -676,7 +700,7 @@ def two_norm_bp(
         "info": info,
         **_run_options(tol_abs, tol_rolling_diff),
     }
-    bp.run(**_quimb_bp_run_options(bp, run_opts))
+    _run_bp_strict(bp, run_opts)
     max_mdiff = float(info.get("max_mdiff", float("nan")))
     return RelayBPResult(
         bp=bp,
@@ -820,7 +844,7 @@ def relay_bp(
                 "info": info,
                 **_run_options(tol_abs, tol_rolling_diff),
             }
-            bp.run(**_quimb_bp_run_options(bp, run_opts))
+            _run_bp_strict(bp, run_opts)
             iteration = int(info.get("iterations", 0))
             max_mdiff = float(info.get("max_mdiff", float("nan")))
             converged = _strict_converged(max_mdiff, tol, tol_abs)

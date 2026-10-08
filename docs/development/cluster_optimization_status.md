@@ -6,6 +6,16 @@ the backend correction `cf1d84c` and the newer remote work merged at
 `a13031b`. Gaugy's matching API/refinement is published at **`a7af793`**.
 These are development commits, not a new tagged package release.
 
+## Full-suite compatibility follow-up, 2026-10-08
+
+The corrections bind compact-channel backend callables before
+Torch capture. The repository test harness also declares its JAX matrix-product
+precision and allocation policy. See the
+[failure-correction record](notes/2026-10-08-full-suite-failure-corrections.md)
+for fresh scoped/full validation; earlier published results above are unchanged.
+The [publication handoff](../../history/2026-10-08-review-fixes-publication.md)
+records the commit scope and validation limits.
+
 ## Joint notebook solver defaults, 2026-10-06
 
 The subsequent [optimizer review and publication](../../history/2026-10-06-gradient-publication.md)

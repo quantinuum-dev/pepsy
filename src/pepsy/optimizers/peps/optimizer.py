@@ -2414,13 +2414,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         return pair.optimize(norm, self.full_update_kwargs)
 
     @timed_phase('full_update_refinement')
-    def _full_update_refine(self, target, key, *, chi, boundary):
+    def _full_update_refine(self, target, key, *, chi, boundary, overlap_boundary=None):
         from ._strip_update import refine_strip
+        if overlap_boundary is None:
+            overlap_boundary = getattr(self, '_refinement_overlap_boundary', None)
         result, report, boundary, overlap = refine_strip(
             self.state, target, key=key, chi=chi, contraction_opt=self.contraction_opt,
             boundary_kwargs=self.boundary_kwargs, sweeps=self.full_update_kwargs['refine_sweeps'],
             rtol=self.full_update_kwargs['refine_rtol'], rcond=self.full_update_kwargs['rcond'],
-            boundary=boundary, overlap_boundary=getattr(self, '_refinement_overlap_boundary', None),
+            boundary=boundary, overlap_boundary=overlap_boundary,
             reuse=self.boundary_convergence is None or self.boundary_convergence['reuse_environments'],
         )
         self._full_update_boundary = boundary
@@ -2462,10 +2464,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             from tqdm.auto import tqdm
             entries = tqdm(entries, total=len(self.gates), desc='PEPS full-update')
         for step, (gate_payload, where, which) in entries:
+            sample = resolve_backend_sample_data_from_tn(self.state)
+            if ar.infer_backend(sample) in {'torch', 'cupy'}:
+                # Pair reduction and exact strip targets must consume the same
+                # native gate, including when refinement is enabled.
+                gate_payload = infer_backend_converter_from_sample(sample)(gate_payload)
             if self._site_count(where, self.state) == 1:
-                sample = resolve_backend_sample_data_from_tn(self.state)
-                if ar.infer_backend(sample) in {'torch', 'cupy'}:
-                    gate_payload = infer_backend_converter_from_sample(sample)(gate_payload)
                 opts = self._target_gate_options(cutoff=cutoff, cutoff_mode=cutoff_mode,
                                                  gate_kwargs=gate_kwargs)
                 self.state = self._apply_gate_entry(self.state, gate_payload, where, which,
@@ -2475,6 +2479,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         refine_target, gate_payload, where, which, cutoff=0.,
                         cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
                     )
+                if normalize_target:
+                    old_norm = self._normalize_state(
+                        self.state, normalize_chi=normalize_chi, normalize_kwargs=normalize_kwargs,
+                    )
+                    if refine_target is not None:
+                        self._normalize_without_rescaling_sites(
+                            refine_target, getattr(old_norm, 'cost', old_norm),
+                        )
                 continue
             before = self._phase_timer.snapshot() if self._phase_timer else None
             evaluation_start = len(self.evaluation_records)
@@ -2574,6 +2586,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         self._normalize_state(refine_target, normalize_chi=normalize_chi,
                                               normalize_kwargs=normalize_kwargs)
                     refine_calibration = None
+                    refine_overlap_boundary = None
                     if self.boundary_convergence is not None:
                         refine_calibration = self._calibrate_sweep_boundaries(
                             self.state, refine_target, normalize_chi=normalize_chi,
@@ -2581,10 +2594,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         )
                         evaluation_chi = refine_calibration['chi']
                         normalize_chi = evaluation_chi[0]
-                        boundary = refine_calibration.get('fit_boundaries', {}).get('bdy')
-                    refine_chi = normalize_chi if refine_calibration else norm_environment_chi
+                        fit_boundaries = refine_calibration.get('fit_boundaries', {})
+                        boundary = fit_boundaries.get('bdy')
+                        refine_overlap_boundary = fit_boundaries.get('bdy_overlap')
+                        refine_target = refine_calibration.get('fit_target', refine_target)
+                    refine_chi = evaluation_chi if refine_calibration else self.boundary_chi
                     self.state, refinement, boundary = self._full_update_refine(
                         refine_target, key, chi=refine_chi, boundary=boundary,
+                        overlap_boundary=refine_overlap_boundary,
                     )
                     refinement['start_step'] = refine_start
                     refinement['end_step'] = step

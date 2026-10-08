@@ -49,15 +49,15 @@ def _inventory(source):
     return tuple(words), tuple(signature)
 
 
-def _hadamard(values, n, namespace, butterfly):
+def _hadamard(values, n, transpose, butterfly):
     dimension = 1 << n
     for bit in range(n):
         stride = 1 << bit
         blocks = values.reshape(dimension, dimension//(2*stride), 2, stride)
         # Fixed 2x2 contractions avoid backend keyword-translation wrappers
         # inside Torch full-graph capture as well as any factorization.
-        blocks = namespace.transpose(blocks, (0, 1, 3, 2)) @ butterfly
-        values = namespace.transpose(blocks, (0, 1, 3, 2)).reshape(dimension, dimension)
+        blocks = transpose(blocks, (0, 1, 3, 2)) @ butterfly
+        values = transpose(blocks, (0, 1, 3, 2)).reshape(dimension, dimension)
     return values
 
 
@@ -100,6 +100,7 @@ class PauliSpace:
             return lambda value: value.reshape(-1), lambda value: value
         d, n = self.dimension, len(self.sites)
         namespace = _array_namespace(like)
+        transpose = namespace.transpose
         # Arrange R[row, column] as R[column XOR x, column]. The permutation
         # is its own inverse. A Walsh transform then yields the X^x Z^z basis.
         ids = np.array([((column ^ x)*d+column) for x in range(d) for column in range(d)])
@@ -113,14 +114,14 @@ class PauliSpace:
                                                 like=like, dtype=like.dtype), like.dtype)
 
         def transform(value):
-            return _hadamard(value.reshape(-1)[ids].reshape(d, d), n, namespace, butterfly)/d
+            return _hadamard(value.reshape(-1)[ids].reshape(d, d), n, transpose, butterfly)/d
 
         def coordinates(value):
             return transform(value).reshape(-1)[rows]
 
         def project(value):
             coefficients = transform(value)*mask
-            return _hadamard(coefficients, n, namespace, butterfly).reshape(-1)[ids].reshape(d, d)
+            return _hadamard(coefficients, n, transpose, butterfly).reshape(-1)[ids].reshape(d, d)
 
         return coordinates, project
 

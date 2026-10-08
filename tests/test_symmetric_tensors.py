@@ -4569,7 +4569,9 @@ def test_native_fermionic_ctmrg_matches_exact_on_small_double_layer(
     exact = norm.contract(all, optimize="auto-hq")
     ctmrg = pepsy.contract_flat(
         norm,
-        chi=2,
+        # The doubled bond has dimension D**2. A cap of D=2 truncates
+        # nonzero sectors on current Quimb and is not an exact reference.
+        chi=4,
         method="ctmrg",
         progress=False,
         cutoff=1.0e-10,

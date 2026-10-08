@@ -344,7 +344,9 @@ small_arrays = assemble(residuals)
 ```
 
 `bind_assembler` captures constants only, including native charge gathers and
-tree permutations. Rebind after changing backend, dtype or device, and
+tree permutations. Backend transpose/einsum callables are resolved during
+binding so lazy namespace caching does not mutate state during Torch capture.
+Rebind after changing backend, dtype or device, and
 compile separately for each fixed topology and chi. This complete assembly
 kernel has passed full-graph capture and backward on dense/native MPO,
 graph PEPO and square PEPO;

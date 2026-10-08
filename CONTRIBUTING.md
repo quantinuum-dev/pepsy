@@ -37,6 +37,14 @@ python -m pip install -e ".[dev,test-extended]"
 | One domain | `python -m pytest -q -o addopts="" -m vmc` (or `bp`, `tree`, `peps`, etc.) |
 
 The `core` marker alone includes some tests that need optional backends.
+The test harness defaults `JAX_DEFAULT_MATMUL_PRECISION=highest` so numerical
+references use full float32 accumulation on GPUs, and
+`XLA_PYTHON_CLIENT_PREALLOCATE=false` so JAX can share memory with other tested
+backends. Explicit environment settings take precedence. These are test
+defaults; importing Pepsy does not change either setting.
+Tests also restore the public JAX mesh on exit when that API is available,
+so importing NetKet in one test does not pin subsequent CPU tests to a GPU mesh.
+
 Tests skip when a required dependency or upstream capability is unavailable;
 a skipped test is not validation of that path.
 CI prints skip reasons with `-ra`. Add that flag locally when investigating

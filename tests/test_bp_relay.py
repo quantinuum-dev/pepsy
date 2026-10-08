@@ -10,7 +10,7 @@ import warnings
 qtn = pytest.importorskip("quimb.tensor")
 from quimb.tensor.belief_propagation import D1BP  # noqa: E402
 
-from pepsy.bp import RelayBPResult, ScalarClusterCache, one_norm_bp, relay_bp  # noqa: E402
+from pepsy.bp import RelayBPResult, ScalarClusterCache, one_norm_bp, relay_bp, two_norm_bp  # noqa: E402
 from pepsy.bp.relay import _relay_message_sources  # noqa: E402
 
 
@@ -101,6 +101,20 @@ def test_top_level_one_norm_bp_runs_d1bp():
 
     assert result.converged
     assert np.isclose(float(result.contract()), 13.0)
+
+
+def test_two_norm_bp_confirms_residual_without_exceeding_iteration_budget():
+    state = qtn.PEPS.rand(1, 4, bond_dim=2, seed=1908, dtype="complex128")
+    limited = two_norm_bp(state, max_iterations=2, tol=1e-10, diis=False)
+    assert limited.iterations <= 2
+    assert not limited.converged
+    assert limited.max_mdiff > 1e-10
+
+    result = two_norm_bp(state, max_iterations=20, tol=1e-10, diis=False)
+    assert result.iterations <= 20
+    assert result.converged
+    assert result.max_mdiff < 1e-10
+    assert result.contract() == pytest.approx(state.norm() ** 2, rel=1e-10)
 
 
 def test_relay_bp_returns_plain_fixed_point_when_easy():

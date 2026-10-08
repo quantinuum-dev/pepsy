@@ -58,6 +58,21 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Fixed
 
+- PEPS full-update strip refinement honors separate norm and overlap boundary
+  caps, including the complete adaptive calibration pair. Checked overlap
+  handles and target labels are carried into refinement with cache signatures
+  refreshed after bra-index alignment; diagnostics report both caps.
+- Confirm BP's final residual after an upstream pending-queue early stop,
+  within the requested iteration budget; preserve explicit rolling stops.
+- Resolve compact-channel transpose/einsum dispatch before Torch graph capture.
+- Support unfused native fermionic bond axes in the scoped CTMRG projector
+  adapter, and retain one explicit boolean readback for MPS norm validation.
+- PEPS full-update strip refinement accepts NumPy and mismatched-dtype gates
+  through the same native conversion as pair updates. Single-site gates honor
+  target normalization even when final normalization is disabled. Smart gate
+  scheduling updates readiness incrementally, removing cubic predecessor-copy
+  work on overlapping queues while preserving the ordering heuristic.
+
 - Full-update ALS uses dtype-aware `rtol="auto"`, normalized complete-sweep
   stopping, and actual iteration/convergence diagnostics. Public Quimb native
   ALS solves and open overlap networks are reused with QR/LQ regauging between

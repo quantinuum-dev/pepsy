@@ -6,6 +6,26 @@ import sys
 
 import pytest
 
+# Numerical references assume full float32 accumulation, including on GPUs
+# where JAX otherwise permits reduced-precision matrix products. Set this
+# before optional JAX imports; explicit caller settings still take precedence.
+os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
+# Let the full backend matrix share a GPU without JAX reserving most memory.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+
+@pytest.fixture(autouse=True)
+def restore_jax_mesh():
+    """Do not let an optional NetKet import pin later tests to its mesh."""
+    jax = sys.modules.get("jax")
+    get_mesh = getattr(getattr(jax, "sharding", None), "get_mesh", None)
+    previous = get_mesh() if callable(get_mesh) else None
+    yield
+    jax = sys.modules.get("jax")
+    set_mesh = getattr(getattr(jax, "sharding", None), "set_mesh", None)
+    if callable(set_mesh):
+        set_mesh(previous)
+
 
 @pytest.fixture(autouse=True)
 def restore_torch_linalg_policy():

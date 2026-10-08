@@ -139,7 +139,7 @@ def _check_deferred_norm_errors(self):
             return
     # This is an intentional host validation boundary in Torch (and thus a
     # graph break), not a conversion through NumPy's scalar machinery.
-    invalid = bool(pending) if ar.infer_backend(pending) == "torch" else bool(self._real_float(pending))
+    invalid = pending.item() if ar.infer_backend(pending) == "torch" else bool(self._real_float(pending))
     if invalid:
         raise FloatingPointError(
             "Cannot stabilize a unitary FIT state with a zero or non-finite norm."

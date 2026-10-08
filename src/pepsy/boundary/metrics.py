@@ -525,8 +525,12 @@ def quimb_ctmrg_projector_compat():
                     **compress_opts,
                 )
 
+            # Newer Quimb keeps the bond axes unfused for native arrays.
+            # Contract them directly to preserve graded axis ordering.
+            nbond = Rl.ndim - 1
             Ut, st, VHt = oblique_globals["array_split"](
-                Rl @ Rr,
+                ar.do("tensordot", Rl, Rr,
+                      (tuple(range(1, nbond + 1)), tuple(range(nbond)))),
                 max_bond=-1 if max_bond is None else max_bond,
                 cutoff=cutoff,
                 absorb=None,
@@ -548,13 +552,13 @@ def quimb_ctmrg_projector_compat():
                 return out
 
             inverse_sqrt.apply_to_arrays(_inverse_sqrt)
-            Pl = Rr @ oblique_globals["rdmul"](
+            Pl = ar.do("tensordot", Rr, oblique_globals["rdmul"](
                 oblique_globals["dag"](VHt), inverse_sqrt
-            )
-            Pr = oblique_globals["ldmul"](
+            ), ((nbond,), (0,)))
+            Pr = ar.do("tensordot", oblique_globals["ldmul"](
                 inverse_sqrt,
                 oblique_globals["dag"](Ut),
-            ) @ Rl
+            ), Rl, ((1,), (0,)))
 
             # If an entire charge block is empty, both projectors above are
             # zero in that block. Keep a finite identity block so subsequent

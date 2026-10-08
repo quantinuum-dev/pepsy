@@ -202,6 +202,11 @@ Native Symmray contraction supports the validated `projector` route with
 established factorization safeguards. Pepsy capability-checks each selected
 mode against the installed Quimb build at execution time.
 
+The native projector adapter accepts both matrix factors and factors with
+multiple unfused bond axes, preserving their graded contraction order. Exact
+reference comparisons need a cap large enough for the double layer: a PEPS
+bond of dimension D can require D squared before further boundary growth.
+
 ```python
 norm_bp_projectors = pepsy.peps_norm(
     state,

@@ -92,6 +92,32 @@ def math_size(value):
     return np.prod(getattr(value, 'shape', ()))
 
 
+@pytest.mark.parametrize('backend', ['torch', pytest.param('cupy', marks=pytest.mark.optional)])
+@pytest.mark.parametrize('gate_kind', ['numpy', 'native_complex64'])
+def test_refinement_accepts_gate_backend_and_dtype_conversion(backend, gate_kind):
+    state, gate, where = fixture(backend=backend)
+    if gate_kind == 'numpy':
+        supplied = ar.to_numpy(gate)
+    else:
+        supplied = ar.do('astype', gate, 'complex64')
+    if backend == 'torch':
+        import torch
+        native = torch.as_tensor(supplied, dtype=gate.dtype, device=gate.device)
+    else:
+        import cupy as cp
+        native = cp.asarray(supplied, dtype=gate.dtype)
+    expected = run(optimizer(state, [(native, where)], refine_sweeps=1))
+    opt = optimizer(state, [(supplied, where)], refine_sweeps=1)
+    actual = run(opt)
+    assert opt.get_step_records()[0]['strip_refinement']['accepted']
+    np.testing.assert_allclose(ar.to_numpy(actual.to_dense()), ar.to_numpy(expected.to_dense()),
+                               rtol=1e-10, atol=1e-11)
+    for tensor in actual:
+        assert ar.infer_backend(tensor.data) == backend
+        assert tensor.data.dtype == gate.dtype
+        assert tensor.data.device == gate.device
+
+
 @pytest.mark.parametrize('shift', [0., 80.])
 def test_cached_and_fresh_refinement_agree_with_large_network_exponents(shift):
     state, gate, where = fixture()
@@ -247,3 +273,57 @@ def test_nonunitary_strip_refinement_with_adaptive_boundaries_and_final_measurem
     assert report['accepted'] and report['boundary_convergence']['converged']
     assert float(out.norm().real) == pytest.approx(1., abs=1e-9)
     assert record['final_infidelity'] == pytest.approx(1. - fidelity(out, target), abs=1e-8)
+
+
+@pytest.mark.parametrize('backend', ['torch', pytest.param('cupy', marks=pytest.mark.optional)])
+@pytest.mark.parametrize('adaptive', [False, True])
+def test_refinement_honors_separate_caps_and_checked_handles(monkeypatch, backend, adaptive):
+    from pepsy.optimizers.peps import _strip_update
+
+    state, gate, where = fixture(backend=backend)
+    opt = PepsOptimizer(
+        state, [(gate, where)], chi=2, mode='full-update', contraction_opt='greedy',
+        fit_mode='direct', boundary_kwargs={'cutoff': 0.}, normalize_initial=False,
+        boundary_chi=(4, 32), normalize_chi=32,
+        boundary_convergence=({'start_chi': (4, 32), 'max_chi': (32, 64),
+                               'patience': 1} if adaptive else False),
+        full_update_kwargs={'max_iterations': 4, 'refine_sweeps': 2},
+    )
+    calibrate, calibrations = opt._calibrate_sweep_boundaries, []
+    def record_calibration(*args, **kwargs):
+        result = calibrate(*args, **kwargs)
+        calibrations.append(result)
+        return result
+    monkeypatch.setattr(opt, '_calibrate_sweep_boundaries', record_calibration)
+    boundary_strip, caps = _strip_update.boundary_strip, []
+    def record_cap(*args, **kwargs):
+        caps.append(kwargs['chi'])
+        return boundary_strip(*args, **kwargs)
+    monkeypatch.setattr(_strip_update, 'boundary_strip', record_cap)
+    refine = opt._full_update_refine
+    def check_refinement(target, key, **kwargs):
+        expected = calibrations[-1]['chi'] if adaptive else (4, 32)
+        if adaptive:
+            assert calibrations[-1]['converged']
+            handles = calibrations[-1]['fit_boundaries']
+            assert kwargs['boundary'] is handles['bdy']
+            assert kwargs['overlap_boundary'] is handles['bdy_overlap']
+            assert target is calibrations[-1]['fit_target']
+        # An independent fresh fit must agree with the handed-off environments.
+        fresh, fresh_report, _, _ = refine_strip(
+            opt.state, target, key=key, chi=expected, contraction_opt='greedy',
+            boundary_kwargs=opt.boundary_kwargs, sweeps=2, rtol='auto', reuse=False,
+        )
+        caps.clear()
+        actual, report, handle = refine(target, key, **kwargs)
+        assert caps == [expected[0], expected[1], expected[0]]
+        assert (report['chi'], report['overlap_chi']) == expected
+        assert report['accepted'] and fresh_report['accepted']
+        np.testing.assert_allclose(ar.to_numpy(actual.to_dense()), ar.to_numpy(fresh.to_dense()),
+                                   rtol=1e-9, atol=1e-10)
+        assert report['infidelity_after'] == pytest.approx(fresh_report['infidelity_after'], abs=1e-10)
+        assert report['infidelity_after'] == pytest.approx(1. - fidelity(actual, target), abs=1e-9)
+        return actual, report, handle
+    monkeypatch.setattr(opt, '_full_update_refine', check_refinement)
+    out = run(opt)
+    assert float(ar.to_numpy(out.norm()).real) == pytest.approx(1., abs=1e-9)

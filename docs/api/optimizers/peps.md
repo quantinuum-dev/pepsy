@@ -287,6 +287,9 @@ honors `normalize_target` and its `non_unitary` default independently of final
 output normalization. Its global magnitude is represented by a network
 exponent shared by the reduced target and its reconstructions, without
 rescaling exterior site tensors during the pair fit.
+Single-site gates also honor `normalize_target`, including its `non_unitary`
+default, even with `normalize_final=False`. When a smart refinement block
+is active, its exact target receives the same normalization scale.
 
 Full-update acceptance checks retain raw pre/post infidelities. Values clipped
 for display cannot reject an ALS candidate, and a successful fixed-cap
@@ -355,7 +358,13 @@ MPS and prefix/suffix caches are reused across site updates; contractions use
 the supplied Cotengra optimizer. Torch/CuPy tensors remain on their device.
 The exterior boundaries stay fixed within a refinement; adaptive calibration,
 when enabled, is repeated against the block target beforehand. Dense local
-solves can be expensive at large bond dimension. `refine_rtol="auto"` uses the
+solves can be expensive at large bond dimension. Refinement preserves the
+separate norm and overlap caps: fixed-cap runs use `boundary_chi`, and adaptive
+runs use the complete calibrated `(norm cap, overlap cap)` pair. Both state
+norms use its first component and the overlap uses its second. Matching checked
+norm/overlap handles are handed to the fit; changed index labels invalidate
+dependent cuts. The report's `chi` and `overlap_chi` record the respective caps.
+`refine_rtol="auto"` uses the
 same dtype tolerance policy as pair ALS; zero or `None` runs the requested
 pass budget. Successive passes alternate direction. Only a finite candidate
 with lower cost and non-worsening fidelity in the fixed boundary estimate is
@@ -429,14 +438,16 @@ unrelated rotations. It compares greedy row-first and column-first schedules
 by refinement-block count and then strip changes. This is a heuristic; it
 does not globally minimize contraction cost. Dependency storage can grow
 quadratically with the number of gates sharing sites. Submit one depth per
-run when depth boundaries must remain strict.
+run when depth boundaries must remain strict. Pair readiness is updated as
+dependencies clear, avoiding repeated traversal of blocked predecessor sets.
 
 Adjacent fixed single-site gates on the same site and native backend/dtype/
 device are fused in execution order. Two-qubit gates are never fused, so each
 retains its own local fidelity record. Transpose/dagger gate options disable
 single-site fusion to preserve product order. In full-update mode, supplied
-single-qubit matrices are converted to the PEPS backend/dtype/device before
-absorption, just as pair gates are. No PEPS tensor is converted to NumPy.
+single- and two-qubit matrices are converted to the PEPS backend/dtype/device
+before application, including construction of exact strip-refinement targets.
+No PEPS tensor is converted to NumPy.
 Commutation checks use native small gate arrays; only scalar decisions reach
 the host. Shared gate identities and comparison constants are reused within
 compilation, and reclassified on each run to observe gate mutations.

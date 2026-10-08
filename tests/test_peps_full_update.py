@@ -83,6 +83,23 @@ def test_full_update_rejects_nonadjacent_pairs():
         ReducedPair(state, gate, ((0, 0), (1, 1)), chi=2)
 
 
+@pytest.mark.parametrize('normalize_target', [None, True, False])
+def test_single_site_full_update_honors_target_normalization(normalize_target):
+    torch = pytest.importorskip('torch')
+    state, _, _ = fixture(bond=1)
+    identity = torch.eye(2, dtype=torch.complex128)
+    opt = PepsOptimizer(
+        state, [(2 * identity, (0, 0)), (3 * identity, (1, 1))],
+        chi=2, mode='full-update', contraction_opt='greedy', fit_mode='direct',
+        normalize_initial=False, normalize_chi=16, boundary_convergence=False,
+    )
+    out = opt.run(non_unitary=True, normalize_target=normalize_target, normalize_final=False,
+                  measure_infidelity=False, measure_final_infidelity=False,
+                  accept_if_improved=False)
+    scale = 6. if normalize_target is False else 1.
+    torch.testing.assert_close(out.to_dense(), scale * state.to_dense(), atol=1e-11, rtol=1e-11)
+
+
 def test_custom_output_normalization_uses_selected_cap(monkeypatch):
     state, _, policy = fixture()
     opt = PepsOptimizer(state, chi=2, mode='full-update', contraction_opt=policy,

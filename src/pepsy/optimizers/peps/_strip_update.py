@@ -6,9 +6,10 @@ import autoray as ar
 import quimb.tensor as qtn
 
 from ..._internal.cutoff import resolve_fit_rtol
-from ...boundary._reuse import StripEnvironmentCache
+from ...boundary._reuse import StripEnvironmentCache, layer_sources
 from ...boundary.metrics import build_bra_ket, _as_scaled_scalar
 from ...bp._backend import all_finite, dag
+from ._boundary_convergence import chi_pair
 from ._full_update import boundary_strip
 
 
@@ -54,7 +55,9 @@ def refine_strip(state, target, *, key, chi, contraction_opt, boundary_kwargs,
     Both objective networks are scaled to unit initial norms before solving;
     their relative exponents are restored in each cached local equation.
     Exterior arrays, tensor metadata, and all bond dimensions stay fixed.
+    ``chi`` accepts separate norm and overlap caps, as in boundary calibration.
     """
+    norm_chi, overlap_chi = chi_pair(chi)
     axis, coordinate = key
     sites = ([(i, coordinate) for i in range(state.Lx)] if axis == 'y'
              else [(coordinate, j) for j in range(state.Ly)])
@@ -77,8 +80,12 @@ def refine_strip(state, target, *, key, chi, contraction_opt, boundary_kwargs,
                     if original in inner:
                         mapping[actual] = f'{original}_*'
             network.reindex_(mapping)
+            # Checked overlap handles can use different bra labels. Cache
+            # signatures must describe the relabeled network actually fitted.
+            layer_sources(ket, bra, network)
         result, handle = boundary_strip(network, axis=axis, coordinate=coordinate,
-                                        boundary=handle if reuse else None, chi=chi,
+                                        boundary=handle if reuse else None,
+                                        chi=norm_chi if bra is None else overlap_chi,
                                         contraction_opt=contraction_opt, boundary_kwargs=boundary_kwargs)
         # Quimb selections omit the full-network exponent; transverse boundary
         # cuts contain only their own compression exponents.
@@ -91,7 +98,8 @@ def refine_strip(state, target, *, key, chi, contraction_opt, boundary_kwargs,
     report = {'axis': axis, 'coordinate': coordinate, 'sites': sites,
               'solver': 'quimb', 'max_sweeps': sweeps, 'sweeps': 0,
               'rtol': tolerance, 'accepted': False, 'converged': False,
-              'target_max_bond': int(target.max_bond()), 'chi': chi,
+              'target_max_bond': int(target.max_bond()),
+              'chi': norm_chi, 'overlap_chi': overlap_chi,
               'fidelity_convention': 'fixed boundary estimate against exact strip-block target'}
     try:
         log_aa = _norm_log(_scalar(aa, contraction_opt), roundoff)

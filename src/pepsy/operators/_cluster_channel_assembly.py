@@ -180,16 +180,17 @@ def _bind_tree(source, key, like):
     output_order = tuple(order.index(site) for site in range(n))
     physical_permutation = tuple(axis for site in range(n) for axis in (site, n+site))
     namespace = _array_namespace(like)
+    transpose = namespace.transpose
 
     def factor(operator):
-        carry = namespace.transpose(operator.reshape((d,)*(2*n)), physical_permutation).reshape((d*d,)*n)
+        carry = transpose(operator.reshape((d,)*(2*n)), physical_permutation).reshape((d*d,)*n)
         arrays = []
         for permutation, matrix_shape, identity_left, eye, left_shape, move, core_shape, carry_shape in steps:
-            matrix = namespace.transpose(carry, permutation).reshape(matrix_shape)
+            matrix = transpose(carry, permutation).reshape(matrix_shape)
             left, right = (eye, matrix) if identity_left else (matrix, eye)
-            arrays.append(namespace.transpose(left.reshape(left_shape), move).reshape(core_shape))
+            arrays.append(transpose(left.reshape(left_shape), move).reshape(core_shape))
             carry = right.reshape(carry_shape)
-        arrays.append(namespace.transpose(carry, root_permutation).reshape(root_shape))
+        arrays.append(transpose(carry, root_permutation).reshape(root_shape))
         return tuple(arrays[i] for i in output_order)
 
     return factor
@@ -206,6 +207,7 @@ class _Recipe:
 
     def bind(self, like):
         namespace = _array_namespace(like)
+        einsum = namespace.einsum
         constants = tuple(ar.do('astype', _as_backend(np.array(c, copy=True), like=like,
                                                      dtype=like.dtype), like.dtype) for c in self.constants)
         steps = self.steps
@@ -214,7 +216,7 @@ class _Recipe:
             operands = [value, *constants]
             for positions, equation in steps:
                 selected = [operands[i] for i in positions]
-                result = namespace.einsum(equation, *selected)
+                result = einsum(equation, *selected)
                 operands.append(result)
             return operands[-1]
 

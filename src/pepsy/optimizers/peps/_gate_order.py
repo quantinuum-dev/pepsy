@@ -131,36 +131,55 @@ def _schedule(entries, descriptors, preferred):
     remaining = set(range(len(entries)))
     pairs = {i for i in remaining if len(descriptors[i][0]) == 2}
     ordered, active, used = [], None, set()
+    pending_counts = [len(pred) for pred in predecessors]
+    ready = set()
+
+    def unlock(nodes):
+        # Single-site ancestors do not block pair selection once their own
+        # pair dependencies are satisfied. Release them logically here; emit
+        # them physically only when the chosen pair actually needs them.
+        while nodes:
+            i = nodes.pop()
+            if i in pairs:
+                ready.add(i)
+                continue
+            for j in followers[i]:
+                pending_counts[j] -= 1
+                if pending_counts[j] == 0:
+                    nodes.append(j)
+
+    unlock([i for i in remaining if pending_counts[i] == 0])
+
     def emit(i):
         ordered.append(entries[i])
         remaining.remove(i)
         for j in followers[i]:
             predecessors[j].discard(i)
     while pairs:
-        eligible = []
-        for i in sorted(pairs):
-            pending, required = list(predecessors[i]), set()
-            while pending:
-                ancestor = pending.pop()
-                if ancestor in pairs:
-                    break
-                if ancestor not in required:
-                    required.add(ancestor)
-                    pending.extend(predecessors[ancestor])
-            else:
-                sites = descriptors[i][0]
-                strip, bond = _strip(sites), frozenset(sites)
-                inner = min(site[0 if strip[0] == 'column' else 1] for site in sites)
-                key = (strip != active or bond in used, strip != active,
-                       strip[0] != preferred, strip[1], inner if strip[1] % 2 == 0 else -inner, i)
-                eligible.append((key, i, required))
-        _, chosen, required = min(eligible, key=lambda item: item[0])
+        def priority(i):
+            sites = descriptors[i][0]
+            strip, bond = _strip(sites), frozenset(sites)
+            inner = min(site[0 if strip[0] == 'column' else 1] for site in sites)
+            return (strip != active or bond in used, strip != active,
+                    strip[0] != preferred, strip[1], inner if strip[1] % 2 == 0 else -inner, i)
+
+        chosen = min(ready, key=priority)
+        pending, required = list(predecessors[chosen]), set()
+        while pending:
+            ancestor = pending.pop()
+            if ancestor not in required:
+                required.add(ancestor)
+                pending.extend(predecessors[ancestor])
         # All required ancestors are single-site operations on this bond.
         # Different sites commute; preserve original order within each site.
         for i in sorted(required, key=lambda i: (descriptors[i][0], i)):
             emit(i)
         emit(chosen)
         pairs.remove(chosen)
+        ready.remove(chosen)
+        # A chosen pair now acts like a released single-site node: visit each
+        # outgoing dependency once, recursively unlocking local rotations.
+        unlock([chosen])
         sites = descriptors[chosen][0]
         strip = _strip(sites)
         if strip != active:

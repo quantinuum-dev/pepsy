@@ -223,9 +223,12 @@ def test_unitary_ledger_reads_only_one_boolean_per_replay(mode, monkeypatch):
 @pytest.mark.parametrize("restore", [False, True])
 def test_backend_ledger_matches_cpu_and_preserves_state_dtype(convert, restore):
     initial = qtn.MPS_rand_state(4, 3, seed=19, dtype="complex64")
-    stream = [(np.array(qu.CNOT()), (0, 3))] * 3
+    # Compare the same precision: NumPy otherwise promotes its state through
+    # complex128 gates while the device fixture uses complex64 throughout.
+    stream = [(np.array(qu.CNOT(), dtype="complex64"), (0, 3))] * 3
     cpu = MpsOptimizer(initial, stream, chi=2)
     cpu.run(progbar=False, cutoff=0., stabilize_unitary=restore)
+    assert all(t.dtype == "complex64" for t in cpu.p)
     state = initial.copy()
     state.apply_to_arrays(convert)
     opt = MpsOptimizer(state, [(convert(g), w) for g, w in stream], chi=2)

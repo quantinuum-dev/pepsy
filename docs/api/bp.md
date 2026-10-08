@@ -4,6 +4,12 @@ The BP namespace contains message-passing, loop-expansion, and partitioned
 norm-estimation helpers. It is an advanced extension and is loaded lazily by
 the top-level package.
 
+Plain and relay BP report strict residual convergence. If Quimb stops because
+its pending-message queue empties while the last residual is still too large,
+Pepsy confirms convergence with the remaining iteration budget. The reported
+iteration count includes those confirmation sweeps. Explicit rolling-stop
+settings remain respected; a rolling stop alone does not imply a fixed point.
+
 Jump to [boundary measurements](#peps-boundary-measurements),
 [fermionic PEPO norms](#native-fermionic-pepo-norm-workflow),
 [loop-cluster compression](#reduced-loop-cluster-compression), or
