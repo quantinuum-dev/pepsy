@@ -1348,14 +1348,19 @@ class ReducedALSSolution:
     """Result of a reduced-tensor ALS solve.
 
     ``left`` and ``right`` use the canonical reduced layouts, and ``costs``
-    records the initial objective followed by the solver's accepted iterates.
-    The native Quimb route reports its initial and final objective.
+    records the initial objective followed by solver objective measurements.
+    The native Quimb route reports initial/final objectives by default, or
+    each complete sweep with ``monitor_convergence=True``. Monitoring also
+    supplies ``iterations``, ``converged`` and ``termination_reason``.
     """
 
     left: Any
     right: Any
     costs: tuple[float, ...]
     solver: str | None = None
+    iterations: int | None = None
+    converged: bool | None = None
+    termination_reason: str | None = None
 
     def theta(self):
         """Return the optimized joint reduced tensor."""
@@ -2582,6 +2587,7 @@ def _solve_reduced_als_quimb(
     tol: float,
     rcond: float,
     quimb_opts: dict[str, Any] | None = None,
+    monitor_convergence: bool = False,
 ) -> ReducedALSSolution:
     """Solve the reduced ALS problem through Quimb's public TN ALS API."""
     import quimb.tensor as qtn
@@ -2683,16 +2689,49 @@ def _solve_reduced_als_quimb(
         "progbar": False,
     }
     fit_opts.update(quimb_opts)
+    if monitor_convergence:
+        # Reuse Quimb's public native solves and the same live overlap networks.
+        # Owning the outer sweep loop makes stopping observable and permits
+        # QR/LQ regauging between sweeps without copying tensors to NumPy.
+        costs = [initial_cost]
+        target_norm = _scalar_float(problem.target_norm)
+        if not np.isfinite(target_norm) or target_norm <= 0:
+            raise ValueError('monitored ALS requires a positive finite target norm')
+        converged, reason = False, 'max_iterations'
+        for iteration in range(1, max_iterations + 1):
+            qtn.tensor_network_fit_als(
+                tn_fit, tn_target, steps=1, tol=0., tnAA=tn_aa, tnAB=tn_ab,
+                xBB=target_norm, inplace=False, **fit_opts,
+            )
+            left = left_ket.transpose(pair.reduced_left_ind, pair.physical_left_ind, ket_bond).data
+            right = right_ket.transpose(ket_bond, pair.physical_right_ind, pair.reduced_right_ind).data
+            left, right = _gauge_reduced_factors(left, right)
+            # Quimb can reorder the live tensor indices during its solve.
+            # Write back in that order, including the shared conjugate views.
+            for ket, bra, data, inds in (
+                (left_ket, left_bra, left,
+                 (pair.reduced_left_ind, pair.physical_left_ind, ket_bond)),
+                (right_ket, right_bra, right,
+                 (ket_bond, pair.physical_right_ind, pair.reduced_right_ind)),
+            ):
+                ordered = qtn.Tensor(data, inds=inds).transpose(*ket.inds).data
+                ket.modify(data=ordered)
+                bra.modify(data=_conj(ordered))
+            current = problem.cost(_einsum('aps,sqb->apqb', left, right))
+            costs.append(current)
+            reason = _reduced_als_stop(costs[-2], current, target_norm, tol)
+            if reason is not None:
+                converged = reason != 'nonfinite_cost'
+                break
+        return ReducedALSSolution(
+            left=left, right=right, costs=tuple(costs), solver='quimb',
+            iterations=iteration, converged=converged,
+            termination_reason=reason or 'max_iterations',
+        )
+
     qtn.tensor_network_fit_als(
-        tn_fit,
-        tn_target,
-        steps=max_iterations,
-        tol=tol,
-        tnAA=tn_aa,
-        tnAB=tn_ab,
-        xBB=problem.target_norm,
-        inplace=False,
-        **fit_opts,
+        tn_fit, tn_target, steps=max_iterations, tol=tol, tnAA=tn_aa,
+        tnAB=tn_ab, xBB=problem.target_norm, inplace=False, **fit_opts,
     )
 
     left_tensor = tn_aa["__KET__", "__VAR0__"]
@@ -3046,6 +3085,19 @@ def _dense_problem_linear_term(problem, metric):
     return _native(problem.linear_term)
 
 
+def _reduced_als_stop(previous, current, target_norm, tol):
+    """Stop on a normalized residual or complete-sweep objective change."""
+    if not np.isfinite(current):
+        return 'nonfinite_cost'
+    if tol <= 0:
+        return None
+    if 0 <= current <= tol * target_norm:
+        return 'residual_tolerance'
+    if abs(previous - current) <= tol * target_norm:
+        return 'cost_tolerance'
+    return None
+
+
 def solve_reduced_als(
     problem: ReducedUpdateProblem,
     *,
@@ -3057,6 +3109,7 @@ def solve_reduced_als(
     solver: str = "auto",
     quimb_opts: dict[str, Any] | None = None,
     autodiff_opts: dict[str, Any] | None = None,
+    monitor_convergence: bool = False,
 ) -> ReducedALSSolution:
     """Solve a reduced two-site projection by alternating least squares.
 
@@ -3074,13 +3127,20 @@ def solve_reduced_als(
     The native path contracts the open reduced environment directly. The
     physical-identity-expanded dense metric is only needed by the dense
     fallback or when a caller explicitly accesses the compatibility view.
+    ``monitor_convergence=True`` owns the outer Quimb sweep loop, regauges
+    between sweeps, and reports iterations and a stopping reason. Stopping
+    uses cost/target_norm <= tol or the absolute complete-sweep cost change
+    divided by target_norm <= tol; tol=0 requests the full iteration budget.
+    The dense QR/normal routes use the same criterion when monitoring.
     """
     if not isinstance(max_iterations, int) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
     if not (0.0 <= rcond < 1.0):
         raise ValueError("rcond must satisfy 0 <= rcond < 1")
-    if tol < 0.0:
-        raise ValueError("tol must be nonnegative")
+    if not np.isfinite(tol) or tol < 0.0:
+        raise ValueError("tol must be finite and nonnegative")
+    if not isinstance(monitor_convergence, bool):
+        raise TypeError('monitor_convergence must be a bool')
     if not np.isfinite(regularization) or regularization < 0.0:
         raise ValueError("regularization must be finite and nonnegative")
     if not isinstance(solver, str) or solver not in {
@@ -3100,6 +3160,9 @@ def solve_reduced_als(
     if not isinstance(max_bond, int) or max_bond < 1:
         raise ValueError("max_bond must be a positive integer")
     max_bond = min(max_bond, left_dim * physical_left, physical_right * right_dim)
+
+    if monitor_convergence and (is_symmray_array(problem.target) or solver == 'autodiff'):
+        raise ValueError('monitor_convergence is supported only for dense Quimb/QR/normal ALS')
 
     if is_symmray_array(problem.target):
         if regularization:
@@ -3134,6 +3197,7 @@ def solve_reduced_als(
                 tol=tol,
                 rcond=rcond,
                 quimb_opts=quimb_opts,
+                monitor_convergence=monitor_convergence,
             )
         except ValueError:
             if requested_solver != "auto":
@@ -3163,13 +3227,17 @@ def solve_reduced_als(
             )
     use_qr = weight is not None and solver in {"auto", "qr"}
     costs = [problem.cost(_einsum("aps,sqb->apqb", left, right))]
+    target_norm = _scalar_float(problem.target_norm) if monitor_convergence else None
+    if monitor_convergence and (not np.isfinite(target_norm) or target_norm <= 0):
+        raise ValueError('monitored ALS requires a positive finite target norm')
+    converged, reason = False, 'max_iterations'
     target_flat = _reshape(problem.target, (-1,))
     eye_left = _eye(left_dim, like=metric)
     eye_physical_left = _eye(physical_left, like=metric)
     eye_physical_right = _eye(physical_right, like=metric)
     eye_right = _eye(right_dim, like=metric)
 
-    for _ in range(max_iterations):
+    for iteration in range(1, max_iterations + 1):
         # vec(Theta) = K_L vec(R_L), with L_R fixed.
         k_left = _einsum(
             "sqb,aA,pP->apqbAPs",
@@ -3234,11 +3302,19 @@ def solve_reduced_als(
         left, right = _gauge_reduced_factors(left, right)
         current_cost = problem.cost(_einsum("aps,sqb->apqb", left, right))
         costs.append(current_cost)
-        if abs(costs[-2] - current_cost) <= tol * max(1.0, costs[-2]):
+        if monitor_convergence:
+            reason = _reduced_als_stop(costs[-3], current_cost, target_norm, tol)
+            if reason is not None:
+                converged = reason != 'nonfinite_cost'
+                break
+        elif abs(costs[-2] - current_cost) <= tol * max(1.0, costs[-2]):
             break
 
     return ReducedALSSolution(left=left, right=right, costs=tuple(costs),
-                              solver='qr' if use_qr else 'normal')
+                              solver='qr' if use_qr else 'normal',
+                              iterations=iteration if monitor_convergence else None,
+                              converged=converged if monitor_convergence else None,
+                              termination_reason=(reason or 'max_iterations') if monitor_convergence else None)
 
 
 def _valid_warm_start_gauge(tn, index: str, gauge):

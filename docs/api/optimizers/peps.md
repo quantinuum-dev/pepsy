@@ -75,8 +75,9 @@ boundaries expand through the existing boundary API; block FIT grows through
 its local splits. Reused guesses use direct initialization and are always
 refitted. Before accepting convergence, fresh contractions in both directions
 must agree with the reused ones. This rejects a stale variational plateau.
-Direct compressors and Quimb-MPS do not consume these guesses. All guesses
-are discarded after calibration; no tensor environments cross gate updates.
+Direct compressors and Quimb-MPS do not consume these variational guesses.
+Validated boundary cuts may be handed to the fit and retained across gate
+updates as described below; `reuse_environments=False` disables that reuse.
 
 The checked warm-start norm and target norm are reused; the initial fidelity
 check also reuses these measurements instead of contracting again. The
@@ -118,6 +119,11 @@ unit-target-norm shortcut. Global mode and `optimize=False` do not probe.
 Custom `boundary_options` or supplied sweep boundary handles currently require
 disabling adaptive checks; otherwise a clear error prevents a misleading
 comparison using a different boundary policy.
+An explicit `fit_max_bond` is also incompatible with adaptive checks: it would
+keep the actual FIT rank cap fixed while probe chi increases. This combination
+raises before initial normalization or gate application. Leave `fit_max_bond=None`
+and set adaptive `start_chi`/`max_chi`, or use `boundary_convergence=False` to
+retain a fixed FIT cap. This applies to shared and sweep-specific FIT options.
 
 `boundary_engine` controls the boundary implementation used when PEPS cleanup
 delegates to `SweepOptimizer`. The default, `"auto"`, keeps dense inputs on the
@@ -181,7 +187,7 @@ supported without forwarding coordinate-routing options to the split routine.
 
 ### Reusing checked boundary environments
 
-For dense Torch states without gradients, adaptive checking now defaults to
+For dense Torch states without gradients and dense CuPy states, adaptive checking defaults to
 `boundary_convergence={"reuse_environments": True}`. The final checked norm
 and overlap boundary MPS are handed to the row/column fitter with the same
 target index labels. The next sweep extends these cuts instead of starting
@@ -199,7 +205,7 @@ This does not skip chi probes, the final scalar contractions, or independent
 fresh DMRG confirmation. Only the latest checked handles per axis are retained
 across gate batches; no full trajectory is cached. A full row/column sweep can
 change every tensor, so across-gate reuse is most effective for local updates.
-NumPy, CuPy, JAX, Symmray, trainable Torch arrays, and Torch inference tensors
+NumPy, JAX, Symmray, trainable Torch arrays, and Torch inference tensors
 currently use the original path because this cache needs reliable mutation
 tracking. Do not mutate Torch arrays through unversioned `.data` writes.
 Sweep result `environment_reuse` reports cache hits and rebuilds.
@@ -213,7 +219,7 @@ the existing local solver and sweep budgets. `mode="full-update"` is also
 accepted as a two-site alias. No separate one-site ALS mode is introduced.
 The two-site path follows the reduced-tensor scheme
 in [Lubasch, Cirac and Bañuls, Sec. III B](https://arxiv.org/pdf/1405.3259).
-Currently it supports nearest-neighbor coordinate pairs on dense Torch
+Currently it supports nearest-neighbor coordinate pairs on dense Torch or CuPy
 complex64/complex128 PEPS, with Pepsy boundary MPS (direct or DMRG fitting).
 It does not support differentiation through the update or native symmetry
 arrays. `k_2q_batch="auto"` means one two-site gate in this mode; integers
@@ -227,7 +233,7 @@ optimizer = PepsOptimizer(
     fit_mode="eff",                         # DMRG boundary compression
     boundary_convergence={"max_chi": 128, "rtol": 1e-5},
     full_update_kwargs={
-        "max_iterations": 50, "rtol": 1e-9,
+        "max_iterations": 50, "rtol": "auto",
         "rcond": 1e-12, "gauge": True, "solver": "auto",
     },
 )
@@ -254,6 +260,15 @@ starts from the gauged target's SVD. Its result is compared against both
 ordinary and gauged SVD guesses in the same positive metric, retaining the
 lowest cost. The final internal bond is balanced with SVD.
 External PEPS tensors remain unchanged by the pair fit.
+The environment gauges use two independent unfoldings of the same square root.
+Internally `N = root.H @ root`, so the paper's QR/LQ construction for
+`N = X @ X.H` is expressed as two QR factorizations. No inverse is applied
+when either gauge fails the relative singular-value check. The weighted-QR
+ALS route regauges reduced factors after each local solve. The Quimb route
+uses its public native ALS routine for each complete sweep, retaining the same
+open overlap networks, then applies QR/LQ regauging between sweeps. Tensor
+arrays and linear algebra remain on the input backend; only scalar diagnostics
+are read on the host.
 Requested output normalization still runs at the selected norm chi, on the
 same device and dtype. Independent pre/post checks remain controlled by the
 usual `measure_infidelity`, `measure_final_infidelity`, and
@@ -266,24 +281,122 @@ Its boundary cache persists across gates and `run()` calls. Disable both
 independent infidelity measurements and acceptance checks for a norm-only
 workflow; ALS still evaluates its local target in the positive norm metric.
 `norm_environment_chi` records the cap actually used.
+Paired `normalize_chi` settings use their first component, including the
+default `(4*D, 5*D)` when adaptive convergence is disabled. Target normalization
+honors `normalize_target` and its `non_unitary` default independently of final
+output normalization. Its global magnitude is represented by a network
+exponent shared by the reduced target and its reconstructions, without
+rescaling exterior site tensors during the pair fit.
+
+Full-update acceptance checks retain raw pre/post infidelities. Values clipped
+for display cannot reject an ALS candidate, and a successful fixed-cap
+precheck retry supplies the same effective chi to the postcheck. Step records
+include `raw_pre_infidelity`, `raw_post_infidelity`, the effective evaluation
+cap, and the corresponding evaluation records.
+
+Within the active row or column, exact prefix/suffix contractions are cached
+in addition to the transverse boundary MPS cuts. Each partial contraction is
+validated against the source PEPS tensors, boundary tensors, their mutation
+stamps and index layouts, and the preceding partial contraction. Torch uses
+version counters. CuPy has no version counter, so it compares exact snapshots
+on the device, transferring only a boolean. This adds comparison work and one
+device snapshot per live tracked array; weak references release snapshots
+when the corresponding arrays die. In-place writes through views invalidate
+dependent entries. CuPy runs use the PEPS device context. Moving to
+another strip discards its entries, keeping storage bounded to one strip.
+All partial and final strip contractions use the supplied Cotengra optimizer;
+the default reusable optimizer also caches contraction plans. No scalar norm
+is cached. `optimizer_result['strip_environment_reuse']` reports hits and
+rebuilds. Adaptive `reuse_environments=False` disables this strip cache too.
+Fresh adaptive confirmation can replace boundary arrays and therefore invalidate
+partial contractions even if their numerical values happen to agree.
+
 `rcond=None` selects 1e-12 for complex128 and 1e-6 for complex64. Diagnostics
 include the raw environment's anti-Hermitian residual, minimum eigenvalue,
 negative spectral weight, gauge status, accepted ALS loss history, and cache
 counts. `solver` reports the actual route, and `solver_costs` retains its cost
-diagnostics. Quimb does not expose an iteration count here: `iterations=None`
-and `converged=None` avoid claiming a stopping condition that was not observed.
+diagnostics. The default `rtol="auto"` reuses Pepsy's FIT tolerance policy:
+1e-9 for complex128 and 1e-5 for complex64. After each complete ALS sweep, stop
+when either the squared residual divided by the target norm, or the absolute
+change in that normalized cost, is at most `rtol`. This is a local objective
+criterion, not a bound on the global state error. `rtol=None` or zero disables
+tolerance stopping; `max_iterations` always bounds the solve.
+
+`iterations`, resolved `rtol`, `converged`, and `termination_reason` report
+the observed stopping condition. Reasons include `residual_tolerance`,
+`cost_tolerance`, `max_iterations`, and `solver_candidate_rejected`.
+`solver_termination_reason` and `solver_converged` retain the underlying solver
+status if its result is rejected in favor of a better SVD guess. A retained
+guess that itself meets the residual tolerance reports convergence.
+`success=True` means a finite usable update was returned, even if the iteration
+budget was exhausted. Boundary convergence is recorded separately.
 Positive projection stabilizes the local solve; it is **not** proof
 that boundary contraction converged. The reported local positive-environment
 fidelity, and its accumulated product, are not exact global fidelity.
 Timing separates target preparation, chi calibration, reduced environment
 construction, ALS, and output normalization.
 
+Set `full_update_kwargs={"refine_sweeps": 1}` to add an optional one-site ALS
+pass over a completed row or column after its two-site full updates. The
+default is zero. Contiguous gates on the same strip share one exact,
+untruncated block target, captured before their pair updates. A change of
+strip, a one-site gate, a repeated bond, or the end of the run closes the
+block. Each bond appears at most once, bounding target bonds to at most
+`4*chi` for qubit gates. No additional gate reordering is performed here.
+Exterior site arrays and retained bond dimensions stay fixed. This is a
+variational strip fit against the gated state, not a Hamiltonian ground-state
+DMRG calculation. It can improve compression beyond the gated pair, but does
+not guarantee smaller accumulated error against an ideal whole circuit.
+
+The refinement uses Quimb's public native ALS with Hermitian local norm
+matrices and positive eigensystem solves. Separate norm and overlap boundary
+MPS and prefix/suffix caches are reused across site updates; contractions use
+the supplied Cotengra optimizer. Torch/CuPy tensors remain on their device.
+The exterior boundaries stay fixed within a refinement; adaptive calibration,
+when enabled, is repeated against the block target beforehand. Dense local
+solves can be expensive at large bond dimension. `refine_rtol="auto"` uses the
+same dtype tolerance policy as pair ALS; zero or `None` runs the requested
+pass budget. Successive passes alternate direction. Only a finite candidate
+with lower cost and non-worsening fidelity in the fixed boundary estimate is
+retained. Invalid or worsening later candidates preserve the best earlier
+state. `strip_refinement` on the closing gate's step record contains the
+target size, strip sites, pass count, costs, before/after infidelities,
+acceptance, convergence, and cache statistics. Requested final normalization
+and final metric measurements run after accepted refinement.
+
+Every two-qubit full update retains `local_fidelity` and `local_infidelity`
+in `get_step_records()`, even with both metric measurement flags disabled.
+These use the already-built positive environment for the chosen pair result;
+if outer acceptance rejects ALS, they describe the retained SVD warm start.
+They precede any optional strip refinement and remain separate from its
+block-target score. They require only reduced-tensor contractions, with no
+additional whole-lattice metric evaluation. `local_fidelity_convention`
+records this interpretation. An unavailable estimate is `None`.
+
+`full_update_kwargs={"accumulate_local_infidelity": True}` (the default)
+additionally records `accumulated_local_infidelity = 1 - product(F_gate)` and
+`accumulated_local_gate_count`. Accumulation uses logarithms and `expm1` for
+small errors; a zero fidelity produces accumulated infidelity one. A missing
+estimate makes the cumulative result unavailable until traces are reset.
+Set the option to `False` to retain only individual estimates. Accumulation
+persists across runs with `reset_traces=False` and otherwise resets per run.
+This product is a diagnostic, **not an exact global fidelity or error bound**.
+Single-site gates do not add records. The older measured progress getters
+retain their existing behavior; an accepted strip refinement without a final
+measurement has `final_infidelity=None` and adds no measured progress point.
+
 `gate_order="column"` or `"row"` traverses strips in a snake order, improving
-the opportunity to retain cuts on either side of local updates. Only contiguous
-fixed diagonal two-qubit gates are reordered (for example a ZZ layer).
-Single-site, non-diagonal, trainable, or unsupported gates remain barriers.
+the opportunity to retain cuts on either side of local updates. Each commuting
+block finishes the preferred bond orientation before visiting transverse
+strips. A block may contain arbitrary fixed two-qubit gates on disjoint sites;
+overlapping gates may be reordered only when both are exactly diagonal.
+Thus a disjoint circuit-depth layer can be sorted without assuming that
+overlapping non-diagonal gates commute. Single-site, trainable, or unsupported
+gates remain barriers, and a conflicting gate starts a new block.
 This preserves the exact circuit; different truncation order can still change
 the approximate result. The default `"input"` preserves the original order.
+The traversal is a cache-friendly heuristic, not a globally optimal scheduling
+search. When depth boundaries must remain strict, submit one depth per run.
 `optimizer.last_gate_order` records one-based original gate positions in
 execution order, and the supplied gate queue is restored even after failure.
 `run(update_style=..., gate_order=...)` can override both options temporarily.

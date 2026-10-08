@@ -14,6 +14,16 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Optional native Torch/CuPy strip ALS refinement after two-site PEPS full
+  updates, with fixed exact block targets, norm/overlap environment reuse,
+  and rollback. Per-gate positive-environment fidelities are always retained;
+  optional log-space accumulation reports a local infidelity proxy.
+
+- Dense CuPy full-update ALS with native GPU norm projection, gauges and solves.
+  Boundary/strip caches validate CuPy mutations with device-side snapshots.
+  Row/column traversal also sorts disjoint non-diagonal two-qubit layers and
+  finishes each orientation before switching to transverse strips.
+
 - PEPS `update_style` explicitly selects row/column fitting or reduced two-site
   ALS within sweep mode. Optional column/row gate traversal reorders only
   contiguous fixed diagonal two-qubit gates and preserves ordering barriers.
@@ -31,6 +41,18 @@ releases remain backwards-compatible. From 1.0 onward:
   `boundary_convergence={"reuse_environments": False}`.
 
 ### Fixed
+
+- Full-update ALS uses dtype-aware `rtol="auto"`, normalized complete-sweep
+  stopping, and actual iteration/convergence diagnostics. Public Quimb native
+  ALS solves and open overlap networks are reused with QR/LQ regauging between
+  sweeps. PEPS arrays, norm matrices, and linear algebra stay on Torch.
+- PEPS adaptive convergence rejects fixed `fit_max_bond` overrides that would
+  otherwise repeat one approximation at every probe chi. Full updates accept
+  paired normalization caps, honor nonunitary target normalization, and base
+  acceptance on raw valid infidelities measured at matching effective caps.
+- Full updates reuse validated exact prefix/suffix contractions inside the
+  active row or column, in addition to boundary MPS cuts, with Cotengra
+  planning and separate strip-cache diagnostics.
 
 - Two-site PEPS output normalization keeps the calibrated chi even with custom
   normalization options. Failed zero-norm calibration probes discard stale

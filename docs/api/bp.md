@@ -190,6 +190,17 @@ block-sparse through the graded SVD adapter; use `solver="auto"` or
 `solver="quimb"` there. Dense QR/autodiff refinement is intentionally not
 available for native arrays because it would flatten charge sectors.
 
+For dense Quimb, QR, and normal ALS, `monitor_convergence=True` opts into
+complete-sweep stopping and fills `ReducedALSSolution.iterations`, `converged`,
+and `termination_reason`. The stopping criterion is squared residual divided
+by target norm at most `tol`, or absolute complete-sweep cost change divided
+by target norm at most `tol`. Zero tolerance requests the full iteration
+budget. The monitored Quimb route reuses the same open overlap networks and
+regauges with QR/LQ between public Quimb ALS sweeps. It records a cost per
+sweep; QR/normal also retain their half-sweep measurements. The default
+unmonitored behavior is unchanged, with these status fields set to `None`.
+Monitoring is unavailable for autodiff and native Symmray's graded-SVD route.
+
 For explicit dense diagnostics, use `problem.dense_metric()` and
 `problem.dense_linear_term()`. Direct problem builders also accept
 `materialize_metric=True`, but this is unnecessary for the native Quimb path.

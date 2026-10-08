@@ -39,6 +39,33 @@ def test_constant_fidelity_cannot_hide_unconverged_norms():
     assert [c for c, axis in calls if axis == "x"] == [(2, 2), (4, 4), (8, 8), (16, 16)]
 
 
+@pytest.mark.parametrize('scope', ['shared', 'sweep', 'run'])
+def test_adaptive_fixed_fit_cap_rejected_before_state_changes(scope):
+    torch = pytest.importorskip('torch')
+    # GHZ has identical x/y rank-one truncations, with half the correct norm.
+    state = qtn.PEPS.rand(3, 3, bond_dim=2, dtype='complex128', seed=1)
+    for tensor in state:
+        data = torch.zeros(tensor.shape, dtype=torch.complex128)
+        data[(0,) * data.ndim] = data[(1,) * data.ndim] = 1.
+        tensor.modify(data=data)
+    state /= state.norm()
+    options = ({'fit_max_bond': 1} if scope == 'shared' else
+               {'sweep_kwargs': {'fit_max_bond': 1}} if scope == 'sweep' else {})
+    opt = PepsOptimizer(state, [(torch.eye(4, dtype=torch.complex128),
+                                 ((0, 0), (0, 1)))], chi=2,
+                        contraction_opt='greedy', fit_mode='direct', **options)
+    before = opt.state.to_dense().clone()
+    run_kwargs = {'sweep_kwargs': {'fit_max_bond': 1}} if scope == 'run' else {}
+    with pytest.raises(ValueError, match='fit_max_bond=None'):
+        opt.run(**run_kwargs)
+    torch.testing.assert_close(opt.state.to_dense(), before)
+    assert not opt.normalizations
+    # Also guard direct calibration consumers against the false plateau.
+    with pytest.raises(ValueError, match='fit_max_bond=None'):
+        opt._calibrate_sweep_boundaries(state, state.copy(), normalize_chi=4,
+                                        evaluation_chi=4, **run_kwargs)
+
+
 def test_retained_cap_is_rechecked_without_automatic_growth():
     calls = []
 

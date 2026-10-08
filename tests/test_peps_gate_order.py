@@ -21,13 +21,48 @@ def test_commuting_traversal_matches_exact_circuit_and_preserves_barriers(policy
                         boundary_convergence=False, contraction_opt='greedy')
     ordered = order_gates(opt, policy)
     assert [i for i, _ in ordered] != list(range(len(gates)))
-    assert ordered[3][0] == 3 and ordered[7][0] == 7
+    assert ordered[3][0] == 3  # Single-site gates remain barriers.
+    positions = {original: position for position, (original, _) in enumerate(ordered)}
+    # A CNOT can now cross disjoint gates, but never overlapping ZZ gates.
+    assert positions[5] < positions[7] < positions[9]
     def exact(entries):
         out = state.copy()
         for g, where, _ in entries:
             out.gate_(g, where, contract='split', cutoff=0.)
         return out.to_dense()
     np.testing.assert_allclose(exact(opt.gates), exact([entry for _, entry in ordered]), atol=1e-10)
+
+
+@pytest.mark.parametrize('policy', ['row', 'column'])
+def test_disjoint_nondiagonal_layer_is_sorted_without_changing_circuit(policy):
+    state = qtn.PEPS.rand(3, 3, bond_dim=1, dtype='complex128', seed=15)
+    rng = np.random.default_rng(91)
+    gates = [(np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))[0], where)
+             for where in [((2, 1), (2, 2)), ((0, 2), (1, 2)), ((0, 0), (1, 0))]]
+    opt = PepsOptimizer(state, gates, chi=2, normalize_initial=False, contraction_opt='greedy')
+    ordered = order_gates(opt, policy)
+    assert [i for i, _ in ordered] != [0, 1, 2]
+    outputs = []
+    for entries in (opt.gates, [entry for _, entry in ordered]):
+        out = state.copy()
+        for gate, where, _ in entries:
+            out.gate_(gate, where, contract='split', cutoff=0.)
+        outputs.append(out.to_dense())
+    np.testing.assert_allclose(*outputs, atol=1e-12)
+
+
+@pytest.mark.parametrize('policy', ['row', 'column'])
+def test_diagonal_traversal_finishes_strips_before_turning(policy):
+    state = qtn.PEPS.ones(4, 4, bond_dim=1)
+    gate = np.diag([1., 1j, 1j, 1.])
+    bonds = [((i, j), (i + 1, j)) for i in range(3) for j in range(4)]
+    bonds += [((i, j), (i, j + 1)) for j in range(3) for i in range(4)]
+    opt = PepsOptimizer(state, [(gate, b) for b in bonds], chi=2, normalize_initial=False)
+    strips = []
+    for _, (_, (a, b), _) in order_gates(opt, policy):
+        strips.append(('column', a[1]) if a[1] == b[1] else ('row', a[0]))
+    assert strips[0][0] == policy
+    assert sum(a != b for a, b in zip(strips, strips[1:])) == 7
 
 
 def test_failed_run_restores_original_queue():

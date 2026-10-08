@@ -972,7 +972,8 @@ def test_reduced_als_can_use_quimbs_public_tensor_network_als():
     assert solution.costs[-1] <= solution.costs[0] + 1e-12
 
 
-def test_quimb_reduced_als_uses_retained_open_environment(monkeypatch):
+@pytest.mark.parametrize('monitor_convergence', [False, True])
+def test_quimb_reduced_als_uses_retained_open_environment(monkeypatch, monitor_convergence):
     """Native ALS must not reconstruct the full physical metric first."""
     reduced_update = importlib.import_module("pepsy.bp.reduced_update")
     peps = _random_peps()
@@ -991,11 +992,34 @@ def test_quimb_reduced_als_uses_retained_open_environment(monkeypatch):
         max_bond=1,
         max_iterations=2,
         solver="quimb",
+        monitor_convergence=monitor_convergence,
         quimb_opts={"solver_maxiter": 8, "contract_optimize": "greedy"},
     )
 
     assert np.all(np.isfinite(solution.left))
     assert np.all(np.isfinite(solution.right))
+
+
+@pytest.mark.parametrize('solver', ['quimb', 'qr'])
+def test_monitored_als_stopping_is_invariant_to_environment_scale(solver):
+    from pepsy.bp import ReducedEnvironmentUpdateProblem
+    pair = prepare_reduced_bond_pair(_random_peps(), where=((0, 0), (1, 0)))
+    reference = exact_reduced_update_problem(pair, np.eye(4), optimize='greedy')
+    solutions = []
+    for scale in (1e-12, 1., 1e12):
+        problem = ReducedEnvironmentUpdateProblem(
+            pair=pair, environment=reference.environment * scale, target=reference.target,
+        )
+        solution = solve_reduced_als(problem, max_bond=1, max_iterations=20,
+                                     tol=1e-7, solver=solver, monitor_convergence=True)
+        assert solution.converged
+        assert 1 < solution.iterations < 20
+        assert solution.termination_reason == 'cost_tolerance'
+        assert solution.costs[-1] <= solution.costs[0]
+        solutions.append(solution)
+    assert len({s.iterations for s in solutions}) == 1
+    for actual in solutions[1:]:
+        np.testing.assert_allclose(actual.theta(), solutions[0].theta(), rtol=1e-7, atol=1e-9)
 
 
 def test_reduced_als_qr_requires_a_psd_metric():
