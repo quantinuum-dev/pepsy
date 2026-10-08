@@ -74,6 +74,8 @@ def _configure_qr_rank_policy(policy="warn", rank_tol_factor=1.0):
 
 def _handle_qr_rank_policy(rank_deficient):
     """Apply the configured response to a detected QR rank deficiency."""
+    if _QR_RANK_POLICY in {"native", "adaptive"}:
+        return
     if not bool(rank_deficient.any().item()):
         return
     message = (
@@ -825,6 +827,9 @@ def _adaptive_qr_backward(a, q, r, dq, dr, singular_pivot):
     passed to an optimizer. The fallback is an explicit finite extension at
     a singular chart, not a claim of differentiability there.
     """
+    from torch.fx.experimental.proxy_tensor import get_proxy_mode
+    if get_proxy_mode() is not None:
+        return _captured_adaptive_qr_backward(a, q, r, dq, dr)
     result = torch.zeros_like(a)
     active = torch.zeros(a.shape[:-2], dtype=torch.bool, device=a.device)
     for cotangent in (dq, dr):
@@ -858,6 +863,29 @@ def _adaptive_qr_backward(a, q, r, dq, dr, singular_pivot):
     if not bool(torch.isfinite(fallback).all()):
         raise RuntimeError("Torch QR adaptive backward could not produce a finite VJP")
     result[bad] = fallback
+    return result
+
+
+def _captured_adaptive_qr_backward(a, q, r, dq, dr):
+    """Same first-order policy with fixed-shape masks during FX capture.
+
+    Replace undefined native QR inputs by a full-rank rectangular identity,
+    then select the regularized extension only for active failing blocks.
+    No data-dependent Python branches or boolean-indexed dynamic shapes.
+    """
+    active = torch.zeros(a.shape[:-2], dtype=torch.bool, device=a.device)
+    for tangent in (dq, dr):
+        if tangent is not None:
+            active = active | (tangent != 0).any(dim=(-2, -1))
+    zero = (r.diagonal(0, -2, -1) == 0).any(dim=-1)
+    identity = torch.eye(a.shape[-2], a.shape[-1], device=a.device, dtype=a.dtype)
+    safe_a = torch.where((zero | ~active)[..., None, None], identity, a)
+    native = _native_qr_backward(safe_a, dq, dr)
+    bad = active & (zero | ~torch.isfinite(native).all(dim=(-2, -1)))
+    fallback = _regularized_qr_backward(a, q, r, dq, dr, torch.ones_like(active))
+    result = torch.where(bad[..., None, None], fallback, native)
+    result = torch.where(active[..., None, None], result, torch.zeros_like(result))
+    torch._assert_async(torch.isfinite(result).all(), "nonfinite captured adaptive QR VJP")
     return result
 
 

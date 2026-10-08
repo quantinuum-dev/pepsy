@@ -1909,7 +1909,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._validate_canonical_boundary(self.p, self.mode)
         center = self.p.L // 2
         self.info_c = {}
-        self.p.canonicalize_([center], cur_orthog="calc", info=self.info_c)
+        # Backend tensors may be traced. Discovering isometries numerically
+        # requires Python boolean conversions; a full sweep is traceable and
+        # establishes the same authoritative center without that scan.
+        cur_orthog = None if self.backend in ("jax", "torch") else "calc"
+        self.p.canonicalize_([center], cur_orthog=cur_orthog, info=self.info_c)
         self._current_orthog(self.p)
 
     @staticmethod

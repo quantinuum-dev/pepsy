@@ -257,6 +257,34 @@ def _apply_dense_gate_with_method(
             opts["canonize"] = False
         opts.update(compression_opts or {})
         quimb_seed = seed if method in _MPO_METHODS_USE_SEED else None
+        if (method in {"direct", "dm", "zipup"} and cutoff == 0 and len(where) == 2
+                and ar.infer_backend(gate) in ("jax", "torch")):
+            # An exact two-site MPO with a fixed operator bond. Unlike the
+            # default gate_nonlocal decomposition this has no rank selection
+            # (or derivatives of a rank-deficient operator SVD) before the
+            # requested state compression. Keep all operator entries.
+            d0, d1 = dims
+            data = ar.do("reshape", gate, (d0, d1, d0, d1))
+            if where[0] > where[1]:
+                data = ar.do("transpose", data, (1, 0, 3, 2))
+                d0, d1 = d1, d0
+            data = ar.do("reshape", ar.do("transpose", data, (0, 2, 1, 3)),
+                         (d0*d0, d1, d1))
+            if ar.infer_backend(gate) == "torch":
+                import torch
+                identity = torch.eye(d0*d0, device=gate.device, dtype=gate.dtype)
+            else:
+                identity = ar.do("eye", d0*d0, like=gate)
+                identity = ar.astype(identity, ar.get_dtype_name(gate))
+            left = ar.do("transpose", ar.do("reshape", identity, (d0, d0, d0*d0)),
+                         (2, 0, 1))
+            submpo = qtn.MatrixProductOperator(
+                [left, data], sites=sorted(where), L=p.L, shape="lrud")
+            opts.pop("dims")
+            return _run_seeded_quimb(
+                quimb_seed, p.gate_with_submpo_, submpo, where=sorted(where),
+                inplace_mpo=True, **opts,
+            )
         with _small_matrix_precision(gate) as factor_gate:
             if factor_gate is gate:
                 return _run_seeded_quimb(quimb_seed, p.gate_nonlocal_, gate, where, **opts)

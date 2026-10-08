@@ -118,7 +118,29 @@ def _check_deferred_norm_errors(self):
     pending = self._pending_zero_norm
     if pending is None:
         return
-    if bool(self._real_float(pending)):
+    if ar.infer_backend(pending) == "torch":
+        from torch.fx.experimental.proxy_tensor import get_proxy_mode
+        if get_proxy_mode() is not None:
+            import torch
+            torch._assert_async(~pending, "Cannot stabilize an MPS with a zero or non-finite norm")
+            self._pending_zero_norm = None
+            return
+    if ar.infer_backend(pending) == "jax":
+        import jax
+        if isinstance(pending, jax.core.Tracer):
+            def fail(_):
+                def raise_zero_norm():
+                    raise FloatingPointError(
+                        "Cannot stabilize a unitary FIT state with a zero or non-finite norm."
+                    )
+                jax.debug.callback(raise_zero_norm)
+            jax.lax.cond(pending, fail, lambda _: None, operand=None)
+            self._pending_zero_norm = None
+            return
+    # This is an intentional host validation boundary in Torch (and thus a
+    # graph break), not a conversion through NumPy's scalar machinery.
+    invalid = bool(pending) if ar.infer_backend(pending) == "torch" else bool(self._real_float(pending))
+    if invalid:
         raise FloatingPointError(
             "Cannot stabilize a unitary FIT state with a zero or non-finite norm."
         )

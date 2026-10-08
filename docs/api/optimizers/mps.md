@@ -110,6 +110,28 @@ and delegates non-unitary gate replay to this optimizer.
 
 ## Torch SVD policy
 
+For JAX direct replay under `jit`, use `cutoff=0` and a fixed `chi`, and pass
+the packed MPS arrays as runtime arguments. `register_jax_linalg(stabilized=True,
+qr_rank_policy="adaptive")` installs truncation-safe SVD and adaptive QR
+derivatives. The default QR policy remains native. Adaptive QR preserves finite
+native VJPs and supplies a relative-regularized extension at singular charts;
+it does not remove singular-value degeneracies or rank-crossing limitations.
+`reset_linalg_registrations("jax")` restores both native registrations.
+
+Dense Torch/JAX `direct`, `dm` and `zipup` replay with zero cutoff uses a fixed exact operator
+bond for two-site gates, then performs the requested Quimb state compression.
+It avoids a separate value-dependent operator-SVD rank choice. Canonicalization
+establishes the center with a full sweep instead of inspecting backend tensor
+values in Python. JAX runtime zero-norm errors remain checked through a callback.
+Gaugy's prepared global MPSEngine evaluator configures these policies itself.
+
+Adaptive Torch QR also supports FX capture of its first-order VJP with
+fixed-shape masks instead of value-dependent Python branches. Captured MPS
+zero-norm validation uses a runtime tensor assertion. This permits downstream
+capture of a complete forward/VJP program while preserving Pepsy's linalg
+policy; forward-only FX tracing alone does not preserve a custom backward.
+The fixed-rank derivative remains a local approximation at singular charts.
+
 Torch/Autoray SVD dispatch is process-global, so configure it once at
 application startup or use a scoped policy for an experiment:
 

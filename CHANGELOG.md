@@ -19,10 +19,20 @@ releases remain backwards-compatible. From 1.0 onward:
   and rollback. Per-gate positive-environment fidelities are always retained;
   optional log-space accumulation reports a local infidelity proxy.
 
+- Fixed-shape FX capture for adaptive Torch QR VJPs and deferred MPS norm
+  validation, preserving first-order derivatives across changing singular-chart
+  masks. Zero-cutoff two-site Torch/JAX gate replay also uses an exact fixed
+  operator bond for native Quimb `dm` and `zipup` compression.
+
 - Dense CuPy full-update ALS with native GPU norm projection, gauges and solves.
   Boundary/strip caches validate CuPy mutations with device-side snapshots.
   Row/column traversal also sorts disjoint non-diagonal two-qubit layers and
   finishes each orientation before switching to transverse strips.
+
+- Opt-in adaptive JAX QR VJP through `register_jax_linalg(qr_rank_policy="adaptive")`,
+  retaining native finite derivatives and a regularized singular-chart extension.
+  Dense direct MPS replay with zero cutoff supports fixed operator bonds and
+  traceable canonical initialization; JAX retains runtime zero-norm checks.
 
 - PEPS `update_style` explicitly selects row/column fitting or reduced two-site
   ALS within sweep mode. Optional column/row gate traversal reorders only

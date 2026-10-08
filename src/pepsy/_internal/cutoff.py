@@ -20,10 +20,13 @@ def dtype_auto_cutoff(dtype):
     classification when NumPy cannot construct a dtype directly.
     """
 
-    try:
-        dtype_name = np.dtype(dtype).name.lower()
-    except (TypeError, ValueError):
-        dtype_name = str(dtype).strip().lower()
+    dtype_name = str(dtype).strip().lower()
+    # Torch compilation cannot trace NumPy's exception on torch.dtype.
+    if not dtype_name.startswith("torch."):
+        try:
+            dtype_name = np.dtype(dtype).name.lower()
+        except (TypeError, ValueError):
+            pass
 
     if "16" in dtype_name:
         return 1.0e-3

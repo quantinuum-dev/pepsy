@@ -711,15 +711,21 @@ def register_torch_linalg(
     return config.register()
 
 
-def register_jax_linalg(*, stabilized=False):
-    """Register native or truncation-safe JAX SVD in Autoray.
+def register_jax_linalg(*, stabilized=False, qr_rank_policy="native"):
+    """Register JAX SVD and an explicit QR derivative policy in Autoray.
 
     Parameters
     ----------
     stabilized : bool, default=False
         Keep native thin SVD by default. Set this to ``True`` to install the
         custom VJP that restores cotangents from Quimb fixed-rank truncation.
+    qr_rank_policy : {"native", "adaptive"}, default="native"
+        ``adaptive`` retains finite native reduced-QR derivatives and uses a
+        relative-regularized extension at singular/nonfinite QR charts.
+        This does not resolve degeneracies of the SVD itself.
     """
+    if qr_rank_policy not in ("native", "adaptive"):
+        raise ValueError("qr_rank_policy must be native or adaptive")
     try:
         __import__("jax")
     except ImportError as exc:  # pragma: no cover - optional dependency
@@ -733,6 +739,9 @@ def register_jax_linalg(*, stabilized=False):
         lr.reg_complex_svd_jax()
     else:
         lr.reg_native_svd_jax()
+    qr_function = lr.qr_jax if qr_rank_policy == "adaptive" else lr._NATIVE_QR
+    if ar.get_lib_fn("jax", "linalg.qr") is not qr_function:
+        ar.register_function("jax", "linalg.qr", qr_function)
 
 
 def reset_linalg_registrations(backend="all"):

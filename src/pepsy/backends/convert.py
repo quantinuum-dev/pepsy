@@ -148,6 +148,11 @@ def to_float(value, *, real=True):
         If ``False``, complex values follow Python's normal ``float(...)``
         rules and therefore raise when they are not real.
     """
+    if ar.infer_backend(value) == "torch":
+        if value.shape != ():
+            raise TypeError(f"Expected a scalar-like value, got shape {value.shape}.")
+        # Avoid np.real on Dynamo's symbolic Python scalar after a graph break.
+        return float((value.real if real else value).item())
     scalar = _backend_scalar(value)
     if real:
         scalar = np.real(scalar)
@@ -356,8 +361,11 @@ def infer_backend_and_dtype(sample_data):
     if sample_data is None:
         raise ValueError("Cannot infer backend: sample_data is None.")
 
-    dtype_name = ar.get_dtype_name(sample_data)
     backend = ar.infer_backend(sample_data)
+    # Autoray probes ``dtype.name`` and catches AttributeError on Torch.
+    # Dynamo cannot trace that probe; Torch's public string form is stable.
+    dtype_name = (str(sample_data.dtype).removeprefix("torch.") if backend == "torch"
+                  else ar.get_dtype_name(sample_data))
     return backend, dtype_name
 
 
