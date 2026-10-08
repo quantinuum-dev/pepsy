@@ -31,7 +31,7 @@ def test_peps_default_shares_builder_with_metrics_and_boundary_fits(monkeypatch)
     monkeypatch.setattr(boundary_metrics, "CompBdy", comp)
     state = qtn.PEPS.rand(2, 2, bond_dim=1, dtype="complex128", seed=61)
     gate = np.diag(np.exp(-.2j * np.array([1., -1., -1., 1.])))
-    opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=1, fit_mode="direct")
+    opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=1, fit_mode="direct", boundary_convergence=False)
     output = opt.run(optimize=False)
     assert len(built) == 1
     assert opt.contraction_opt is opt._sweep_local_contraction_opt is built[0]
@@ -135,7 +135,7 @@ def test_driver_reuses_local_cotengra_optimizer_across_batches_and_runs(monkeypa
     state = qtn.PEPS.rand(2, 2, bond_dim=1, dtype="complex128", seed=61)
     gate = np.linalg.qr(np.random.default_rng(31).normal(size=(4, 4)))[0]
     gates = [(gate, ((0, 0), (0, 1)))] * 2
-    opt = PepsOptimizer(state, gates, chi=1, contraction_opt="greedy")
+    opt = PepsOptimizer(state, gates, chi=1, contraction_opt="greedy", boundary_convergence=False)
     for _ in range(2):
         opt.set_gates(gates)
         opt.run(k_2q_batch=1)
@@ -200,7 +200,7 @@ def test_precheck_reuse_requires_matching_metric_policy(evaluation_chi, metric_o
         state, [(gate, ((0, 0), (0, 1)))], chi=1, fit_mode="direct",
         evaluation_chi=evaluation_chi, infidelity_kwargs=metric_options,
         contraction_opt="greedy", optimizer_options={"maxeval": 4},
-        sweep_optimize_kwargs={"n_round_trips": 1},
+        sweep_optimize_kwargs={"n_round_trips": 1}, boundary_convergence=False,
     )
     opt.run(infidelity_tol=0.)
     record = opt.get_step_records()[0]

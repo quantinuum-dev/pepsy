@@ -2169,6 +2169,10 @@ def build_bra_ket(
     ket_tagged.add_tag("KET")
     bra_tagged.add_tag("BRA")
     norm_tagged = bra_tagged | ket_tagged
+    # Private provenance is consumed only by explicitly enabled environment
+    # caches. Ordinary contractions and unsupported backends are unchanged.
+    from ._reuse import layer_sources
+    layer_sources(ket, ket if auto_bra else bra, norm_tagged)
     return ket_tagged, norm_tagged
 
 
@@ -2339,6 +2343,8 @@ def contract_boundary(
 
     retag = bool(retag)
     norm_tagged = norm.copy()
+    if hasattr(norm, '_pepsy_boundary_sources'):
+        norm_tagged._pepsy_boundary_sources = norm._pepsy_boundary_sources
 
     comp_bdy = CompBdy(
         norm_tagged,

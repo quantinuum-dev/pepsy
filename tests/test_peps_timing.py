@@ -17,7 +17,7 @@ def make_optimizer():
     return PepsOptimizer(
         state, [(gate, ((0, 0), (0, 1)))], chi=1,
         optimizer_options={"maxeval": 4},
-        sweep_optimize_kwargs={"n_round_trips": 1},
+        sweep_optimize_kwargs={"n_round_trips": 1}, boundary_convergence=False,
     )
 
 

@@ -1030,6 +1030,30 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         return guess
 
     def _fit_boundary(
+        self, tn, boundary_key, previous, site_tag_id, boundary_len,
+    ):
+        cache = getattr(self.mps_boundaries, 'environment_cache', None)
+        signature = None
+        if cache is not None:
+            cached, signature = cache.lookup(self, boundary_key, previous)
+            if cached is not None:
+                return cached
+            # A local gate can change the outgoing bond of this cut. Retain
+            # other cuts, but recreate this lazy guess if its interface changed.
+            guess = dict.get(self.mps_boundaries, boundary_key)
+            if guess is not None:
+                expected = {i: tn.ind_size(i) for i in tn.outer_inds()}
+                actual = {i: guess.ind_size(i) for i in guess.outer_inds()}
+                if actual != expected:
+                    self.mps_boundaries.pop(boundary_key, None)
+        result = self._fit_boundary_uncached(
+            tn, boundary_key, previous, site_tag_id, boundary_len,
+        )
+        if cache is not None:
+            cache.store(boundary_key, signature, result)
+        return result
+
+    def _fit_boundary_uncached(
         self,
         tn,
         boundary_key,

@@ -137,6 +137,7 @@ _SYMBOL_MODULES = {
     'ContractionCost': '._compression_utils',
     'ContractionPlanCache': '._compression_utils',
     'ExactReducedUpdateProblem': '.reduced_update',
+    'ReducedEnvironmentUpdateProblem': '.reduced_update',
     'LoopClusterReducedUpdateProblem': '.reduced_update',
     'LoopClusterTerm': '.reduced_update',
     'ReducedALSSolution': '.reduced_update',
@@ -167,6 +168,7 @@ __all__ = [
     "ContractionCost",
     "ContractionPlanCache",
     "ExactReducedUpdateProblem",
+    "ReducedEnvironmentUpdateProblem",
     "BPCandidateScore",
     "BPCandidateSelection",
     "BPState",
@@ -387,6 +389,7 @@ if TYPE_CHECKING:
     )
     from .reduced_update import (  # noqa: F401 -- public aliases
         ExactReducedUpdateProblem,
+        ReducedEnvironmentUpdateProblem,
         LoopClusterReducedUpdateProblem,
         LoopClusterTerm,
         ReducedALSSolution,

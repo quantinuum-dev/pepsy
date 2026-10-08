@@ -31,6 +31,7 @@ class _LazyBoundaryMap(dict):
     def __init__(self, owner):
         super().__init__()
         self._owner = owner
+        self.environment_cache = None
 
     def __missing__(self, key):
         self._owner._ensure_boundary_key(key)

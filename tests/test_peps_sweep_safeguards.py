@@ -152,9 +152,9 @@ def test_driver_does_not_label_all_skipped_objective_only_sweep_optimized(monkey
         normalize_kwargs={"method": "exact"},
         sweep_optimize_kwargs={"n_round_trips": 0},
     )
-    reference = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], **kwargs)
+    reference = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], **kwargs, boundary_convergence=False)
     warm = reference.run(optimize=False, measure_infidelity=False, progress=False)
-    optimizer = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], **kwargs)
+    optimizer = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], **kwargs, boundary_convergence=False)
     monkeypatch.setattr(SweepOptimizer, "_scaled_overlap_fidelity", lambda *args: 1.25)
     with pytest.warns(UserWarning, match="Skipping a local sweep update"):
         output = optimizer.run(measure_infidelity=False, progress=False)
@@ -178,7 +178,7 @@ def test_clipped_outer_precheck_still_invokes_sweep(monkeypatch):
     })
     optimizer = PepsOptimizer(
         state, [(gate, ((0, 0), (0, 1)))], chi=1, fit_mode="direct",
-        boundary_chi=4, evaluation_chi=4, contraction_opt="greedy",
+        boundary_chi=4, evaluation_chi=4, contraction_opt="greedy", boundary_convergence=False,
     )
     calls = []
 
@@ -216,7 +216,7 @@ def test_retried_postcheck_restores_reliable_warmstart_comparison(
     optimizer = PepsOptimizer(
         state, [(gate, ((0, 0), (0, 1)))], chi=1, fit_mode="direct",
         boundary_chi=4, evaluation_chi=4, contraction_opt="greedy",
-        infidelity_kwargs={"norm_target": None},
+        infidelity_kwargs={"norm_target": None}, boundary_convergence=False,
     )
     monkeypatch.setattr(optimizer, "_optimize_state", lambda warmstart, target, **kw: (
         warmstart, .01, {"success": True},
@@ -274,9 +274,9 @@ def test_real_coarse_boundary_failure_returns_warm_start(measure, accept_if_impr
         normalize_kwargs={"method": "exact"},
         infidelity_kwargs={"method": "exact"},
     )
-    reference = PepsOptimizer(state, [(gate, ((1, 1), (1, 2)))], **kwargs)
+    reference = PepsOptimizer(state, [(gate, ((1, 1), (1, 2)))], **kwargs, boundary_convergence=False)
     warm = reference.run(optimize=False, measure_infidelity=measure, progress=False)
-    optimizer = PepsOptimizer(state, [(gate, ((1, 1), (1, 2)))], **kwargs)
+    optimizer = PepsOptimizer(state, [(gate, ((1, 1), (1, 2)))], **kwargs, boundary_convergence=False)
     with pytest.warns(UserWarning, match="initial boundary infidelity is invalid"):
         output = optimizer.run(
             infidelity_tol=0., measure_infidelity=measure,
@@ -311,7 +311,7 @@ def test_rejected_scipy_fit_restores_unchanged_normalized_warmstart(monkeypatch)
         optimizer_options={"n_steps": 2},
         sweep_optimize_kwargs={"n_round_trips": 0},
         normalize_kwargs={"method": "exact"},
-        infidelity_kwargs={"method": "exact"},
+        infidelity_kwargs={"method": "exact"}, boundary_convergence=False,
     )
     original_fit = optimizer._optimize_state
     saved = {}

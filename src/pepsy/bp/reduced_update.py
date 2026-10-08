@@ -56,6 +56,7 @@ from ._symmray import is_symmray_array
 
 __all__ = [
     "ExactReducedUpdateProblem",
+    "ReducedEnvironmentUpdateProblem",
     "ReducedLoopClusterGateResult",
     "LoopClusterReducedUpdateProblem",
     "LoopClusterTerm",
@@ -1202,6 +1203,25 @@ class ReducedBondPair:
 
 
 @dataclass(frozen=True)
+class ReducedEnvironmentUpdateProblem(_ReducedUpdateProblemMixin):
+    """Reduced fit with an externally contracted open environment.
+
+    This allows boundary-MPS consumers to use the same ALS solver as BP
+    consumers without running BP or rebuilding an exact exterior. Environment
+    legs are ket-left, ket-right, bra-left, bra-right. ``target`` is ordered
+    left-reduced, left-physical, right-physical, right-reduced. The caller owns
+    environment approximation and Hermitian/PSD projection. Physical identity
+    factors stay implicit when ``metric`` and ``linear_term`` are None.
+    """
+
+    pair: ReducedBondPair
+    environment: Any
+    target: Any
+    metric: Any = None
+    linear_term: Any = None
+
+
+@dataclass(frozen=True)
 class ExactReducedUpdateProblem(_ReducedUpdateProblemMixin):
     """Exact reduced-tensor least-squares problem for one two-site gate.
 
@@ -1316,7 +1336,8 @@ class LoopClusterReducedUpdateProblem(_ReducedUpdateProblemMixin):
 
 
 ReducedUpdateProblem: TypeAlias = (
-    ExactReducedUpdateProblem
+    ReducedEnvironmentUpdateProblem
+    | ExactReducedUpdateProblem
     | SUClusterReducedUpdateProblem
     | LoopClusterReducedUpdateProblem
 )
@@ -1334,6 +1355,7 @@ class ReducedALSSolution:
     left: Any
     right: Any
     costs: tuple[float, ...]
+    solver: str | None = None
 
     def theta(self):
         """Return the optimized joint reduced tensor."""
@@ -1993,7 +2015,7 @@ def _loop_cluster_region_counts(
     )
 
 
-def _psd_project_metric(metric, psd_floor: float):
+def _psd_project_metric(metric, psd_floor: float, *, return_spectrum=False):
     """Return a Hermitian PSD projection and projection diagnostics."""
     if psd_floor < 0.0:
         raise ValueError("psd_floor must be nonnegative")
@@ -2014,7 +2036,12 @@ def _psd_project_metric(metric, psd_floor: float):
     )
     projected = (eigenvectors * clipped) @ _dag(eigenvectors)
     projected = 0.5 * (projected + _dag(projected))
-    return projected, raw_min, _scalar_int(ar.do("sum", eigenvalues < floor))
+    result = projected, raw_min, _scalar_int(ar.do("sum", eigenvalues < floor))
+    if return_spectrum:
+        # Boundary full-update gauges need the same eigensystem: returning it
+        # avoids a second decomposition of the already projected metric.
+        return (*result, eigenvalues, eigenvectors, clipped)
+    return result
 
 
 def _psd_project_open_environment(pair, environment, psd_floor: float):
@@ -2686,6 +2713,7 @@ def _solve_reduced_als_quimb(
         left=left,
         right=right,
         costs=(initial_cost, final_cost),
+        solver='quimb',
     )
 
 
@@ -3209,7 +3237,8 @@ def solve_reduced_als(
         if abs(costs[-2] - current_cost) <= tol * max(1.0, costs[-2]):
             break
 
-    return ReducedALSSolution(left=left, right=right, costs=tuple(costs))
+    return ReducedALSSolution(left=left, right=right, costs=tuple(costs),
+                              solver='qr' if use_qr else 'normal')
 
 
 def _valid_warm_start_gauge(tn, index: str, gauge):

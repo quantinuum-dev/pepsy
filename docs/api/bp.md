@@ -196,8 +196,14 @@ For explicit dense diagnostics, use `problem.dense_metric()` and
 All reduced problem builders Hermitianize and PSD-project the smaller open
 environment by default. `problem.raw_min_eigenvalue` and
 `problem.clipped_eigenvalues` expose the projection diagnostics.
-The three builder return types share the `ReducedUpdateProblem` type alias for
-annotations. The full-system `max_cluster_size` cutoff is an exact small-system
+The builder return types share the `ReducedUpdateProblem` type alias for
+annotations. `ReducedEnvironmentUpdateProblem(pair, environment, target)`
+also accepts an externally contracted reduced environment, such as the checked
+boundary-MPS environment used by `PepsOptimizer` two-site updates. It does not
+claim an exact environment or run BP. The shared `solve_reduced_als` result
+reports `solver="quimb"`, `"qr"`, or `"normal"` on those dense routes;
+other routes retain `None` when no route diagnostic is available.
+The full-system `max_cluster_size` cutoff is an exact small-system
 oracle (up to the requested Hermitian/PSD projection), so a practical
 convergence study compares a ladder of total cutoffs against
 `exact_reduced_update_problem(..., psd_project=False)` and reports the open

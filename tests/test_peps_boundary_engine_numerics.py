@@ -93,7 +93,7 @@ def test_entangled_peps_boundary_engine_sweep_matches_exact_fidelity(engine, fit
         state, gates, chi=2,
         boundary_engine=engine, fit_mode=fit_mode,
         boundary_chi=(8, 10), normalize_chi=(32, 48), evaluation_chi=(32, 48),
-        contraction_opt="greedy", fit_timing=True,
+        contraction_opt="greedy", fit_timing=True, boundary_convergence=False,
     )
     # Keep the real default LD_LBFGS budget (50) and four round trips per axis.
     output = optimizer.run(infidelity_tol=0., progress=False)

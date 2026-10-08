@@ -12,7 +12,44 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Added
+
+- PEPS `update_style` explicitly selects row/column fitting or reduced two-site
+  ALS within sweep mode. Optional column/row gate traversal reorders only
+  contiguous fixed diagonal two-qubit gates and preserves ordering barriers.
+  Two-site updates reuse Pepsy's reduced-pair preparation, PSD projection and
+  Quimb/weighted-QR ALS with an externally contracted environment.
+
+- Optional dense Torch PEPS `mode="full-update"`: gate-by-gate reduced
+  two-site QR/LQ update, positive norm-environment projection, environment
+  gauges, and alternating least-squares solves with rollback and diagnostics.
+  Adaptive boundary checks and selected-chi output normalization are retained.
+- Dense Torch adaptive PEPS fits can reuse checked boundary MPS and valid
+  directional cuts. Slice/predecessor versions and compression settings
+  invalidate affected cuts in both sweep directions; fresh convergence
+  confirmation remains independent. Disable with
+  `boundary_convergence={"reuse_environments": False}`.
+
 ### Fixed
+
+- Two-site PEPS output normalization keeps the calibrated chi even with custom
+  normalization options. Failed zero-norm calibration probes discard stale
+  boundary handles and report nonconvergence without a cache-handoff error.
+- Fixed-chi two-site PEPS updates use `boundary_chi` for the reduced norm
+  environment independently of overlap-evaluation caps, and retain validated
+  boundary cuts across gates even when adaptive calibration is disabled.
+
+- PEPS sweep refinement now checks norm/overlap convergence at increasing
+  boundary chi by default, reuses measured norms and the cap floor, and warns
+  with explicit diagnostics when its configurable ceiling is insufficient.
+  Probes now scale as D squared, 2 D squared, 3 D squared up to 8 D squared,
+  require two stable increases, and confirm reused DMRG boundary guesses
+  with fresh contractions. Selected caps are fixed during fitting and final
+  normalization; reports include actual ranks, thresholds and stop reasons.
+  Imaginary norm residuals now use the requested relative accuracy with a
+  dtype roundoff floor, rather than forcing machine precision on approximate
+  contractions. Reports distinguish converged selection from a ceiling fallback.
+  Set `boundary_convergence=False` for the previous fixed-cap policy.
 
 - PEPS sweep clipping no longer turns negative approximate losses into
   perfect-fit convergence or best-state scores. Clipped outer prechecks still

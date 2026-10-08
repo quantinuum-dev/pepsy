@@ -1,5 +1,6 @@
 # `pepsy.optimizers.peps`
 
+For global mode and fixed-cap sweeps (`boundary_convergence=False`),
 `PepsOptimizer` has separate chi controls for different jobs:
 
 - `chi` caps the optimized PEPS/PEPO virtual bonds.
@@ -9,7 +10,7 @@
 - `evaluation_chi` controls pre/post infidelity diagnostics used for accepting
   or rejecting a candidate.
 
-With no cap overrides, all three settings resolve to `(4*D, 5*D)`.
+With no cap overrides, all three configured starting settings resolve to `(4*D, 5*D)`.
 Each accepts a scalar or a `(norm cap, overlap cap)` pair. Normalization uses
 only the first entry; infidelity uses the first for both state norms and the
 second for their overlap. For example, `chi=4` gives `(16, 20)` throughout.
@@ -24,8 +25,99 @@ normalization mappings remain available through `sweep_kwargs`/`global_kwargs`.
 An explicit mapping `chi=None` is preserved for exact metrics or reuse of
 existing DMRG boundary handles. Named caps require positive integers or pairs.
 
-Use `evaluation_chi` larger than `boundary_chi` when you want a stricter final
+With `boundary_convergence=False`, use `evaluation_chi` larger than `boundary_chi` when you want a stricter final
 quality check without making every optimization environment more expensive.
+
+## Adaptive boundary convergence before sweeps
+
+`boundary_convergence=True` is the default for `PepsOptimizer` sweep mode.
+Before refining a compressed target, it probes the unchanged warm start and
+target at increasing `(chi_norm, chi_overlap)` caps. It measures both norms
+and the complex overlap in **both x and y**. Norms must agree relatively;
+the overlap comparison uses its complex amplitude divided by the square
+root of the measured norm product. Comparing norms separately prevents a
+constant fidelity ratio from concealing changing numerator/denominator errors.
+Both successive-cap and cross-direction comparisons must pass. Nonpositive
+norms and fidelity above one beyond dtype roundoff cannot establish convergence.
+Norm reality is checked at the requested approximation accuracy:
+`abs(Im(norm))/abs(norm) <= max(rtol, dtype_roundoff)` for each state norm.
+Using only machine roundoff here would force cap growth even when residuals
+are far below the requested contraction tolerance. Raw complex values remain
+saved; this does not discard their imaginary parts or loosen fidelity guards.
+
+```python
+optimizer = PepsOptimizer(
+    state, gates, chi=4, mode="sweep", fit_mode="eff",
+    boundary_convergence={
+        "start_chi": "auto", "max_chi": "auto", "rtol": 1e-5, "atol": 1e-8,
+    },
+)
+```
+
+The default `schedule="d2"` probes `D**2, 2*D**2, 3*D**2, ...`, where D is
+the fitted PEPS cap, up to `max_chi="auto" = 8*D**2`. Thus D=4 probes
+16,32,48,...,128 and D=2 probes 4,8,12,...,32. `start_chi` and `max_chi`
+accept explicit scalar or norm/overlap pairs. These adaptive controls replace
+the fixed `boundary_chi`, `normalize_chi`, and `evaluation_chi` settings for
+this path, including initial normalization. A larger target still has its
+own measured norm; D-squared is a cost heuristic, not an accuracy bound.
+
+Defaults are `rtol=1e-5`, `atol=1e-8` and `patience=2`: both norms and the
+complex overlap must pass on two consecutive cap increases and across x/y.
+The selected pair stays fixed throughout this sweep fit. Final normalization
+uses exactly the selected norm cap, preserving backend, dtype and device.
+For the earlier multiplicative search, set `schedule="geometric"` and
+`growth=2`; that schedule uses the resolved fixed caps as its starting minimum.
+
+With `warm_start=True`, Pepsy DMRG probes reuse three boundary MPS guesses per
+axis (state norm, target norm, overlap) on the unchanged states. One-site
+boundaries expand through the existing boundary API; block FIT grows through
+its local splits. Reused guesses use direct initialization and are always
+refitted. Before accepting convergence, fresh contractions in both directions
+must agree with the reused ones. This rejects a stale variational plateau.
+Direct compressors and Quimb-MPS do not consume these guesses. All guesses
+are discarded after calibration; no tensor environments cross gate updates.
+
+The checked warm-start norm and target norm are reused; the initial fidelity
+check also reuses these measurements instead of contracting again. The
+independent post-fit check, when enabled, remains separate. Explicit custom
+normalization methods/options still run their requested normalization instead
+of reusing the warm-start norm.
+
+The cap floor survives `run(reset_traces=True)` and `set_gates()`. Each new
+state is rechecked starting two D-squared increments below the retained cap,
+bounded by `start_chi`. Larger caps are retained for subsequent fits.
+Adaptive start/retained caps above `max_chi`
+raise instead of silently exceeding the ceiling.
+
+At the ceiling, an unsuccessful check emits a warning and continues the
+sweep at that cap with `boundary_convergence.converged=False`. Unusable
+nonfinite or nonpositive norms still raise. A warning does not certify
+accuracy, and pre-fit convergence does not guarantee every later local
+environment is accurate. Existing local-update safeguards remain active.
+For reused DMRG guesses, the ceiling also gets a fresh contraction check;
+its measured values are used for continuation without changing the failed
+convergence status.
+
+`get_boundary_convergence()` exposes the retained `chi_floor` and per-run
+records. Each gate-batch record contains `boundary_convergence`, including
+tested caps, actual boundary bond dimensions, warm/fresh initialization,
+scalar norms/overlaps with their exponents, named comparisons, thresholds,
+stable comparison counts, status and stopping reason.
+`selection_status="converged"` means the checks passed;
+`selection_status="limit_unconverged"` means the ceiling was used without
+passing. `at_ceiling` is separate: the ceiling can itself pass. Per-axis
+`validity` records contain relative imaginary residuals, their threshold,
+fidelity validity and explicit rejection reasons.
+The `boundary_convergence` timing phase includes these extra contractions.
+
+This check runs even with `measure_infidelity=False`; that option disables
+the separate acceptance check, not the new convergence probe. Set
+`boundary_convergence=False` to retain the old fixed-cap behavior and its
+unit-target-norm shortcut. Global mode and `optimize=False` do not probe.
+Custom `boundary_options` or supplied sweep boundary handles currently require
+disabling adaptive checks; otherwise a clear error prevents a misleading
+comparison using a different boundary policy.
 
 `boundary_engine` controls the boundary implementation used when PEPS cleanup
 delegates to `SweepOptimizer`. The default, `"auto"`, keeps dense inputs on the
@@ -86,6 +178,115 @@ remains invalid. Physical-index strings such as `("k0,0", "k0,1")` are
 supported without forwarding coordinate-routing options to the split routine.
 
 ## Profiling
+
+### Reusing checked boundary environments
+
+For dense Torch states without gradients, adaptive checking now defaults to
+`boundary_convergence={"reuse_environments": True}`. The final checked norm
+and overlap boundary MPS are handed to the row/column fitter with the same
+target index labels. The next sweep extends these cuts instead of starting
+every boundary again. Use `reuse_environments=False` for a fresh-fit comparison.
+
+Every left and right cut is validated against the tensors in its next slice,
+its preceding boundary, and its compression policy. A changed row or column
+invalidates all cuts that depend on it; cuts outside that region can be reused.
+Changes to Torch data (including versioned in-place writes), indices, chi,
+solver budget, cutoff, or boundary data invalidate the corresponding entries.
+Network scale exponents remain outside this cache and are applied afresh.
+Index/topology changes conservatively create new boundary guesses.
+
+This does not skip chi probes, the final scalar contractions, or independent
+fresh DMRG confirmation. Only the latest checked handles per axis are retained
+across gate batches; no full trajectory is cached. A full row/column sweep can
+change every tensor, so across-gate reuse is most effective for local updates.
+NumPy, CuPy, JAX, Symmray, trainable Torch arrays, and Torch inference tensors
+currently use the original path because this cache needs reliable mutation
+tracking. Do not mutate Torch arrays through unversioned `.data` writes.
+Sweep result `environment_reuse` reports cache hits and rebuilds.
+
+### Two-site full update
+
+Select the update explicitly with `mode="sweep", update_style="two-site"`.
+The default `update_style="row-column"` retains row/column variational fitting;
+`"row"` selects x slices and `"column"` selects y slices. Those choices retain
+the existing local solver and sweep budgets. `mode="full-update"` is also
+accepted as a two-site alias. No separate one-site ALS mode is introduced.
+The two-site path follows the reduced-tensor scheme
+in [Lubasch, Cirac and Bañuls, Sec. III B](https://arxiv.org/pdf/1405.3259).
+Currently it supports nearest-neighbor coordinate pairs on dense Torch
+complex64/complex128 PEPS, with Pepsy boundary MPS (direct or DMRG fitting).
+It does not support differentiation through the update or native symmetry
+arrays. `k_2q_batch="auto"` means one two-site gate in this mode; integers
+greater than one are rejected. For row/column fitting, `k_2q_batch=1` explicitly
+selects gate-by-gate fitting; `"auto"` retains automatic batching.
+
+```python
+optimizer = PepsOptimizer(
+    state, gates, chi=4, mode="sweep", update_style="two-site",
+    gate_order="column",
+    fit_mode="eff",                         # DMRG boundary compression
+    boundary_convergence={"max_chi": 128, "rtol": 1e-5},
+    full_update_kwargs={
+        "max_iterations": 50, "rtol": 1e-9,
+        "rcond": 1e-12, "gauge": True, "solver": "auto",
+    },
+)
+state = optimizer.run(
+    k_2q_batch=1, normalize_final=True,
+    measure_infidelity=False, measure_final_infidelity=False,
+    accept_if_improved=False,
+)
+```
+
+QR/LQ separates fixed external factors from the two reduced tensors. The
+exact gated pair supplies the target; only its retained shared bond is
+truncated to `chi`. The untouched row/column strip is contracted using the
+checked boundary MPS. Its reduced norm matrix is Hermitianized, then negative
+eigenvalues are set to zero. Independent gauges from its square root improve
+conditioning when invertible; singular gauges use the ungauged path.
+
+Reduction, PSD projection, and ALS reuse `pepsy.bp.reduced_update`; this path
+does not run BP or use a BP environment. `solver="auto"` delegates to Quimb's
+public ALS fitter, with the existing weighted-QR fallback. `solver="quimb"`
+requires that route, while `solver="qr"` requires weighted least squares.
+All new contractions receive Pepsy's Cotengra optimizer. The shared solver
+starts from the gauged target's SVD. Its result is compared against both
+ordinary and gauged SVD guesses in the same positive metric, retaining the
+lowest cost. The final internal bond is balanced with SVD.
+External PEPS tensors remain unchanged by the pair fit.
+Requested output normalization still runs at the selected norm chi, on the
+same device and dtype. Independent pre/post checks remain controlled by the
+usual `measure_infidelity`, `measure_final_infidelity`, and
+`accept_if_improved` options. Adaptive calibration remains active without them.
+
+`full_update_kwargs` owns the ALS controls, not SciPy/LBFGS sweep options.
+With `boundary_convergence=False`, `boundary_chi` (first entry for a pair)
+sets the reduced norm environment cap independently of `evaluation_chi`.
+Its boundary cache persists across gates and `run()` calls. Disable both
+independent infidelity measurements and acceptance checks for a norm-only
+workflow; ALS still evaluates its local target in the positive norm metric.
+`norm_environment_chi` records the cap actually used.
+`rcond=None` selects 1e-12 for complex128 and 1e-6 for complex64. Diagnostics
+include the raw environment's anti-Hermitian residual, minimum eigenvalue,
+negative spectral weight, gauge status, accepted ALS loss history, and cache
+counts. `solver` reports the actual route, and `solver_costs` retains its cost
+diagnostics. Quimb does not expose an iteration count here: `iterations=None`
+and `converged=None` avoid claiming a stopping condition that was not observed.
+Positive projection stabilizes the local solve; it is **not** proof
+that boundary contraction converged. The reported local positive-environment
+fidelity, and its accumulated product, are not exact global fidelity.
+Timing separates target preparation, chi calibration, reduced environment
+construction, ALS, and output normalization.
+
+`gate_order="column"` or `"row"` traverses strips in a snake order, improving
+the opportunity to retain cuts on either side of local updates. Only contiguous
+fixed diagonal two-qubit gates are reordered (for example a ZZ layer).
+Single-site, non-diagonal, trainable, or unsupported gates remain barriers.
+This preserves the exact circuit; different truncation order can still change
+the approximate result. The default `"input"` preserves the original order.
+`optimizer.last_gate_order` records one-based original gate positions in
+execution order, and the supplied gate queue is restored even after failure.
+`run(update_style=..., gate_order=...)` can override both options temporarily.
 
 When the driver performs a final acceptance check, the sweep's duplicate final
 diagnostic is skipped unless custom debug diagnostics are requested. For
@@ -166,7 +367,11 @@ controls with `optimizer_options` or per-run
 
 ## Fidelity evaluation
 
-For default unitary evolution, `run()` passes `norm_target=1` to every
+With adaptive sweep checks, the target norm is measured during calibration
+and reused throughout that fit, overriding the unitary shortcut below.
+
+For global mode or `boundary_convergence=False`, default unitary evolution
+passes `norm_target=1` to every
 pre/post fidelity evaluation and to variational cleanup, avoiding the
 enlarged target's norm contraction. This assumes that the incoming retained
 PEPS is normalized and the gates are unitary. The compressed candidate's
@@ -183,7 +388,7 @@ not be normalized. Known or measured target norms from the precheck are
 forwarded to variational cleanup.
 
 The delegated sweep's initial/final diagnostics reuse that same target norm,
-so default unitary optimization also avoids target norm contractions inside
+so optimization also avoids duplicate target norm contractions inside
 the sweep. Explicit diagnostic overrides and exact debug metrics remain
 available. With `measure_infidelity=False`, optimization still needs a valid
 objective: an unknown target norm is measured once using `evaluation_chi`
@@ -192,11 +397,13 @@ default of one, avoids that measurement. Disabling both measurement and
 optimization needs no target norm contraction.
 
 An inconsistent finite-cap contraction can still produce a negative
-infidelity. By default `evaluation_max_retries=2` allows up to two retries,
+infidelity. Outside adaptive sweep fits, `evaluation_max_retries=2` allows up to two retries,
 each using the same cap for both norms and overlap, twice the preceding
 maximum cap. Every retry warns. Use `evaluation_max_retries=0` to enforce
 strict caps. Exact contractions, nonfinite estimates and explicitly supplied
 norms do not trigger automatic cap growth. Persistent invalid estimates raise.
+Adaptive sweep postchecks use the calibrated cap without these extra retries,
+so evaluation cannot silently exceed the configured convergence ceiling.
 The default unit-target-norm path likewise does not retry or silently enable
 target contraction. A negative estimate can indicate insufficient
 `normalize_chi`; increase normalization/evaluation accuracy or opt into
@@ -252,9 +459,10 @@ objectives; there is no `auto-hq` or `greedy` preset fallback in this policy.
 Explicit caller overrides still take precedence.
 
 **The clipping allowance is a continuation policy, not an accuracy bound.**
-A negative approximate precheck can become zero and satisfy `infidelity_tol`,
-skipping refinement; a clipped local loss can also satisfy sweep convergence
-bookkeeping. Neither outcome demonstrates a converged overlap. For accurate
+A negative approximate loss beyond dtype roundoff is excluded from sweep
+early stopping and best-iterate selection even when its reported value is
+clipped to zero. A small positive approximate loss can still be inaccurate.
+For accurate
 comparisons, inspect raw diagnostics and check convergence as both
 normalization and norm/overlap evaluation caps increase, using exact small
 systems as references where practical. Setting the clipping allowance to zero
@@ -299,9 +507,10 @@ Increase `normalize_chi` to check convergence. `normalize_final=False` skips
 candidate/direct-output normalization; warm starts are always normalized.
 `normalize_target=None` follows `non_unitary`; set `non_unitary=True` for
 nonunitary evolution or explicitly override `normalize_target=True/False`.
-Default unitary fidelity evaluation uses target norm one without contracting
-or rescaling that target. Explicit target-norm measurement remains available
-to account for finite-boundary normalization error.
+Adaptive sweeps measure the unchanged target norm before fitting. Outside
+that path, default unitary fidelity evaluation uses target norm one without
+contracting or rescaling that target; explicit target-norm measurement
+remains available to account for finite-boundary normalization error.
 The sweep receives an already normalized warm start and skips duplicate
 constructor normalization. Explicit `sweep_kwargs={"renormalize_state": True}`
 enables it, using `normalize_chi` independently of `boundary_chi` unless
@@ -314,8 +523,9 @@ and `optimized=False`, even with `accept_if_improved=False` or fidelity
 measurement disabled. `optimizer_result` includes the raw initial estimate
 and `termination_reason="invalid_initial_loss"`. The failed cleanup adds no
 postcheck or normalization contraction. This is a safeguard, not an automatic
-boundary-accuracy correction; requested caps, FIT iterations, and the known
-unitary target-norm policy remain unchanged.
+boundary-accuracy correction during the local fit: the already selected caps,
+FIT iterations, and target-norm value remain unchanged until the next fit's
+calibration.
 
 In `mode="global"`, the default optimizer is NLopt `LD_VAR2` with an evaluation
 budget of 1200, using Torch autodiff through Quimb MPS contractions. Override
