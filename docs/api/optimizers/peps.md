@@ -340,8 +340,9 @@ Set `full_update_kwargs={"refine_sweeps": 1}` to add an optional one-site ALS
 pass over a completed row or column after its two-site full updates. The
 default is zero. Contiguous gates on the same strip share one exact,
 untruncated block target, captured before their pair updates. A change of
-strip, a one-site gate, a repeated bond, or the end of the run closes the
-block. Each bond appears at most once, bounding target bonds to at most
+strip, a repeated bond, or the end of the run closes the block. One-site
+gates also close it unless smart scheduling retains in-strip rotations as
+described below. Each bond appears at most once, bounding target bonds to at most
 `4*chi` for qubit gates. No additional gate reordering is performed here.
 Exterior site arrays and retained bond dimensions stay fixed. This is a
 variational strip fit against the gated state, not a Hamiltonian ground-state
@@ -400,6 +401,63 @@ search. When depth boundaries must remain strict, submit one depth per run.
 `optimizer.last_gate_order` records one-based original gate positions in
 execution order, and the supplied gate queue is restored even after failure.
 `run(update_style=..., gate_order=...)` can override both options temporarily.
+
+For more scheduling freedom, opt into `gate_order="smart"`:
+
+```python
+optimizer = PepsOptimizer(
+    state, gates, chi=4, mode="full-update", gate_order="smart",
+    full_update_kwargs={"refine_sweeps": 1, "accumulate_local_infidelity": True},
+)
+```
+
+This policy builds ordering dependencies for overlapping gates whose
+commutation is not established. Disjoint fixed gates can move independently.
+Exact entry patterns recognize gates in `span(I, P)` for one- and two-qubit
+Pauli products, including RX/RY/RZ and RXX/RYY/RZZ, plus general diagonal
+gates. Pauli commutation uses the parity of different nonidentity axes on
+shared sites: XX and YY commute on the same bond but generally do not on
+bonds sharing only one site. There is no near-commuting numerical tolerance.
+Unknown dense gates retain their overlapping dependencies; trainable gates,
+unsupported arrays, selectors, and non-neighbor gates remain global barriers.
+Smart scheduling requires dense NumPy, Torch, or CuPy state arrays.
+
+Among legal next pair updates, the scheduler prefers the active strip and
+unused bonds within its current refinement block. It pulls in required
+single-site operations before their next dependent pair gate, while deferring
+unrelated rotations. It compares greedy row-first and column-first schedules
+by refinement-block count and then strip changes. This is a heuristic; it
+does not globally minimize contraction cost. Dependency storage can grow
+quadratically with the number of gates sharing sites. Submit one depth per
+run when depth boundaries must remain strict.
+
+Adjacent fixed single-site gates on the same site and native backend/dtype/
+device are fused in execution order. Two-qubit gates are never fused, so each
+retains its own local fidelity record. Transpose/dagger gate options disable
+single-site fusion to preserve product order. In full-update mode, supplied
+single-qubit matrices are converted to the PEPS backend/dtype/device before
+absorption, just as pair gates are. No PEPS tensor is converted to NumPy.
+Commutation checks use native small gate arrays; only scalar decisions reach
+the host. Shared gate identities and comparison constants are reused within
+compilation, and reclassified on each run to observe gate mutations.
+
+With smart scheduling, a refinement block may span absorbed single-site
+gates inside its active strip. These gates also act on the retained exact
+block target. A repeated bond, change of strip, unsupported gate, or end of
+the queue still closes the block. Single-site gates outside the strip also
+close it. Two-qubit fidelity counts and the exact-target bond bound are
+unchanged. Reordering still changes where truncations occur and can change
+the approximate output, despite preserving the exact circuit.
+
+`last_gate_order['original_step_groups']` maps each executed entry to all of
+its original one-based gate IDs, including fused rotations. The existing
+`original_steps` list contains the first original ID of each executed entry.
+`input_gate_count`, `compiled_gate_count`, and `single_qubit_gates_fused`
+summarize compilation. Step/refinement records retain their full applicable
+original gate IDs. Execution `step`, `start_step`, and `end_step` use the
+compiled queue positions. The user's original queue and gate arrays remain
+unchanged, including after a failed run. Input, row, and column policies keep
+their existing scheduling behavior.
 
 When the driver performs a final acceptance check, the sweep's duplicate final
 diagnostic is skipped unless custom debug diagnostics are requested. For

@@ -14,6 +14,12 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Opt-in `gate_order="smart"` for dense PEPS: Pauli commutation dependencies,
+  strip-aware traversal, native single-qubit fusion, and complete original
+  gate IDs. Full-update refinement can retain an exact strip target across
+  absorbed local rotations. Single-qubit NumPy gates are converted to the
+  Torch/CuPy PEPS backend before absorption.
+
 - Optional native Torch/CuPy strip ALS refinement after two-site PEPS full
   updates, with fixed exact block targets, norm/overlap environment reuse,
   and rollback. Per-gate positive-environment fidelities are always retained;

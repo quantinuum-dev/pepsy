@@ -30,6 +30,7 @@ from ...boundary._reuse import EnvironmentCache, StripEnvironmentCache, _array_s
 from ...backends import (
     TorchLinalgConfig,
     register_jax_linalg,
+    infer_backend_converter_from_sample,
     resolve_backend_sample_data_from_tn,
     to_float as _backend_to_float,
 )
@@ -50,7 +51,7 @@ from ..sweep.environments import (
 )
 from ._timing import profile_run, timed_phase
 from ._boundary_convergence import chi_pair, convergence_options, select_boundary_chi
-from ._gate_order import gate_order_option, ordered_gate_run
+from ._gate_order import fixed_gate_sites, gate_order_option, ordered_gate_run
 
 __all__ = ["PepsOptimizer"]
 
@@ -249,10 +250,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     update_style : {"row-column", "row", "column", "two-site"}, default="row-column"
         Sweep local update scope. Row/column fits use the existing variational
         solver; two-site uses reduced ALS and processes each two-site gate.
-    gate_order : {"input", "column", "row"}, default="input"
-        Reorder commuting two-qubit blocks into strip traversal. Disjoint gates
-        commute; overlapping gates must both be diagonal. ``last_gate_order`` maps the executed
+    gate_order : {"input", "column", "row", "smart"}, default="input"
+        Row/column policies reorder commuting two-qubit blocks into strips.
+        Disjoint gates commute; overlapping gates must both be diagonal for
+        these two policies. ``last_gate_order`` maps the executed
         traversal to one-based original queue positions; the queue is preserved.
+        ``smart`` uses Pauli commutation dependencies to retain active strips
+        and fuse adjacent single-site gates. Full original index groups are
+        retained in ``last_gate_order['original_step_groups']``.
     contraction_opt : str | object, optional
         Contraction path optimizer forwarded to boundary contractions and the
         variational backend. None builds Pepsy's reusable Cotengra optimizer.
@@ -2458,10 +2463,18 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             entries = tqdm(entries, total=len(self.gates), desc='PEPS full-update')
         for step, (gate_payload, where, which) in entries:
             if self._site_count(where, self.state) == 1:
+                sample = resolve_backend_sample_data_from_tn(self.state)
+                if ar.infer_backend(sample) in {'torch', 'cupy'}:
+                    gate_payload = infer_backend_converter_from_sample(sample)(gate_payload)
                 opts = self._target_gate_options(cutoff=cutoff, cutoff_mode=cutoff_mode,
                                                  gate_kwargs=gate_kwargs)
                 self.state = self._apply_gate_entry(self.state, gate_payload, where, which,
                                                     opts=opts, inplace=False)
+                if refine_target is not None:
+                    refine_target = self._build_target(
+                        refine_target, gate_payload, where, which, cutoff=0.,
+                        cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                    )
                 continue
             before = self._phase_timer.snapshot() if self._phase_timer else None
             evaluation_start = len(self.evaluation_records)
@@ -2539,6 +2552,20 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             if refine_enabled:
                 key = strip_key(where)
                 next_where = self.gates[step][1] if step < len(self.gates) else None
+                if self.last_gate_order['policy'] == 'smart':
+                    # Local rotations in this strip may be absorbed before
+                    # its next pair update without closing the exact target.
+                    next_where = None
+                    for entry in self.gates[step:]:
+                        sites = fixed_gate_sites(self, entry)
+                        if sites is None:
+                            break
+                        if len(sites) == 1:
+                            if sites[0][0 if key[0] == 'x' else 1] == key[1]:
+                                continue
+                            break
+                        next_where = entry[1]
+                        break
                 next_key = strip_key(next_where)
                 finished = (key != next_key or next_key is None or
                             tuple(sorted(tuple(site) for site in next_where)) in refine_bonds)
@@ -2561,6 +2588,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     refinement['start_step'] = refine_start
                     refinement['end_step'] = step
+                    refinement['original_steps'] = [i for group in
+                        self.last_gate_order['original_step_groups'][refine_start-1:step] for i in group]
                     refinement['boundary_convergence'] = (refine_calibration['record']
                                                            if refine_calibration else None)
                     if refinement['accepted']:
@@ -2583,7 +2612,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             fidelity, geometric = self._record_fidelity_progress(loss)
             record = {
                 'step': step, 'start_step': step, 'where': where, 'which': which,
-                'original_steps': [self.last_gate_order['original_steps'][step - 1]],
+                'original_steps': list(self.last_gate_order['original_step_groups'][step - 1]),
                 'gate_order': self.last_gate_order['policy'], 'update_style': 'two-site',
                 'batch_size': 1, 'two_site_batch': 1, 'k_2q_batch': 1,
                 'batch_stop_reason': 'gate_count', 'batch_target_bond_limit': None,
@@ -3247,7 +3276,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 record = {
                     "step": int(record_step),
                     "start_step": int(step),
-                    "original_steps": self.last_gate_order['original_steps'][idx:next_idx],
+                    "original_steps": [step for group in self.last_gate_order['original_step_groups'][idx:next_idx]
+                                       for step in group],
                     "gate_order": self.last_gate_order['policy'], "update_style": style,
                     "where": record_where,
                     "which": record_which,
