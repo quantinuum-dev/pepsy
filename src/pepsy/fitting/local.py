@@ -289,8 +289,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
     Parameters
     ----------
-    tn : qtn.TensorNetwork
-        Target tensor network to fit.
+    tn : qtn.TensorNetwork | list[qtn.TensorNetwork] | tuple[qtn.TensorNetwork, ...]
+        Target network, or a non-empty sequence of networks whose sum is fit.
+        Sum terms retain separate overlap environments; their local effective
+        tensors are added before each update or truncation.
     p : qtn.MatrixProductState | qtn.MatrixProductOperator
         Initial open-boundary state or operator to optimize.
     cutoffs : float, default=1e-12
@@ -328,9 +330,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         and transfer ownership, avoiding one complete target-network copy.
     Attributes
     ----------
-    tn : qtn.TensorNetwork
-        Owned target network. Its internal indices are randomized during
-        construction so it can safely share physical outer indices with ``p``.
+    tn : qtn.TensorNetwork | tuple[qtn.TensorNetwork, ...]
+        Owned target network (or tuple of sum terms). Internal indices are
+        randomized during construction so each term can safely share physical
+        outer indices with ``p``.
     p : qtn.MatrixProductState | qtn.MatrixProductOperator
         Current fitted network. This is a copy unless ``inplace=True``.
     range_int : list[int]
@@ -378,7 +381,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
     def __init__(
         self,
-        tn: qtn.TensorNetwork,
+        tn: qtn.TensorNetwork | Sequence[qtn.TensorNetwork],
         p: Optional[qtn.TensorNetwork] = None,
         cutoffs: float = 1e-12,
         backend: Optional[str] = None,
@@ -582,6 +585,17 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             or not has_symmray
         )
         self._sweep_environment_reuse_count = 0
+
+    @functools.wraps(__init__)
+    def __new__(cls, tn=None, *args, **kwargs):
+        # Keep the public constructor signature while selecting the internal
+        # representation before Python invokes its initializer.
+        if cls is FIT and isinstance(tn, (list, tuple)):
+            from ._sum import _SumFIT
+
+            return object.__new__(_SumFIT)
+        return object.__new__(cls)
+
     # ------------------------------------------------------------------
     # Target cache, public inspection, and visualization
     # ------------------------------------------------------------------
@@ -837,7 +851,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         psi = self.p
         L = self.L
-        contraction_opt = self.contraction_opt
         site_tag_id = self.site_tag_id
 
         for _ in range(n_iter):
@@ -847,21 +860,28 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 psi.canonize(site, cur_orthog=ortho_arg, bra=None)
 
                 psi_h = psi.H.select([site_tag_id.format(site)], "!any")
-                tn_ = psi_h | self.tn
-
                 # Keep the target scale; normalizing here changes the objective.
-                f = tn_.contract(all, optimize=contraction_opt)
-                f = f.transpose(*psi[site].inds)
+                f = self._reference_effective_tensor(psi_h, psi[site].inds)
 
                 psi[site].modify(data=f.data)
 
             if verbose:
-                fidelity = tn_fidelity(
-                    self.tn,
-                    psi,
-                    contraction_opt=contraction_opt,
-                )
+                fidelity = self._target_fidelity(psi)
                 self.fidelity_trace.append(ar.do("real", fidelity))
+
+    def _reference_effective_tensor(self, bra, output_inds):
+        return (bra | self.tn).contract(
+            all, optimize=self.contraction_opt
+        ).transpose(*output_inds)
+
+    def _target_fidelity(self, psi, *, contraction_opt=None):
+        return tn_fidelity(
+            self.tn, psi,
+            contraction_opt=contraction_opt or self.contraction_opt,
+        )
+
+    def _target_isfermionic(self):
+        return self.tn.isfermionic()
 
     # ------------------------------------------------------------------
     # Full-chain cached solvers
@@ -1142,7 +1162,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 adaptive_block_sweeps=adaptive_block_sweeps,
                 min_iter=min_iter, rtol=rtol, patience=patience,
             )
-        elif rtol is not None or not (self.p.isfermionic() or self.tn.isfermionic()):
+        elif rtol is not None or not (self.p.isfermionic() or self._target_isfermionic()):
             self._run_eff_one_site_sweeps(
                 psi, L, contraction_opt, n_iter=n_iter, verbose=verbose,
                 sweep_sequence=sweep_sequence, min_iter=min_iter,
@@ -1229,8 +1249,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 block_size=active_block_size,
             )
             if verbose:
-                fidelity = tn_fidelity(
-                    self.tn,
+                fidelity = self._target_fidelity(
                     self._physical_working_state(psi),
                     contraction_opt=contraction_opt,
                 )
@@ -1373,8 +1392,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 block_size=1,
             )
             if verbose:
-                fidelity = tn_fidelity(
-                    self.tn,
+                fidelity = self._target_fidelity(
                     self._physical_working_state(psi),
                     contraction_opt=contraction_opt,
                 )
@@ -1500,8 +1518,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 psi[site].modify(data=f.data)
 
             if verbose:
-                fidelity = tn_fidelity(
-                    self.tn,
+                fidelity = self._target_fidelity(
                     psi,
                     contraction_opt=contraction_opt,
                 )
@@ -1647,7 +1664,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         fitted-state bond is therefore the exact identity environment supplied
         by those untouched sites.
         """
-        if self._fermionic_bra_working:
+        if self._fermionic_bra_working or getattr(self, "_explicit_exterior", False):
             # Native fermions retain the actual outside overlap environments.
             # Replacing those graded contractions by identity reindexing loses
             # the bond-space Koszul gauge on a right-moving sweep.
@@ -3623,8 +3640,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self.final_norm = self.local_norm_trace[-1]
 
                 if verbose:
-                    fidelity = tn_fidelity(
-                        self.tn,
+                    fidelity = self._target_fidelity(
                         self._physical_working_state(psi),
                         contraction_opt=self.contraction_opt,
                     )
@@ -3902,8 +3918,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self.final_norm = self.local_norm_trace[-1]
 
                 if verbose:
-                    fidelity = tn_fidelity(
-                        self.tn,
+                    fidelity = self._target_fidelity(
                         self._physical_working_state(psi),
                         contraction_opt=self.contraction_opt,
                     )

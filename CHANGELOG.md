@@ -19,6 +19,13 @@ releases remain backwards-compatible. From 1.0 onward:
   compression after each layer. DMRG/FIT modes retain a joint uncontracted
   target; explicit layer policies still take precedence.
 
+- `FIT([T1, T2, ...], p=guess)` fits tensor-network sums using separate cached
+  overlap environments and one combined local update, without materializing
+  sum bonds. Supports MPS/MPO targets, layered terms, weighted cancellation,
+  one-/two-/three-site sweeps, and native Symmray arrays. Cached target-block
+  selections and a shared fitted bra avoid repeated construction; optional
+  verbose target norms reuse Hermitian cross terms once per run.
+
 - Two-site PEPS fits now expose `tensor_mode="reduced"` (default) and opt-in
   `tensor_mode="full"` with joint L-BFGS on both full site tensors. Reduced
   tensors also support `solver="lbfgs"`. Environment gauges remain off by
