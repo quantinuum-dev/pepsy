@@ -151,6 +151,21 @@ def test_bdymps_chi_reports_largest_boundary_bond():
     assert bdy.chi == max(int(mps.max_bond()) for mps in bdy.mps_b.values())
 
 
+def test_same_cap_retuning_regrows_compressed_boundaries():
+    """Reuse must not freeze a low-rank guess that has room to grow."""
+    from pepsy.boundary.metrics import _retune_bdy_to_chi
+
+    ket = qtn.PEPS.rand(3, 3, bond_dim=2, seed=37, dtype='complex128')
+    _, norm = pepsy.build_bra_ket(ket=ket)
+    bdy = pepsy.BdyMPS(tn_double=norm, chi=8)
+    for mps in bdy.mps_b.values():
+        mps.compress(max_bond=1)
+    assert bdy.chi == 1
+    assert bdy._chi_target == 8
+    _retune_bdy_to_chi(bdy, 8, 'regrow')
+    assert bdy.chi > 1
+
+
 def test_bdymps_expand_bnd_updates_all_boundaries():
     """expand_bnd should update chi and enforce max-bond cap."""
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=37, dtype="complex128")

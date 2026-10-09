@@ -1,7 +1,8 @@
-"""Reduced two-site full update (Lubasch et al., arXiv:1405.3259, III B).
+"""Two-site full update (Lubasch et al., arXiv:1405.3259, III B).
 
 Dense Torch/CuPy implementation: QR/LQ reduction, positive norm environment,
-environment gauges and alternating least squares. No dense full PEPS vector.
+optional environment gauges and reduced ALS or pair L-BFGS. No dense full
+PEPS vector. Full-tensor L-BFGS retains the environment as a tensor network.
 """
 
 import math
@@ -24,7 +25,8 @@ from ...bp.reduced_update import (
 
 
 def options(values=None):
-    result = {'max_iterations': 50, 'rtol': 'auto', 'rcond': None, 'gauge': True,
+    result = {'max_iterations': 50, 'rtol': 'auto', 'rcond': None, 'gauge': False,
+              'tensor_mode': 'reduced', 'skip_exact': True,
               'solver': 'auto', 'refine_sweeps': 0, 'refine_rtol': 'auto',
               'accumulate_local_infidelity': True}
     values = dict(values or {})
@@ -34,6 +36,8 @@ def options(values=None):
     result.update(values)
     if not isinstance(result['gauge'], bool):
         raise TypeError('full update gauge must be a bool')
+    if not isinstance(result['skip_exact'], bool):
+        raise TypeError('full update skip_exact must be a bool')
     if not isinstance(result['accumulate_local_infidelity'], bool):
         raise TypeError('full update accumulate_local_infidelity must be a bool')
     if (isinstance(result['refine_sweeps'], bool)
@@ -41,8 +45,17 @@ def options(values=None):
         raise ValueError('full update refine_sweeps must be a nonnegative integer')
     if result['refine_rtol'] != 'auto':
         result['refine_rtol'] = resolve_fit_rtol(result['refine_rtol'])
-    if result['solver'] not in ('auto', 'quimb', 'qr'):
-        raise ValueError('full update solver must be auto, quimb or qr')
+    if result['tensor_mode'] not in ('reduced', 'full'):
+        raise ValueError('full update tensor_mode must be reduced or full')
+    if result['solver'] not in ('auto', 'quimb', 'qr', 'lbfgs'):
+        raise ValueError('full update solver must be auto, quimb, qr or lbfgs')
+    if result['tensor_mode'] == 'full':
+        if result['solver'] == 'auto':
+            result['solver'] = 'lbfgs'
+        if result['solver'] != 'lbfgs':
+            raise ValueError('full tensor mode requires solver=lbfgs')
+        if result['gauge']:
+            raise ValueError('full tensor mode requires gauge=False')
     if isinstance(result['max_iterations'], bool) or not isinstance(result['max_iterations'], int) or result['max_iterations'] < 1:
         raise ValueError('full update max_iterations must be a positive integer')
     for name in ('rtol', 'rcond'):
@@ -100,6 +113,8 @@ def boundary_strip(network, *, axis, coordinate, boundary, chi, contraction_opt,
 class ReducedPair:
     """Keep all tensors outside the gated pair fixed, including QR/LQ factors."""
 
+    tensor_mode = 'reduced'
+
     def __init__(self, state, gate, where, chi):
         self.state = state
         self.where = tuple(tuple(site) for site in where)
@@ -140,6 +155,7 @@ class ReducedPair:
         if not all_finite(gate):
             raise ValueError('full-update gate contains nonfinite values')
         gate = gate.reshape(*self.dims, *self.dims)
+        self.gate = gate
         self.theta = einsum('PQpq,apqb->aPbQ', gate, self.reduced.theta_array())
         self.chi = int(chi)
 
@@ -151,9 +167,39 @@ class ReducedPair:
         return self.reduced.reconstruct_tn(left, transpose(right, (0, 2, 1)))
 
     def initial_states(self):
-        guess = self.state_from(*self.split(self.theta, self.chi))
-        target = self.state_from(*self.split(self.theta, min(self.na * self.dims[0], self.nb * self.dims[1])))
+        # One local SVD supplies the warm start and exact target. Determine
+        # numerical support using machine precision, never the fit tolerance:
+        # a small but genuinely discarded component must still trigger FU.
+        matrix = transpose(self.theta, (0, 1, 3, 2)).reshape(
+            self.na * self.dims[0], self.dims[1] * self.nb)
+        u, s, vh = ar.do('linalg.svd', matrix)
+        eps = 2.**-23 if ar.get_dtype_name(matrix) == 'complex64' else 2.**-52
+        threshold = eps * max(matrix.shape) * float(s[0])
+        self.target_rank = int(ar.do('sum', s > threshold))
+        self.warmstart_exact = 0 < self.target_rank <= self.chi
+        rank = max(1, min(self.chi, self.target_rank))
+        total = float(ar.do('sum', s**2))
+        self.discarded_weight = float(ar.do('sum', s[rank:]**2)) / total if total > 0 else 0.
+
+        def factors(count):
+            roots = ar.do('sqrt', s[:count])
+            left = (u[:, :count] * roots).reshape(self.na, self.dims[0], count)
+            right = (roots[:, None] * vh[:count]).reshape(count, self.dims[1], self.nb)
+            return left, transpose(right, (0, 2, 1))
+
+        guess = self.state_from(*factors(rank))
+        target = self.state_from(*factors(len(s)))
         return guess, target
+
+    def exact_report(self):
+        """No exterior metric is needed when the local SVD loses no support."""
+        return dict(backend='full-update', tensor_mode=self.tensor_mode, solver='svd',
+                    success=True, converged=True, iterations=0, warmstart_loss=0.,
+                    warmstart_fidelity=1., fidelity=1., infidelity=0., loss_history=[0.],
+                    termination_reason='exact_svd', environment_gauge_applied=False,
+                    norm_matrix_formed=False, target_rank=self.target_rank,
+                    discarded_weight=self.discarded_weight,
+                    fidelity_convention='untruncated local SVD; exact to floating-point precision')
 
     def normalize_target(self, norm):
         """Apply the target's global scale to every subsequent reconstruction.
@@ -169,8 +215,8 @@ class ReducedPair:
         self.reduced.tn.exponent -= .5 * (math.log10(magnitude) + exponent)
         self.theta = self.theta * (complex(mantissa) / magnitude)**-.5
 
-    def environment(self, state, *, boundary=None, chi, contraction_opt, boundary_kwargs,
-                    strip_cache=None):
+    def strip_environment(self, state, *, boundary=None, chi, contraction_opt, boundary_kwargs,
+                          strip_cache=None):
         """Contract the untouched strip using validated left/right boundary cuts."""
         self.contraction_opt = contraction_opt
         _, network = build_bra_ket(ket=state)
@@ -187,13 +233,21 @@ class ReducedPair:
                 coordinate=coordinate, length=state.Lx if along == 0 else state.Ly,
                 active=tuple(site[along] for site in self.where), optimize=contraction_opt,
             )
+        for site in self.where:
+            strip.delete(state.site_tag(*site))
+        # Every local scalar uses this same environment scale, which cancels
+        # in the target-normalized objective and fidelity.
+        strip.exponent = 0.
+        return strip, boundary
+
+    def environment(self, state, **kwargs):
+        strip, boundary = self.strip_environment(state, **kwargs)
+        contraction_opt = self.contraction_opt
         qa_ind, qb_ind = qtn.rand_uuid(), qtn.rand_uuid()
         for site, data, inds in (
             (self.where[0], self.qa.reshape(*self.shapes[0], self.na), (*self.external[0], qa_ind)),
             (self.where[1], self.qb.reshape(self.nb, *self.shapes[1]), (qb_ind, *self.external[1])),
         ):
-            site_tag = state.site_tag(*site)
-            strip.delete(site_tag)
             q = qtn.Tensor(data, inds=inds)
             bra = q.conj().reindex({ind: f'{ind}_*' for ind in inds})
             strip = strip | q | bra
@@ -273,25 +327,7 @@ class ReducedPair:
         if baseline_loss < loss(left, right):
             left, right = baseline_left, baseline_right
         history = [loss(left, right)]
-        pair = self.reduced
-        environment = qtn.Tensor(
-            transpose(n, (2, 3, 0, 1)),
-            inds=(pair.reduced_left_ind, pair.reduced_right_ind,
-                  pair.reduced_left_bra_ind, pair.reduced_right_bra_ind),
-        )
-        problem = ReducedEnvironmentUpdateProblem(
-            pair=pair, environment=environment, target=transpose(theta, (0, 1, 3, 2)),
-        )
-        from ...tensors.contractions import build_optimizer
-        policy = getattr(self, 'contraction_opt', None)
-        if policy is None:
-            policy = build_optimizer(progbar=False)
-        solution = solve_reduced_als(
-            problem, max_bond=self.chi, max_iterations=controls['max_iterations'],
-            tol=tolerance, rcond=rcond, solver=controls['solver'],
-            monitor_convergence=True,
-            quimb_opts={'contract_optimize': policy, 'enforce_pos': True, 'progbar': False},
-        )
+        solution = self.solve(n, theta, left, right, controls, tolerance, rcond)
         proposed_left, proposed_right = solution.left, transpose(solution.right, (0, 2, 1))
         current = loss(proposed_left, proposed_right)
         accepted = math.isfinite(current) and current <= history[-1]
@@ -309,7 +345,7 @@ class ReducedPair:
         residual_converged = tolerance > 0 and history[-1] <= tolerance
         reason = ('residual_tolerance' if residual_converged else
                   solution.termination_reason if accepted else 'solver_candidate_rejected')
-        report.update(backend='full-update', success=True,
+        report.update(backend='full-update', success=True, tensor_mode=self.tensor_mode,
                       converged=bool(residual_converged or (accepted and solution.converged)),
                       warmstart_loss=baseline_loss,
                       warmstart_fidelity=baseline_fidelity,
@@ -319,9 +355,75 @@ class ReducedPair:
                       termination_reason=reason,
                       solver_converged=solution.converged,
                       solver_termination_reason=solution.termination_reason,
-                      stopping_rule='normalized residual or complete-sweep cost change',
+                      stopping_rule=('normalized residual or L-BFGS stopping criteria'
+                                     if solution.solver == 'lbfgs' else
+                                     'normalized residual or complete-sweep cost change'),
                       loss_history=history,
                       solver_costs=[float(c) / float(target_norm) for c in solution.costs],
                       fidelity=float(fidelity.real), infidelity=max(0., min(1., 1. - float(fidelity.real))),
                       fidelity_convention='local positive-environment estimate; not global fidelity')
         return self.state_from(left, right), report
+
+    def solve(self, n, theta, left, right, controls, tolerance, rcond):
+        if controls['solver'] == 'lbfgs':
+            from ._pair_lbfgs import solve_pair_lbfgs
+            return solve_pair_lbfgs(n, theta, left, right,
+                                    max_iterations=controls['max_iterations'], tol=tolerance)
+        pair = self.reduced
+        environment = qtn.Tensor(
+            transpose(n, (2, 3, 0, 1)),
+            inds=(pair.reduced_left_ind, pair.reduced_right_ind,
+                  pair.reduced_left_bra_ind, pair.reduced_right_bra_ind),
+        )
+        problem = ReducedEnvironmentUpdateProblem(
+            pair=pair, environment=environment, target=transpose(theta, (0, 1, 3, 2)),
+        )
+        from ...tensors.contractions import build_optimizer
+        policy = getattr(self, 'contraction_opt', None)
+        if policy is None:
+            policy = build_optimizer(progbar=False)
+        return solve_reduced_als(
+            problem, max_bond=self.chi, max_iterations=controls['max_iterations'],
+            tol=tolerance, rcond=rcond, solver=controls['solver'],
+            monitor_convergence=True,
+            quimb_opts={'contract_optimize': policy, 'enforce_pos': True, 'progbar': False},
+        )
+
+
+class FullPair(ReducedPair):
+    """Fit full sites through cached scalar TNs; never form a full norm matrix.
+
+    Reduction is used only to initialize the guess and exact diagnostic target.
+    The objective retains the original pair plus its explicit gate as a TN.
+    """
+
+    tensor_mode = 'full'
+
+    def __init__(self, state, gate, where, chi):
+        super().__init__(state, gate, where, chi)
+        self.target_phase = 1.
+
+    def normalize_target(self, norm):
+        super().normalize_target(norm)
+        mantissa, _ = _as_scaled_scalar(norm)
+        self.target_phase *= (complex(mantissa) / abs(complex(mantissa)))**-.5
+
+    def environment(self, state, **kwargs):
+        from ._pair_objective import PairObjective
+        env, boundary = self.strip_environment(state, **kwargs)
+        tags = tuple(state.site_tag(*site) for site in self.where)
+        # Keep the gate lazy, separate from the frozen pre-gate site tensors.
+        target = self.state.select_any(tags).gate(
+            self.gate * self.target_phase, self.where, contract=False,
+        )
+        objective = PairObjective(env, tuple(state[site] for site in self.where), target,
+                                  physical_inds=self.phys, optimize=self.contraction_opt)
+        return objective, boundary
+
+    def optimize(self, objective, controls):
+        controls = options(dict(controls, tensor_mode='full'))
+        params, report = objective.optimize(controls)
+        state = self.reduced.tn.copy()
+        for site, data in zip(self.where, params):
+            state[site].modify(data=data)
+        return state, report

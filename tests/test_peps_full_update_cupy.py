@@ -87,32 +87,48 @@ def test_cupy_stamps_detect_alias_writes_and_release_snapshots(cp):
     assert ref() is None and key not in _cupy_versions
 
 
-@pytest.mark.parametrize('fit_mode', ['eff', 'dmrg2'])
-def test_cupy_full_update_with_dmrg_boundary_compression(cp, monkeypatch, fit_mode):
-    state = qtn.PEPS.rand(3, 3, bond_dim=2, dtype='complex128', seed=45)
+@pytest.mark.parametrize(('fit_mode', 'layers'), [
+    ('direct', None), ('zipup', None), ('eff', None), ('dmrg', None), ('dmrg2', None),
+    ('direct', ('BRA', 'KET')), ('direct', ('KET', 'BRA')),
+])
+@pytest.mark.parametrize('dtype', ['complex64', 'complex128'])
+@pytest.mark.parametrize('solver', ['quimb', 'qr'])
+def test_cupy_full_update_with_dmrg_boundary_compression(cp, monkeypatch, fit_mode, layers, dtype, solver):
+    state = qtn.PEPS.rand(3, 3, bond_dim=2, dtype=dtype, seed=45)
     state.apply_to_arrays(cp.asarray)
     state /= state.norm()
-    gate = cp.diag(cp.exp(cp.asarray([-.21j, .21j, .21j, -.21j])))
+    gate = cp.diag(cp.exp(cp.asarray([-.21j, .21j, .21j, -.21j], dtype=dtype)))
     where = ((1, 0), (1, 1))
     target = state.gate(gate, where, contract='split', cutoff=0.)
+    boundary_kwargs = {'cutoff': 0., 'n_iter': 2}
+    if layers is not None:
+        boundary_kwargs.update(fit_layer_mode='sequential', layer_tags=layers)
     opt = PepsOptimizer(state, [(gate, where)], chi=2, mode='full-update',
                         contraction_opt='greedy', fit_mode=fit_mode, boundary_chi=16,
-                        boundary_kwargs={'cutoff': 0., 'n_iter': 2},
+                        boundary_kwargs=boundary_kwargs,
                         normalize_chi=16, boundary_convergence=False,
-                        full_update_kwargs={'max_iterations': 4})
+                        full_update_kwargs={'solver': solver, 'max_iterations': 4})
     original = ar.to_numpy
-    def scalar_only(value):
+    original_asnumpy = cp.asnumpy
+    def scalar_only(value, *args, **kwargs):
         assert not isinstance(value, cp.ndarray) or value.size == 1
-        return original(value)
+        return original(value, *args, **kwargs)
+    def scalar_asnumpy(value, *args, **kwargs):
+        assert not isinstance(value, cp.ndarray) or value.size == 1
+        return original_asnumpy(value, *args, **kwargs)
     monkeypatch.setattr(ar, 'to_numpy', scalar_only)
+    monkeypatch.setattr(cp, 'asnumpy', scalar_asnumpy)
     out = opt.run(measure_infidelity=False, measure_final_infidelity=False,
                   accept_if_improved=False)
-    assert all(isinstance(t.data, cp.ndarray) for t in out)
+    assert all(isinstance(t.data, cp.ndarray) and t.data.dtype == dtype
+               and t.data.device == state[0, 0].data.device for t in out)
     a, b = out.to_dense().ravel(), target.to_dense().ravel()
     fidelity = float(abs(cp.vdot(a, b))**2 / (cp.vdot(a, a).real * cp.vdot(b, b).real))
     report = opt.get_step_records()[0]['optimizer_result']
-    assert float(cp.linalg.norm(a)) == pytest.approx(1., abs=1e-10)
-    assert report['fidelity'] == pytest.approx(fidelity, abs=1e-9)
+    assert report['solver'] == solver
+    tolerance = 2e-5 if dtype == 'complex64' else 1e-9
+    assert float(cp.linalg.norm(a)) == pytest.approx(1., abs=tolerance)
+    assert report['fidelity'] == pytest.approx(fidelity, abs=tolerance)
 
 
 @pytest.mark.parametrize('axis', ['column', 'row'])

@@ -19,6 +19,52 @@ def fixture(dtype='complex128', shape=(2, 2), bond=2):
     return state, gate, policy
 
 
+@pytest.mark.parametrize('fit_mode', ['direct', 'zipup', 'dmrg', 'dmrg2'])
+def test_boundary_default_preserves_separate_layers_or_joint_fit(monkeypatch, fit_mode):
+    from pepsy.boundary import CompBdy
+    state, gate, _ = fixture(shape=(3, 3))
+    seen = []
+    direct = fit_mode in ('direct', 'zipup')
+    method = '_compress_direct_target' if direct else '_run_fit_solver'
+    original = getattr(CompBdy, method)
+    expected_arrays = []
+    prepare = CompBdy._build_fit_initial_guess
+
+    def track_target(comp, tn, *args, **kwargs):
+        assert 'BRA' in tn.tags and 'KET' in tn.tags
+        assert not any('BRA' in t.tags and 'KET' in t.tags for t in tn)
+        expected_arrays[:] = [id(t.data) for t in tn]
+        return prepare(comp, tn, *args, **kwargs)
+
+    def tracked(comp, target, *args, **kwargs):
+        if direct:
+            layers = tuple(tag for tag in ('BRA', 'KET') if tag in target.tags)
+            seen.append(layers)
+            assert layers in (('BRA',), ('KET',))
+        else:
+            # FIT retags and reindexes the graph, preserving its layer arrays.
+            assert [id(t.data) for t in target.tn] == expected_arrays
+            assert target.tn.num_tensors >= 2 * target.L
+            seen.append(('BRA', 'KET'))
+        return original(comp, target, *args, **kwargs)
+
+    monkeypatch.setattr(CompBdy, method, tracked)
+    if not direct:
+        monkeypatch.setattr(CompBdy, '_build_fit_initial_guess', track_target)
+    opt = PepsOptimizer(state, [(gate, ((1, 0), (1, 1)))], chi=2,
+                        mode='full-update', fit_mode=fit_mode, boundary_chi=16,
+                        contraction_opt='greedy', normalize_initial=False,
+                        boundary_kwargs={'cutoff': 0., 'n_iter': 2},
+                        full_update_kwargs={'max_iterations': 2})
+    out = opt.run(normalize_final=False, measure_infidelity=False,
+                  measure_final_infidelity=False, accept_if_improved=False)
+    assert seen
+    if direct:
+        assert seen == [('BRA',), ('KET',)] * (len(seen) // 2)
+    assert out.max_bond() <= 2
+    assert opt.get_step_records()[0]['optimizer_attempted']
+
+
 @pytest.mark.parametrize('where', [((0, 0), (0, 1)), ((0, 1), (0, 0)), ((0, 1), (1, 1))])
 @pytest.mark.parametrize('dtype', ['complex64', 'complex128'])
 def test_reduction_preserves_exact_gate_and_als_preserves_outside_pair(where, dtype):
@@ -32,6 +78,7 @@ def test_reduction_preserves_exact_gate_and_als_preserves_outside_pair(where, dt
                               boundary_kwargs={'fit_mode': 'direct', 'cutoff': 0., 'n_iter': 2})
     final, result = pair.optimize(norm, {'max_iterations': 20, 'rtol': 1e-8})
     assert result['success'] and np.isfinite(result['fidelity'])
+    assert not result['environment_gauge_applied']
     assert all(b <= a for a, b in zip(result['loss_history'], result['loss_history'][1:]))
     assert final.max_bond() <= 2
     for site in state.gen_site_coos():
@@ -65,7 +112,7 @@ def test_full_update_driver_checks_chi_and_normalizes_output():
                         chi=2, mode='full-update', contraction_opt=policy,
                         boundary_kwargs={'fit_mode': 'direct', 'cutoff': 0., 'n_iter': 2},
                         boundary_convergence={'max_chi': 16},
-                        full_update_kwargs={'max_iterations': 8})
+                        full_update_kwargs={'max_iterations': 8, 'skip_exact': False})
     out = opt.run(measure_infidelity=False, measure_final_infidelity=False,
                   accept_if_improved=False, timing=True)
     assert out.max_bond() <= 2
@@ -75,6 +122,100 @@ def test_full_update_driver_checks_chi_and_normalizes_output():
     assert all(r['boundary_convergence']['converged'] for r in records)
     assert all(r['optimizer_result']['backend'] == 'full-update' for r in records)
     assert all(r['k_2q_batch'] == 1 for r in records)
+
+
+@pytest.mark.parametrize('selection', ['alias', 'style', 'run-style'])
+def test_full_update_defaults_use_one_fixed_chi_and_cached_dmrg(monkeypatch, selection):
+    state, gate, policy = fixture(shape=(3, 3))
+    gates = [(gate, ((1, 0), (1, 1))), (gate, ((1, 1), (1, 2)))]
+    constructor = {'mode': 'full-update'} if selection == 'alias' else (
+        {'update_style': 'two-site'} if selection == 'style' else {})
+    opt = PepsOptimizer(state, gates, chi=2, contraction_opt=policy,
+                        full_update_kwargs={'max_iterations': 4}, **constructor)
+    if selection == 'run-style':
+        assert opt.boundary_chi == (8, 10)
+        assert opt.boundary_convergence is not None
+        assert opt.evaluation_max_retries == 2
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail('default full update must not probe boundary chi convergence')
+    monkeypatch.setattr(opt, '_calibrate_sweep_boundaries', unexpected_probe)
+    monkeypatch.setattr(opt, 'estimate_infidelity', unexpected_probe)
+    run_options = {'update_style': 'two-site'} if selection == 'run-style' else {}
+    out = opt.run(**run_options)
+    assert opt.boundary_chi == 8
+    assert opt._boundary_chi_for_norm() == 8
+    assert opt._boundary_chi_for_infidelity() == 8
+    assert opt.boundary_convergence is None
+    assert opt.evaluation_max_retries == 0
+    assert not opt.accept_if_improved
+    assert opt.evaluation_records == []
+    assert opt.boundary_kwargs['fit_mode'] == 'dmrg'
+    assert opt.full_update_kwargs['tensor_mode'] == 'reduced'
+    assert not opt.full_update_kwargs['gauge']
+    records = opt.get_step_records()
+    assert len(records) == len(gates)
+    assert all(r['pre_infidelity'] is None and r['post_infidelity'] is None for r in records)
+    assert records[-1]['accumulated_local_fidelity'] == pytest.approx(
+        np.prod([r['local_fidelity'] for r in records]))
+    assert all(r['norm_environment_chi'] == 8 for r in records)
+    assert all(r['boundary_convergence'] is None for r in records)
+    assert all(r['optimizer_result']['solver'] == 'quimb' for r in records)
+    assert records[-1]['optimizer_result']['environment_reuse']['hits'] > 0
+    assert float(out.norm().real) == pytest.approx(1., abs=1e-9)
+
+
+def test_full_update_metric_defaults_follow_explicit_boundary_chi():
+    state, _, policy = fixture()
+    opt = PepsOptimizer(state, chi=2, mode='full-update', boundary_chi=13,
+                        contraction_opt=policy)
+    assert opt._boundary_chi_for_norm() == 13
+    assert opt._boundary_chi_for_infidelity() == 13
+    opt.set_boundary_chi(17)
+    assert opt._boundary_chi_for_norm() == 17
+    assert opt._boundary_chi_for_infidelity() == 17
+
+
+@pytest.mark.parametrize('tensor_mode', ['reduced', 'full'])
+def test_full_update_owns_complete_gate_stream_without_outer_metrics(monkeypatch, tensor_mode):
+    import torch
+    state, gate, _ = fixture(shape=(3, 3))
+    x = torch.tensor([[0., 1.], [1., 0.]], dtype=gate.dtype)
+    gates = [(gate, ((1, 0), (1, 1))), (gate, ((1, 1), (1, 2))), (x, (0, 0))]
+    opt = PepsOptimizer(state, gates, chi=2, mode='full-update', normalize_initial=False,
+                        contraction_opt='greedy', boundary_chi=16,
+                        full_update_kwargs={'tensor_mode': tensor_mode, 'max_iterations': 2})
+    results = []
+    solve = opt._full_update_optimize
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('default FU called an independent fidelity or convergence check')
+
+    def tracked(*args, **kwargs):
+        result = solve(*args, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(opt, 'estimate_infidelity', forbidden)
+    monkeypatch.setattr(opt, '_calibrate_sweep_boundaries', forbidden)
+    monkeypatch.setattr(opt, '_full_update_optimize', tracked)
+    out = opt.run(normalize_final=False)
+    assert len(results) == 2 and opt.evaluation_records == []
+    expected = results[-1][0].gate(x, (0, 0), contract=True)
+    torch.testing.assert_close(out.to_dense(), expected.to_dense())
+    records = opt.get_step_records()
+    assert len(records) == 2 and all(r['optimized'] for r in records)
+    product = np.prod([r['local_fidelity'] for r in records])
+    assert records[-1]['accumulated_local_fidelity'] == pytest.approx(product)
+    assert records[-1]['accumulated_local_infidelity'] == pytest.approx(1. - product)
+
+
+@pytest.mark.parametrize('bond', [1, 3, 4])
+def test_full_update_default_chi_is_twice_squared_peps_cap(bond):
+    state, _, policy = fixture(bond=1)
+    opt = PepsOptimizer(state, chi=bond, mode='full-update', contraction_opt=policy)
+    assert opt.boundary_chi == 2 * bond**2
+    assert opt._boundary_chi_for_norm() == 2 * bond**2
+    assert opt._boundary_chi_for_infidelity() == 2 * bond**2
 
 
 def test_full_update_rejects_nonadjacent_pairs():
@@ -169,7 +310,7 @@ def test_full_update_native_torch_and_automatic_stopping(monkeypatch, solver, dt
     opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=2,
                         mode='full-update', contraction_opt=policy, fit_mode='direct',
                         boundary_convergence=False,
-                        full_update_kwargs={'solver': solver, 'max_iterations': 8})
+                        full_update_kwargs={'solver': solver, 'max_iterations': 8, 'skip_exact': False})
     out = opt.run(measure_infidelity=False, measure_final_infidelity=False,
                   accept_if_improved=False)
     report = opt.get_step_records()[0]['optimizer_result']
@@ -221,7 +362,8 @@ def test_two_site_style_alias_and_single_site_barrier_preserve_exact_evolution()
     assert float(abs(torch.vdot(a, b)) ** 2 / (torch.vdot(a, a).real * torch.vdot(b, b).real)) == pytest.approx(1.)
     assert float(out.norm().real) == pytest.approx(1.)
     assert opt.last_gate_order['original_steps'] == [1, 2, 3]
-    assert all(r['optimizer_result']['solver'] == 'quimb' for r in opt.get_step_records())
+    assert all(r['optimizer_result']['solver'] == 'svd' for r in opt.get_step_records())
+    assert all(r['reason'] == 'exact_svd' for r in opt.get_step_records())
 
 
 @pytest.mark.parametrize('where', [((0, 0), (0, 1)), ((0, 1), (0, 0)), ((1, 1), (0, 1))])
@@ -295,9 +437,9 @@ def test_full_update_acceptance_uses_raw_metric_validity(monkeypatch, scores, ac
     })
     if accepted:
         with pytest.warns(RuntimeWarning, match='approximate PEPS infidelity'):
-            opt.run()
+            opt.run(measure_infidelity=True, measure_final_infidelity=True, accept_if_improved=True)
     else:
-        opt.run()
+        opt.run(measure_infidelity=True, measure_final_infidelity=True, accept_if_improved=True)
     record = opt.get_step_records()[0]
     assert record['optimized'] is accepted
     assert record['raw_pre_infidelity'] == scores[0]
@@ -310,20 +452,22 @@ def test_full_update_postcheck_keeps_successful_retry_cap(monkeypatch):
     state, gate, policy = fixture()
     opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=2,
                         mode='full-update', contraction_opt=policy, fit_mode='direct',
-                        boundary_convergence=False, full_update_kwargs={'max_iterations': 4})
+                        boundary_convergence=False, evaluation_max_retries=2,
+                        full_update_kwargs={'max_iterations': 4})
     caps, values = [], iter([-.1, .02, .01])
     def metric(*args, **kwargs):
         caps.append(kwargs['chi'])
         return {'infidelity': next(values), 'norm_target': 1.}
     monkeypatch.setattr(module, 'boundary_infidelity', metric)
     with pytest.warns(RuntimeWarning, match='retrying'):
-        opt.run(infidelity_kwargs={'norm_target': None})
-    assert caps == [(8, 10), 20, 20]
+        opt.run(infidelity_kwargs={'norm_target': None}, measure_infidelity=True,
+                measure_final_infidelity=True, accept_if_improved=True)
+    assert caps == [8, 16, 16]
     record = opt.get_step_records()[0]
     assert record['optimized']
-    assert record['evaluation_chi'] == (8, 10)
-    assert record['effective_evaluation_chi'] == 20
-    assert all(r['effective_chi'] == 20 for r in record['evaluation_records'])
+    assert record['evaluation_chi'] == 8
+    assert record['effective_evaluation_chi'] == 16
+    assert all(r['effective_chi'] == 16 for r in record['evaluation_records'])
 
 
 @pytest.mark.parametrize('dtype,adaptive,normalize_target,exponent', [
@@ -410,7 +554,7 @@ def test_independent_environment_gauges_whiten_a_separable_metric(monkeypatch):
         torch.testing.assert_close(metric, expected, atol=1e-10, rtol=1e-10)
         return solve(problem, **kwargs)
     monkeypatch.setattr(module, 'solve_reduced_als', checked)
-    _, report = pair.optimize(norm, {'max_iterations': 4})
+    _, report = pair.optimize(norm, {'max_iterations': 4, 'gauge': True})
     assert report['environment_gauge_applied']
 
 

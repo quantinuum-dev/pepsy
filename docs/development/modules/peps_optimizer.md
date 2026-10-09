@@ -100,6 +100,13 @@ MPS environment store.
 ## Extraction map
 
 - `optimizer.py`: `PepsOptimizer` and the current orchestration logic.
+- `_pair_lbfgs.py`: reduced-pair L-BFGS with native analytic complex gradients
+  and host SciPy iteration on the reduced positive norm matrix.
+- `_pair_objective.py`: full-pair scalar norm/overlap expressions with folded
+  constants, explicit target gates, and shared `GradientOptimizer` autodiff.
+- `_full_update.py`: reduced-pair positive norm projection or full-pair TN
+  objectives, and cached transverse boundaries. Defaults are reduced ALS,
+  disabled environment gauges, one fixed chi, and DMRG boundary fitting.
 - `gates.py`: target location for gate routing helpers.
 - `warmstart.py`: target location for warm-start construction.
 - `routing.py`: target location for sweep/global backend selection.

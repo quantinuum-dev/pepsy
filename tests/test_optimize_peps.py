@@ -298,6 +298,33 @@ def test_peps_optimizer_routes_adaptive_eff_boundary_policy(monkeypatch):
         assert init_kwargs[key] == value
 
 
+@pytest.mark.parametrize('fit_mode', sorted(peps_mod._FIT_QUIMB_MODES) + ['dmrg', 'dmrg2', 'eff'])
+def test_peps_optimizer_defaults_layer_policy_by_compressor(monkeypatch, fit_mode):
+    calls = _install_fake_normalize(monkeypatch)
+    opt = PepsOptimizer(DummyState(bond=1), [], chi=3, fit_mode=fit_mode,
+                        normalize_initial=False, boundary_convergence=False)
+    opt.normalize()
+    init_kwargs, _, _ = opt._sweep_boundary_kwargs(progress=False)
+    direct = fit_mode in peps_mod._FIT_QUIMB_MODES
+    for policy in (opt.boundary_kwargs, calls[-1][1], init_kwargs):
+        assert policy['fit_layer_mode'] == ('sequential' if direct else 'joint')
+        if direct:
+            assert policy['layer_tags'] == ('BRA', 'KET')
+
+
+def test_peps_optimizer_preserves_explicit_joint_direct_compression():
+    opt = PepsOptimizer(DummyState(bond=1), [], chi=3, fit_mode='direct',
+                        fit_layer_mode='joint', normalize_initial=False,
+                        boundary_convergence=False)
+    assert opt.boundary_kwargs['fit_layer_mode'] == 'joint'
+
+
+def test_peps_optimizer_default_layer_order_requires_explicit_tags_for_auto():
+    with pytest.raises(ValueError, match='requires explicit layer_tags'):
+        PepsOptimizer(DummyState(bond=1), [], chi=3, fit_mode='direct',
+                      fit_layer_order='auto', normalize_initial=False)
+
+
 def test_peps_optimizer_routes_layered_boundary_policy(monkeypatch):
     """Layer and timing policies reach all three PEPS boundary entry points."""
     calls = _install_fake_normalize(monkeypatch)

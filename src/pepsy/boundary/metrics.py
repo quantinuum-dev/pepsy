@@ -1162,6 +1162,21 @@ def _unpack_bdy_handle(handle, name):
     return obj, holder
 
 
+def _boundary_at_geometric_capacity(mps, chi):
+    """Whether every open-MPS bond already spans its possible cut space."""
+    if getattr(mps, 'cyclic', False):
+        return False
+    outer = set(mps.outer_inds())
+    dims = [math.prod(mps[i].ind_size(ix) for ix in mps[i].inds if ix in outer)
+            for i in range(mps.L)]
+    left, right = 1, math.prod(dims)
+    for i, dim in enumerate(dims[:-1]):
+        left, right = left * dim, right // dim
+        if mps.bond_size(i, i + 1) < min(chi, left, right):
+            return False
+    return True
+
+
 def _retune_bdy_to_chi(obj, chi, name, *, expand_growth=True):
     """Retune an existing boundary object to the requested chi.
 
@@ -1173,6 +1188,12 @@ def _retune_bdy_to_chi(obj, chi, name, *, expand_growth=True):
         return
     cur = getattr(obj, "chi", None)
     if cur is None or int(cur) == chi:
+        return
+    # Canonicalization can reduce actual rank below the requested cap. Do not
+    # pad these same-cap boundaries again: that needlessly mutates valid cached
+    # cuts (and the rank will shrink again on the next fit).
+    if (int(cur) < chi and getattr(obj, '_chi_target', None) == chi
+            and all(_boundary_at_geometric_capacity(mps, chi) for mps in obj.mps_b.values())):
         return
     if int(cur) < chi and not expand_growth:
         # Preserve a low-rank warm start. The caller passes ``chi`` directly

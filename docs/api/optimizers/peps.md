@@ -1,6 +1,12 @@
 # `pepsy.optimizers.peps`
 
-For global mode and fixed-cap sweeps (`boundary_convergence=False`),
+Two-site full update defaults to reduced-tensor ALS, `gauge=False`, one
+`boundary_chi=2*D**2` shared by normalization and evaluation, and cached boundary
+MPS with `fit_mode="dmrg"`. Boundary/norm convergence probes and automatic
+evaluation cap retries are disabled. Set `boundary_convergence=True` or a
+mapping to opt into convergence checks.
+
+For global mode and fixed-cap row/column sweeps (`boundary_convergence=False`),
 `PepsOptimizer` has separate chi controls for different jobs:
 
 - `chi` caps the optimized PEPS/PEPO virtual bonds.
@@ -30,7 +36,8 @@ quality check without making every optimization environment more expensive.
 
 ## Adaptive boundary convergence before sweeps
 
-`boundary_convergence=True` is the default for `PepsOptimizer` sweep mode.
+`boundary_convergence="auto"` enables checks for row/column sweeps and
+disables them for two-site full update.
 Before refining a compressed target, it probes the unchanged warm start and
 target at increasing `(chi_norm, chi_overlap)` caps. It measures both norms
 and the complex overlap in **both x and y**. Norms must agree relatively;
@@ -226,15 +233,40 @@ arrays. `k_2q_batch="auto"` means one two-site gate in this mode; integers
 greater than one are rejected. For row/column fitting, `k_2q_batch=1` explicitly
 selects gate-by-gate fitting; `"auto"` retains automatic batching.
 
+Boundary `fit_mode` can be `"direct"`, `"dmrg"` (the default, also `"eff"`),
+or `"dmrg2"`, among the supported boundary modes. `"dmrg2"` uses two-site
+warm-up followed by one-site refinement; `"two-site"` keeps two-site sweeps.
+In `PepsOptimizer`, direct compressors (including `direct`, `zipup`, `src`,
+`sdc`, and `dm`) default to separate BRA then KET absorption, compressing
+after each layer. Variational `dmrg`/`dmrg2` retain a joint, uncontracted
+BRA/KET target. Explicit `fit_layer_mode="joint"` restores joint direct
+compression; `layer_tags` controls an explicitly requested layer order.
+The modes `direct`, `zipup`, `eff`, `dmrg`, and `dmrg2` are checked with CuPy
+complex64/128 and both reduced ALS solvers (`quimb` and `qr`). Reduced ALS
+keeps numerical tensor arrays on the GPU, with scalar synchronization for
+checks. Full-tensor L-BFGS uses Torch CUDA autodiff for CuPy inputs and still
+exchanges parameter/gradient vectors with its SciPy optimizer on the host.
+
+For fixed physical dimension, the usual one-site boundary and pair-environment
+contractions cost O(chi^3 D^4 + chi^2 D^6): O(D^10), not O(D^8), when
+chi is proportional to D^2. Reduced dense ALS itself costs O(D^6) per solve.
+Two-site boundary SVDs can cost O(D^12). Sequential `direct` canonicalization
+with grouped boundary sites can cost O(D^11); explicit joint `direct`
+canonicalization can cost O(D^14). These bulk arithmetic estimates assume
+the ranks attain their caps; caching reduces repeated work but does not
+remove the cost of rebuilding an environment. See the
+[mode and scaling audit](../../development/notes/2026-10-09-fu-boundary-costs.md)
+for assumptions, memory costs and dimension-only contraction checks.
+
 ```python
 optimizer = PepsOptimizer(
     state, gates, chi=4, mode="sweep", update_style="two-site",
     gate_order="column",
-    fit_mode="eff",                         # DMRG boundary compression
-    boundary_convergence={"max_chi": 128, "rtol": 1e-5},
+    boundary_chi=32,                        # default 2*D**2 for D=4
+    fit_mode="dmrg",                        # default boundary compression
     full_update_kwargs={
         "max_iterations": 50, "rtol": "auto",
-        "rcond": 1e-12, "gauge": True, "solver": "auto",
+        "rcond": 1e-12, "gauge": False, "solver": "auto", "tensor_mode": "reduced",
     },
 )
 state = optimizer.run(
@@ -244,23 +276,37 @@ state = optimizer.run(
 )
 ```
 
+A local SVD supplies the initial pair. With `skip_exact=True` (default), if
+its numerical rank is at most the PEPS cap D, the gate is accepted directly:
+local fidelity is one and no FU environment, chi probes, overlap diagnostics,
+or ALS/L-BFGS solve are needed. This includes early evolution from D=1 and
+rank exactly equal to the cap with no discarded support. Numerical rank uses
+machine precision, independently of the fit tolerance; a genuinely truncated
+warm start still runs FU. Requested target/output normalization still applies.
+Step records identify `reason="exact_svd"`, `optimizer_attempted=False`, the
+retained target rank, and discarded SVD weight. Set `skip_exact=False` to
+exercise the solver even for an exact warm start. This local SVD initialization
+does not carry explicit SU bond weights between gates.
+
 QR/LQ separates fixed external factors from the two reduced tensors. The
 exact gated pair supplies the target; only its retained shared bond is
 truncated to `chi`. The untouched row/column strip is contracted using the
-checked boundary MPS. Its reduced norm matrix is Hermitianized, then negative
-eigenvalues are set to zero. Independent gauges from its square root improve
-conditioning when invertible; singular gauges use the ungauged path.
+cached boundary MPS. Its reduced norm matrix is Hermitianized, then negative
+eigenvalues are set to zero. Environment gauge conditioning is disabled by
+default (`gauge=False`). The existing explicit `gauge=True` option remains
+available; it uses independent gauges from the same square root when invertible.
+Reduction and positive-environment projection do not require this conditioning.
 
 Reduction, PSD projection, and ALS reuse `pepsy.bp.reduced_update`; this path
 does not run BP or use a BP environment. `solver="auto"` delegates to Quimb's
 public ALS fitter, with the existing weighted-QR fallback. `solver="quimb"`
 requires that route, while `solver="qr"` requires weighted least squares.
 All new contractions receive Pepsy's Cotengra optimizer. The shared solver
-starts from the gauged target's SVD. Its result is compared against both
-ordinary and gauged SVD guesses in the same positive metric, retaining the
+starts from the target's SVD in the selected basis. Its result is compared against
+the SVD guesses in the same positive metric, retaining the
 lowest cost. The final internal bond is balanced with SVD.
 External PEPS tensors remain unchanged by the pair fit.
-The environment gauges use two independent unfoldings of the same square root.
+When explicitly enabled, environment gauges use two independent unfoldings of the same square root.
 Internally `N = root.H @ root`, so the paper's QR/LQ construction for
 `N = X @ X.H` is expressed as two QR factorizations. No inverse is applied
 when either gauge fails the relative singular-value check. The weighted-QR
@@ -270,19 +316,81 @@ open overlap networks, then applies QR/LQ regauging between sweeps. Tensor
 arrays and linear algebra remain on the input backend; only scalar diagnostics
 are read on the host.
 Requested output normalization still runs at the selected norm chi, on the
-same device and dtype. Independent pre/post checks remain controlled by the
-usual `measure_infidelity`, `measure_final_infidelity`, and
-`accept_if_improved` options. Adaptive calibration remains active without them.
+same device and dtype. By default the FU engine completes the gate stream
+without independent pre/post global fidelity checks or outer acceptance tests.
+It records each pair's `local_fidelity` and their product as
+`accumulated_local_fidelity`, plus `accumulated_local_infidelity`. The product
+is an accumulated local estimate, not the exact fidelity to the full evolved
+state. Internal pair solvers retain their best local candidate.
+Explicit `measure_infidelity=True`, `measure_final_infidelity=True`, and
+`accept_if_improved=True` enable independent checks and acceptance. Their
+automatic defaults remain enabled for row/column and global optimization.
+Explicitly enabled adaptive calibration remains
+active without them.
 
-`full_update_kwargs` owns the ALS controls, not SciPy/LBFGS sweep options.
-With `boundary_convergence=False`, `boundary_chi` (first entry for a pair)
-sets the reduced norm environment cap independently of `evaluation_chi`.
+To optimize both full site tensors jointly, use:
+
+```python
+full_update_kwargs = {
+    "tensor_mode": "full", "solver": "lbfgs", "gauge": False,
+    "max_iterations": 50, "rtol": "auto",
+}
+```
+
+`tensor_mode="reduced"` remains the default. In full mode, `solver="auto"`
+selects L-BFGS; explicit ALS solvers and `gauge=True` raise. Full mode releases
+the fixed external QR/LQ factors, so all entries of both active site tensors
+can change. All other site tensors stay fixed. `solver="lbfgs"` is also
+available with reduced tensors, including optional reduced environment gauges.
+Both modes minimize the normalized squared residual and retain the warm start
+if the proposed fit is worse. Reduced mode uses its dense positive norm metric.
+Full mode keeps the boundary environment as a fixed TN and the gate as an
+explicit target tensor. It builds scalar norm and overlap contraction
+expressions with Cotengra, folds constant-only contractions once per pair
+solve, and reuses them for every loss/gradient evaluation. Only the two site
+tensors vary. Version-checked boundary and strip caches provide reuse across
+gates; each new gate gets fresh objective constants.
+
+Full mode uses the shared `GradientOptimizer` L-BFGS solver with Torch
+automatic differentiation. CuPy inputs use Torch contractions on the same
+CUDA device and return CuPy arrays. Reduced L-BFGS uses analytic complex
+gradients. Both use SciPy L-BFGS-B; real parameter and gradient vectors are
+exchanged with the host optimizer each evaluation, while contractions retain
+the original device and dtype.
+`max_iterations` bounds L-BFGS iterations; line-search evaluations are extra.
+`rtol` controls the normalized residual, SciPy function-change and gradient
+criteria. Zero/None disables these tolerance thresholds; finite-precision
+line-search termination can still stop early. Reports distinguish convergence
+from iteration exhaustion or line-search failure and identify `tensor_mode`.
+
+Full mode does not construct or PSD-project the full pair norm matrix.
+It checks scalar norms, residuals, and fidelities for validity in the fixed
+approximate environment. Its contraction cost depends on D, boundary chi,
+geometry, and the selected path; avoiding the dense `D**12` norm storage does
+not remove those costs or autodiff's intermediate storage. Only reduced mode
+forms a dense pair norm matrix. Reduced and full estimates may differ because
+PSD projection is applied only to the reduced metric.
+
+The separation of reduction and gauge conditioning follows
+[Lubasch et al., Sec. III B](https://arxiv.org/pdf/1405.3259).
+[Haghshenas and Sheng, Sec. III C](https://arxiv.org/pdf/1711.07584) uses
+reduced tensors, a positive approximant and alternating optimized regions;
+its full-tensor comparison uses conjugate gradients. The L-BFGS option here
+is an additional solver choice, not a reproduction of that paper's
+second-neighbor/plaquette update. Pepsy retains eigenvalue clipping for the
+positive approximant; that paper instead describes the spectral absolute
+value of the Hermitian environment.
+
+`full_update_kwargs` owns these pair controls, independently of sweep options.
+By default, `boundary_chi` is a single cap shared by the norm environment,
+normalization, and evaluation. Explicit `normalize_chi`/`evaluation_chi`
+overrides remain available. Legacy paired caps use the first entry for the
+pair norm environment.
 Its boundary cache persists across gates and `run()` calls. Disable both
 independent infidelity measurements and acceptance checks for a norm-only
 workflow; ALS still evaluates its local target in the positive norm metric.
 `norm_environment_chi` records the cap actually used.
-Paired `normalize_chi` settings use their first component, including the
-default `(4*D, 5*D)` when adaptive convergence is disabled. Target normalization
+Paired `normalize_chi` settings use their first component. Target normalization
 honors `normalize_target` and its `non_unitary` default independently of final
 output normalization. Its global magnitude is represented by a network
 exponent shared by the reduced target and its reconstructions, without
@@ -308,16 +416,29 @@ when the corresponding arrays die. In-place writes through views invalidate
 dependent entries. CuPy runs use the PEPS device context. Moving to
 another strip discards its entries, keeping storage bounded to one strip.
 All partial and final strip contractions use the supplied Cotengra optimizer;
-the default reusable optimizer also caches contraction plans. No scalar norm
-is cached. `optimizer_result['strip_environment_reuse']` reports hits and
+the default reusable optimizer also caches contraction plans. Boundary and
+strip caches do not retain scalar norms; a full-tensor objective computes its
+fixed target norm once per local solve.
+`optimizer_result['strip_environment_reuse']` reports hits and
 rebuilds. Adaptive `reuse_environments=False` disables this strip cache too.
 Fresh adaptive confirmation can replace boundary arrays and therefore invalidate
 partial contractions even if their numerical values happen to agree.
 
-`rcond=None` selects 1e-12 for complex128 and 1e-6 for complex64. Diagnostics
+Gate ordering and smart single-site fusion run before environment selection.
+Both cache levels therefore follow the executed gate coordinates and tensor
+dependencies, rather than the original gate numbers. The default
+`gate_order='input'` preserves input traversal; `row`, `column`, and `smart`
+can group compatible gates to increase reuse within a strip. Transverse
+boundary cuts remain cached across strip changes, while the prefix/suffix
+cache holds only the active strip. Legal commuting reorderings preserve the
+exact circuit, but can change finite-bond truncation results.
+
+For reduced tensors, `rcond=None` selects 1e-12 for complex128 and 1e-6 for complex64. Diagnostics
 include the raw environment's anti-Hermitian residual, minimum eigenvalue,
 negative spectral weight, gauge status, accepted ALS loss history, and cache
-counts. `solver` reports the actual route, and `solver_costs` retains its cost
+counts. Full-tensor reports instead include `norm_matrix_formed=False`, the
+autodiff backend, and expression/constant counts under `contraction_cache`.
+`solver` reports the actual route, and `solver_costs` retains its cost
 diagnostics. The default `rtol="auto"` reuses Pepsy's FIT tolerance policy:
 1e-9 for complex128 and 1e-5 for complex64. After each complete ALS sweep, stop
 when either the squared residual divided by the target norm, or the absolute
@@ -579,7 +700,8 @@ default of one, avoids that measurement. Disabling both measurement and
 optimization needs no target norm contraction.
 
 An inconsistent finite-cap contraction can still produce a negative
-infidelity. Outside adaptive sweep fits, `evaluation_max_retries=2` allows up to two retries,
+infidelity. Outside adaptive sweep fits, `evaluation_max_retries=2` allows up to two retries
+(the default for row/column and global modes; two-site full update defaults to zero),
 each using the same cap for both norms and overlap, twice the preceding
 maximum cap. Every retry warns. Use `evaluation_max_retries=0` to enforce
 strict caps. Exact contractions, nonfinite estimates and explicitly supplied
@@ -816,12 +938,18 @@ and reusable boundary handles remain authoritative. Symmray boundaries safely
 fall back to direct initialization with a warning for dense Quimb guesses.
 
 `fit_layer_mode` and `layer_tags` use the same semantics as the lower-level
-boundary APIs. Keep the default `"joint"` for the ordinary PEPS BRA--KET
-double layer. Direct Quimb modes may use `"sequential"` with explicit tags;
+boundary APIs. `PepsOptimizer` chooses `"sequential"` with BRA then KET
+for direct Quimb compressors when `fit_layer_mode` is omitted. It chooses
+`"joint"` for variational FIT (`dmrg`, `dmrg2`, `eff`), preserving the separate
+layer tensors in one fitting target. Explicit layer policies take precedence;
+standalone boundary helpers retain their own defaults.
+Automatic compression-layer settings do not override an explicitly selected
+exact metric contraction or the separate native Quimb MPS boundary engine.
 `fit_layer_order="input"` preserves those tags, while
 `fit_layer_order="auto"` estimates dense intermediate sizes and is allowed
-only with explicitly tagged, mathematically interchangeable layers;
-This requires `boundary_engine="dmrg"` when using `PepsOptimizer`, because the
+only with explicitly tagged, mathematically interchangeable layers.
+Sequential compression requires `boundary_engine="dmrg"` (the dense-array
+`"auto"` choice) when using `PepsOptimizer`, because the
 native Quimb MPS sweep provider handles layers jointly.
 The shared `boundary_kwargs` mapping forwards this policy to normalization,
 infidelity checks, and the delegated `SweepOptimizer`. `fit_timing` and
@@ -925,7 +1053,8 @@ SWAP routing. Use `route_opts` for routing controls such as `sequence`,
   The default `reset_traces=True` resets diagnostics only; use `set_state(...)`
   when you want to replay from a fresh input state.
 - If `normalize_chi` or `evaluation_chi` is left unset, standalone
-  normalization and infidelity diagnostics use `(4*D, 5*D)`, independently
+  normalization and infidelity diagnostics inherit `boundary_chi` for
+  two-site full update, otherwise `(4*D, 5*D)` independently
   of the optimizer environment cap. Increase these explicitly for stricter
   metric contractions, at extra computational cost.
 - `accept_if_improved=True` is most consistent with

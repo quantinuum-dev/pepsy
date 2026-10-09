@@ -14,6 +14,26 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- `PepsOptimizer` defaults direct boundary compressors (`direct`, `zipup`,
+  SRC/SDC and related modes) to separate BRA then KET absorption with
+  compression after each layer. DMRG/FIT modes retain a joint uncontracted
+  target; explicit layer policies still take precedence.
+
+- Two-site PEPS fits now expose `tensor_mode="reduced"` (default) and opt-in
+  `tensor_mode="full"` with joint L-BFGS on both full site tensors. Reduced
+  tensors also support `solver="lbfgs"`. Environment gauges remain off by
+  default. Full mode uses Torch autodiff of cached scalar Cotengra contractions
+  with a fixed environment TN and explicit gate, without a full norm matrix.
+  Two-site full-update defaults are reduced ALS, one boundary cap `2*chi**2`
+  shared by normalization/evaluation, cached DMRG boundary MPS, and no
+  automatic boundary-convergence probes or evaluation cap retries.
+  The FU engine defaults to local fidelity reporting and accumulated local
+  fidelity, with independent global pre/post checks and outer acceptance off.
+  Explicit diagnostic settings remain available.
+  A local SVD warm start whose numerical rank fits the PEPS cap is accepted
+  directly with local fidelity one, skipping FU environment/solver work
+  (`skip_exact=True`). Same-cap boundary retuning preserves cached DMRG cuts.
+
 - Opt-in `gate_order="smart"` for dense PEPS: Pauli commutation dependencies,
   strip-aware traversal, native single-qubit fusion, and complete original
   gate IDs. Full-update refinement can retain an exact strip target across
@@ -57,6 +77,10 @@ releases remain backwards-compatible. From 1.0 onward:
   `boundary_convergence={"reuse_environments": False}`.
 
 ### Fixed
+
+- PEPS full-update environment gauge conditioning now defaults to off;
+  Hermitian positive norm projection remains active. The existing explicit
+  `gauge=True` pair-update option is retained.
 
 - PEPS full-update strip refinement honors separate norm and overlap boundary
   caps, including the complete adaptive calibration pair. Checked overlap
