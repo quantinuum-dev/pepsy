@@ -16,6 +16,17 @@ for fresh scoped/full validation; earlier published results above are unchanged.
 The [publication handoff](../../history/2026-10-08-review-fixes-publication.md)
 records the commit scope and validation limits.
 
+## Sum-target FIT, 2026-10-09
+
+`FIT([T1, T2, ...], p=guess)` retains separate cached overlap environments
+and adds effective local tensors before each shared update. Layered terms
+and native symmetry arrays remain supported without materializing sum bonds.
+See the [API](../api/fitting/local.md#fitting-a-sum-of-target-networks),
+[implementation record](../../history/2026-10-09-fit-sum-targets.md), and
+[cache review](../../history/2026-10-09-fit-sum-cache-review.md).
+Publication validation is recorded in the
+[follow-up](../../history/2026-10-09-sum-fit-publication.md).
+
 ## Joint notebook solver defaults, 2026-10-06
 
 Follow-up, 2026-10-08: the 2D Gaugy notebook's current eager/compiled MPS
