@@ -22,10 +22,14 @@ for contracts, upstream audit and downstream evidence.
   truncation checks. These runs overlap; they are not additive.
 - `python -m ruff check src tests` and `git diff --check` passed.
 - Local Markdown links passed.
-- A full suite was started during development and is still running at this
-  implementation commit. It spans a changing workspace, including unrelated
-  PEPS work. The focused checks above cover this task's final implementation;
-  the full-suite result will be recorded separately when it finishes.
+- Full development run, `JAX_PLATFORMS=cpu python -m pytest -q -o addopts=''`:
+  **8,581 passed, 10 skipped, 2,118 warnings**, 2,060.61 s; exit status zero.
+  BLAS/OpenMP thread counts were one. This run started during development
+  before the final capture/metadata refinements and spans a changing workspace,
+  including unrelated PEPS work. It is not a full-suite validation of an
+  unchanged final commit. The focused checks above cover this task's final
+  implementation. CUDA was available and exercised by the focused tests;
+  JAX used CPU in the full run.
 
 ## Limits
 
@@ -33,3 +37,9 @@ The compatibility default is unchanged. Projector replay requires supported,
 numerically resolved charts and rejects others. The downstream bounded exact
 trace fixes the recorded untruncated cases; it does not silently substitute
 an exact objective for a truncated one. No native-array algorithm changed.
+
+## Publication
+
+Implementation commit `3afa925` was pushed to `origin/develop`. The downstream
+Gaugy change was committed and pushed as `3cfcbd3`. The existing PEPS/ALS
+working-tree changes, including their separate changelog entry, were excluded.
