@@ -2237,6 +2237,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "round_trips": sum(run.get("n_round_trips", 0) for run in als_runs),
                     "site_solves": len(local_solves),
                     "accepted_site_solves": sum(solve["accepted"] for solve in local_solves),
+                    "skipped_site_visits": sum(len(run.get("skipped_site_visits", ()))
+                                               for run in als_runs),
+                    "contraction_cache_hits": sum(run.get("contraction_cache", {}).get("hits", 0)
+                                                  for run in als_runs),
                     "cg_solves": sum(solve.get("solver") in ("cg", "dense-cg") for solve in local_solves),
                     "dense_cg_solves": sum(solve.get("solver") == "dense-cg" for solve in local_solves),
                     "matrix_free_solves": sum(solve.get("solver") in ("cg", "lbfgs") for solve in local_solves),

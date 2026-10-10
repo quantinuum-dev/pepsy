@@ -14,6 +14,13 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Fixed-chi sweep ALS reuses bounded contraction expressions with fresh input
+  arrays. Optional endpoint skipping and absolute-tolerance/minimum/patience
+  controls reduce inner work while retaining solver residual and overlap
+  checks. `SweepOptimizer.optimize_strip` supports one-row/column cleanup
+  without changing exterior tensors or boundary caps. Optional lazy boundary
+  initialization avoids constructing unused guesses.
+
 - Dense direct MPO replay supports `mpo_factorization="projector"` for
   paired-factor derivatives with fixed-rank/gap validation. Unsupported charts
   raise `pepsy.backends.ProjectorDerivativeError`; the QR default is unchanged.

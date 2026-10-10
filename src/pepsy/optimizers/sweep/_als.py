@@ -13,7 +13,9 @@ from ...bp._backend import all_finite, dag
 
 def options(values=None):
     """Validate local ALS controls independently of outer sweep budgets."""
-    result = dict(n_round_trips=2, rtol=1e-9, rcond=None, max_matrix_size=1024,
+    result = dict(n_round_trips=2, rtol=1e-9, atol=0., min_round_trips=1, patience=1,
+                  cache_contractions=True, skip_repeated_endpoints=False,
+                  rcond=None, max_matrix_size=1024,
                   linear_solver='dense-cg', dense_shift=0., cg_maxiter=200,
                   cg_rtol=None, cg_shift=0., cg_fallback=False,
                   lbfgs_maxiter=100, lbfgs_rtol=None, lbfgs_history=10, lbfgs_maxls=20)
@@ -23,20 +25,23 @@ def options(values=None):
     result.update(values or {})
     if result['linear_solver'] not in ('dense-cg', 'dense', 'cg', 'pinv', 'lbfgs', 'dense-lbfgs'):
         raise ValueError("ALS linear_solver must be 'dense-cg', 'dense', 'cg', 'pinv', 'lbfgs', or 'dense-lbfgs'")
-    if not isinstance(result['cg_fallback'], bool):
-        raise ValueError('ALS cg_fallback must be boolean')
+    for key in ('cg_fallback', 'cache_contractions', 'skip_repeated_endpoints'):
+        if not isinstance(result[key], bool):
+            raise ValueError(f'ALS {key} must be boolean')
     for key in ('n_round_trips', 'max_matrix_size', 'cg_maxiter',
-                'lbfgs_maxiter', 'lbfgs_history', 'lbfgs_maxls'):
+                'lbfgs_maxiter', 'lbfgs_history', 'lbfgs_maxls', 'min_round_trips', 'patience'):
         value = result[key]
         if key == 'max_matrix_size' and value is None:
             continue
         if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
             raise ValueError(f'ALS {key} must be a positive integer')
-    for key in ('rtol', 'rcond', 'cg_rtol', 'cg_shift', 'dense_shift', 'lbfgs_rtol'):
+    if result['min_round_trips'] > result['n_round_trips']:
+        raise ValueError('ALS min_round_trips must not exceed n_round_trips')
+    for key in ('rtol', 'atol', 'rcond', 'cg_rtol', 'cg_shift', 'dense_shift', 'lbfgs_rtol'):
         value = result[key]
         if value is None:
-            if key == 'dense_shift':
-                raise ValueError('ALS dense_shift must be finite and nonnegative')
+            if key in ('dense_shift', 'atol'):
+                raise ValueError(f'ALS {key} must be finite and nonnegative')
             continue
         if (isinstance(value, bool) or not isinstance(value, Real)
                 or not math.isfinite(float(value)) or value < 0):
@@ -112,10 +117,13 @@ def _cg_controls(controls, sample):
     )
 
 
-def _solve_site(norm, overlap, tag, *, optimize, rcond, controls=None):
+def _solve_site(norm, overlap, tag, *, optimize, rcond, controls=None, contract=None):
     # Spectral solves remain explicit; iterative/local L-BFGS paths share the
     # same one-site norm and overlap environments.
     from ..peps._strip_solve import solve_positive
+    from ._als_contract import contract_scaled
+
+    contract = contract or contract_scaled
 
     ket = norm[tag, '__ALS_KET__']
     bra = norm[tag, '__ALS_BRA__']
@@ -145,10 +153,8 @@ def _solve_site(norm, overlap, tag, *, optimize, rcond, controls=None):
     else:
         projected = _hole(overlap, (cross_bra,))
         rhs_optimize = optimize
-    rhs, rhs_exponent = projected.contract(
-        all, output_inds=cross_bra.inds, optimize=rhs_optimize,
-        strip_exponent=True, preserve_tensor=True,
-    )
+    rhs, rhs_exponent = contract(projected, output_inds=cross_bra.inds,
+                                 optimize=rhs_optimize, preserve_tensor=True)
     # Cross bra virtual labels can differ from norm bra labels. Their tensor
     # axes follow the same candidate ket, so align by position, not by name.
     cross_left = tuple(cross_bra.inds[ket.inds.index(i)] for i in right)
@@ -174,10 +180,8 @@ def _solve_site(norm, overlap, tag, *, optimize, rcond, controls=None):
                 raise
             failure = exc.report
     if not matrix_free or failure is not None:
-        matrix, exponent = hole.contract(
-            all, output_inds=(*left, *right), optimize=optimize,
-            strip_exponent=True, preserve_tensor=True,
-        )
+        matrix, exponent = contract(hole, output_inds=(*left, *right),
+                                    optimize=optimize, preserve_tensor=True)
         data = data * 10.**float(rhs_exponent - exponent)
         if not all_finite(matrix.data) or not all_finite(data):
             raise ValueError('nonfinite ALS local equation')
@@ -263,6 +267,9 @@ def _optimize_slice(owner, index, *, axis, controls):
     pseudoinverse are alternatives. Acceptance uses the original overlap.
     """
     from ..peps._strip_cursor import StripSweepCursor
+    from ._als_contract import ContractionCache, contract_scaled
+
+    contract = ContractionCache() if controls['cache_contractions'] else contract_scaled
 
     tags = owner._site_tensor_tags(axis, index)
     local = owner.state.select(f'{owner._axis_tag(axis)}{index}').copy()
@@ -293,7 +300,8 @@ def _optimize_slice(owner, index, *, axis, controls):
 
     def scalar(network):
         if iterative and (network is norm or network is overlap):
-            cursor = StripSweepCursor(network, axis=along, length=len(tags), optimize=scalar_optimize)
+            cursor = StripSweepCursor(network, axis=along, length=len(tags),
+                                      optimize=scalar_optimize, contract=contract)
             cursor.start()
             network = cursor.local(0)
         if single:
@@ -303,10 +311,11 @@ def _optimize_slice(owner, index, *, axis, controls):
             network = network.copy()
             network.apply_to_arrays(lambda x: ar.do(
                 'astype', x, 'complex128' if dtype == 'complex64' else 'float64'))
-        return network.contract(all, optimize=scalar_optimize, strip_exponent=True)
+        return contract(network, optimize=scalar_optimize)
     report = dict(axis=axis, index=index, solver='als', update_applied=False,
                   history=[], best_history=[], local_solves=[], n_round_trips=0,
-                  max_round_trips=controls['n_round_trips'], invalid_loss=False)
+                  max_round_trips=controls['n_round_trips'], invalid_loss=False,
+                  skipped_site_visits=[], round_trip_gains=[])
     dtype = ar.get_dtype_name(local[tags[0]].data)
     single = dtype in ('float32', 'complex64')
     roundoff = 2e-5 if single else 1e-10
@@ -339,7 +348,8 @@ def _optimize_slice(owner, index, *, axis, controls):
     report.update(loss_initial=max(0., initial), raw_loss_initial=initial,
                   history=[initial], best_history=[max(0., initial)],
                   termination_reason='max_round_trips')
-    cursors = [StripSweepCursor(tn, axis=along, length=len(tags), optimize=scalar_optimize)
+    cursors = [StripSweepCursor(tn, axis=along, length=len(tags), optimize=scalar_optimize,
+                               contract=contract)
                for tn in (norm, overlap)]
 
     def write(tag, data):
@@ -348,6 +358,8 @@ def _optimize_slice(owner, index, *, axis, controls):
         norm[tag, '__ALS_BRA__'].modify(data=ar.do('conj', data))
         overlap[tag, '__ALS_BRA__'].modify(data=ar.do('conj', data))
 
+    stagnant = 0
+    previous_visit = None
     for trip in range(controls['n_round_trips']):
         previous = best
         for reverse in (False, True):
@@ -360,9 +372,17 @@ def _optimize_slice(owner, index, *, axis, controls):
                 aa, ab = [cursor.local(position) for cursor in cursors]
                 detail = dict(site=tag, round_trip=trip, direction='backward' if reverse else 'forward',
                               accepted=False)
+                # Only a converged, accepted solve can make an immediate repeat
+                # redundant. In particular, budget-limited L-BFGS must run again.
+                if (controls['skip_repeated_endpoints'] and previous_visit is not None
+                        and previous_visit['site'] == tag and previous_visit['accepted']
+                        and previous_visit.get('converged', False)):
+                    report['skipped_site_visits'].append({
+                        **detail, 'reason': 'unchanged_converged_endpoint'})
+                    continue
                 try:
                     answer, info = _solve_site(aa, ab, tag, optimize=optimize, rcond=rcond,
-                                               controls=controls)
+                                               controls=controls, contract=contract)
                     detail.update(info)
                     write(tag, answer)
                     # The cursor's reduced network owns the same active site
@@ -382,12 +402,18 @@ def _optimize_slice(owner, index, *, axis, controls):
                     detail.update(getattr(exc, 'report', {}))
                     detail['rejection_reason'] = 'invalid_candidate'
                 report['local_solves'].append(detail)
+                previous_visit = detail
                 report['history'].append(best)
                 report['best_history'].append(max(0., best))
         report['n_round_trips'] += 1
-        tolerance = controls['rtol']
-        if tolerance and max(0., previous - best) <= tolerance * max(abs(previous), 1e-15):
-            report['termination_reason'] = 'relative_tolerance'
+        gain = max(0., previous - best)
+        report['round_trip_gains'].append(gain)
+        tolerance = max(controls['atol'], (controls['rtol'] or 0.) * max(abs(previous), 1e-15))
+        stagnant = stagnant + 1 if gain <= tolerance else 0
+        if (tolerance and report['n_round_trips'] >= controls['min_round_trips']
+                and stagnant >= controls['patience']):
+            report['termination_reason'] = (
+                'improvement_tolerance' if controls['atol'] else 'relative_tolerance')
             break
     # Write only active-site data: no tags, index order, exterior arrays, or
     # PEPS exponent changes. The normalized overlap is scale invariant.
@@ -397,6 +423,8 @@ def _optimize_slice(owner, index, *, axis, controls):
     report.update(loss_final=max(0., best), raw_loss_final=best, loss_best=max(0., best),
                   update_applied=any(s['accepted'] for s in report['local_solves']),
                   environment_reuse=[cursor.report() for cursor in cursors])
+    if controls['cache_contractions']:
+        report['contraction_cache'] = contract.report()
     if not report['update_applied']:
         invalid = all(s.get('rejection_reason') == 'invalid_candidate' for s in report['local_solves'])
         report.update(invalid_loss=invalid,

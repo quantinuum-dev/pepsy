@@ -11,20 +11,26 @@ class StripSweepCursor:
     no external mutation or cross-run cache is trusted by this private cursor.
     """
 
-    def __init__(self, network, *, axis, length, optimize):
+    def __init__(self, network, *, axis, length, optimize, contract=None):
         self.network = network
         self.layers = [network.select(f'{axis}{i}') for i in range(length)]
         for layer in self.layers:
             layer.exponent = 0.
         self.optimize = optimize
+        self.contract = contract
         self.hits = self.rebuilds = 0
 
     def _extend(self, layer, previous):
         network = layer if previous is None else layer | previous
-        tensor, exponent = network.contract(
-            all, output_inds=network.outer_inds(), optimize=self.optimize,
-            strip_exponent=True, preserve_tensor=True,
-        )
+        if self.contract is None:
+            tensor, exponent = network.contract(
+                all, output_inds=network.outer_inds(), optimize=self.optimize,
+                strip_exponent=True, preserve_tensor=True,
+            )
+        else:
+            tensor, exponent = self.contract(
+                network, output_inds=network.outer_inds(), optimize=self.optimize,
+                preserve_tensor=True)
         result = qtn.TensorNetwork([tensor])
         result.exponent = exponent
         self.rebuilds += 1

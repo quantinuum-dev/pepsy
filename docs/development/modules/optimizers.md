@@ -95,6 +95,8 @@ important downstream time-compression consumer that depends on Pepsy behavior.
     halves, Jacobi-preconditioned CG, residual and curvature checks.
   - `_als_lbfgs.py`: one-site quadratic L-BFGS with analytic complex gradients,
     SciPy host vectors, native environment actions, and residual diagnostics.
+  - `_als_contract.py`: bounded, strip-local contraction expressions keyed by
+    topology and shapes, with fresh array/exponent inputs on every call.
   - `environments.py`: Quimb MPS boundary store and engine selection helpers.
   - `local_objective.py`: extraction target for local objective assembly.
   - `traces.py`: extraction target for sweep traces and progress summaries.

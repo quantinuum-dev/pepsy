@@ -53,6 +53,60 @@ no full norm matrix or eigendecomposition. Environment halves are contracted
 separately; a trial tensor is absorbed before joining them. Small cursor/scalar
 kernels use optimal paths to avoid a hidden dense-metric contraction.
 
+### Fixed-chi performance controls
+
+Constructor option `lazy_boundaries=True` builds owned DMRG boundary guesses
+only when requested, including after restoring a best-state snapshot. This
+avoids unused directions for a strip fit and unused final guesses when a
+caller only needs the returned state. Caps, deterministic initialization, and
+subsequent boundary fitting are unchanged. The default is `False`; supplied
+boundary objects retain their own initialization policy.
+
+`cache_contractions=True` reuses bounded, strip-local contraction expressions
+for matching topology, shapes, output order, backend, and contraction policy.
+Every call supplies the current arrays and exponent; no tensor values are
+cached. Set it to `False` for an uncached comparison. Reports include
+`contraction_cache` hit/miss counts.
+
+Optional `skip_repeated_endpoints=True` omits an immediate repeat of the same
+site only after an accepted, converged solve and with no intervening site
+update. Budget-limited L-BFGS remains eligible for another solve. Skips appear
+in `skipped_site_visits`, separately from the actual `local_solves`. The
+default is `False`, preserving the original visit schedule.
+
+`atol=0.`, `min_round_trips=1`, and `patience=1` extend the existing `rtol`
+stopping rule. After a complete inner round trip, compare the accepted local
+infidelity decrease with `max(atol, rtol * max(abs(previous_loss), 1e-15))`.
+Stop after `patience` consecutive small decreases, once `min_round_trips`
+have completed. `n_round_trips` remains the upper budget; setting both
+tolerances to zero disables early stopping. These controls do not alter CG's
+residual tolerance or the boundary cap. `round_trip_gains` records the evidence.
+
+```python
+sweeper.set_optimize_kwargs(
+    optimizer="als",
+    optimizer_options={
+        "n_round_trips": 4, "min_round_trips": 1, "patience": 1,
+        "atol": 1e-7, "skip_repeated_endpoints": True,
+    },
+)
+```
+
+The tolerance above is an example, not an accuracy guarantee. Stopping uses
+the fixed approximate boundary objective. Validate fidelity for the intended
+trajectory before reducing the work budget.
+
+For local cleanup between global sweeps, `optimize_strip(index, axis="y",
+solver="als", solver_options=None, env_n_iter=4)` fits only column `index`;
+`axis="x"` selects a row. It builds fresh fixed-cap environments, advances
+across preceding strips without changing their sites, and returns one local
+report. It supports both boundary engines and the same local solvers as
+`optimize_axis`. It does not normalize the state or restore a global snapshot.
+Callers decide when to invoke this local operation versus `run()` and must
+keep their gate target and acceptance policy consistent.
+
+### CG and explicit-matrix alternatives
+
 `cg_maxiter=200` bounds the iteration count. `cg_rtol=None` selects a
 relative true-residual tolerance of 1e-8 in double or 1e-5 in single precision.
 `cg_shift=0.` leaves the

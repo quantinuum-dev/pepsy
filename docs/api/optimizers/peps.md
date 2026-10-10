@@ -1211,3 +1211,13 @@ SWAP routing. Use `route_opts` for routing controls such as `sequence`,
 - `SimpleUpdateGen(update="parallel")` currently supports only direct-neighbor
   terms. Long-range routed terms need route-aware layer scheduling and should
   use `update="sequential"` for now.
+
+## Fixed-boundary sweep performance
+
+Sweep ALS accepts `cache_contractions=True` (the default) to reuse contraction
+expressions with fresh arrays. Optional `skip_repeated_endpoints=True` avoids
+an immediate repeat after an accepted, converged site solve. Inner stopping
+also accepts `atol`, `min_round_trips`, and `patience`, independently of the
+outer sweep schedule and CG residual tolerance. These controls are supplied
+through `optimizer_options`; none changes boundary chi. See the
+[sweep controls and single-strip API](sweep.md#fixed-chi-performance-controls).

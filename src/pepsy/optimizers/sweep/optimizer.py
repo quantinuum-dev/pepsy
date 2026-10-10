@@ -92,6 +92,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     cache_contraction_paths : bool, default=True
         Reuse paths within a fixed local environment when topology/shapes
         match and the optimizer is a string preset. Never cache tensor values.
+    lazy_boundaries : bool, default=False
+        Initialize owned DMRG boundary guesses only when requested. This
+        preserves their caps and deterministic initialization, and avoids
+        constructing unused directions or final restored-state guesses.
     chi : int | tuple[int, int] | None, default=None
         Boundary bond dimension used when ``bdy``/``bdy_overlap`` are not
         supplied.  Pass a single ``int`` to use the same dimension for both
@@ -483,6 +487,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         evaluation_negative_tol=1.0e-3,
         collect_contraction_metrics=False,
         cache_contraction_paths=True,
+        lazy_boundaries=False,
         chi=None,
         bdy=None,
         bdy_overlap=None,
@@ -524,6 +529,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.evaluation_negative_tol = float(evaluation_negative_tol)
         self.collect_contraction_metrics = bool(collect_contraction_metrics)
         self.cache_contraction_paths = bool(cache_contraction_paths)
+        if not isinstance(lazy_boundaries, bool):
+            raise ValueError('lazy_boundaries must be boolean')
+        self.lazy_boundaries = lazy_boundaries
         self.local_contraction_opt = local_contraction_opt
         if not math.isfinite(self.evaluation_negative_tol) or self.evaluation_negative_tol < 0:
             raise ValueError("evaluation_negative_tol must be finite and non-negative.")
@@ -630,7 +638,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     if block_fit and self.boundary_engine == "dmrg"
                     else None
                 ),
-                lazy=fit_mode == "direct",
+                lazy=self.lazy_boundaries or fit_mode == "direct",
             )
 
         self.state = state
@@ -1074,6 +1082,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
                 else None
             ),
+            lazy=getattr(self, 'lazy_boundaries', False),
         )
         self._set_boundary_pair(bdy_new, bdy_overlap_new)
         self.chi = chi
@@ -1151,6 +1160,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     else chi_overlap
                 ),
                 single_layer=single_layer,
+                lazy=getattr(self, 'lazy_boundaries', False),
             )
         self._set_boundary_pair(self.bdy, bdy_overlap_new)
         if chi_was_provided:
@@ -2591,6 +2601,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         debug_loss_mode="exact",
         debug_loss_kwargs=None,
         collect_boundary_norms=False,
+        active_indices=None,
     ):
         """Run a single forward or backward half-sweep over *indices*."""
         indices = tuple(indices)
@@ -2686,12 +2697,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             t_bdy = time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            run_info = self._optimize_axis_slice_with_current_env(
-                index,
-                axis=axis,
-                solver=solver,
-                solver_options=solver_options,
-            )
+            run_info = None
+            if active_indices is None or index in active_indices:
+                run_info = self._optimize_axis_slice_with_current_env(
+                    index,
+                    axis=axis,
+                    solver=solver,
+                    solver_options=solver_options,
+                )
             t_opt = time.perf_counter() - t0
 
             if uses_quimb:
@@ -2716,6 +2729,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
                 t_bdy += time.perf_counter() - t0
 
+            if run_info is None:
+                continue
             run_info["sweep"] = sweep_name
             run_info["time_boundary"] = t_bdy
             run_info["time_optimize"] = t_opt
@@ -2745,6 +2760,37 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 run_callback(run_info)
 
         return runs
+
+    def optimize_strip(self, index, *, axis="y", solver="als", solver_options=None,
+                       env_n_iter=4):
+        """Fit one row/column with fresh fixed-cap boundaries and frozen exterior.
+
+        ``axis='y'`` selects column ``index``; ``axis='x'`` selects row
+        ``index``. Preceding strips only advance the environment, without
+        optimizing their tensors. Returns the local solver report. This
+        method does not normalize the state or restore a global best snapshot.
+        """
+        if axis not in ("x", "y"):
+            raise ValueError("axis must be 'x' or 'y'")
+        if (isinstance(index, bool) or not isinstance(index, Integral)
+                or not 0 <= index < self._axis_n(axis)):
+            raise ValueError("strip index is outside the lattice")
+        if (isinstance(env_n_iter, bool) or not isinstance(env_n_iter, Integral)
+                or env_n_iter < 1):
+            raise ValueError("env_n_iter must be a positive integer")
+        if self.state_target is None:
+            raise ValueError("state_target is required for optimize_strip()")
+        solver = self._resolve_user_solver(solver, solver_options=solver_options)
+        if solver == "als":
+            from ._als import options, validate_input
+            validate_input(self, options(solver_options))
+        self._reset_run_traces()
+        if self.boundary_engine != "quimb-mps":
+            self._refresh_right_boundaries_once(axis, env_n_iter=env_n_iter)
+        return self._run_axis_half_sweep(
+            range(index + 1), axis=axis, update_side="left", sweep_name="strip",
+            solver=solver, solver_options=solver_options, env_n_iter=env_n_iter,
+            active_indices={index})[0]
 
     def optimize_axis(
         self,
@@ -3151,7 +3197,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     single_layer=getattr(self, "single_layer", False),
                     boundary_engine=getattr(self, "boundary_engine", "dmrg"),
                     boundary_options=getattr(self, "boundary_options", None),
-                    lazy=self.fit_mode == "direct",
+                    lazy=getattr(self, 'lazy_boundaries', False) or self.fit_mode == "direct",
                 )
             )
 
