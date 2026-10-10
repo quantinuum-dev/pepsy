@@ -1808,6 +1808,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             raise TypeError("solver must be a string")
         solver = solver.strip().lower()
 
+        if solver == "als":
+            from ._als import options
+            options(solver_options)
+            return solver
+
         if solver not in SUPPORTED_SOLVERS:
             supported = ", ".join(SUPPORTED_SOLVERS)
             raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
@@ -2194,6 +2199,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver="torch-adam",
         solver_options=None,
     ):
+        if solver == "als":
+            from ._als import optimize_slice
+            return optimize_slice(self, index, axis=axis, solver_options=solver_options)
         axis_tag = self._axis_tag(axis)
         right_key, left_key = self._boundary_keys_for_index(index, axis)
 
@@ -2765,9 +2773,21 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             Number of backward+forward round-trips after the initial forward pass.
         solver : str, default="scipy"
             Gradient solver name. Supported values: ``torch-adam``, ``scipy``,
-            and ``nlopt``.
+            and ``nlopt``. ``als`` instead fits one tensor at a time inside
+            each row/column using explicit Hermitian metrics and iterative CG.
         solver_options : dict | None, default=None
             Extra backend-specific options for the selected ``solver``.
+            For ``als``: ``n_round_trips=2`` (inner forward/backward passes),
+            ``rtol=1e-9``, ``rcond=None`` (dtype-aware), and
+            ``linear_solver='dense-cg'``, ``dense_shift=0.``,
+            ``cg_maxiter=200``, ``cg_rtol=None``,
+            ``cg_shift=0.``, ``cg_fallback=False``, ``max_matrix_size=1024``.
+            The matrix guard applies to explicit dense solves/fallback only.
+            The outer ``n_round_trips`` is separate.
+            ``linear_solver='dense-lbfgs'`` or ``'lbfgs'`` selects one-site
+            L-BFGS with explicit or matrix-free environments, respectively;
+            ``lbfgs_maxiter=100``, ``lbfgs_history=10``, ``lbfgs_maxls=20``,
+            and ``lbfgs_rtol=None`` control these optional paths.
         env_n_iter : int, default=4
             Local boundary-fit iterations per boundary move.
         collect_boundary_norms : bool, default=False
@@ -2794,6 +2814,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             solver,
             solver_options=solver_options,
         )
+        if resolved_solver == "als":
+            from ._als import options, validate_input
+            validate_input(self, options(solver_options))
         all_runs = []
 
         if normalize_boundaries is None:
@@ -2928,6 +2951,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "state_target is required for run(). "
                 "Set it in constructor or via set_target()."
             )
+        if isinstance(solver, str) and solver.strip().lower() == "als":
+            from ._als import options, validate_input
+            validate_input(self, options(solver_options))
         if normalize_boundaries is None:
             normalize_boundaries = self.normalize_boundaries
         normalize_boundaries = bool(normalize_boundaries)

@@ -18,6 +18,24 @@ releases remain backwards-compatible. From 1.0 onward:
   paired-factor derivatives with fixed-rank/gap validation. Unsupported charts
   raise `pepsy.backends.ProjectorDerivativeError`; the QR default is unchanged.
 
+- PEPS row/column sweeps support `optimizer="als"`: fixed-rank one-site
+  least-squares solves with independent inner forward/backward budgets,
+  directional environment reuse, default explicit Hermitian metrics with
+  iterative CG, true-residual checks and overlap acceptance. Matrix-free CG,
+  direct factorization and spectral pseudoinverse are explicit alternatives,
+  with no automatic CG fallback. Assembled matrices retain size guards. Native
+  NumPy/Torch/CuPy are supported; existing L-BFGS defaults are unchanged.
+  Optional one-site `linear_solver="dense-lbfgs"` / `"lbfgs"` replaces CG
+  with analytic-gradient L-BFGS using explicit / matrix-free Hermitian
+  environments. SciPy manages host vectors while contractions remain on the
+  input backend/device. Budget-limited candidates retain convergence diagnostics
+  and the original overlap acceptance check; the default stays `"dense-cg"`.
+  Explicit CG fallback reports retain the final direct solution's residual
+  separately from the failed CG residual (`cg_relative_residual`).
+  Initial and candidate norm checks use the same Hermitian metric as the
+  site solver, so imaginary boundary-compression residuals no longer reject
+  all site updates before optimization.
+
 - `PepsOptimizer` defaults direct boundary compressors (`direct`, `zipup`,
   SRC/SDC and related modes) to separate BRA then KET absorption with
   compression after each layer. DMRG/FIT modes retain a joint uncontracted

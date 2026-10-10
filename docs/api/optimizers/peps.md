@@ -223,7 +223,8 @@ Select the update explicitly with `mode="sweep", update_style="two-site"`.
 The default `update_style="row-column"` retains row/column variational fitting;
 `"row"` selects x slices and `"column"` selects y slices. Those choices retain
 the existing local solver and sweep budgets. `mode="full-update"` is also
-accepted as a two-site alias. No separate one-site ALS mode is introduced.
+accepted as a two-site alias. For one-site ALS within row/column sweeps,
+keep `update_style="row-column"` and select `optimizer="als"` below.
 The two-site path follows the reduced-tensor scheme
 in [Lubasch, Cirac and Bañuls, Sec. III B](https://arxiv.org/pdf/1405.3259).
 Currently it supports nearest-neighbor coordinate pairs on dense Torch or CuPy
@@ -685,6 +686,87 @@ are explicitly marked as such. Timing off adds no accelerator barriers and
 does not enable extra contractions or alter optimization settings.
 
 ## Local solver defaults
+
+### One-site ALS inside each row or column
+
+`mode="sweep", optimizer="als"` keeps the existing outer row/column schedule
+and boundary environments. Within each active strip it optimizes one complete
+site tensor at a time, with all other tensors fixed, first forward and then
+backward. Every inner round trip visits each site twice. Bond dimensions stay
+fixed; this is distinct from gate-by-gate two-site full update and from jointly
+optimizing all tensors of a strip with L-BFGS.
+
+```python
+from pepsy.optimizers import PepsOptimizer
+
+optimizer = PepsOptimizer(
+    state, gates, chi=4, mode="sweep", optimizer="als",
+    optimizer_options={"n_round_trips": 2, "rtol": 1e-9},
+    sweep_optimize_kwargs={"axes": ("y", "x"), "n_round_trips": 1},
+)
+result = optimizer.run()
+```
+
+`optimizer_options["n_round_trips"]` controls passes **inside each strip**;
+`sweep_optimize_kwargs["n_round_trips"]` controls outer backward/forward trips
+over the strips after the initial forward pass. Use `axes=("y",)` for columns
+at fixed y, traversing x within each column. The default local budget is two
+inner round trips. `rtol=0` or `None` runs the full budget; otherwise relative
+infidelity improvement is checked after each complete inner round trip.
+
+The default `linear_solver="dense-cg"` constructs the active site's norm matrix
+from cached environments, sets `N_H = (N + N.H) / 2`, and solves
+`N_H A = b` iteratively with Jacobi-preconditioned CG, without SVD,
+diagonalization, or direct factorization. Each next tensor sees updated
+neighbors. `cg_shift=0.` leaves the Hermitian matrix unshifted; an optional
+positive value adds relative diagonal regularization. Failed or inaccurate
+solves retain the previous tensor. The D⁴-by-D⁴ matrix takes O(k D⁸) to solve
+in k iterations, but its assembly costs O(D¹²) at boundary rank chi=D².
+`max_matrix_size=1024` guards assembled matrices; `None` disables the guard.
+
+Explicit `linear_solver="cg"` enables matrix-free Hermitian CG with at most
+`cg_maxiter=200` iterations and a true-residual check. At boundary rank chi=D²,
+k iterations cost O(k D¹⁰), excluding outer boundary construction. Here D is
+the constructor's `chi`, while the boundary rank is `boundary_chi`; for D=4,
+set `chi=4, boundary_chi=16`. This count assumes fixed physical dimension and
+target bonds O(D), and does not promise fewer seconds at small D. CG does not
+use the dense matrix-size guard and has no automatic dense fallback;
+`cg_fallback=True` explicitly enables one within the guard.
+
+Explicit `linear_solver="dense"` selects direct factorization without an
+eigendecomposition, with optional `dense_shift` regularization.
+Explicit `linear_solver="pinv"` selects the positive-support eigensolve.
+Its `rcond=None` selects 1e-12 for double and 1e-6 for single precision.
+See the [sweep controls](sweep.md#als-within-a-slice) for all solver options.
+
+To use L-BFGS for each tensor inside the same cached row/column sweeps:
+
+```python
+optimizer_options={
+    "linear_solver": "dense-lbfgs",  # explicit Hermitian N; "lbfgs" is matrix-free
+    "lbfgs_maxiter": 100,
+    "n_round_trips": 2,
+}
+```
+
+These alternatives use analytic one-site quadratic gradients, rather than
+jointly optimizing a complete strip. The default remains `"dense-cg"`.
+SciPy owns host parameter/gradient vectors; contractions and returned tensors
+retain their backend/device. A finite L-BFGS budget may produce an improving
+unconverged candidate, which is accepted only by the original overlap check.
+See the [local L-BFGS controls](sweep.md#l-bfgs-for-each-site).
+
+Dense NumPy, Torch, and CuPy arrays stay on their backend/device. Symmray and
+other backends raise rather than densifying or changing solvers. Candidate
+updates are accepted only when the original boundary-estimated normalized
+overlap improves or is unchanged; invalid estimates are rejected. This does
+not guarantee improvement against the unknown exact state at finite boundary
+caps. Changing solver does not change those caps or target construction.
+Step records identify `optimizer_result["optimizer"] == "als"` and retain
+aggregate slice, inner-round-trip and attempted/accepted site-solve counts
+under `optimizer_result["als"]`.
+
+### Gradient solvers
 
 The default sweep solver is NLopt `LD_LBFGS` for dense and Torch-backed Symmray
 states. Torch supplies autograd derivatives for Torch parameters; NumPy

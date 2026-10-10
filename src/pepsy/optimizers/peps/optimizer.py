@@ -340,7 +340,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         sweep mode this maps to :class:`SweepOptimizer`'s local solver name;
         when left as ``None`` the sweep local solver defaults to NLopt
         ``LD_LBFGS``. Torch-backed Symmray states still supply gradients via
-        Torch autograd. In global mode, ``"nlopt"`` together with
+        Torch autograd. ``"als"`` selects dense one-site ALS passes inside
+        each row/column, retaining the outer sweep schedule. In global mode, ``"nlopt"`` together with
         ``optimizer_options={"algorithm": "LD_VAR2"}`` routes to
         :meth:`GlobalOptimizer.optimize_nlopt`.
     optimizer_options : mapping, optional
@@ -350,6 +351,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         each local slice solve, not the complete circuit. Global mode accepts aliases such as
         ``algorithm``, ``maxeval``/``n_steps``, tolerance keys, ``device``, and
         ``progress``.
+        Sweep ALS accepts ``n_round_trips=2`` for the inner forward/backward
+        passes, ``rtol=1e-9``, ``rcond=None`` and ``max_matrix_size=1024``.
     sweep_kwargs : mapping, optional
         Constructor options forwarded to :class:`SweepOptimizer`.
     sweep_optimize_kwargs : mapping, optional
@@ -2225,6 +2228,24 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         runs = result.get("runs")
         if runs is not None:
             summary["n_runs"] = len(runs)
+            als_runs = [run for run in runs if run.get("solver") == "als"]
+            if als_runs:
+                local_solves = [solve for run in als_runs for solve in run.get("local_solves", ())]
+                summary["optimizer"] = "als"
+                summary["als"] = {
+                    "slices": len(als_runs),
+                    "round_trips": sum(run.get("n_round_trips", 0) for run in als_runs),
+                    "site_solves": len(local_solves),
+                    "accepted_site_solves": sum(solve["accepted"] for solve in local_solves),
+                    "cg_solves": sum(solve.get("solver") in ("cg", "dense-cg") for solve in local_solves),
+                    "dense_cg_solves": sum(solve.get("solver") == "dense-cg" for solve in local_solves),
+                    "matrix_free_solves": sum(solve.get("solver") in ("cg", "lbfgs") for solve in local_solves),
+                    "lbfgs_solves": sum(solve.get("solver") in ("lbfgs", "dense-lbfgs") for solve in local_solves),
+                    "lbfgs_evaluations": sum(solve.get("lbfgs_evaluations", 0) for solve in local_solves),
+                    "dense_solves": sum(solve.get("solver") == "dense" for solve in local_solves),
+                    "pinv_solves": sum(solve.get("solver") == "pinv" for solve in local_solves),
+                    "cg_fallbacks": sum(solve.get("fallback_from") == "cg" for solve in local_solves),
+                }
             summary["invalid_loss_records"] = [
                 {key: run[key] for key in (
                     "axis", "index", "sweep", "raw_loss_initial", "raw_loss_final",

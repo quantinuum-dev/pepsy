@@ -87,6 +87,14 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `diagnostics.py`: extraction target for infidelity/progress records.
 - `sweep/`: local PEPS slice optimization.
   - `optimizer.py`: `SweepOptimizer`.
+  - `_als.py`: fixed-rank one-site ALS within each row/column, using the
+    existing boundary stores and directional strip cursor, with default
+    explicit Hermitian metrics and iterative CG; matrix-free CG, direct solves,
+    and spectral pseudoinverse are alternatives.
+  - `_als_cg.py`: native Hermitian environment actions, balanced environment
+    halves, Jacobi-preconditioned CG, residual and curvature checks.
+  - `_als_lbfgs.py`: one-site quadratic L-BFGS with analytic complex gradients,
+    SciPy host vectors, native environment actions, and residual diagnostics.
   - `environments.py`: Quimb MPS boundary store and engine selection helpers.
   - `local_objective.py`: extraction target for local objective assembly.
   - `traces.py`: extraction target for sweep traces and progress summaries.
