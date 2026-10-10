@@ -107,6 +107,13 @@ MPS environment store.
 - `_full_update.py`: reduced-pair positive norm projection or full-pair TN
   objectives, and cached transverse boundaries. Defaults are reduced ALS,
   disabled environment gauges, one fixed chi, and DMRG boundary fitting.
+- `_strip_update.py`: full-site fixed-rank ALS within a row/column, with
+  fixed-boundary acceptance and dense matrix-size preflight.
+- `_strip_cursor.py`: owned directional prefix/suffix contractions during
+  synchronous ALS; exterior boundary caches retain mutation validation.
+- `_strip_solve.py`: native Hermitian positive-support pseudoinverse.
+- `_layer_update.py`: fixed-window row/column cycles, target-norm reuse,
+  independent whole-cycle checks, and rollback.
 - `gates.py`: target location for gate routing helpers.
 - `warmstart.py`: target location for warm-start construction.
 - `routing.py`: target location for sweep/global backend selection.

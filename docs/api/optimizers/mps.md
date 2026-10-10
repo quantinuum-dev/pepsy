@@ -429,7 +429,10 @@ Every numeric gate and every tensor in a sub-MPO is checked for matching backend
 device at construction, `set_gates`, `add_gates`, and `set_p`; non-NumPy
 payloads must also match dtype, while NumPy-to-NumPy dtype promotion is
 compatible. Symbolic gates are generated and converted internally as described
-above. A
+above. Dense JAX tracers can have unknown device metadata under `vmap` or
+`grad`; backend and dtype checks still apply, and concrete device mismatches
+are rejected whenever both placements are known. No array conversion is added
+for traced inputs. A
 mismatch raises a `TypeError` with the stream location and preparation guidance;
 `MpsOptimizer` does not silently copy or cast user payloads. Use the same
 explicit converter used to build the state, for example

@@ -18,6 +18,12 @@ records the commit scope and validation limits.
 
 ## Joint notebook solver defaults, 2026-10-06
 
+Follow-up, 2026-10-08: the 2D Gaugy notebook's current eager/compiled MPS
+workflow exposed mixed concrete/traced JAX device validation. A local MPS-only
+fix retains backend/dtype checks and rejects known-device mismatches while
+allowing unknown tracer placement. See the [handoff](../../history/2026-10-08-jax-traced-mps-backends.md)
+for scope and focused checks; this fix is not yet committed or published.
+
 The subsequent [optimizer review and publication](../../history/2026-10-06-gradient-publication.md)
 adds native complex-gradient correction, terminal-state bookkeeping, explicit
 invalid-cost handling, and SciPy budget/callback repairs. Gaugy's signed-cost

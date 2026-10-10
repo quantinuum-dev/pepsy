@@ -473,9 +473,14 @@ variational strip fit against the gated state, not a Hamiltonian ground-state
 DMRG calculation. It can improve compression beyond the gated pair, but does
 not guarantee smaller accumulated error against an ideal whole circuit.
 
-The refinement uses Quimb's public native ALS with Hermitian local norm
-matrices and positive eigensystem solves. Separate norm and overlap boundary
-MPS and prefix/suffix caches are reused across site updates; contractions use
+The default `refine_solver="quimb"` uses Quimb's public native ALS with Hermitian
+local norm matrices and positive eigensystem solves. `refine_solver="pinv"`
+instead Hermitianizes the norm, discards negative eigenvalues and eigenvalues
+at or below `rcond * largest_eigenvalue`, and solves on the retained positive
+support. Unlike Quimb's eigenvalue floor, it does not amplify RHS components
+in discarded directions. There is no environment gauge conditioning in this
+refinement solver. Separate norm and overlap boundary MPS and directional
+prefix/suffix environments are reused across site updates; contractions use
 the supplied Cotengra optimizer. Torch/CuPy tensors remain on their device.
 The exterior boundaries stay fixed within a refinement; adaptive calibration,
 when enabled, is repeated against the block target beforehand. Dense local
@@ -494,6 +499,53 @@ state. `strip_refinement` on the closing gate's step record contains the
 target size, strip sites, pass count, costs, before/after infidelities,
 acceptance, convergence, and cache statistics. Requested final normalization
 and final metric measurements run after accepted refinement.
+
+For refinement beyond one strip, use a fixed gate-window target:
+
+```python
+full_update_kwargs = {
+    "refine_scope": "layer",
+    "refine_sweeps": 1,
+    "refine_solver": "pinv",
+    "refine_max_matrix_size": 1024,
+}
+```
+
+`refine_scope="layer"` captures an exact target before a bounded ordered window
+of gates, runs its pair full updates, then fits full site tensors over every row
+and column against that same target. Here one `refine_sweeps` unit is a complete
+row-plus-column cycle; successive cycles reverse the strip order. The target
+bond budget is `2*chi` for diagonal qubit gates and `4*chi` when other gates are
+included, using the existing automatic batching policy. Intermediate single-site
+gates are included in order; trailing single-site gates execute after the window.
+Targets are not compressed to this budget: the window closes before an added
+gate would exceed it. This is fixed-rank variational compression, with no claim
+of a global optimum.
+
+Each complete cycle receives a fresh whole-lattice norm/overlap check at
+`evaluation_chi` (the calibrated caps for adaptive runs). Only the unchanged
+target norm is cached. A finite lower-cost cycle with non-worsening fidelity
+is retained; a worsening or invalid cycle rolls back to the best earlier state.
+These checks run even when optional per-gate metric measurements are disabled.
+The closing gate's `layer_refinement` record contains the window span, caps,
+per-strip diagnostics, cycle costs, and whole-window infidelities. Per-gate
+fidelities still describe the preceding pair updates. Finite boundary caps make
+these scores estimates; increase/check caps before comparing close results.
+
+Both scopes have a preflight limit `refine_max_matrix_size=1024` on the product
+of a site's virtual dimensions, before allocating a dense local norm. An
+oversized strip/window is skipped with `termination_reason="matrix_size_limit"`
+and FU continues; oversized layer refinement also skips building its exact
+window target. Set a larger limit or `None` explicitly to permit larger solves.
+For an interior site the matrix dimension is `D**4`, memory scales as `D**8`,
+and dense eigendecomposition as `D**12`; the default excludes interior `D>=6`.
+This guard does not bound boundary-contraction memory or total runtime.
+`refine_balance=True` optionally rescales accepted active tensors by their
+maximum magnitude while compensating the PEPS exponent; its default is false.
+It preserves the represented state and does not apply virtual-leg gauges.
+Directional environments require linear many strip extensions per sweep,
+while transverse boundaries retain source-validated reuse. Full-layer refinement
+is opt-in (`refine_sweeps=0`, `refine_scope="strip"` remain the defaults).
 
 Every two-qubit full update retains `local_fidelity` and `local_infidelity`
 in `get_step_records()`, even with both metric measurement flags disabled.

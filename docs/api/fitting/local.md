@@ -43,6 +43,63 @@ uses both solvers. A matching keyword name does not make chain and tree
 iteration counts interchangeable. See [tree FIT](../optimizers/tree_fit.md)
 for tree-specific region and diagnostic meanings.
 
+## Fitting a sum of target networks
+
+Pass a non-empty list or tuple to fit the sum without building its combined
+MPS/MPO bonds:
+
+```python
+from pepsy.fitting import FIT
+
+fit = FIT([T1, T2, T3], p=guess, cutoffs=0.0)
+fit.run_eff(n_iter=4, block_size=2, max_bond=chi, cutoff=0.0)
+result = fit.p
+```
+
+At each update, FIT contracts the fitted bra with each target separately,
+omitting the active fitted tensor(s), and adds the resulting effective
+tensors. One shared local update/SVD follows. Thus cancellation happens
+**before** truncation, and the bond cap applies to the combined result.
+The fitted-state norm metric is shared; individual terms are neither
+normalized nor separately compressed. For weights or subtraction, pass
+`[T1, alpha * T2, -T3]`.
+
+Each term must have the same physical outer indices and dimensions as
+`guess`, compatible array backends/native symmetry spaces, and one site tag
+per tensor. Terms can have different internal bonds and can be layered
+networks with several tensors at each site. Use `retag=True` to infer site
+tags where appropriate. Multi-site gate tensors must first be factored into
+site-tagged layers, as for ordinary cached FIT. Nested lists are not accepted.
+
+All three entry points accept sums. One-site sweeps retain the guess's
+available rank; two-/three-site updates can grow bonds up to `max_bond`.
+For a partial `run_gate()` window, set `range_int=(start, stop)` on the
+constructor, and ensure the guess is canonical outside that interval
+(for example, `guess.canonize(start)`). Sum fitting contracts each term's
+actual outside overlaps, including coefficients there. The dense outside
+fitted tensors are untouched; native fermionic fitting retains its existing
+graded canonical-gauge preparation.
+
+Cached environments are separate for each term and reused across compatible
+sweep reversals, including transitions from three-site to two-/one-site
+updates. Target tensor selections and their ordering are cached lazily for
+each visited block. All terms share one freshly constructed fitted bra per
+environment-site update. The cache retains references to target factors;
+it does not allocate contracted target blocks. Fitted-state environments are
+rebuilt at the start of each run, since the fitted state changes.
+Their work/storage grows with the terms' individual
+contraction costs, without allocating a direct-sum target bond. Normal fitting
+does not compute target-target overlaps. Optional `verbose=True` fidelity
+includes every cross term in the target norm. It evaluates only one triangle
+of the Hermitian overlap matrix and caches that norm within the run. This
+adds quadratic work in the number of terms once per run, with linear overlap
+work per verbose sweep; normalized fidelity is undefined for a zero sum.
+The diagnostic cache is reset between runs to avoid stale values or autodiff
+graphs. Target structure and indices must remain fixed for a FIT instance.
+Default ownership protects the supplied targets and guess. `fit.tn` and
+`fit.prepared_target` are tuples for sum targets; `copy_target=False` transfers
+ownership of each term just as for a single target.
+
 ## Choose a sweep method
 
 `FIT.run_gate(finite_check=False)` skips per-sweep active-array finite scans

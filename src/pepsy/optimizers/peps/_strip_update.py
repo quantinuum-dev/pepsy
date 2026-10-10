@@ -6,11 +6,18 @@ import autoray as ar
 import quimb.tensor as qtn
 
 from ..._internal.cutoff import resolve_fit_rtol
-from ...boundary._reuse import StripEnvironmentCache, layer_sources
+from ...boundary._reuse import layer_sources
 from ...boundary.metrics import build_bra_ket, _as_scaled_scalar
 from ...bp._backend import all_finite, dag
 from ._boundary_convergence import chi_pair
 from ._full_update import boundary_strip
+from ._strip_cursor import StripSweepCursor
+from ._strip_solve import solve_positive
+
+
+def local_matrix_size(state, site):
+    tensor = state[site]
+    return tensor.size // tensor.ind_size(state.site_ind(*site))
 
 
 def strip_key(where):
@@ -49,7 +56,8 @@ def _value(network, optimize):
 
 def refine_strip(state, target, *, key, chi, contraction_opt, boundary_kwargs,
                  sweeps, rtol, rcond=None, boundary=None, overlap_boundary=None,
-                 reuse=True):
+                 reuse=True, solver='quimb', balance=False,
+                 max_matrix_size=1024, target_norm=None):
     """Fit only strip tensors against a fixed exact block target.
 
     Both objective networks are scaled to unit initial norms before solving;
@@ -61,6 +69,14 @@ def refine_strip(state, target, *, key, chi, contraction_opt, boundary_kwargs,
     axis, coordinate = key
     sites = ([(i, coordinate) for i in range(state.Lx)] if axis == 'y'
              else [(coordinate, j) for j in range(state.Ly)])
+    largest = max(local_matrix_size(state, site) for site in sites)
+    if max_matrix_size is not None and largest > max_matrix_size:
+        return state, {'accepted': False, 'converged': False, 'sweeps': 0,
+                       'termination_reason': 'matrix_size_limit', 'max_matrix_size': largest,
+                       'matrix_size_limit': max_matrix_size, 'axis': axis,
+                       'coordinate': coordinate, 'sites': sites, 'solver': solver,
+                       'chi': norm_chi, 'overlap_chi': overlap_chi,
+                       'target_max_bond': int(target.max_bond())}, boundary, overlap_boundary
     along = 'X' if axis == 'y' else 'Y'
     sample = state[sites[0]].data
     tolerance = resolve_fit_rtol(rtol, dtype=sample.dtype) or 0.
@@ -94,23 +110,26 @@ def refine_strip(state, target, *, key, chi, contraction_opt, boundary_kwargs,
 
     aa, boundary = strip(candidate, handle=boundary)
     ab, overlap_boundary = strip(target, candidate, overlap_boundary)
-    bb, _ = strip(target)
+    bb = strip(target)[0] if target_norm is None else None
     report = {'axis': axis, 'coordinate': coordinate, 'sites': sites,
-              'solver': 'quimb', 'max_sweeps': sweeps, 'sweeps': 0,
+              'solver': solver, 'max_sweeps': sweeps, 'sweeps': 0,
               'rtol': tolerance, 'accepted': False, 'converged': False,
               'target_max_bond': int(target.max_bond()),
               'chi': norm_chi, 'overlap_chi': overlap_chi,
+              'max_matrix_size': largest, 'matrix_size_limit': max_matrix_size,
+              'local_solves': [],
               'fidelity_convention': 'fixed boundary estimate against exact strip-block target'}
     try:
         log_aa = _norm_log(_scalar(aa, contraction_opt), roundoff)
-        log_bb = _norm_log(_scalar(bb, contraction_opt), roundoff)
+        log_bb = _norm_log(_scalar(bb, contraction_opt) if bb is not None else target_norm, roundoff)
     except ValueError:
         report['termination_reason'] = 'invalid_environment'
         return state, report, boundary, overlap_boundary
     aa.exponent -= log_aa
     ab.exponent -= .5 * (log_aa + log_bb)
     del bb
-    caches = [StripEnvironmentCache(), StripEnvironmentCache()]
+    caches = [StripSweepCursor(network, axis=along, length=len(sites), optimize=contraction_opt)
+              for network in (aa, ab)] if reuse else []
 
     def score():
         norm = _value(aa, contraction_opt)
@@ -137,18 +156,17 @@ def refine_strip(state, target, *, key, chi, contraction_opt, boundary_kwargs,
     report.update(cost_history=[initial[0]], infidelity_before=initial[1],
                   infidelity_after=initial[1], termination_reason='max_sweeps')
     for sweep in range(sweeps):
+        for cache in caches:
+            cache.start(reverse=bool(sweep % 2))
         positions = range(len(sites)) if sweep % 2 == 0 else range(len(sites) - 1, -1, -1)
         valid = True
         for position in positions:
             site = sites[position]
             tag = state.site_tag(*site)
             local = []
-            for network, cache in zip((aa, ab), caches):
+            for index, network in enumerate((aa, ab)):
                 if reuse:
-                    reduced = cache.reduce(network, sources=(), axis=along, coordinate=coordinate,
-                                           length=len(sites), active=(position, position),
-                                           optimize=contraction_opt)
-                    reduced.exponent += network.exponent
+                    reduced = caches[index].local(position)
                 else:
                     reduced = network.copy()
                 # select() retains virtual tensor views. Keep Quimb's temporary
@@ -193,16 +211,31 @@ def refine_strip(state, target, *, key, chi, contraction_opt, boundary_kwargs,
             if not all_finite(matrix.data) or not all_finite(vector.data):
                 valid = False
                 break
-            local_aa = qtn.TensorNetwork([ket, bra, matrix], virtual=True)
-            local_ab = qtn.TensorNetwork([overlap_bra, vector], virtual=True)
-            # Quimb's prebuilt-network ALS reads live variables; one variable
-            # per call lets the surrounding strip cache reuse both directions.
-            dummy = qtn.TensorNetwork([ket.copy()])
-            qtn.tensor_network_fit_als(
-                dummy, dummy, steps=1, tol=0., tnAA=local_aa, tnAB=local_ab,
-                xBB=1., dense_solve=True, solver_dense='eigh', enforce_pos=True,
-                pos_smudge=rcond, contract_optimize=contraction_opt, inplace=False,
-            )
+            if solver == 'pinv':
+                physical = tuple(i for i in overlap_bra.inds if i not in left)
+                rhs_data = vector.transpose(*left, *physical).data.reshape(size, -1)
+                shape = tuple(ket.ind_size(i) for i in right)
+                try:
+                    answer, local_report = solve_positive(
+                        matrix.data.reshape(size, size), rhs_data, rcond=rcond,
+                    )
+                except ValueError:
+                    valid = False
+                    break
+                local_report.update(site=site, sweep=sweep)
+                report['local_solves'].append(local_report)
+                solved = qtn.Tensor(answer.reshape(*shape, *(ket.ind_size(i) for i in physical)),
+                                    inds=(*right, *physical))
+                ket.modify(data=solved.transpose(*ket.inds).data)
+            else:
+                local_aa = qtn.TensorNetwork([ket, bra, matrix], virtual=True)
+                local_ab = qtn.TensorNetwork([overlap_bra, vector], virtual=True)
+                dummy = qtn.TensorNetwork([ket.copy()])
+                qtn.tensor_network_fit_als(
+                    dummy, dummy, steps=1, tol=0., tnAA=local_aa, tnAB=local_ab,
+                    xBB=1., dense_solve=True, solver_dense='eigh', enforce_pos=True,
+                    pos_smudge=rcond, contract_optimize=contraction_opt, inplace=False,
+                )
             data = ket.transpose(*candidate[site].inds).data
             if not all_finite(data):
                 valid = False
@@ -227,10 +260,18 @@ def refine_strip(state, target, *, key, chi, contraction_opt, boundary_kwargs,
             break
     report['environment_reuse'] = boundary.mps_b.environment_cache.report()
     report['overlap_environment_reuse'] = overlap_boundary.mps_b.environment_cache.report()
-    report['strip_environment_reuse'] = {'norm': caches[0].report(), 'overlap': caches[1].report()}
+    report['strip_environment_reuse'] = ({'norm': caches[0].report(), 'overlap': caches[1].report()}
+                                          if reuse else None)
     if best is not None:
         # The solve used unit initial norms. Restore the target's physical scale.
         best.exponent += .5 * (log_bb - log_aa)
+        if balance:
+            for site in sites:
+                tensor = best[site]
+                scale = float(ar.do('max', ar.do('abs', tensor.data)))
+                if scale > 0 and math.isfinite(scale):
+                    tensor.modify(data=tensor.data / scale)
+                    best.exponent += math.log10(scale)
         report.update(accepted=True, infidelity_after=best_score[1], best_cost=best_score[0])
         return best, report, boundary, overlap_boundary
     return state, report, boundary, overlap_boundary

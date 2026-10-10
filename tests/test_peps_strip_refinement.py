@@ -119,7 +119,8 @@ def test_refinement_accepts_gate_backend_and_dtype_conversion(backend, gate_kind
 
 
 @pytest.mark.parametrize('shift', [0., 80.])
-def test_cached_and_fresh_refinement_agree_with_large_network_exponents(shift):
+@pytest.mark.parametrize('solver', ['quimb', 'pinv'])
+def test_cached_and_fresh_refinement_agree_with_large_network_exponents(shift, solver):
     state, gate, where = fixture()
     target = state.gate(gate, where, contract='split', cutoff=0.)
     baseline = run(optimizer(state, [(gate, where)]))
@@ -130,6 +131,7 @@ def test_cached_and_fresh_refinement_agree_with_large_network_exponents(shift):
         out, report, _, _ = refine_strip(
             baseline, target, key=('x', 1), chi=32, contraction_opt='greedy',
             boundary_kwargs={'fit_mode': 'direct', 'cutoff': 0.}, sweeps=2, rtol=None, reuse=reuse,
+            solver=solver, balance=reuse,
         )
         assert report['accepted'] and report['sweeps'] == 2
         # For an exact metric, the least-squares projection satisfies

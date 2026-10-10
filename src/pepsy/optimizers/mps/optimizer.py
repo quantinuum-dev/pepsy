@@ -4414,6 +4414,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     @staticmethod
     def _backend_signatures_compatible(source_signature, target_signature):
         """Return whether two payloads can be used without backend transfer."""
+        if source_signature[0] == target_signature[0] == "jax":
+            # vmap/grad can trace only one side of an otherwise native replay.
+            # Tracers have no concrete device; compare placement when known on
+            # both sides, retaining strict backend/dtype checks while tracing.
+            return (
+                source_signature[:2] == target_signature[:2]
+                and source_signature[3:] == target_signature[3:]
+                and (
+                    source_signature[2] is None
+                    or target_signature[2] is None
+                    or source_signature[2] == target_signature[2]
+                )
+            )
         if source_signature[:1] == target_signature[:1] == ("symmray",):
             # A real native gate is safe to apply to a complex native state:
             # the contraction promotes the result while preserving charge and

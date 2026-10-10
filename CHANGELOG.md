@@ -19,6 +19,13 @@ releases remain backwards-compatible. From 1.0 onward:
   compression after each layer. DMRG/FIT modes retain a joint uncontracted
   target; explicit layer policies still take precedence.
 
+- `FIT([T1, T2, ...], p=guess)` fits tensor-network sums using separate cached
+  overlap environments and one combined local update, without materializing
+  sum bonds. Supports MPS/MPO targets, layered terms, weighted cancellation,
+  one-/two-/three-site sweeps, and native Symmray arrays. Cached target-block
+  selections and a shared fitted bra avoid repeated construction; optional
+  verbose target norms reuse Hermitian cross terms once per run.
+
 - Two-site PEPS fits now expose `tensor_mode="reduced"` (default) and opt-in
   `tensor_mode="full"` with joint L-BFGS on both full site tensors. Reduced
   tensors also support `solver="lbfgs"`. Environment gauges remain off by
@@ -33,6 +40,14 @@ releases remain backwards-compatible. From 1.0 onward:
   A local SVD warm start whose numerical rank fits the PEPS cap is accepted
   directly with local fidelity one, skipping FU environment/solver work
   (`skip_exact=True`). Same-cap boundary retuning preserves cached DMRG cuts.
+
+- Opt-in fixed-layer PEPS refinement (`refine_scope="layer"`) fits full site
+  tensors over rows and columns against one bounded exact gate-window target,
+  with independent whole-cycle checks and rollback. Native Torch/CuPy
+  `refine_solver="pinv"` solves on the Hermitian norm's positive numerical
+  support without environment gauges. Directional strip environments use
+  linear many extensions per sweep; a configurable local matrix-size guard
+  skips expensive dense refinement while retaining pair FU.
 
 - Opt-in `gate_order="smart"` for dense PEPS: Pauli commutation dependencies,
   strip-aware traversal, native single-qubit fusion, and complete original
@@ -96,6 +111,9 @@ releases remain backwards-compatible. From 1.0 onward:
   target normalization even when final normalization is disabled. Smart gate
   scheduling updates readiness incrementally, removing cubic predecessor-copy
   work on overlapping queues while preserving the ordering heuristic.
+
+- MPS replay accepts mixed concrete and traced JAX arrays under eager `vmap`
+  and `grad`, while retaining backend, dtype and known-device mismatch checks.
 
 - Full-update ALS uses dtype-aware `rtol="auto"`, normalized complete-sweep
   stopping, and actual iteration/convergence diagnostics. Public Quimb native

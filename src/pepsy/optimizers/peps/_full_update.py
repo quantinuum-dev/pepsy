@@ -28,12 +28,24 @@ def options(values=None):
     result = {'max_iterations': 50, 'rtol': 'auto', 'rcond': None, 'gauge': False,
               'tensor_mode': 'reduced', 'skip_exact': True,
               'solver': 'auto', 'refine_sweeps': 0, 'refine_rtol': 'auto',
+              'refine_scope': 'strip', 'refine_solver': 'quimb',
+              'refine_balance': False,
+              'refine_max_matrix_size': 1024,
               'accumulate_local_infidelity': True}
     values = dict(values or {})
     unknown = values.keys() - result.keys()
     if unknown:
         raise ValueError(f'Unknown full_update_kwargs: {sorted(unknown)}')
     result.update(values)
+    if result['refine_scope'] not in ('strip', 'layer'):
+        raise ValueError('full update refine_scope must be strip or layer')
+    if result['refine_solver'] not in ('quimb', 'pinv'):
+        raise ValueError('full update refine_solver must be quimb or pinv')
+    if not isinstance(result['refine_balance'], bool):
+        raise TypeError('full update refine_balance must be a bool')
+    limit = result['refine_max_matrix_size']
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ValueError('refine_max_matrix_size must be a positive integer or None')
     if not isinstance(result['gauge'], bool):
         raise TypeError('full update gauge must be a bool')
     if not isinstance(result['skip_exact'], bool):

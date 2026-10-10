@@ -374,8 +374,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         and fixed boundary environment; it never forms a full norm matrix. Explicit
         ``solver="lbfgs"`` also supports reduced tensors. This mode keeps
         the outside tensors fixed and always processes one two-site gate.
-        Positive ``refine_sweeps`` enables additional fixed-rank strip ALS
-        (default zero) with ``refine_rtol="auto"``. ``accumulate_local_infidelity=True`` retains
+        Positive ``refine_sweeps`` enables additional full-site, fixed-rank ALS
+        (default zero) with ``refine_rtol="auto"``. ``refine_scope="strip"``
+        visits a completed strip; ``"layer"`` alternates all rows/columns
+        against a fixed bounded gate-window target. ``refine_solver="pinv"``
+        discards unsupported norm eigenvectors; the default is ``"quimb"``.
+        ``refine_max_matrix_size=1024`` skips oversized refinement before
+        dense allocation. ``refine_balance=False`` controls scalar rescaling.
+        ``accumulate_local_infidelity=True`` retains
         a running product of local pair fidelities alongside per-gate records.
     global_kwargs : mapping, optional
         Constructor options forwarded to :class:`GlobalOptimizer`.
@@ -1232,7 +1238,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         return batch_entries, two_site_in_batch, idx
 
     @timed_phase("target")
-    def _collect_auto_batch_target(self, start_idx, *, cutoff, cutoff_mode, gate_kwargs):
+    def _collect_auto_batch_target(self, start_idx, *, cutoff, cutoff_mode, gate_kwargs,
+                                   gate_converter=None, end_on_pair=False):
         """Grow an ordered exact target until bonds exceed its budget.
 
         Diagonal qubit batches use 2D; batches with other gates use 4D.
@@ -1249,9 +1256,13 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         idx = start_idx
         stop_reason = "end_of_queue"
         bond_factor = 2
+        last_pair = None
         while idx < len(self.gates):
             entry = self.gates[idx]
             gate_payload, where, which = entry
+            if gate_converter is not None:
+                gate_payload = gate_converter(gate_payload)
+                entry = (gate_payload, where, which)
             site_count = self._site_count(where, target)
             if site_count not in (1, 2):
                 raise ValueError("PepsOptimizer supports one- and two-site gates only.")
@@ -1274,9 +1285,13 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             idx += 1
             if site_count == 2:
                 n_two_site += 1
+                last_pair = (len(entries), idx, target, bond_factor)
             if exceeds_limit:
                 stop_reason = "single_gate_exceeds_limit"
                 break
+        if end_on_pair and last_pair is not None:
+            count, idx, target, bond_factor = last_pair
+            entries = entries[:count]
         return entries, n_two_site, idx, target, stop_reason, bond_factor * self.chi
 
     @staticmethod
@@ -2476,16 +2491,28 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         return pair.optimize(norm, self.full_update_kwargs)
 
     @timed_phase('full_update_refinement')
-    def _full_update_refine(self, target, key, *, chi, boundary, overlap_boundary=None):
+    def _full_update_refine(self, target, key, *, chi, boundary, overlap_boundary=None,
+                            evaluation_chi=None):
         from ._strip_update import refine_strip
+        from ._layer_update import refine_layer
+        controls = self.full_update_kwargs
+        extra = dict(solver=controls['refine_solver'],
+                     balance=controls['refine_balance'], max_matrix_size=controls['refine_max_matrix_size'])
+        if key is None:
+            fitter = refine_layer
+            extra['evaluation_chi'] = evaluation_chi
+        else:
+            fitter = refine_strip
+            extra['key'] = key
         if overlap_boundary is None:
             overlap_boundary = getattr(self, '_refinement_overlap_boundary', None)
-        result, report, boundary, overlap = refine_strip(
-            self.state, target, key=key, chi=chi, contraction_opt=self.contraction_opt,
+        result, report, boundary, overlap = fitter(
+            self.state, target, chi=chi, contraction_opt=self.contraction_opt,
             boundary_kwargs=self.boundary_kwargs, sweeps=self.full_update_kwargs['refine_sweeps'],
             rtol=self.full_update_kwargs['refine_rtol'], rcond=self.full_update_kwargs['rcond'],
             boundary=boundary, overlap_boundary=overlap_boundary,
             reuse=self.boundary_convergence is None or self.boundary_convergence['reuse_environments'],
+            **extra,
         )
         self._full_update_boundary = boundary
         self._refinement_overlap_boundary = overlap
@@ -2520,9 +2547,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                          accept_if_improved, improvement_tol, metric_kwargs,
                          cutoff, cutoff_mode, gate_kwargs, step_callback, progress):
         """Sequential nearest-neighbor updates sharing the checked boundary cache."""
-        from ._strip_update import strip_key
+        from ._strip_update import strip_key, local_matrix_size
         refine_target, refine_bonds, refine_start = None, set(), None
         refine_enabled = self.full_update_kwargs['refine_sweeps'] > 0
+        layer_refine = refine_enabled and self.full_update_kwargs['refine_scope'] == 'layer'
+        layer_end, layer_stop, layer_limit = None, None, None
         entries = enumerate(self.gates, 1)
         if progress:
             from tqdm.auto import tqdm
@@ -2538,7 +2567,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                                                  gate_kwargs=gate_kwargs)
                 self.state = self._apply_gate_entry(self.state, gate_payload, where, which,
                                                     opts=opts, inplace=False)
-                if refine_target is not None:
+                if refine_target is not None and not layer_refine:
                     refine_target = self._build_target(
                         refine_target, gate_payload, where, which, cutoff=0.,
                         cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
@@ -2547,7 +2576,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     old_norm = self._normalize_state(
                         self.state, normalize_chi=normalize_chi, normalize_kwargs=normalize_kwargs,
                     )
-                    if refine_target is not None:
+                    if refine_target is not None and not layer_refine:
                         self._normalize_without_rescaling_sites(
                             refine_target, getattr(old_norm, 'cost', old_norm),
                         )
@@ -2556,13 +2585,28 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             evaluation_start = len(self.evaluation_records)
             pair, guess, target = self._full_update_pair(gate_payload, where)
             if refine_enabled:
-                if refine_target is None:
+                if layer_refine and refine_target is None:
+                    limit = self.full_update_kwargs['refine_max_matrix_size']
+                    if limit is not None and any(local_matrix_size(self.state, site) > limit
+                                                 for site in self.state.gen_site_coos()):
+                        # Keep FU usable without constructing an expensive
+                        # layer target for refinement that will be skipped.
+                        refine_target, layer_end = target, step
+                        layer_stop, layer_limit = 'matrix_size_limit', None
+                    else:
+                        _, _, layer_end, refine_target, layer_stop, layer_limit = self._collect_auto_batch_target(
+                            step - 1, cutoff=0., cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                            gate_converter=infer_backend_converter_from_sample(sample), end_on_pair=True,
+                        )
+                    refine_start = step
+                elif not layer_refine and refine_target is None:
                     refine_target, refine_start = self.state.copy(), step
-                refine_target = self._build_target(
-                    refine_target, gate_payload, where, which, cutoff=0.,
-                    cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
-                )
-                refine_bonds.add(tuple(sorted(tuple(site) for site in where)))
+                if not layer_refine:
+                    refine_target = self._build_target(
+                        refine_target, gate_payload, where, which, cutoff=0.,
+                        cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                    )
+                    refine_bonds.add(tuple(sorted(tuple(site) for site in where)))
             if normalize_target:
                 old_norm = self._normalize_state(
                     target, normalize_chi=normalize_chi, normalize_kwargs=normalize_kwargs,
@@ -2655,13 +2699,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 next_key = strip_key(next_where)
                 finished = (key != next_key or next_key is None or
                             tuple(sorted(tuple(site) for site in next_where)) in refine_bonds)
+                if layer_refine:
+                    finished, key = step == layer_end, None
                 if finished:
                     if normalize_target:
                         self._normalize_state(refine_target, normalize_chi=normalize_chi,
                                               normalize_kwargs=normalize_kwargs)
                     refine_calibration = None
                     refine_overlap_boundary = None
-                    if self.boundary_convergence is not None:
+                    if self.boundary_convergence is not None and not (layer_refine and layer_stop == 'matrix_size_limit'):
                         refine_calibration = self._calibrate_sweep_boundaries(
                             self.state, refine_target, normalize_chi=normalize_chi,
                             evaluation_chi=evaluation_chi,
@@ -2676,7 +2722,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self.state, refinement, boundary = self._full_update_refine(
                         refine_target, key, chi=refine_chi, boundary=boundary,
                         overlap_boundary=refine_overlap_boundary,
+                        **({'evaluation_chi': evaluation_chi} if layer_refine else {}),
                     )
+                    if layer_refine:
+                        refinement.update(batch_stop_reason=layer_stop, target_bond_limit=layer_limit)
                     refinement['start_step'] = refine_start
                     refinement['end_step'] = step
                     refinement['original_steps'] = [i for group in
@@ -2721,7 +2770,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 'optimized': accepted and not exact_svd, 'optimizer_attempted': not exact_svd,
                 'reason': 'exact_svd' if exact_svd else ('optimized' if accepted else 'optimizer_rejected'),
                 'optimizer_result': summary,
-                'strip_refinement': refinement,
+                'strip_refinement': refinement if not layer_refine else None,
+                'layer_refinement': refinement if layer_refine else None,
                 **local_metrics,
             }
             if before is not None:
