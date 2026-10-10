@@ -4226,7 +4226,7 @@ class MpoOptimizer:
                     target_strategy=fit_target_strategy,
                     cutoff_mode=cutoff_mode,
                 )
-                if self._can_use_native_gate_sandwich(
+                if not (compression_opts or {}).get("mpo_factorization") and self._can_use_native_gate_sandwich(
                     p, gate, bra_gate, where, method
                 ):
                     p = self._timed_call(
@@ -4343,6 +4343,7 @@ class MpoOptimizer:
         mode=None,
         compression_seed=None,
         compression_opts=None,
+        mpo_factorization="qr",
         submpo_method=None,
         progbar=False,
         cutoff="auto",
@@ -4400,6 +4401,12 @@ class MpoOptimizer:
             cutoff_oversample, cutoff_mode_oversample, and compress_opts_final
             when named by the installed compressor. chi remains the final cap.
             Native Symmray replay and channel streams reject explicit settings.
+        mpo_factorization : {"qr", "projector"}, default="qr"
+            Dense direct replay can use gauge-invariant paired factors in
+            gate construction, canonicalization and compression. Projector
+            backward requires a fixed numerical rank and resolved truncation
+            gap, and rejects unsupported charts. Native arrays, channels,
+            layout changes and fallback replay are excluded from this mode.
         submpo_method : str | None, default=None
             Optional Quimb compression override for an MPO-mode run. This is
             the MPO analogue of `MpsOptimizer`'s ``submpo_method``; for
@@ -4538,6 +4545,15 @@ class MpoOptimizer:
 
         compression_method = self._resolve_mpo_method(submpo_method)
         compression_opts = quimb_compression_options(compression_method, compression_opts)
+        if mpo_factorization not in {"qr", "projector"}:
+            raise ValueError("mpo_factorization must be 'qr' or 'projector'")
+        if mpo_factorization == "projector":
+            from ...operators._mpo_factorization import projector_method
+
+            if not self._is_mpo_mode(self.mode) or layout or fit_fallback is not None:
+                raise NotImplementedError("projector factorization requires direct MPO replay without layout changes or fallback")
+            projector_method(self.p, compression_method)
+            compression_opts["mpo_factorization"] = "projector"
         if compression_opts and (
             not self._is_mpo_mode(self.mode) or self._has_symmray_data(self.p)
             or any(isinstance(gate, MpoChannelEvent) for gate in self._execution_stream()[0])

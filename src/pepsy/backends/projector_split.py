@@ -8,9 +8,44 @@ points and a closed kept/discarded spectral gap are not smooth charts.
 
 import autoray as ar
 import numpy as np
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 _METHOD = "pepsy:projector"
 _REGISTERED = False
+_DERIVATIVE_ERRORS = ContextVar("projector_derivative_errors", default=None)
+
+
+class ProjectorDerivativeError(RuntimeError):
+    """The paired factors do not define a supported differentiable chart."""
+
+
+@contextmanager
+def capture_projector_derivative_errors():
+    """Record unsupported charts and return NaN cotangents for diagnostics.
+
+    This opt-in context is for validation, not optimization: callers must
+    reject a result if the yielded list is nonempty. Outside it, backward
+    raises ProjectorDerivativeError. Keep callbacks on the caller thread so
+    the scoped policy also applies during autograd execution.
+    """
+    import torch
+
+    errors = []
+    token = _DERIVATIVE_ERRORS.set(errors)
+    try:
+        with torch.autograd.set_multithreading_enabled(False):
+            yield errors
+    finally:
+        _DERIVATIVE_ERRORS.reset(token)
+
+
+def _derivative_failure(message, u, vh):
+    errors = _DERIVATIVE_ERRORS.get()
+    if errors is None:
+        raise ProjectorDerivativeError(message)
+    errors.append(message)
+    return u.new_full((u.shape[0], vh.shape[1]), float("nan")), None, None, None
 
 
 def _retained_rank(u, s, vh, *, cutoff, cutoff_mode, max_bond):

@@ -4006,6 +4006,7 @@ def gate_with_submpo(
     inplace_mpo=True,
     ind_id_k="k{}",
     ind_id_b="b{}",
+    mpo_factorization="qr",
     **compress_opts,
 ):
     """Apply a sub-MPO to the upper (ket) or lower (bra) layer of an MPS/MPO.
@@ -4039,6 +4040,10 @@ def gate_with_submpo(
         Whether the applied sub-MPO may be reused without a defensive copy.
         This does not control whether the operator is applied. The target's
         mutation is controlled solely by ``inplace``.
+    mpo_factorization : {"qr", "projector"}, default="qr"
+        Projector mode uses paired-factor derivatives throughout dense direct
+        replay. It removes numerical nulls and requires a locally fixed rank
+        and resolved kept/discarded gap. Other backends/methods are rejected.
     ind_id_k : str, default="k{}"
         Format string for ket-family physical index names.
     ind_id_b : str, default="b{}"
@@ -4055,11 +4060,25 @@ def gate_with_submpo(
     if which_norm not in ("upper", "lower"):
         raise ValueError("which must be 'upper' or 'lower' (case-insensitive).")
 
+    if mpo_factorization not in {"qr", "projector"}:
+        raise ValueError("mpo_factorization must be 'qr' or 'projector'")
+    split_method = None
+    if mpo_factorization == "projector":
+        from ._mpo_factorization import (
+            canonicalize_projector, compression_options, projector_method,
+        )
+
+        split_method = projector_method(p, method)
+        compress_opts = compression_options(compress_opts, split_method)
+
     p = p if inplace else p.copy()
     si, sf = min(where), max(where)
 
     # make the region canonical
-    p.canonicalize_((si, sf), info=info)
+    if split_method is None:
+        p.canonicalize_((si, sf), info=info)
+    else:
+        canonicalize_projector(p, (si, sf), info, split_method)
 
     # Quimb's lazy method's inplace flag refers to the target, not submpo.
     # Always absorb into our already selected working target.
@@ -4193,6 +4212,7 @@ def gate_nonlocal_opt(
     inplace=False,
     ind_id_k="k{}",
     ind_id_b="b{}",
+    mpo_factorization="qr",
     **compress_opts,
 ):
     """Apply a nonlocal gate (dense operator) to an MPO layer via sub-MPO compression.
@@ -4232,6 +4252,10 @@ def gate_nonlocal_opt(
     **compress_opts :
         Additional options forwarded to ``tensor_network_1d_compress``
         (e.g. ``max_bond``, ``cutoff``, ``cutoff_mode``).
+    mpo_factorization : {"qr", "projector"}, default="qr"
+        Use paired factors in gate construction, canonicalization and direct
+        compression. Projector mode has the same derivative-chart limits as
+        :func:`gate_with_submpo` and does not change global QR/SVD drivers.
 
     Returns
     -------
@@ -4240,7 +4264,14 @@ def gate_nonlocal_opt(
     """
     if dims is None:
         dims = tuple(p.phys_dim(i) for i in where)
-    submpo = qtn.MatrixProductOperator.from_dense(G, dims=dims, sites=where, L=p.L)
+    split_opts = {}
+    if mpo_factorization == "projector":
+        from ._mpo_factorization import projector_method
+
+        split_opts = {"method": projector_method(p, method), "cutoff": 0.0}
+    elif mpo_factorization != "qr":
+        raise ValueError("mpo_factorization must be 'qr' or 'projector'")
+    submpo = qtn.MatrixProductOperator.from_dense(G, dims=dims, sites=where, L=p.L, **split_opts)
     return gate_with_submpo(
         p,
         submpo,
@@ -4253,5 +4284,6 @@ def gate_nonlocal_opt(
         inplace_mpo=True,
         ind_id_k=ind_id_k,
         ind_id_b=ind_id_b,
+        mpo_factorization=mpo_factorization,
         **compress_opts,
     )

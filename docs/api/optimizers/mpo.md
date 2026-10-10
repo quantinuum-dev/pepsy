@@ -42,6 +42,24 @@ resolved at the public call boundary; explicitly conflicting values raise.
 
 ## Supported representations and compression
 
+Dense direct replay accepts `run(mpo_factorization="projector")` to use
+paired-factor derivatives in gate construction, canonicalization and every
+compression split. This avoids differentiating arbitrary singular vectors
+within a retained degenerate subspace. It reuses canonical-center metadata
+and preserves the requested `chi`, cutoff, dtype, device and operator scale.
+The compatibility default is `"qr"`.
+
+The mode applies the existing cutoff rule followed by numerical-null removal
+at `max(m,n) * eps * s_max`. It supports dense NumPy/Torch and first-order
+Torch derivatives. A locally fixed rank and resolved kept/discarded gap are
+required. Noninvariant or numerically unresolved factor cotangents raise
+`pepsy.backends.ProjectorDerivativeError` (a `RuntimeError` subclass).
+Passing a forward check alone does not establish derivative accuracy.
+Native symmetry arrays, cyclic MPO storage, other compressors, channel
+streams, layout changes and fallback replay are rejected explicitly.
+Global QR/SVD registrations are unchanged. See the
+[implementation and numerical evidence](../../development/notes/2026-10-10-mpo-paired-gradients.md).
+
 Dense Quimb gate replay accepts `run(compression_opts=...)` for both MPO
 physical layers. See [compression stages](../boundary/compression.md) for
 intermediate/final settings and the restrictions on native and channel replay.

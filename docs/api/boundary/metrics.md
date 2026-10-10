@@ -147,8 +147,14 @@ pruning. Pepsy's compatibility default remains `mps_factorization="qr"`.
 
 The first-order rule requires a gauge-invariant loss of both factors, a
 locally fixed retained rank, and a resolved kept/discarded singular-value gap.
-Backward rejects a closed gap or noninvariant factor observable. At the zero
+Backward raises `pepsy.backends.ProjectorDerivativeError` (a `RuntimeError`
+subclass) for a closed gap or noninvariant factor observable. At the zero
 matrix it returns zero only for zero incoming cotangents; otherwise it raises.
+Diagnostic callers can use `pepsy.backends.capture_projector_derivative_errors()`
+to collect error messages and receive NaN cotangents instead of throwing inside
+autograd. Reject any nonempty error list or nonfinite derivative before use;
+this context is not an optimization policy. It scopes and restores its error
+handling and runs autograd callbacks on the caller thread.
 It does not guarantee derivatives across rank/cutoff changes. Test the full
 approximate contraction against finite differences at representative parameters.
 Dense NumPy/Torch, direct compression, and left/right absorption are supported;

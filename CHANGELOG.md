@@ -14,6 +14,10 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- Dense direct MPO replay supports `mpo_factorization="projector"` for
+  paired-factor derivatives with fixed-rank/gap validation. Unsupported charts
+  raise `pepsy.backends.ProjectorDerivativeError`; the QR default is unchanged.
+
 - `PepsOptimizer` defaults direct boundary compressors (`direct`, `zipup`,
   SRC/SDC and related modes) to separate BRA then KET absorption with
   compression after each layer. DMRG/FIT modes retain a joint uncontracted

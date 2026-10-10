@@ -3,7 +3,7 @@
 import torch
 from torch.autograd.function import once_differentiable
 
-from .projector_split import _retained_rank
+from .projector_split import _derivative_failure, _retained_rank
 
 
 class _ProjectorSplit(torch.autograd.Function):
@@ -39,7 +39,7 @@ class _ProjectorSplit(torch.autograd.Function):
         r = ctx.rank
         if r == 0:
             if any(g is not None and bool((g != 0).any()) for g in (gq, gb)):
-                raise RuntimeError("zero-matrix projector split has no differentiable subspace chart")
+                return _derivative_failure("zero-matrix projector split has no differentiable subspace chart", u, vh)
             return u.new_zeros((u.shape[0], vh.shape[1])), None, None, None
 
         q, sr, vr = u[:, :r], s[:r], vh[:r]
@@ -53,7 +53,7 @@ class _ProjectorSplit(torch.autograd.Function):
         scale = (q.abs().mT @ gq.abs() + b.abs() @ gb.abs().mT).amax()
         tolerance = 64 * torch.finfo(s.dtype).eps * (q.shape[0] + b.shape[1]) * scale
         if bool((vertical - vertical.mH).abs().amax() > tolerance):
-            raise RuntimeError("projector split requires a gauge-invariant loss of its paired factors")
+            return _derivative_failure("projector split requires a gauge-invariant loss of its paired factors", u, vh)
         result = q @ gb
 
         # Choose parallel transport within the retained subspace: Q^H dQ=0.
@@ -65,7 +65,7 @@ class _ProjectorSplit(torch.autograd.Function):
             ratio = sd[:, None] / sr[None, :]
             gap = (1 - ratio) * (1 + ratio)
             if bool((gap <= max(u.shape[0], vh.shape[1]) * torch.finfo(s.dtype).eps).any()):
-                raise RuntimeError("projector split has no resolved kept/discarded singular-value gap")
+                return _derivative_failure("projector split has no resolved kept/discarded singular-value gap", u, vh)
             # Evaluate U_d^H (gQ + A gB^H) spectrally. Forming A gB^H first
             # and subtracting/projecting large terms would amplify roundoff
             # when the retained spectrum includes small resolved values.

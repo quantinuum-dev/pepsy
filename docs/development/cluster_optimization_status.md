@@ -8,6 +8,14 @@ These are development commits, not a new tagged package release.
 
 ## Full-suite compatibility follow-up, 2026-10-08
 
+Follow-up, 2026-10-10: opt-in dense direct MPO replay now supports the shared
+paired-factor derivative throughout gate construction and compression, with
+explicit chart errors. Gaugy can also evaluate small untruncated objectives
+without decompositions under an explicit operator-storage budget. See the
+[numerical evidence](notes/2026-10-10-mpo-paired-gradients.md) and
+[session handoff](../../history/2026-10-10-mpo-paired-gradients.md) for validation
+and publication state. The existing QR/SVD compatibility defaults remain.
+
 The corrections bind compact-channel backend callables before
 Torch capture. The repository test harness also declares its JAX matrix-product
 precision and allocation policy. See the

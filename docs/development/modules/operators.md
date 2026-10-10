@@ -17,6 +17,12 @@ point to the canonical objects rather than creating parallel implementations.
 
 ## API tiers
 
+Dense direct MPO replay delegates its optional paired-factor canonicalization
+and compression controls to `operators._mpo_factorization`. The derivative
+primitive remains owned by `backends.projector_split` and
+`backends.linalg_torch_projector`; optimizer orchestration stays in
+`optimizers.mpo.optimizer`.
+
 ### Canonical construction API
 
 These are the names to use in new code.
