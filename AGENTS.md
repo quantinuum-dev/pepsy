@@ -27,6 +27,12 @@ Use existing session authorization; do not add redundant approval steps.
 
 ## How to interpret repository guidance
 
+Follow the [concise mathematical Markdown policy](docs/development/markdown_policy.md)
+for documentation, notebook prose, plans and skills: brief explanations, precise
+equations and colored important formula terms. Keep assumptions explicit.
+Use the [plan index](docs/development/plans/README.md) for planning routes;
+root [plan.md](plan.md) is the deferred fermionic PEPO proposal.
+
 | Source | Purpose |
 | --- | --- |
 | `AGENTS.md` and applicable local/nested instructions | Workflow, scope, environment, and repository-wide constraints |

@@ -18,6 +18,8 @@ references:
   - CONTRIBUTING.md
   - pyproject.toml
   - docs/development/package_layout.md
+  - docs/development/markdown_policy.md
+  - docs/development/plans/README.md
   - .github/skills/SKILL_POLICY.md
   - .github/skills/README.md
 
