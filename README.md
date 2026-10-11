@@ -80,6 +80,7 @@ shows how to collect fidelity diagnostics.
 | Contribute or run tests | [Contributing](CONTRIBUTING.md) |
 | Track cluster PEPO / downstream optimization | [Development status](docs/development/cluster_optimization_status.md) |
 | Find implementation notes | [Development documentation](docs/development/README.md) |
+| Plan work or write mathematical Markdown | [Plan index](docs/development/plans/README.md) and [writing policy](docs/development/markdown_policy.md) |
 
 Prefer imports from the owning namespace, such as `pepsy.tensors` or
 `pepsy.optimizers`. The top-level `pepsy` aliases remain available for

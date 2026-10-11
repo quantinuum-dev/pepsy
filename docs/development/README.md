@@ -17,6 +17,7 @@ work. For application code, start with the [API guides](../api/index.md).
 | Inspect import costs | [Import measurements](import-weight.md) |
 | Check fermionic MPO conventions | [Fermi-Hubbard notes](fermi_hubbard_u1u1_mpo_notes.md) |
 | Prepare plots | [Plotting policy](plot_policy.md) |
+| Write concise mathematical documentation | [Markdown policy](markdown_policy.md) |
 
 Plans and dated notes describe their recorded state, not current guarantees.
 Check the implementation and tests before treating a proposal as supported.
@@ -24,6 +25,9 @@ Session handoffs live in the repository's
 [history directory](https://github.com/quantinuum-dev/pepsy/tree/develop/history).
 
 ## Writing Markdown
+
+Follow the [Markdown policy](markdown_policy.md) for brief explanations, precise
+equations, colored important formula terms and compact plans/skills.
 
 - Start with the page's purpose and the action the reader can take.
 - Keep installation commands in the [installation guide](../installation.md)

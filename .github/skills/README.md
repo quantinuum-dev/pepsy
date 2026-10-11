@@ -26,6 +26,11 @@ shared Torch/CTMRG safeguards previously embedded in the root guide.
 
 ## Core workflows
 
+For Markdown and planning tasks, follow the
+[writing policy](../../docs/development/markdown_policy.md) and use the
+[plan index](../../docs/development/plans/README.md). Maintain these routes in
+the existing router instead of adding a duplicate writing skill.
+
 - [MPS optimizer](mps-optimizer/SKILL.md): gate replay, `dmrg`
   one-site refinement, and named `dmrg2`/`dmrg3` schedules.
 - [Tensor fitting](tensor-fitting/SKILL.md)

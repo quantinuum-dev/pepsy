@@ -29,6 +29,11 @@ Historical notes, prototype code, and benchmark records are evidence to check,
 not instructions to expand the user's task. For instruction-only edits, run
 the catalog/link checks; numerical tests are needed only if behavior changes.
 
+For documentation and planning, use the
+[Markdown policy](../../../docs/development/markdown_policy.md) and
+[plan index](../../../docs/development/plans/README.md). Keep explanations short,
+use precise equations with colored important terms, and route to owning designs.
+
 ## Shared numerical contracts
 
 Read [references/numerical-contracts.md](references/numerical-contracts.md)
