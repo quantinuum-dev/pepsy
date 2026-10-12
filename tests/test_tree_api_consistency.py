@@ -1,6 +1,7 @@
 """Consistent TreeOptimizer options at construction, replay and operator calls."""
 
 from copy import deepcopy
+import warnings
 
 import numpy as np
 import pytest
@@ -19,6 +20,103 @@ def _gate(theta=0.6):
 def _configuration(opt):
     return (opt.mode, opt.compression_mode, opt._dmrg_mode_alias,
             opt.compression_seed, opt.track_infidelity, opt.chi, opt.cutoff)
+
+
+@pytest.mark.parametrize("entry", ("constructor", "run", "two_site_mode"))
+def test_dmrg1_warns_to_use_dmrg_and_refines_one_site(entry):
+    stream = [(_gate(), (0, 3))]
+    options = dict(n=4, chi=4, fit_rtol=None, structure="balanced")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if entry == "constructor":
+            optimizer = TreeOptimizer(stream, mode=" DMRG1 ", **options)
+        elif entry == "two_site_mode":
+            optimizer = TreeOptimizer(stream, two_site_mode="dmrg1", **options)
+        else:
+            optimizer = TreeOptimizer(None, run=False, **options)
+            optimizer.run(stream, mode="dmrg1")
+        optimizer.copy()
+        optimizer.run([])  # Retaining the selected mode must not warn again.
+    notices = [notice for notice in caught if notice.category is FutureWarning]
+    assert len(notices) == 1
+    assert "use mode='dmrg' for one-site refinement" in str(notices[0].message)
+    assert "same FIT settings and schedule" in str(notices[0].message)
+    assert notices[0].filename == __file__
+    assert optimizer._dmrg_mode_alias == "dmrg1"
+    assert optimizer.fit_diagnostics[-1]["block_size_trace"] == (1, 1, 1, 1)
+    expected = np.zeros(16, dtype=complex)
+    expected[[0, 9]] = np.cos(0.6), np.sin(0.6)
+    np.testing.assert_allclose(optimizer.to_dense().reshape(-1), expected, atol=1e-11)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("iterations", [1, 4])
+@pytest.mark.parametrize("entry", ["constructor", "run", "copy"])
+def test_dmrg1_is_numerically_identical_to_dmrg(backend, iterations, entry):
+    from pepsy.optimizers.tree import TreeTensorNetwork
+
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    state = TreeTensorNetwork.rand(plan, D=2, seed=404, dtype="complex128")
+    gates = [(_gate(.3), (0, 3)), (_gate(.7), (1, 2))]
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        state.apply_to_arrays(lambda data: torch.as_tensor(data.copy()))
+        gates = [(torch.as_tensor(gate.copy()), where) for gate, where in gates]
+    options = dict(state=state, tree=plan, chi=2, cutoff=0., fit_rtol=None,
+                   fit_n_iter=iterations, fit_block_size=1,
+                   fit_adaptive_sweeps=3, fit_init_seed=17, run=False)
+    reference = TreeOptimizer(gates, mode="dmrg", **options)
+    reference.run()
+    with pytest.warns(FutureWarning, match="use mode='dmrg'"):
+        alias = TreeOptimizer(gates, mode="dmrg1" if entry != "run" else "dmrg", **options)
+        if entry == "run":
+            alias.run(mode="dmrg1")
+    if entry == "copy":
+        alias = alias.copy()
+    if entry != "run":
+        alias.run()
+    np.testing.assert_allclose(alias.to_dense(), reference.to_dense(), rtol=1e-12, atol=1e-12)
+    actual, expected = alias.get_fit_diagnostics(), reference.get_fit_diagnostics()
+    assert actual["block_size_trace"] == expected["block_size_trace"]
+    assert actual["iterations"] == expected["iterations"]
+    assert actual["convergence_reason"] == expected["convergence_reason"]
+    assert actual["block_size_trace"] == (1,) * iterations
+    assert alias.center == reference.center
+    assert alias.tn.validate(check_canonical=True) is alias.tn
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "fit", "dmrg1"])
+@pytest.mark.parametrize("block_size", [2, 3])
+@pytest.mark.parametrize("entry", ["constructor", "two_site_mode", "run", "shots"])
+def test_one_site_dmrg_rejects_larger_blocks_before_replay(mode, block_size, entry):
+    stream = [(_gate(), (0, 3))]
+    options = dict(n=4, fit_block_size=block_size, run=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        if entry in {"constructor", "two_site_mode"}:
+            selector = "mode" if entry == "constructor" else "two_site_mode"
+            with pytest.raises(ValueError, match="fixes fit_block_size=1.*dmrg2.*dmrg3"):
+                TreeOptimizer(stream, **{selector: mode}, **options)
+        else:
+            opt = TreeOptimizer(stream, mode="dmrg2", **options)
+            before = opt.to_dense().copy()
+            configuration = _configuration(opt)
+            queue = (tuple(opt.G), tuple(opt.where), tuple(opt.event_types))
+            with pytest.raises(ValueError, match="fixes fit_block_size=1.*dmrg2.*dmrg3"):
+                opt.run([], mode=mode, **({"shots": 2} if entry == "shots" else {}))
+            assert _configuration(opt) == configuration
+            assert (tuple(opt.G), tuple(opt.where), tuple(opt.event_types)) == queue
+            np.testing.assert_array_equal(opt.to_dense(), before)
+
+
+@pytest.mark.parametrize("mode", ("dmrg", "fit", "dmrg2", "dmrg3"))
+def test_current_dmrg_selectors_do_not_emit_legacy_warning(mode):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        optimizer = TreeOptimizer(None, n=3, mode=mode)
+        optimizer.run(mode=mode)
+    assert not [notice for notice in caught if notice.category is FutureWarning]
 
 
 def test_constructor_propagates_map_mode_to_automatic_layout():

@@ -11,7 +11,7 @@ from pepsy.optimizers.tree import TreeOptimizer, TreePlan, TreeTensorNetwork
 
 
 @pytest.mark.parametrize("mode,trace", [
-    ("dmrg1", (2, 2, 1, 1)),
+    ("dmrg1", (1, 1)),
     ("dmrg2", (2, 2, 1, 1)),
     ("dmrg3", (3, 3, 2, 1)),
 ])

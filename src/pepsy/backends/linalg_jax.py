@@ -8,6 +8,7 @@ from jax import custom_vjp
 
 _SVD_REGISTERED = False
 _SVD_REGISTERED_FUNCTION = None
+_NATIVE_QR = ar.get_lib_fn("jax", "linalg.qr")
 
 
 @custom_vjp
@@ -25,7 +26,83 @@ def _svd_jax(A):
 
 def h(x):
     """Return the conjugate transpose of ``x`` (Hermitian transpose)."""
-    return jnp.conj(jnp.transpose(x))
+    return jnp.conj(jnp.swapaxes(x, -1, -2))
+
+
+@custom_vjp
+def _qr_jax(a):
+    return tuple(_NATIVE_QR(a))
+
+
+def _qr_fwd(a):
+    q, r = _NATIVE_QR(a)
+    return (q, r), (a, q, r)
+
+
+def _qr_bwd(residual, tangents):
+    """Reduced QR VJP, with a finite extension at singular QR charts.
+
+    Match Pepsy's Torch policy: preserve the exact QR forward and native
+    derivative at resolved pivots; only singular blocks use a relative
+    Tikhonov right inverse. JAX complex cotangents use the conjugate of the
+    convention used in the corresponding Torch rule.
+    """
+    a, q, r = residual
+    dq, dr = (jnp.conj(t) for t in tangents)
+    scale = jnp.max(jnp.abs(a))
+    eps = max(1e-6, jnp.finfo(a.real.dtype).eps**.5)
+    singular = jnp.any(jnp.diag(r) == 0)
+
+    def native(_):
+        _, pullback = jax.vjp(lambda x: tuple(_NATIVE_QR(x)), a)
+        return pullback(tangents)[0]
+
+    def regularized(_):
+        gradient = dr @ h(r) - h(q) @ dq
+        shift = eps*jnp.where(scale == 0, 1., scale)
+
+        def solve(rhs, tri):
+            gram = h(tri) @ tri + shift**2*jnp.eye(tri.shape[-1], dtype=a.dtype)
+            return h(jnp.linalg.solve(gram, h(rhs @ tri)))
+
+        m, n = a.shape
+        if m >= n:
+            upper = jnp.triu(gradient)
+            projected = upper + h(upper)
+            projected = projected - jnp.diag(jnp.real(jnp.diag(upper)))
+            gradient = solve(q @ projected + dq, r)
+        else:
+            skew = jnp.tril(h(gradient) - gradient)
+            if jnp.iscomplexobj(a):
+                skew = skew - .5j*jnp.diag(jnp.imag(jnp.diag(skew)))
+            leading = solve(q @ skew, r[:, :m])
+            gradient = jnp.pad(leading, ((0, 0), (0, n-m))) + q @ dr
+        return jnp.conj(jnp.where(scale == 0, jnp.zeros_like(a), gradient))
+
+    def adaptive(_):
+        candidate = native(None)
+        return jax.lax.cond(jnp.all(jnp.isfinite(candidate)),
+                            lambda _: candidate, regularized, operand=None)
+
+    active = jnp.any(dq != 0) | jnp.any(dr != 0)
+    return (jax.lax.cond(active,
+        lambda _: jax.lax.cond(singular, regularized, adaptive, operand=None),
+        lambda _: jnp.zeros_like(a), operand=None),)
+
+
+_qr_jax.defvjp(_qr_fwd, _qr_bwd)
+
+
+def qr_jax(a, mode="reduced"):
+    """Rank-aware reduced QR; other modes retain native JAX behavior."""
+    if mode != "reduced":
+        return jnp.linalg.qr(a, mode=mode)
+    if a.ndim > 2:
+        shape = a.shape
+        q, r = jax.vmap(_qr_jax)(a.reshape((-1, *shape[-2:])))
+        return (q.reshape((*shape[:-2], *q.shape[-2:])),
+                r.reshape((*shape[:-2], *r.shape[-2:])))
+    return _qr_jax(a)
 
 
 def _restore_truncated_tangent(tangent, full, *, axis):
@@ -133,6 +210,8 @@ def reset_jax_linalg_registrations():
     _SVD_REGISTERED = False
     _SVD_REGISTERED_FUNCTION = None
     reg_native_svd_jax()
+    if ar.get_lib_fn("jax", "linalg.qr") is not _NATIVE_QR:
+        ar.register_function("jax", "linalg.qr", _NATIVE_QR)
 
 
 def reg_complex_svd_jax():

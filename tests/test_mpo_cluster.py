@@ -106,8 +106,14 @@ def test_three_ordered_factors_have_a_reusable_compiled_surface():
     )
     compiled = expansion.compile_exp()
     assert isinstance(compiled, CompiledMPOClusterExp)
+    assert compiled is expansion.compile_exp()
+    assert compiled.cache_info["compiled_exp"]
+    assert compiled.last_report is None
 
-    result = compiled(0.05).to_mpo().to_dense()
+    semantic, report = compiled(0.05, return_report=True)
+    assert report is compiled.last_report
+    assert report is semantic.metadata["cluster_report"]
+    result = semantic.to_mpo().to_dense()
     a = 0.01 * _kron_all((x, x, np.eye(2)))
     b = -0.015 * _kron_all((np.eye(2), z, z))
     c = 0.02 * _kron_all((z, x, np.eye(2)))
@@ -116,7 +122,10 @@ def test_three_ordered_factors_have_a_reusable_compiled_surface():
     assert compiled.cache_info["builds"] == 1
     assert compiled.cache_info["static_matrix_count"] > 0
 
-    compiled.exp(0.02)
+    second = compiled.exp(0.02)
+    assert isinstance(second, FirstDegreeMPO)
+    assert compiled.last_report is second.metadata["cluster_report"]
+    assert compiled.last_report is not report
     assert compiled.cache_info["builds"] == 2
 
 
@@ -155,6 +164,7 @@ def test_mpo_basis_reuses_cluster_topology_without_caching_values():
     )
     compiled = basis.compile_cluster_expansion(cluster_size=3, cutoff=0.0)
     assert basis.cache_info["compiled_cluster_variants"] == 1
+    assert compiled is basis.compile_cluster_expansion(cluster_size=3, cutoff=0.0)
     first = compiled.exp(0.01, parameters={"J": 0.7, "K": -0.2})
     second = compiled.exp(0.02, parameters={"J": -0.4, "K": 0.3})
     assert first is not second
@@ -1097,3 +1107,31 @@ def test_cluster_native_physical_space_and_adaptive_streaming_api():
     assert report.assembly_form == "right"
     assert report.assembly_compression_count == 2
     assert len(report.assembly_discarded_weights) > 0
+
+
+def test_compiled_square_mpo_reports_resolved_assembly_without_changing_policy():
+    terms = [(("ZZ", 0.3), ((0, 0), (1, 0))), (("X", 0.2), (0, 0))]
+    basis = MPOBasis.from_terms(terms, shape=(2, 2), map_mode="snake")
+    compiled = basis.compile_graph_cluster_expansion(
+        graph="square", cluster_size=2, graph_assembly="auto", collection_budget=1,
+    )
+    assert compiled.last_report is None
+    assert compiled.cache_info["graph_assembly"] == "auto"
+    with pytest.warns(RuntimeWarning, match="bounded one-cluster approximation"):
+        semantic, report = compiled.exp(-0.03j, return_report=True)
+    assert compiled.cache_info["graph_assembly"] == "auto"
+    assert report is compiled.last_report
+    assert report is semantic.metadata["cluster_report"]
+    assert report.graph_assembly == "bounded"
+    assert report.graph_collection_truncated
+    # Only one physical interacting pair is present, spanning sites 0 and 3
+    # in the snake. This example remains exact at cluster_size=2.
+    x, z = _paulis()
+    mapping = basis.lattice_to_chain
+    edge_ops = [np.eye(2) for _ in range(4)]
+    edge_ops[mapping[(0, 0)]] = z
+    edge_ops[mapping[(1, 0)]] = z
+    site_ops = [np.eye(2) for _ in range(4)]
+    site_ops[mapping[(0, 0)]] = x
+    expected = scipy_linalg.expm(-0.03j * (0.3 * _kron_all(edge_ops) + 0.2 * _kron_all(site_ops)))
+    np.testing.assert_allclose(semantic.to_mpo().to_dense(), expected, atol=1e-12)

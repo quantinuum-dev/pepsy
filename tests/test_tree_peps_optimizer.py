@@ -325,7 +325,7 @@ def test_zipup_oversample_rejects_branching_edge_compression():
 
 @pytest.mark.parametrize("compression_mode", ("sdc", "src", "zipup"))
 def test_path_two_layer_and_fused_operator_application_agree(compression_mode, quimb_compressor):
-    """Path compression can retain either the MPO-MPS or fused application."""
+    """Both path layouts preserve the state and report pre-compression bonds."""
     quimb_compressor(compression_mode)
 
     plan = _path_plan((1, 5))
@@ -342,6 +342,7 @@ def test_path_two_layer_and_fused_operator_application_agree(compression_mode, q
         compression_layout="two_layer",
         run=False,
         track_infidelity=False,
+        track_bond_diagnostics=True,
     )
     fused = two_layer.copy()
     fused.compression_layout = "fused"
@@ -353,6 +354,16 @@ def test_path_two_layer_and_fused_operator_application_agree(compression_mode, q
     np.testing.assert_allclose(fused.to_dense(), expected, atol=1e-10, rtol=1e-10)
     assert two_layer.last_report["compression_layout"] == "two_layer"
     assert fused.last_report["compression_layout"] == "fused"
+    for optimizer in (two_layer, fused):
+        report = optimizer.last_report
+        expected_max = max(report["uncompressed_bonds"].values(), default=1)
+        assert report["transient_max_bond"] == expected_max
+        assert report["transient_exceeds_chi"] == (expected_max > optimizer.chi)
+        assert report["live_max_bond_after"] == optimizer.state.max_bond()
+    assert (
+        two_layer.last_report["uncompressed_bonds"]
+        == fused.last_report["uncompressed_bonds"]
+    )
     assert two_layer.validate(check_canonical=True) is two_layer
     assert fused.validate(check_canonical=True) is fused
 

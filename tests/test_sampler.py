@@ -3,6 +3,7 @@
 from itertools import product
 
 import numpy as np
+from pepsy.sampling import bp as bp_sampler_mod, vector as vector_sampler_mod
 import pytest
 import quimb.tensor as qtn
 
@@ -70,8 +71,8 @@ def test_sampler_exact_method_collects_configs_and_scalars(monkeypatch):
         }
         return config, DummyFlatTN(idx), 0.0123 * (idx + 1)
 
-    monkeypatch.setattr(sampler_mod, "sample_d2bp", fake_sample_d2bp)
-    monkeypatch.setattr(sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
+    monkeypatch.setattr(bp_sampler_mod, "sample_d2bp", fake_sample_d2bp)
+    monkeypatch.setattr(bp_sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
 
     sampler = sampler_mod.PepsBpSampler(DummyTN())
     result = sampler.sample(samples=2, method="exact", seed=10)
@@ -97,8 +98,8 @@ def test_sampler_contraction_methods(monkeypatch):
         config = {"k0,0": 0, "k0,1": 0, "k1,0": 1, "k1,1": 1}
         return config, DummyFlatTN(0), 1.0
 
-    monkeypatch.setattr(sampler_mod, "sample_d2bp", fake_sample_d2bp)
-    monkeypatch.setattr(sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
+    monkeypatch.setattr(bp_sampler_mod, "sample_d2bp", fake_sample_d2bp)
+    monkeypatch.setattr(bp_sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
 
     sampler = sampler_mod.PepsBpSampler(DummyTN())
     mps_result = sampler.sample(samples=1, chi=7, method="mps")
@@ -115,8 +116,8 @@ def test_sampler_rejects_unknown_contraction_method(monkeypatch):
         config = {"k0,0": 0, "k0,1": 0, "k1,0": 0, "k1,1": 0}
         return config, DummyFlatTN(0), 1.0
 
-    monkeypatch.setattr(sampler_mod, "sample_d2bp", fake_sample_d2bp)
-    monkeypatch.setattr(sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
+    monkeypatch.setattr(bp_sampler_mod, "sample_d2bp", fake_sample_d2bp)
+    monkeypatch.setattr(bp_sampler_mod, "build_optimizer", lambda **kwargs: "OPT")
 
     with pytest.raises(ValueError, match="Unknown contraction method"):
         sampler_mod.PepsBpSampler(DummyTN()).sample(method="bad")
@@ -133,20 +134,9 @@ def test_sampler_public_exports_resolve():
 
 def test_stabilizer_mps_sampler_public_exports_resolve():
     """The STN physical sampler is available from both public namespaces."""
-    from pepsy.sampling.stabilizer import MpsStabSampler, StabilizerMpsSampler
+    from pepsy.sampling.stabilizer import StabilizerMpsSampler
 
     assert pepsy.StabilizerMpsSampler is StabilizerMpsSampler
-    assert MpsStabSampler is StabilizerMpsSampler
-
-
-def test_stabilizer_mps_sampler_legacy_alias_warns_and_matches_canonical():
-    import pepsy.sampling as sampling
-
-    sampling.__dict__.pop("MpsStabSampler", None)
-    with pytest.warns(DeprecationWarning, match="StabilizerMpsSampler"):
-        old_name = sampling.MpsStabSampler
-
-    assert old_name is sampling.StabilizerMpsSampler
 
 
 def test_mps_sampler_rejects_incomplete_site_map():
@@ -232,6 +222,36 @@ def test_mps_sampler_native_numpy_sample_arrays_returns_arrays():
     assert probs.shape == (4,)
     np.testing.assert_array_equal(configs, np.array([[1, 0, 1]] * 4))
     np.testing.assert_allclose(probs, np.ones(4))
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("phys_dim", [2, 3])
+def test_native_complex_mps_born_probabilities_match_dense(backend, phys_dim):
+    """Complex right environments must contract bra and ket indices correctly."""
+    psi = qtn.MPS_rand_state(
+        3, bond_dim=2, phys_dim=phys_dim, seed=7, dtype="complex128"
+    )
+    dense = psi.to_dense().reshape(-1)
+    expected = np.abs(dense) ** 2
+    expected /= expected.sum()
+    original = [tensor.data.copy() for tensor in psi]
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        psi.apply_to_arrays(pepsy.backend_torch(dtype=torch.complex128, device="cpu"))
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+    configs = np.asarray(list(product(range(phys_dim), repeat=3)))
+    actual = sampler.probabilities(configs, to_numpy=True)
+    np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-12)
+    assert actual.sum() == pytest.approx(1.0)
+
+    batch = sampler.sample_batch(64, seed=4).to_numpy()
+    indices = batch.configs @ np.array([phys_dim**2, phys_dim, 1])
+    np.testing.assert_allclose(batch.probs, expected[indices], rtol=1e-11, atol=1e-12)
+    repeated = sampler.sample_batch(64, seed=4).to_numpy()
+    np.testing.assert_array_equal(batch.configs, repeated.configs)
+    for tensor, before in zip(psi, original):
+        data = tensor.data.detach().numpy() if backend == "torch" else tensor.data
+        np.testing.assert_array_equal(data, before)
 
 
 def test_mps_sampler_native_numpy_sample_batch_result_helpers():
@@ -1924,7 +1944,7 @@ def test_vec_sampler_native_torch_keeps_vector_and_batch_on_torch():
 def test_vec_sampler_torch_large_category_fallback(monkeypatch):
     """Large Torch categorical vectors use the backend-native CDF path."""
     torch = pytest.importorskip("torch")
-    monkeypatch.setattr(sampler_mod, "_TORCH_MULTINOMIAL_MAX_CATEGORIES", 2)
+    monkeypatch.setattr(vector_sampler_mod, "_TORCH_MULTINOMIAL_MAX_CATEGORIES", 2)
     state = torch.ones(8, dtype=torch.complex64) / torch.sqrt(
         torch.tensor(8.0)
     )
@@ -1937,6 +1957,98 @@ def test_vec_sampler_torch_large_category_fallback(monkeypatch):
     assert isinstance(batch.configs, torch.Tensor)
     assert batch.configs.shape == (16, 3)
     assert torch.all(batch.probs > 0)
+
+
+@pytest.mark.parametrize("track_grad", [False, True])
+def test_vec_sampler_torch_cdf_resolves_small_probability_intervals(monkeypatch, track_grad):
+    """A narrow Born interval must survive both accumulation and RNG dtype."""
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(vector_sampler_mod, "_TORCH_MULTINOMIAL_MAX_CATEGORIES", 2)
+    probability = 2.0**-26
+    state = torch.sqrt(torch.tensor(
+        [0.5, probability, probability, 0.5 - 2 * probability],
+        dtype=torch.float32,
+    )).to(torch.complex64).requires_grad_()
+    sampler = sampler_mod.VecSampler(state)
+    # Choose the interior of outcome 01's interval using the actual cached
+    # Born weights. A float32 draw or CDF rounds this interval away.
+    weights = sampler.probability_vector().to(torch.float64)
+    draw = float((weights[0] + weights[1] / 2) / weights.sum())
+
+    def fixed_draw(n_samples, *, dtype, device, generator):
+        return torch.full((n_samples,), draw, dtype=dtype, device=device)
+
+    monkeypatch.setattr(torch, "rand", fixed_draw)
+    batch = sampler.sample_batch(3, seed=5, chunk_size=2, track_grad=track_grad)
+    torch.testing.assert_close(
+        batch.configs, torch.tensor([[0, 1]] * 3, dtype=torch.int8)
+    )
+    assert batch.probs.dtype == torch.float32
+    assert batch.probs.requires_grad == track_grad
+    torch.testing.assert_close(batch.probs, sampler.probability_vector()[1].expand(3))
+    if track_grad:
+        batch.probs.sum().backward()
+        assert torch.isfinite(state.grad).all()
+        assert state.grad[1].abs() > 0
+
+
+@pytest.mark.slow
+@pytest.mark.integration
+def test_vec_sampler_torch_large_uniform_vector_has_unbiased_low_bits():
+    """Exercise the real >2**24-category route, where float32 draws bias bits."""
+    torch = pytest.importorskip("torch")
+    sampler = sampler_mod.VecSampler(torch.ones(2**25, dtype=torch.complex64))
+    batch = sampler.sample_batch(8192, seed=62, chunk_size=1200)
+    means = batch.configs.to(torch.float64).mean(dim=0)
+    assert torch.all(torch.abs(means - 0.5) < 0.03), means
+
+
+def test_vec_sampler_cupy_cdf_resolves_small_probability_intervals(monkeypatch):
+    """Exercise a deterministic interval lost by CuPy's float32 choice CDF."""
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CUDA unavailable")
+    except cp.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(str(exc))
+    probability = 2.0**-26
+    state = cp.sqrt(cp.asarray(
+        [0.5, probability, probability, 0.5 - 2 * probability], dtype=cp.float32
+    )).astype(cp.complex64)
+    original = state.copy()
+    sampler = sampler_mod.VecSampler(state)
+    weights = sampler.probability_vector().astype(cp.float64)
+    draw = float((weights[0] + weights[1] / 2) / weights.sum())
+
+    class FixedRng:
+        def random_sample(self, size, dtype=float):
+            return cp.full(size, draw, dtype=dtype)
+
+    monkeypatch.setattr(sampler, "_new_rng", lambda seed: FixedRng())
+    batch = sampler.sample_batch(3, seed=5, chunk_size=2)
+    cp.testing.assert_array_equal(batch.configs, cp.asarray([[0, 1]] * 3))
+    cp.testing.assert_allclose(batch.probs, sampler.probability_vector()[1])
+    cp.testing.assert_array_equal(state, original)
+    assert batch.probs.dtype == cp.float32
+    assert batch.configs.device == state.device
+
+
+@pytest.mark.slow
+@pytest.mark.integration
+@pytest.mark.parametrize("n_qubits", [16, 20, 25])
+def test_vec_sampler_cupy_uniform_vector_has_unbiased_bits(n_qubits):
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CUDA unavailable")
+    except cp.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(str(exc))
+    sampler = sampler_mod.VecSampler(cp.ones(2**n_qubits, dtype=cp.complex64))
+    batch = sampler.sample_batch(8192, seed=62, chunk_size=1200)
+    means = batch.configs.astype(cp.float64).mean(axis=0)
+    assert bool(cp.all(cp.abs(means - 0.5) < 0.03)), means
+    assert batch.probs.dtype == cp.float32
+    cp.testing.assert_allclose(batch.probs, 2.0**-n_qubits)
 
 
 def test_vec_sampler_native_cupy_keeps_vector_and_batch_on_cupy():

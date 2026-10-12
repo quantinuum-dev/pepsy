@@ -14,7 +14,9 @@ and validate small systems against exact contractions before optimizing.
 ## Current implementation
 
 The reference implementation is `pepsy.PepsSampler` in
-`src/pepsy/sampling/samplers.py`.
+`src/pepsy/sampling/peps.py`. Shared result records live in `sampling/results.py`;
+`sampling/samplers.py` preserves historical imports and serialized class paths.
+The distinct BP proposal implementation lives in `sampling/bp.py`.
 
 - It is dense, Quimb-based, and samples in increasing `y`, then increasing `x`
   order. `sample(...)` is serial; `sample_batch(...)` shares identical prefix

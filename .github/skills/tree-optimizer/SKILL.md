@@ -246,7 +246,9 @@ projection is unsupported; use native `direct` or `zipup` for those states.
   each outgoing message immediately. Do not add a full-target materialization
   or canonical precompression. Its intermediate cuts have noncanonical
   unvisited environments, so discarded weights are not global error bounds.
-- TreeFIT uses incremental neighboring messages and `inward-outward` passes.
+- Generic `dmrg` defaults to one-node TreeFIT refinement with inward/outward passes.
+  Unchanged non-differentiable Torch exteriors can use shared-array identity
+  proofs; combine the device target norm with the first convergence read.
   TreeOptimizer's `fit_rtol="auto"` follows the state dtype; `None` disables
   tolerance stopping. Keep finite scans and exact overlap diagnostics opt-in.
   Read [`references/fit-environments.md`](references/fit-environments.md)
@@ -428,8 +430,8 @@ canonicalization/compression, or independent/coalesced trajectory replay.
 ## Performance and layout
 
 The public performance defaults are ``mode="auto"`` (TreeMPO routing),
-``threads=1`` and ``subtree_workers=1`` (small-TTN operations avoid
-oversubscription), ``profile=False``, and ``track_truncation=False`` (no
+``threads=None`` (preserve ambient CPU settings), ``subtree_workers=1``,
+``profile=False``, and ``track_truncation=False`` (no
 diagnostic spectrum SVDs). The low-level
 ``TreeTensorNetwork.compress_edge_`` default is the same ``cutoff_mode="rsum2"``
 used by ``TreeOptimizer``. A ``track_truncation=True`` warning is intentional:
@@ -439,7 +441,7 @@ selectors are the other actionable warning class.
 
 Dense and native trees share the direct one-edge contraction, immutable path
 cache, routed-isometry reuse, and proof-forwarding optimizations. Keep the
-thread cap, self-healing tensor-id cache, copy semantics, and
+explicit opt-in thread cap, self-healing tensor-id cache, copy semantics, and
 TreeLayoutFinder objective plumbing intact. The native QR safeguard, detailed
 performance rules, and non-binary layout contract are in
 [`references/performance-layout.md`](references/performance-layout.md); read

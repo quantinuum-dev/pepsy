@@ -5,7 +5,7 @@ from __future__ import annotations
 import autoray as ar
 import numpy as np
 
-__all__ = ["backend_random_array"]
+__all__ = ["backend_random_array", "fit_random_array"]
 
 
 def _fallback_dtype(dtype):
@@ -69,5 +69,30 @@ def backend_random_array(shape, *, like, dtype=None, scale=1.0, rng=None):
         scale=scale,
         dtype=dtype,
         like=like,
+        rng=rng,
+    )
+
+
+def fit_random_array(data, shape, *, strength, rng):
+    """Draw FIT initialization data using the template's real/complex precision.
+
+    Float32 and complex64 templates retain their precision; other real and
+    complex templates use float64 and complex128, respectively. The caller
+    owns the generator so successive tensor draws advance the same stream.
+    """
+    dtype_name = str(getattr(data, "dtype", "float64"))
+    if "complex64" in dtype_name:
+        random_dtype = np.complex64
+    elif "complex" in dtype_name:
+        random_dtype = np.complex128
+    elif "float32" in dtype_name:
+        random_dtype = np.float32
+    else:
+        random_dtype = np.float64
+    return backend_random_array(
+        shape,
+        like=data,
+        dtype=random_dtype,
+        scale=float(strength),
         rng=rng,
     )

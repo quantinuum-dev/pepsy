@@ -6,13 +6,13 @@ from typing import TYPE_CHECKING
 _SYMBOL_MODULES = {
     "GibbsMps": ".gibbs",
     "MpsOptimizer": ".optimizer",
-    "guess": ".optimizer",
+    "guess": ".compression",
     "MpsGateStreamLayoutFinder": ".layout",
     "MpsGateStreamSchedule": ".layout",
     "is_submpo_event": ".optimizer",
     "normalize_submpo_where": ".optimizer",
     "submpo_event_parts": ".optimizer",
-    "svd_guess": ".optimizer",
+    "svd_guess": ".compression",
 }
 
 __all__ = [
@@ -59,11 +59,10 @@ def __getattr__(name):
 if TYPE_CHECKING:
     from .layout import MpsGateStreamLayoutFinder, MpsGateStreamSchedule  # noqa: F401
     from .gibbs import GibbsMps  # noqa: F401
+    from .compression import guess, svd_guess  # noqa: F401
     from .optimizer import (  # noqa: F401
         MpsOptimizer,
-        guess,
         is_submpo_event,
         normalize_submpo_where,
         submpo_event_parts,
-        svd_guess,
     )

@@ -10,6 +10,13 @@ newer (`python -m pip install ".[symmetry]"` from the checkout) and share Pepsy'
 requirement. Version 0.4.0 fixes pending fermionic phases in
 scalar readout and reductions, and fused charge selection under Torch `vmap`.
 
+Import state wrappers with `from pepsy.tensors import SymMPS, SymPEPS`.
+Import model helpers and diagnostics from the same `pepsy.tensors` namespace.
+The earlier `pepsy.tensors.symmetric` imports remain compatible, including
+class and function references in existing pickled states and models. Internally,
+states, fermion models, and diagnostics have separate implementation modules;
+see the [module map](../../development/modules/tensors.md#symmetric-tensors).
+
 For flat-Z2 Torch PEPS, `TorchPEPSAmplitude(..., amplitude_batching="auto")`
 already probes batching and keeps a serial fallback. Explicit `"vmap"` is
 also available. This does not make variable-sector U1/U1U1 contractions or
@@ -369,8 +376,8 @@ the native Symmray gate directly. ``imaginary=True`` changes the evolution to
 ``exp(-dt H)``. The local exponential must be neutral so it remains in one
 conserved charge sector.
 
-``SpinfulFermion`` and ``SpinfulFermionHubbard`` remain compatibility
-constructors that fix ``spinful=True``. ``SymmFermions.spinless(...)`` and
+``SpinfulFermion`` is the spinful constructor and fixes ``spinful=True``.
+``SymmFermions.spinless(...)`` and
 ``SymmFermions.spinful(...)`` are factory-style alternatives with the same
 local-space guarantees.
 
@@ -559,6 +566,10 @@ ham_torch = ham.to_backend(to_backend, inplace=False)
 ```
 
 ## Symmetric MPO mapping
+
+`SymHamiltonian.to_mpo()` and `to_pepo()` remain the public conversion methods.
+Their internal assembly helpers live in `pepsy.operators._symmetric_mpo`;
+existing imports through `pepsy.tensors.symmetric` remain compatible.
 
 Symmetric Hamiltonians can be flattened into an MPS-chain MPO with
 ``SymHamiltonian.to_mpo(...)``. Coordinate edges from a 2D or 3D lattice can be

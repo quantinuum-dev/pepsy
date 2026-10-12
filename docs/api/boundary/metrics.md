@@ -1,5 +1,11 @@
 # `pepsy.boundary.metrics`
 
+`peps_infidelity(..., chi=(chi_norm, chi_overlap))` uses the first cap for
+both state norms and the second for the overlap. A scalar uses one cap for
+all three contractions. `peps_normalize` also accepts this pair and uses only
+its first entry, since normalization has no overlap contraction. Both entries
+must be positive integers. Supplied norms still skip their contractions.
+
 `peps_norm`, `peps_normalize`, `peps_infidelity`, and `contract_flat` accept
 the following boundary-compression modes:
 
@@ -111,6 +117,53 @@ The layer policy applies to the package `method="dmrg"` path. Quimb's native
 `method="mps"` path already handles `layer_tags` itself and rejects
 `fit_layer_mode="sequential"` rather than silently ignoring the option.
 
+## Differentiating rank-deficient boundary MPS contractions
+
+Custom dense NumPy/Torch boundary algorithms can register the same split via
+`from pepsy.backends import register_projector_split`. Calling it returns the
+Quimb method name `pepsy:projector`; registration is idempotent and does not
+replace global QR/SVD drivers. Use the returned method with left/right
+absorption and gauge-invariant paired factors. This exposes the existing
+primitive; its fixed-rank, resolved-gap and first-order derivative limits
+remain unchanged. Registration itself does not import Torch.
+
+For a closed dense 2D NumPy/Torch network, select the composed-factor path:
+
+```python
+value = pepsy.contract_flat(
+    flat, method="mps", chi=16, cutoff=1e-12,
+    compression_mode="direct", mps_factorization="projector",
+    preserve_backend=True,
+)
+```
+
+This replaces QR canonicalization, QR/LQ reductions, and truncated splits
+with isometric factors `A -> (Q, B)`. Torch differentiates their retained
+subspace jointly, avoiding inverse zero QR pivots and arbitrary rotations
+within repeated retained singular values. The existing chi/cutoff policy is
+applied, followed by numerical-null removal at `max(m, n) * eps * s_max`.
+This is a numerical factorization, distinct from structural Pauli-history
+pruning. Pepsy's compatibility default remains `mps_factorization="qr"`.
+
+The first-order rule requires a gauge-invariant loss of both factors, a
+locally fixed retained rank, and a resolved kept/discarded singular-value gap.
+Backward raises `pepsy.backends.ProjectorDerivativeError` (a `RuntimeError`
+subclass) for a closed gap or noninvariant factor observable. At the zero
+matrix it returns zero only for zero incoming cotangents; otherwise it raises.
+Diagnostic callers can use `pepsy.backends.capture_projector_derivative_errors()`
+to collect error messages and receive NaN cotangents instead of throwing inside
+autograd. Reject any nonempty error list or nonfinite derivative before use;
+this context is not an optimization policy. It scopes and restores its error
+handling and runs autograd callbacks on the caller thread.
+It does not guarantee derivatives across rank/cutoff changes. Test the full
+approximate contraction against finite differences at representative parameters.
+Dense NumPy/Torch, direct compression, and left/right absorption are supported;
+native Symmray, JAX, higher derivatives, and split renormalization are not.
+The global QR/SVD policies, SU, and CTMRG are unchanged. See the
+[derivation and regressions](../../development/notes/2026-09-26-projector-boundary-gradients.md).
+The [development ledger](../../development/cluster_optimization_status.md)
+records published commits, downstream Gaugy defaults, and test scopes.
+
 ## CTMRG boundary modes
 
 With `method="ctmrg"`, `ctmrg_mode` selects the finite-boundary compressor:
@@ -154,6 +207,11 @@ Native Symmray contraction supports the validated `projector` route with
 `ctmrg_canonize=True` or `"layered"` and the native region, retaining its
 established factorization safeguards. Pepsy capability-checks each selected
 mode against the installed Quimb build at execution time.
+
+The native projector adapter accepts both matrix factors and factors with
+multiple unfused bond axes, preserving their graded contraction order. Exact
+reference comparisons need a cap large enough for the double layer: a PEPS
+bond of dimension D can require D squared before further boundary growth.
 
 ```python
 norm_bp_projectors = pepsy.peps_norm(

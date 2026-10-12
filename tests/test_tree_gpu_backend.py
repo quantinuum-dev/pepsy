@@ -42,7 +42,8 @@ def _state():
 
 
 @pytest.mark.parametrize("mode", ["direct", "dm", "src", "sdc", "zipup"])
-def test_compression_keeps_norm_ledger_on_backend_without_clocks(mode, monkeypatch):
+@pytest.mark.parametrize("exponent", [0., -400., 400.])
+def test_compression_keeps_norm_ledger_on_backend_without_clocks(mode, exponent, monkeypatch):
     torch = pytest.importorskip("torch")
     state = _state()
     state.apply_to_arrays(lambda x: torch.tensor(x, dtype=torch.complex64))
@@ -52,6 +53,7 @@ def test_compression_keeps_norm_ledger_on_backend_without_clocks(mode, monkeypat
     # Uncached operator SVD rank selection is an upstream host decision;
     # separately guard that preparation against full-array transfers below.
     opt.run()
+    opt.tn.exponent = exponent
 
     def forbidden(*args, **kwargs):
         raise AssertionError("default compression read a host scalar or profiling clock")
@@ -101,6 +103,77 @@ def test_backend_replay_matches_numpy_and_does_not_download_gate_matrices(conver
     assert clone.get_norm_events() == opt.get_norm_events()
     opt.get_norm_events()[0]["local_fidelity"] = -1.
     assert opt.get_norm_events()[0]["local_fidelity"] >= 0.
+
+
+@pytest.mark.parametrize("mode", ["direct", "dm"])
+def test_branch_final_center_and_following_path_preserve_backend(convert, mode):
+    plan = TreePlan.from_order(range(8), structure="balanced", top_arity=2)
+    initial = TreeTensorNetwork.rand(plan, D=2, seed=81, dtype="complex64")
+    initial.multiply_(1 / initial.norm())
+    reference = TreeOptimizer(None, state=initial, mode=mode, chi=2, cutoff=0., run=False)
+    initial.apply_to_arrays(convert)
+    candidate = TreeOptimizer(None, state=initial, mode=mode, chi=2, cutoff=0., run=False)
+    signature = candidate.backend_info()
+    rng = np.random.default_rng(65)
+    for where in ((0, 2, 7), (1, 6)):
+        size = 2 ** len(where)
+        gate = np.linalg.qr(
+            rng.normal(size=(size, size)) + 1j * rng.normal(size=(size, size))
+        )[0].astype("complex64")
+        reference.apply_gate(gate, where)
+        candidate.apply_gate(convert(gate), where)
+        assert candidate.backend_info() == signature
+        assert candidate.center == reference.center
+        assert candidate.tn.is_canonical_form(candidate.center, tol=2e-5)
+        candidate.validate_isometry_metadata()
+        np.testing.assert_allclose(candidate.to_dense(), reference.to_dense(), atol=2e-5)
+        assert candidate.norm() == pytest.approx(reference.norm(), abs=2e-5)
+
+
+@pytest.mark.parametrize("where", [(3,), (3, 0), (3, 0, 2)])
+@pytest.mark.parametrize("exponent", [-400., 0., 400.])
+def test_kraus_probabilities_use_exact_local_readout(convert, where, exponent, monkeypatch):
+    from copy import deepcopy
+
+    from pepsy import TrajectoryChannel
+    from pepsy.optimizers.noise import _kraus_probabilities
+
+    state = _state()
+    dense = state.to_statevector()
+    size = 2 ** len(where)
+    weights = np.linspace(.1, .9, size)
+    unitary = np.linalg.qr(np.random.default_rng(9).normal(size=(size, size)))[0]
+    matrices = (np.diag(np.sqrt(weights)), unitary @ np.diag(np.sqrt(1 - weights)))
+    channel = TrajectoryChannel.kraus(list(zip(("first", "second"), matrices)))
+    axes = where + tuple(q for q in range(4) if q not in where)
+    local = dense.reshape((2,) * 4).transpose(axes).reshape(size, -1)
+    expected = [np.linalg.norm(matrix @ local) ** 2 / np.linalg.norm(local) ** 2
+                for matrix in matrices]
+    state.apply_to_arrays(convert)
+    opt = TreeOptimizer(None, state=state, mode="dmrg2", chi=1,
+                        stabilize_unitary=True, run=False)
+    opt.tn.exponent = exponent
+    tensors = [(tensor, tensor.data, tensor.left_inds) for tensor in opt.tn.tensors]
+    center = opt.center
+    rng = deepcopy(opt.rng.bit_generator.state)
+    signature = opt.backend_info()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Kraus probability evaluation replayed or densified a trial state")
+
+    monkeypatch.setattr(opt, "copy", forbidden)
+    monkeypatch.setattr(TreeOptimizer, "apply_gate", forbidden)
+    monkeypatch.setattr(TreeTensorNetwork, "to_dense", forbidden)
+    actual = _kraus_probabilities(opt, channel, where)
+    np.testing.assert_allclose(actual, expected, atol=2e-6)
+    assert opt.center == center
+    assert opt.tn.exponent == exponent
+    assert opt.rng.bit_generator.state == rng
+    assert opt.backend_info() == signature
+    assert not opt.get_norm_events() and not opt.get_fit_diagnostics()
+    for tensor, data, left_inds in tensors:
+        assert tensor.data is data
+        assert tensor.left_inds == left_inds
 
 
 @pytest.mark.parametrize("strategy", ["random", "random_expand"])
@@ -291,6 +364,9 @@ def test_represented_norm_preserves_exponent_range(convert, exponent):
     opt = TreeOptimizer([(gate, (0, 3))], state=state, chi=8, cutoff=0., run=False)
     # Exercise a backend ledger followed by explicit extracted-scale tracking.
     opt.run()
+    # Establish the unit-norm baseline after complex64 QR/SVD roundoff in the
+    # warm-up, so this test isolates extracted-scale range on each device.
+    opt.normalize()
     opt.tn.exponent = exponent
     before = opt.norm()
     opt.run()
@@ -311,3 +387,44 @@ def test_represented_norm_preserves_exponent_range(convert, exponent):
                                    norm_before=before), opt.norm(), 0.)
     assert opt.get_norm_events()[-1]["local_fidelity"] == pytest.approx(
         reference["local_fidelity"], rel=2e-6, abs=0.)
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg1", "dmrg2", "dmrg3", "mix"])
+@pytest.mark.parametrize("tracking, exponent", [(False, 0.), (True, 1.), (False, 1.)])
+def test_fit_target_norm_without_ledger_shortcut(convert, mode, tracking, exponent):
+    state = TreeTensorNetwork.from_plan(TreePlan.from_order(range(4), structure="balanced"))
+    state.apply_to_arrays(convert)
+    state.exponent = exponent
+    gates = [(convert(qu.hadamard()), 0), (convert(qu.CNOT()), (0, 3))]
+    opt = TreeOptimizer(gates, state=state, mode=mode, chi=2, cutoff=0., run=False,
+                        track_infidelity=tracking, stabilize_unitary=False,
+                        fit_init_strategy="guess-direct")
+    signature = opt.backend_info()
+    opt.run()
+    expected = np.zeros(16)
+    expected[[0, 9]] = 10.**exponent / np.sqrt(2.)
+    np.testing.assert_allclose(opt.to_dense().reshape(-1), expected, atol=2e-5)
+    assert opt.backend_info() == signature
+
+
+@pytest.mark.parametrize("mode", ["direct", "dmrg2"])
+@pytest.mark.parametrize("exponent", [-400., 400.])
+def test_stabilization_with_extreme_scale_keeps_backend(convert, mode, exponent):
+    state = _state()
+    gate = np.array(qu.CNOT(), dtype=np.complex64)
+    reference = TreeOptimizer([(gate, (0, 3))], state=state, mode=mode, chi=1,
+                              stabilize_unitary=True, fit_init_strategy="guess-direct")
+    state.apply_to_arrays(convert)
+    state.exponent = exponent
+    opt = TreeOptimizer([(convert(gate), (0, 3))], state=state, mode=mode, chi=1,
+                        stabilize_unitary=True, fit_init_strategy="guess-direct", run=False)
+    signature = opt.backend_info()
+    opt.run()
+    assert opt.tn.exponent == exponent
+    working = opt.tn.copy()
+    working.exponent = 0.
+    np.testing.assert_allclose(ar.to_numpy(working.to_dense()).reshape(-1),
+                               reference.to_dense(), atol=2e-5)
+    assert opt.backend_info() == signature
+    assert opt.norm_diagnostics()["local_fidelity"] == pytest.approx(
+        reference.norm_diagnostics()["local_fidelity"], abs=2e-5)

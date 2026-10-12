@@ -552,23 +552,25 @@ def test_tree_stab_submpo_uses_native_tree_router_for_unacted_root(monkeypatch):
     assert opt.tree_optimizer.update_history[0]["kind"] == "submpo"
 
 
-def test_tree_stab_mpo_mode_reuses_tree_two_factor_kernel(monkeypatch):
-    """TreeStab's MPO mode uses the same TreeOptimizer factor kernel."""
+def test_tree_stab_mpo_mode_reuses_ordinary_compact_gate_route(monkeypatch):
+    """Legacy MPO spelling still uses the ordinary compact gate boundary."""
     opt = pepsy.StabilizerTreeSimulator(2, mode="mpo")
     calls = []
-    apply_factors = opt.tree_optimizer._apply_2q_factors_impl
+    apply_operator = opt.tree_optimizer.apply_sub_mpotree
 
-    def traced_apply_factors(*args, **kwargs):
-        calls.append(True)
-        return apply_factors(*args, **kwargs)
+    def traced_apply_operator(operator, *args, **kwargs):
+        from pepsy.optimizers.tree.operators import SubTreeMPO
+
+        calls.append(isinstance(operator, SubTreeMPO))
+        return apply_operator(operator, *args, **kwargs)
 
     monkeypatch.setattr(
-        opt.tree_optimizer, "_apply_2q_factors_impl", traced_apply_factors
+        opt.tree_optimizer, "apply_sub_mpotree", traced_apply_operator
     )
     opt.apply([("cnot", 0, 1)])
     opt.measure_pauli("Z", 1, outcome=+1, absorb_basis=True)
 
-    assert calls
+    assert calls and all(calls)
     assert opt.tree_optimizer.mode == "mpo"
 
 

@@ -6,6 +6,10 @@ does not replace domain-specific invariants in an individual `SKILL.md`.
 
 ## Design principles
 
+- Follow the [Markdown policy](../../docs/development/markdown_policy.md):
+  concise instructions, precise mathematics and colored important formula terms.
+  Link plans through their [index](../../docs/development/plans/README.md);
+  keep proposals and measured results outside reusable skill procedures.
 - Keep one skill focused on one reusable subsystem or workflow. Do not create
   a skill for a single class, one-off investigation, or information already
   covered by an existing skill.

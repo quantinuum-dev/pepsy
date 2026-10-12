@@ -1862,12 +1862,6 @@ class TreePepsOptimizer:
                 compression_layout=compression_layout,
                 dmrg_mode_alias=dmrg_mode_alias,
             )
-            uncompressed_bonds = _layered_target_bond_sizes(
-                fit_target,
-                self.state,
-                edges,
-            )
-            transient_max_bond = max(uncompressed_bonds.values(), default=1)
             use_two_layer = False
         else:
             use_two_layer = (
@@ -1893,7 +1887,11 @@ class TreePepsOptimizer:
         if use_tree_fit:
             # TreeFIT already produced the bounded-bond result from the exact
             # disposable target above.
-            pass
+            uncompressed_bonds = _layered_target_bond_sizes(
+                fit_target,
+                self.state,
+                edges,
+            )
         elif use_two_layer:
             # Fusing the same operator and state tensors would produce the
             # transient dimensions used by the diagnostics.  Compute them
@@ -1935,7 +1933,10 @@ class TreePepsOptimizer:
             result.validate()
             result.validate_isometry_metadata()
             uncompressed_bonds = self._bond_sizes(result, edges)
-            transient_max_bond = max(uncompressed_bonds.values(), default=1)
+
+        # Every path records the uncompressed dimensions, including two-layer
+        # application where the fused intermediate is never materialized.
+        transient_max_bond = max(uncompressed_bonds.values(), default=1)
 
         if compress and not use_two_layer and not use_tree_fit:
             center = self._region_center(span, preferred=center)

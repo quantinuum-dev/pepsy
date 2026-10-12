@@ -89,6 +89,7 @@ def cast_like(value, like):
 
 
 def conj(value):
+    """Conjugate the unwrapped array while preserving its native backend."""
     return ar.do("conj", native(value))
 
 
@@ -99,10 +100,12 @@ def dag(value):
 
 
 def transpose(value, axes):
+    """Permute native tensor axes in the caller's explicit order."""
     return ar.do("transpose", native(value), axes=tuple(axes))
 
 
 def reshape(value, shape):
+    """Reshape the native array without a host conversion or forced copy."""
     return ar.do("reshape", native(value), tuple(shape))
 
 
@@ -131,14 +134,17 @@ def scalar_bool(value) -> bool:
 
 
 def real(value):
+    """Extract the real component in the input backend, possibly as a view."""
     return ar.do("real", native(value))
 
 
 def abs(value):
+    """Return elementwise magnitudes in the input array's native backend."""
     return ar.do("abs", native(value))
 
 
 def all_finite(value) -> bool:
+    """Check all entries and return a Python bool, synchronizing if needed."""
     return scalar_bool(ar.do("all", ar.do("isfinite", native(value))))
 
 
@@ -171,6 +177,7 @@ def normalize_message_pairs(messages, ind_map):
 
 
 def is_complex(value) -> bool:
+    """Inspect the dtype name without reading or transferring array values."""
     return dtype_name(value).startswith("complex")
 
 

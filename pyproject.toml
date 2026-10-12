@@ -42,12 +42,6 @@ dev = [
   "build>=1.2",
   "twine>=5",
 ]
-docs = [
-  "furo>=2024.8",
-  "myst-parser>=4",
-  "sphinx>=8.2",
-  "sphinx-autoapi>=3.8",
-]
 test-extended = [
   "pepsy[layout,solvers,stabilizer,symmetry,torch,viz]",
   "autograd>=1.7",

@@ -12,7 +12,7 @@ payloads and the direct, density-matrix, SRC, SDC, and zipup alternatives.
 `pepsy.fitting.TreeFIT` is the cached local variational fitting kernel for a
 `TreeTensorNetwork`. It has the same separation of target, disposable initial
 guess, bounded local updates, ownership controls, and diagnostics as
-`pepsy.FIT`, but replaces the chain's left/right environments with one cached
+`pepsy.fitting.FIT`, but replaces the chain's left/right environments with one cached
 directed overlap message for each tree edge:
 
 ```python
@@ -46,8 +46,11 @@ directed tree edge, with tensor sizes determined by the live bond dimensions.
 For dense compact circuit targets, an unchanged canonical exterior component
 can instead be relabelled to its boundary identity without contracting the
 dangling branch; `environment_cache_info()["identity_shortcuts"]` reports
-these uses. Native Symmray and fermionic fits retain the graded message
-contraction.
+these uses. NumPy can prove this by exact array equality. Torch uses shared
+array identity and matching leg order, without a device equality test; distinct
+arrays, changed gauges, and tensors requiring gradients retain full overlap
+contractions. Identity tensors, when needed, keep the source dtype and device.
+Native Symmray and fermionic fits retain the graded message contraction.
 
 Standalone callers who directly edit `fit.p` tensor data must invalidate its
 canonical metadata and call `fit.clear_environment_cache()` before resuming.
@@ -55,9 +58,20 @@ Raw external edits are not automatically tracked by the FIT message cache.
 Construct a new TreeFIT when changing target geometry or connectivity.
 
 `dmrg`, `dmrg1`, `dmrg2`, and `dmrg3` select this
-engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names. Generic
-`dmrg` uses `fit_block_size` (two by default) and its configured adaptive
-warm-up. `dmrg1` and `dmrg2` use two-node warm-up blocks, while `dmrg3` uses
+engine in `TreeOptimizer`; `TreePepsOptimizer` accepts the same names.
+`TreeOptimizer(mode="dmrg")` requires `fit_block_size=1`: one-node refinement
+from the initialized guess, with no two-/three-node FIT warm-up. The `fit`
+and deprecated `dmrg1` aliases enforce the same restriction, including when
+switching modes with `run()`. Larger explicit block sizes raise `ValueError`;
+use `dmrg2` or `dmrg3` for block updates. Guess construction can still split
+tensors and open bond support; one-node refinement retains that support.
+The separate `TreePepsOptimizer` retains its own block-size default of two.
+Selecting `TreeOptimizer`'s legacy `dmrg1` in the constructor or explicitly
+in `run(mode=...)` emits a visible `FutureWarning` recommending `dmrg` for
+one-site refinement. It now uses exactly the same FIT settings and schedule
+as `dmrg`, including explicit overrides, with no automatic two-node warm-up.
+The warning is not repeated by a plain `run()` that keeps the selected mode.
+`dmrg2` uses two-node warm-up blocks, while `dmrg3` uses
 three-node warm-up blocks followed by a two-node transition and one-node
 refinement. The default `fit_n_iter=4` permits eight directional passes and
 reaches refinement: `(2, 2, 1, 1)` for `dmrg2`, `(3, 3, 2, 1)` for `dmrg3`.
@@ -217,7 +231,8 @@ configured `fit_adaptive_sweeps`.
 `get_fit_diagnostics()` returns an independent record for the latest completed
 FIT update, including its effective `max_bond` and `cutoff`. It returns `None`
 outside FIT or after a completed non-FIT update. `fit_diagnostics` retains
-historical FIT records; replacing the state through `set_tn` / `set_p` clears
+historical FIT records only when `record_history=True`; the latest record is
+still available with history disabled. Replacing the state through `set_tn` / `set_p` clears
 both the history and latest record along with the other update diagnostics.
 The record's `split_method` identifies the actual local factorization:
 `"direct"` or `"dm"`. Explicit direct/DM compression settings are retained;
@@ -225,7 +240,33 @@ SRC/SDC/SDCR settings map to direct local SVD because complementary-environment
 compression is a separate whole-subtree algorithm. `fit_init_strategy`
 independently determines the disposable guess method.
 
-TreeOptimizer defaults to `fit_rtol="auto"` and `fit_min_iter=2`:
+For `TreeOptimizer(mode="dmrg")`, the main defaults are:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `fit_block_size` | `1` | One-node refinement, no block-growth warm-up |
+| `fit_n_iter` | `4` | Up to four inward/outward iterations (eight directional passes) |
+| `fit_min_iter` | `2` | Minimum iterations before tolerance stopping |
+| `fit_rtol` | `"auto"` | Dtype-dependent retained-norm tolerance below |
+| `fit_patience` | `1` | One stable comparison between two same-phase norm samples |
+| `fit_init_strategy` | `"auto"` | Dense SRC guess; native fermionic direct-compression guess |
+| `fit_init_seed` | `0` | Seed for guess construction |
+| `fit_init_rand_strength` | `0.0` | No extra random perturbation; SRC itself remains randomized |
+| `fit_sweep_sequence` | `"inward-outward"` | Both directions per iteration |
+| `fit_traversal` | `"auto"` | Endpoint traversal for paths; depth-first for branches |
+| `fit_single_node_fast_path` | `True` | Exact projection when the entire active region is one node |
+| `chi` | `64` | Bond cap used during guess/compression construction |
+| `cutoff`, `cutoff_mode` | `"auto"`, `"auto"` | Dtype-dependent cutoff and `"rsum2"` |
+
+These FIT options are constructor settings, inherited by copies and replay;
+`run()` does not accept `fit_*` overrides. Constructor `mode="auto"` remains
+the general replay default: request `mode="dmrg"` to select this refinement.
+`fit_adaptive_sweeps=2` and `fit_two_site_transition_sweeps=1` remain available
+for larger-block schedules and do not introduce block updates into default DMRG.
+Finite scans, overlap diagnostics, profiling, and unitary stabilization remain
+off by default. The separate standalone `TreeFIT` defaults are unchanged.
+
+Automatic tolerances are:
 
 | State precision | `cutoff="auto"` | `fit_rtol="auto"` |
 | --- | --- | --- |
@@ -242,11 +283,13 @@ same-phase norm samples; the counter resets when the block size changes.
 still gate early stopping. This criterion measures relative change in the
 retained canonical-center norm, not a bound on the global state error.
 
-As with MpsOptimizer's non-unitary policy, automatic tolerance stopping is
-disabled during `run(non_unitary=True)`. It is also disabled for updates with
+TreeOptimizer disables automatic tolerance stopping during
+`run(non_unitary=True)`. It is also disabled for updates with
 `track_norm=False`, whose target norm is not assumed known. Explicit numeric
 `fit_rtol` remains honored in those cases. Optimizer FIT diagnostics report
 both `fit_rtol_requested` and the effective `fit_rtol` for each update.
+MpsOptimizer keeps its automatic tolerance during non-unitary replay; the
+shared dtype thresholds do not imply identical stopping policies.
 Standalone TreeFIT retains `rtol=None` and its fixed-block defaults. All three
 entry points accept `two_site_transition_sweeps=0`; set this to one with
 `block_size=3, adaptive_block_sweeps=2` to request the new transition explicitly.
@@ -290,7 +333,12 @@ local and cumulative retained-norm proxy, which is computed from
 canonical-centre norm ratios and stored in logarithmic form to avoid
 underflow. For lazy targets, pass the known exact `target_norm` (a norm or
 mantissa/exponent pair) to obtain this normalized ratio without additional
-target work. TreeOptimizer supplies the pre-update canonical norm when
+target work. A scalar backend mantissa is retained until the first sweep's
+norm readout, when both scalars are transferred together and the target norm
+is validated. TreeOptimizer reuses its pre-update device norm when available,
+avoiding a separate pre-fit synchronization. Convergence still reads one
+terminal-centre norm per iteration and preserves the same stopping rule.
+TreeOptimizer supplies the pre-update canonical norm when
 `track_norm=True`, the unitary-update contract. For non-unitary updates use
 `track_norm=False`; an unknown lazy target norm yields `local_fidelity=None`
 while the retained norm and convergence trace remain available.

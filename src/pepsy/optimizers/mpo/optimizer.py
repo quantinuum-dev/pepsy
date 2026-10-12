@@ -80,6 +80,7 @@ from ...backends import (
 from ...tensors.contractions import tn_norm
 from ...tensors.observables import tn_fidelity
 from ...fitting.local import FIT
+from ..mps.diagnostics import _summarize_fit_timing
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
 
 __all__ = ["MpoChannelEvent", "MpoOptimizer"]
@@ -166,48 +167,6 @@ _MPO_METHODS_USE_SEED = frozenset(
         "fit-oversample",
     }
 )
-
-# Keep the MPO run-level timing schema aligned with MpsOptimizer. These are
-# compatibility totals and named subsets, not an additive partition.
-_FIT_TIMING_PHASES = (
-    "canonicalization_seconds",
-    "sweep_preparation_canonicalization_seconds",
-    "moving_canonicalization_seconds",
-    "fixed_environment_seconds",
-    "effective_seconds",
-    "svd_seconds",
-    "writeback_seconds",
-    "environment_seconds",
-    "moving_environment_seconds",
-    "non_site_elapsed_seconds",
-    "sweep_overhead_seconds",
-)
-
-
-def _summarize_fit_timing(records):
-    """Summarize detailed FIT sweep timing without discarding raw records."""
-    records = tuple(records)
-    fit_indices = {
-        int(record["fit_index"])
-        for record in records
-        if "fit_index" in record
-    }
-    return {
-        "calls": len(fit_indices),
-        "sweeps": len(records),
-        "site_updates": sum(
-            int(record.get("site_count", len(record.get("site_timings", ()))))
-            for record in records
-        ),
-        "elapsed_seconds": sum(
-            float(record.get("elapsed_seconds", 0.0)) for record in records
-        ),
-        **{
-            phase: sum(float(record.get(phase, 0.0)) for record in records)
-            for phase in _FIT_TIMING_PHASES
-        },
-    }
-
 
 @dataclass(frozen=True)
 class MpoChannelEvent:
@@ -3268,6 +3227,363 @@ class MpoOptimizer:
         self._last_dmrg_fit_diagnostics = record
         return record
 
+    def _run_dmrg_single_window(
+        self,
+        p,
+        gate,
+        bra_gate,
+        where,
+        idx,
+        *,
+        G_seq,
+        n_iter,
+        cutoff,
+        cutoff_mode,
+        fit_block_size,
+        target_cutoff,
+        fit_target_strategy,
+        fit_mpo_guess,
+        fit_mpo_guess_order,
+        fit_init_strategy,
+        fit_init_rand_strength,
+        fit_init_seed,
+        fit_overlap_diagnostics,
+        run_local_fit_transactional,
+    ):
+        """Fit one gate pair and record its canonical norm and diagnostics.
+
+        Build the exact target separately from the guess, then delegate the
+        update to ``run_local_fit_transactional``. That callback owns rollback
+        and fallback; this method records successful FIT norms and metadata.
+        Return the live MPO, next stream index, and number of consumed entries.
+        """
+        xmin, xmax = sorted(where)
+        self.canonize_mpo(p, (xmin, xmax))
+        p_g = self._timed_call(
+            "dmrg.target",
+            self._build_dmrg_target,
+            p,
+            gate,
+            where,
+            bra_gate,
+            cutoff,
+            cutoff_mode,
+            target_cutoff=target_cutoff,
+            target_strategy=fit_target_strategy,
+        )
+
+        expected_norm = self._timed_call(
+            "norm.expected",
+            self._expected_target_norm,
+            p,
+            gate,
+            where,
+            bra_gate,
+            target=p_g,
+            target_cutoff=target_cutoff,
+            target_strategy=fit_target_strategy,
+            cutoff_mode=cutoff_mode,
+        )
+        requested_fit_block_size = min(
+            fit_block_size,
+            xmax - xmin + 1,
+        )
+        self._validate_dmrg1_iteration_budget(
+            p,
+            xmin,
+            xmax,
+            n_iter=n_iter,
+            block_size=requested_fit_block_size,
+        )
+        active_fit_block_size = self._resolve_dmrg_fit_block_size(
+            p,
+            xmin,
+            xmax,
+            fit_block_size,
+        )
+        fit_initialization = self._timed_call(
+            "dmrg.fit_guess",
+            self._prepare_fit_initial_guess,
+            p,
+            [G_seq[idx]],
+            [where],
+            block_size=active_fit_block_size,
+            strategy=fit_init_strategy,
+            fit_mpo_guess=fit_mpo_guess,
+            rand_strength=fit_init_rand_strength,
+            seed=(
+                int(fit_init_seed)
+                + 1000003 * int(idx)
+                + 1009 * int(xmin)
+                + int(xmax)
+            ),
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            layer_order=fit_mpo_guess_order,
+        )
+        fit_guess = fit_initialization["fit_guess"]
+        fit = FIT(
+            p_g,
+            p=fit_guess,
+            cutoffs=cutoff,
+            contraction_opt=self.contraction_opt,
+            retag=False,
+            range_int=[xmin, xmax],
+            inplace=True,
+            copy_target=False,
+        )
+        p, fit_result = run_local_fit_transactional(
+            fit,
+            active_fit_block_size,
+            step_start=idx,
+            step_end=idx + 1,
+            where=where,
+        )
+        if fit_result is None:
+            idx += 1
+            advanced = 1
+        else:
+            final_center = fit.final_center_site
+            if final_center is None:
+                final_center = p.calc_current_orthog_center()[-1]
+            observed_norm = self._timed_call(
+                "norm.observed",
+                self._canonical_norm_measurement,
+                p,
+                final_center,
+            )
+            self.info_c["cur_orthog"] = (
+                int(final_center),
+                int(final_center),
+            )
+            self._timed_call(
+                "norm.record",
+                self._record_norm_event,
+                "dmrg_compression",
+                expected_norm=expected_norm,
+                observed_norm=observed_norm,
+                target_norm=expected_norm,
+                where=(xmin, xmax),
+                unitary=(
+                    self._is_unitary_gate_pair(gate, bra_gate)
+                    and self._unitary_norm_guard_supported(p)
+                ),
+            )
+            fit_overlap = (
+                self._fit_overlap_diagnostics(p_g, fit.p)
+                if fit_overlap_diagnostics
+                else {}
+            )
+            self._record_fit_diagnostics(
+                fit,
+                where=(xmin, xmax),
+                block_size=active_fit_block_size,
+                step=idx + 1,
+                mpo_fit_guess_used=fit_initialization[
+                    "svd_guess_used"
+                ],
+                mpo_fit_guess_order=(
+                    fit_mpo_guess_order
+                    if fit_initialization["svd_guess_used"]
+                    else None
+                ),
+                fit_initialization=fit_initialization,
+                fit_overlap=fit_overlap,
+                fit_overlap_diagnostics=fit_overlap_diagnostics,
+            )
+            self._maybe_lock_dmrg1_one_site_phase()
+            self._last_dmrg_fit_diagnostics[
+                "dmrg1_one_site_locked"
+            ] = bool(self._dmrg1_one_site_locked)
+            idx += 1
+            advanced = 1
+        if fit_result is None:
+            self._maybe_lock_dmrg1_one_site_phase()
+            if self._last_dmrg_fit_diagnostics is not None:
+                self._last_dmrg_fit_diagnostics[
+                    "dmrg1_one_site_locked"
+                ] = bool(self._dmrg1_one_site_locked)
+        return p, idx, advanced
+
+    def _run_dmrg_batch_window(
+        self,
+        p,
+        batch_G,
+        batch_where,
+        idx,
+        *,
+        n_iter,
+        cutoff,
+        cutoff_mode,
+        fit_block_size,
+        target_cutoff,
+        fit_target_strategy,
+        fit_mpo_guess,
+        fit_mpo_guess_order,
+        fit_init_strategy,
+        fit_init_rand_strength,
+        fit_init_seed,
+        fit_overlap_diagnostics,
+        next_idx,
+        run_local_fit_transactional,
+    ):
+        """Fit a collected gate batch with one shared target and recovery point.
+
+        Keep expected-target norms and the all-gates unitary check specific to
+        the batch. The supplied transaction callback owns rollback/fallback;
+        successful FIT records its terminal center before norm measurement.
+        Return the live MPO, next stream index, and number of consumed entries.
+        """
+        batch_span_sites = [site for where_i in batch_where for site in where_i]
+        xmin, xmax = min(batch_span_sites), max(batch_span_sites)
+        self.canonize_mpo(p, (xmin, xmax))
+        p_g = self._timed_call(
+            "dmrg.target",
+            self._build_dmrg_batch_target,
+            p,
+            batch_G,
+            batch_where,
+            cutoff,
+            cutoff_mode,
+            target_cutoff=target_cutoff,
+            target_strategy=fit_target_strategy,
+        )
+
+        expected_norm = self._timed_call(
+            "norm.expected",
+            self._expected_batch_target_norm,
+            p,
+            batch_G,
+            batch_where,
+            target=p_g,
+            cutoff_mode=cutoff_mode,
+        )
+        requested_fit_block_size = min(
+            fit_block_size,
+            xmax - xmin + 1,
+        )
+        self._validate_dmrg1_iteration_budget(
+            p,
+            xmin,
+            xmax,
+            n_iter=n_iter,
+            block_size=requested_fit_block_size,
+        )
+        active_fit_block_size = self._resolve_dmrg_fit_block_size(
+            p,
+            xmin,
+            xmax,
+            fit_block_size,
+        )
+        fit_initialization = self._timed_call(
+            "dmrg.fit_guess",
+            self._prepare_fit_initial_guess,
+            p,
+            batch_G,
+            batch_where,
+            block_size=active_fit_block_size,
+            strategy=fit_init_strategy,
+            fit_mpo_guess=fit_mpo_guess,
+            rand_strength=fit_init_rand_strength,
+            seed=(
+                int(fit_init_seed)
+                + 1000003 * int(idx)
+                + 1009 * int(xmin)
+                + int(xmax)
+            ),
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            layer_order=fit_mpo_guess_order,
+        )
+        fit_guess = fit_initialization["fit_guess"]
+        fit = FIT(
+            p_g,
+            p=fit_guess,
+            cutoffs=cutoff,
+            contraction_opt=self.contraction_opt,
+            retag=False,
+            range_int=[xmin, xmax],
+            inplace=True,
+            copy_target=False,
+        )
+        p, fit_result = run_local_fit_transactional(
+            fit,
+            active_fit_block_size,
+            step_start=idx,
+            step_end=next_idx,
+            where=(xmin, xmax),
+        )
+        if fit_result is None:
+            advanced = next_idx - idx
+            idx = next_idx
+        else:
+            final_center = fit.final_center_site
+            if final_center is None:
+                final_center = p.calc_current_orthog_center()[-1]
+            observed_norm = self._timed_call(
+                "norm.observed",
+                self._canonical_norm_measurement,
+                p,
+                final_center,
+            )
+            self.info_c["cur_orthog"] = (
+                int(final_center),
+                int(final_center),
+            )
+            self._timed_call(
+                "norm.record",
+                self._record_norm_event,
+                "dmrg_compression",
+                expected_norm=expected_norm,
+                observed_norm=observed_norm,
+                target_norm=expected_norm,
+                where=(xmin, xmax),
+                unitary=(
+                    all(
+                        self._is_unitary_gate_pair(
+                            *self._parse_gate_entry(gate_i, where_i)[:2]
+                        )
+                        for gate_i, where_i in zip(batch_G, batch_where)
+                    )
+                    and self._unitary_norm_guard_supported(p)
+                ),
+            )
+            fit_overlap = (
+                self._fit_overlap_diagnostics(p_g, fit.p)
+                if fit_overlap_diagnostics
+                else {}
+            )
+            self._record_fit_diagnostics(
+                fit,
+                where=(xmin, xmax),
+                block_size=active_fit_block_size,
+                step=idx + 1,
+                mpo_fit_guess_used=fit_initialization[
+                    "svd_guess_used"
+                ],
+                mpo_fit_guess_order=(
+                    fit_mpo_guess_order
+                    if fit_initialization["svd_guess_used"]
+                    else None
+                ),
+                fit_initialization=fit_initialization,
+                fit_overlap=fit_overlap,
+                fit_overlap_diagnostics=fit_overlap_diagnostics,
+            )
+            self._maybe_lock_dmrg1_one_site_phase()
+            self._last_dmrg_fit_diagnostics[
+                "dmrg1_one_site_locked"
+            ] = bool(self._dmrg1_one_site_locked)
+            advanced = next_idx - idx
+            idx = next_idx
+        if fit_result is None:
+            self._maybe_lock_dmrg1_one_site_phase()
+            if self._last_dmrg_fit_diagnostics is not None:
+                self._last_dmrg_fit_diagnostics[
+                    "dmrg1_one_site_locked"
+                ] = bool(self._dmrg1_one_site_locked)
+        return p, idx, advanced
+
     def _run_dmrg(
         self,
         G_seq,
@@ -3313,6 +3629,11 @@ class MpoOptimizer:
         requested sweep sequence. Named DMRG modes additionally pass FIT's
         adaptive block schedule so the larger block is followed by fixed-rank
         one-site refinement.
+
+        The local callbacks own FIT scheduling and per-update recovery. Window
+        helpers prepare targets/guesses and record successful fits. This driver
+        owns channel dispatch, batch collection, stream counters, sampled norm
+        traces, and progress reporting.
         """
         if k_2q_batch < 1:
             raise ValueError("k_2q_batch must be >= 1.")
@@ -3532,152 +3853,27 @@ class MpoOptimizer:
             elif n_sites == 2:
                 if k_2q_batch == 1:
                     two_qubit_count += 1
-                    xmin, xmax = sorted(where)
-                    self.canonize_mpo(p, (xmin, xmax))
-                    p_g = self._timed_call(
-                        "dmrg.target",
-                        self._build_dmrg_target,
+                    p, idx, advanced = self._run_dmrg_single_window(
                         p,
                         gate,
-                        where,
                         bra_gate,
-                        cutoff,
-                        cutoff_mode,
-                        target_cutoff=target_cutoff,
-                        target_strategy=fit_target_strategy,
-                    )
-
-                    expected_norm = self._timed_call(
-                        "norm.expected",
-                        self._expected_target_norm,
-                        p,
-                        gate,
                         where,
-                        bra_gate,
-                        target=p_g,
-                        target_cutoff=target_cutoff,
-                        target_strategy=fit_target_strategy,
-                        cutoff_mode=cutoff_mode,
-                    )
-                    requested_fit_block_size = min(
-                        fit_block_size,
-                        xmax - xmin + 1,
-                    )
-                    self._validate_dmrg1_iteration_budget(
-                        p,
-                        xmin,
-                        xmax,
+                        idx,
+                        G_seq=G_seq,
                         n_iter=n_iter,
-                        block_size=requested_fit_block_size,
-                    )
-                    active_fit_block_size = self._resolve_dmrg_fit_block_size(
-                        p,
-                        xmin,
-                        xmax,
-                        fit_block_size,
-                    )
-                    fit_initialization = self._timed_call(
-                        "dmrg.fit_guess",
-                        self._prepare_fit_initial_guess,
-                        p,
-                        [G_seq[idx]],
-                        [where],
-                        block_size=active_fit_block_size,
-                        strategy=fit_init_strategy,
-                        fit_mpo_guess=fit_mpo_guess,
-                        rand_strength=fit_init_rand_strength,
-                        seed=(
-                            int(fit_init_seed)
-                            + 1000003 * int(idx)
-                            + 1009 * int(xmin)
-                            + int(xmax)
-                        ),
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
-                        layer_order=fit_mpo_guess_order,
+                        fit_block_size=fit_block_size,
+                        target_cutoff=target_cutoff,
+                        fit_target_strategy=fit_target_strategy,
+                        fit_mpo_guess=fit_mpo_guess,
+                        fit_mpo_guess_order=fit_mpo_guess_order,
+                        fit_init_strategy=fit_init_strategy,
+                        fit_init_rand_strength=fit_init_rand_strength,
+                        fit_init_seed=fit_init_seed,
+                        fit_overlap_diagnostics=fit_overlap_diagnostics,
+                        run_local_fit_transactional=run_local_fit_transactional,
                     )
-                    fit_guess = fit_initialization["fit_guess"]
-                    fit = FIT(
-                        p_g,
-                        p=fit_guess,
-                        cutoffs=cutoff,
-                        contraction_opt=self.contraction_opt,
-                        retag=False,
-                        range_int=[xmin, xmax],
-                        inplace=True,
-                        copy_target=False,
-                    )
-                    p, fit_result = run_local_fit_transactional(
-                        fit,
-                        active_fit_block_size,
-                        step_start=idx,
-                        step_end=idx + 1,
-                        where=where,
-                    )
-                    if fit_result is None:
-                        idx += 1
-                        advanced = 1
-                    else:
-                        final_center = fit.final_center_site
-                        if final_center is None:
-                            final_center = p.calc_current_orthog_center()[-1]
-                        observed_norm = self._timed_call(
-                            "norm.observed",
-                            self._canonical_norm_measurement,
-                            p,
-                            final_center,
-                        )
-                        self.info_c["cur_orthog"] = (
-                            int(final_center),
-                            int(final_center),
-                        )
-                        self._timed_call(
-                            "norm.record",
-                            self._record_norm_event,
-                            "dmrg_compression",
-                            expected_norm=expected_norm,
-                            observed_norm=observed_norm,
-                            target_norm=expected_norm,
-                            where=(xmin, xmax),
-                            unitary=(
-                                self._is_unitary_gate_pair(gate, bra_gate)
-                                and self._unitary_norm_guard_supported(p)
-                            ),
-                        )
-                        fit_overlap = (
-                            self._fit_overlap_diagnostics(p_g, fit.p)
-                            if fit_overlap_diagnostics
-                            else {}
-                        )
-                        self._record_fit_diagnostics(
-                            fit,
-                            where=(xmin, xmax),
-                            block_size=active_fit_block_size,
-                            step=idx + 1,
-                            mpo_fit_guess_used=fit_initialization[
-                                "svd_guess_used"
-                            ],
-                            mpo_fit_guess_order=(
-                                fit_mpo_guess_order
-                                if fit_initialization["svd_guess_used"]
-                                else None
-                            ),
-                            fit_initialization=fit_initialization,
-                            fit_overlap=fit_overlap,
-                            fit_overlap_diagnostics=fit_overlap_diagnostics,
-                        )
-                        self._maybe_lock_dmrg1_one_site_phase()
-                        self._last_dmrg_fit_diagnostics[
-                            "dmrg1_one_site_locked"
-                        ] = bool(self._dmrg1_one_site_locked)
-                        idx += 1
-                        advanced = 1
-                    if fit_result is None:
-                        self._maybe_lock_dmrg1_one_site_phase()
-                        if self._last_dmrg_fit_diagnostics is not None:
-                            self._last_dmrg_fit_diagnostics[
-                                "dmrg1_one_site_locked"
-                            ] = bool(self._dmrg1_one_site_locked)
                 else:
                     batch_G, batch_where, two_qubit_in_batch, next_idx = (
                         self._collect_dmrg_batch(
@@ -3692,154 +3888,26 @@ class MpoOptimizer:
                         raise RuntimeError("DMRG batch unexpectedly contains no two-qubit gates.")
 
                     two_qubit_count += two_qubit_in_batch
-                    batch_span_sites = [site for where_i in batch_where for site in where_i]
-                    xmin, xmax = min(batch_span_sites), max(batch_span_sites)
-                    self.canonize_mpo(p, (xmin, xmax))
-                    p_g = self._timed_call(
-                        "dmrg.target",
-                        self._build_dmrg_batch_target,
+                    p, idx, advanced = self._run_dmrg_batch_window(
                         p,
                         batch_G,
                         batch_where,
-                        cutoff,
-                        cutoff_mode,
-                        target_cutoff=target_cutoff,
-                        target_strategy=fit_target_strategy,
-                    )
-
-                    expected_norm = self._timed_call(
-                        "norm.expected",
-                        self._expected_batch_target_norm,
-                        p,
-                        batch_G,
-                        batch_where,
-                        target=p_g,
-                        cutoff_mode=cutoff_mode,
-                    )
-                    requested_fit_block_size = min(
-                        fit_block_size,
-                        xmax - xmin + 1,
-                    )
-                    self._validate_dmrg1_iteration_budget(
-                        p,
-                        xmin,
-                        xmax,
+                        idx,
                         n_iter=n_iter,
-                        block_size=requested_fit_block_size,
-                    )
-                    active_fit_block_size = self._resolve_dmrg_fit_block_size(
-                        p,
-                        xmin,
-                        xmax,
-                        fit_block_size,
-                    )
-                    fit_initialization = self._timed_call(
-                        "dmrg.fit_guess",
-                        self._prepare_fit_initial_guess,
-                        p,
-                        batch_G,
-                        batch_where,
-                        block_size=active_fit_block_size,
-                        strategy=fit_init_strategy,
-                        fit_mpo_guess=fit_mpo_guess,
-                        rand_strength=fit_init_rand_strength,
-                        seed=(
-                            int(fit_init_seed)
-                            + 1000003 * int(idx)
-                            + 1009 * int(xmin)
-                            + int(xmax)
-                        ),
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
-                        layer_order=fit_mpo_guess_order,
+                        fit_block_size=fit_block_size,
+                        target_cutoff=target_cutoff,
+                        fit_target_strategy=fit_target_strategy,
+                        fit_mpo_guess=fit_mpo_guess,
+                        fit_mpo_guess_order=fit_mpo_guess_order,
+                        fit_init_strategy=fit_init_strategy,
+                        fit_init_rand_strength=fit_init_rand_strength,
+                        fit_init_seed=fit_init_seed,
+                        fit_overlap_diagnostics=fit_overlap_diagnostics,
+                        next_idx=next_idx,
+                        run_local_fit_transactional=run_local_fit_transactional,
                     )
-                    fit_guess = fit_initialization["fit_guess"]
-                    fit = FIT(
-                        p_g,
-                        p=fit_guess,
-                        cutoffs=cutoff,
-                        contraction_opt=self.contraction_opt,
-                        retag=False,
-                        range_int=[xmin, xmax],
-                        inplace=True,
-                        copy_target=False,
-                    )
-                    p, fit_result = run_local_fit_transactional(
-                        fit,
-                        active_fit_block_size,
-                        step_start=idx,
-                        step_end=next_idx,
-                        where=(xmin, xmax),
-                    )
-                    if fit_result is None:
-                        advanced = next_idx - idx
-                        idx = next_idx
-                    else:
-                        final_center = fit.final_center_site
-                        if final_center is None:
-                            final_center = p.calc_current_orthog_center()[-1]
-                        observed_norm = self._timed_call(
-                            "norm.observed",
-                            self._canonical_norm_measurement,
-                            p,
-                            final_center,
-                        )
-                        self.info_c["cur_orthog"] = (
-                            int(final_center),
-                            int(final_center),
-                        )
-                        self._timed_call(
-                            "norm.record",
-                            self._record_norm_event,
-                            "dmrg_compression",
-                            expected_norm=expected_norm,
-                            observed_norm=observed_norm,
-                            target_norm=expected_norm,
-                            where=(xmin, xmax),
-                            unitary=(
-                                all(
-                                    self._is_unitary_gate_pair(
-                                        *self._parse_gate_entry(gate_i, where_i)[:2]
-                                    )
-                                    for gate_i, where_i in zip(batch_G, batch_where)
-                                )
-                                and self._unitary_norm_guard_supported(p)
-                            ),
-                        )
-                        fit_overlap = (
-                            self._fit_overlap_diagnostics(p_g, fit.p)
-                            if fit_overlap_diagnostics
-                            else {}
-                        )
-                        self._record_fit_diagnostics(
-                            fit,
-                            where=(xmin, xmax),
-                            block_size=active_fit_block_size,
-                            step=idx + 1,
-                            mpo_fit_guess_used=fit_initialization[
-                                "svd_guess_used"
-                            ],
-                            mpo_fit_guess_order=(
-                                fit_mpo_guess_order
-                                if fit_initialization["svd_guess_used"]
-                                else None
-                            ),
-                            fit_initialization=fit_initialization,
-                            fit_overlap=fit_overlap,
-                            fit_overlap_diagnostics=fit_overlap_diagnostics,
-                        )
-                        self._maybe_lock_dmrg1_one_site_phase()
-                        self._last_dmrg_fit_diagnostics[
-                            "dmrg1_one_site_locked"
-                        ] = bool(self._dmrg1_one_site_locked)
-                        advanced = next_idx - idx
-                        idx = next_idx
-                    if fit_result is None:
-                        self._maybe_lock_dmrg1_one_site_phase()
-                        if self._last_dmrg_fit_diagnostics is not None:
-                            self._last_dmrg_fit_diagnostics[
-                                "dmrg1_one_site_locked"
-                            ] = bool(self._dmrg1_one_site_locked)
             else:
                 raise ValueError("Each gate location must have one or two sites.")
 
@@ -4158,7 +4226,7 @@ class MpoOptimizer:
                     target_strategy=fit_target_strategy,
                     cutoff_mode=cutoff_mode,
                 )
-                if self._can_use_native_gate_sandwich(
+                if not (compression_opts or {}).get("mpo_factorization") and self._can_use_native_gate_sandwich(
                     p, gate, bra_gate, where, method
                 ):
                     p = self._timed_call(
@@ -4275,6 +4343,7 @@ class MpoOptimizer:
         mode=None,
         compression_seed=None,
         compression_opts=None,
+        mpo_factorization="qr",
         submpo_method=None,
         progbar=False,
         cutoff="auto",
@@ -4332,6 +4401,12 @@ class MpoOptimizer:
             cutoff_oversample, cutoff_mode_oversample, and compress_opts_final
             when named by the installed compressor. chi remains the final cap.
             Native Symmray replay and channel streams reject explicit settings.
+        mpo_factorization : {"qr", "projector"}, default="qr"
+            Dense direct replay can use gauge-invariant paired factors in
+            gate construction, canonicalization and compression. Projector
+            backward requires a fixed numerical rank and resolved truncation
+            gap, and rejects unsupported charts. Native arrays, channels,
+            layout changes and fallback replay are excluded from this mode.
         submpo_method : str | None, default=None
             Optional Quimb compression override for an MPO-mode run. This is
             the MPO analogue of `MpsOptimizer`'s ``submpo_method``; for
@@ -4470,6 +4545,15 @@ class MpoOptimizer:
 
         compression_method = self._resolve_mpo_method(submpo_method)
         compression_opts = quimb_compression_options(compression_method, compression_opts)
+        if mpo_factorization not in {"qr", "projector"}:
+            raise ValueError("mpo_factorization must be 'qr' or 'projector'")
+        if mpo_factorization == "projector":
+            from ...operators._mpo_factorization import projector_method
+
+            if not self._is_mpo_mode(self.mode) or layout or fit_fallback is not None:
+                raise NotImplementedError("projector factorization requires direct MPO replay without layout changes or fallback")
+            projector_method(self.p, compression_method)
+            compression_opts["mpo_factorization"] = "projector"
         if compression_opts and (
             not self._is_mpo_mode(self.mode) or self._has_symmray_data(self.p)
             or any(isinstance(gate, MpoChannelEvent) for gate in self._execution_stream()[0])
@@ -4591,229 +4675,250 @@ class MpoOptimizer:
             )
 
         if self.mode == "dmrg":
-            dmrg_alias = self._dmrg_mode_alias
-            if dmrg_alias is not None:
-                # Named modes are readable schedule aliases, not separate
-                # compression backends. Their block size is authoritative;
-                # callers tune the warm-up length with fit_adaptive_sweeps.
-                fit_block_size = self._dmrg_alias_block_size(dmrg_alias)
-            if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
-                1,
-                2,
-                3,
-            }:
-                raise ValueError("fit_block_size must be 1, 2, or 3.")
-            if (
-                not isinstance(fit_three_site_sweeps, Integral)
-                or int(fit_three_site_sweeps) < 1
-            ):
-                raise ValueError("fit_three_site_sweeps must be a positive integer.")
-            if (
-                dmrg_alias is None
-                and int(fit_block_size) != 3
-                and int(fit_three_site_sweeps) != 1
-            ):
-                raise ValueError(
-                    "fit_three_site_sweeps is only configurable when "
-                    "fit_block_size=3."
-                )
-            if dmrg_alias is not None:
-                if (
-                    not isinstance(n_iter, Integral)
-                    or int(n_iter) < 1
-                ):
-                    raise ValueError("n_iter must be a positive integer.")
-                if (
-                    not isinstance(fit_adaptive_sweeps, Integral)
-                    or int(fit_adaptive_sweeps) < 1
-                ):
-                    raise ValueError(
-                        "fit_adaptive_sweeps must be a positive integer."
-                    )
-                adaptive_block_sweeps = min(
-                    2 if dmrg_alias == "dmrg1" else int(fit_adaptive_sweeps),
-                    int(n_iter),
-                ) if int(n_iter) >= 2 else None
-                adaptive_until_rank = False
-                # ``fit_three_site_sweeps`` is the legacy generic-DMRG
-                # spelling. Named modes use the common adaptive schedule.
-                fit_three_site_sweeps = 1
-                single_pair_fast_path = bool(fit_single_pair_fast_path)
-            else:
-                # Match the generic MPS DMRG policy: block FIT first grows
-                # attainable bond spaces, then hands the remaining sweep
-                # budget to one-site refinement. Long-range windows opt out
-                # of the rank-until-ready phase below because their terminal
-                # canonical handoff is fixed by the active span.
-                adaptive_block_sweeps = (
-                    min(int(fit_adaptive_sweeps), int(n_iter))
-                    if int(fit_block_size) in {2, 3} and int(n_iter) >= 2
-                    else None
-                )
-                adaptive_until_rank = (
-                    int(fit_block_size) in {2, 3}
-                    and int(n_iter) >= 2
-                )
-                single_pair_fast_path = bool(fit_single_pair_fast_path)
-            fit_max_span = self._resolve_fit_max_span(
-                fit_max_span,
-                k_2q_batch,
+            return self._run_dmrg_replay(
+                n_iter=n_iter,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples,
+                k_2q_batch=k_2q_batch,
+                fit_block_size=fit_block_size,
+                fit_sweep_sequence=fit_sweep_sequence,
+                fit_max_span=fit_max_span,
+                fit_three_site_sweeps=fit_three_site_sweeps,
+                fit_adaptive_sweeps=fit_adaptive_sweeps,
+                fit_single_pair_fast_path=fit_single_pair_fast_path,
+                target_cutoff=target_cutoff,
+                fit_min_iter=fit_min_iter,
+                fit_rtol=fit_rtol,
+                fit_patience=fit_patience,
+                fit_finite_check=fit_finite_check,
+                timing=timing,
+                timing_sync_device=timing_sync_device,
+                fit_collect_split_diagnostics=fit_collect_split_diagnostics,
+                fit_target_strategy=fit_target_strategy,
+                fit_mpo_guess=fit_mpo_guess,
+                fit_mpo_guess_order=fit_mpo_guess_order,
+                fit_init_strategy=fit_init_strategy,
+                fit_init_rand_strength=fit_init_rand_strength,
+                fit_init_seed=fit_init_seed,
+                fit_overlap_diagnostics=fit_overlap_diagnostics,
+                transactional_steps=transactional_steps,
+                fit_fallback=fit_fallback,
+                G_seq=G_seq,
+                where_seq=where_seq,
+                snapshot=snapshot,
+                fallback_event_count=fallback_event_count,
             )
-            target_cutoff = float(target_cutoff)
-            if not np.isfinite(target_cutoff) or target_cutoff < 0.0:
+
+        if self.mode == "svd" or self._is_mpo_mode(self.mode):
+            return self._run_compression_replay(
+                G_seq, where_seq, snapshot=snapshot,
+                progbar=progbar, cutoff=cutoff, cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples, finite_check=fit_finite_check,
+                fit_target_strategy=fit_target_strategy,
+                mpo_method_override=mpo_method_override,
+                compression_seed=compression_seed, compression_opts=compression_opts,
+            )
+
+        supported = ", ".join(sorted(self._ALLOWED_MODES))
+        raise ValueError(f"Unknown mode: {self.mode}. Supported modes: {supported}")
+
+    def _run_dmrg_replay(
+        self,
+        *,
+        n_iter,
+        progbar,
+        cutoff,
+        cutoff_mode,
+        fidelity_samples,
+        k_2q_batch,
+        fit_block_size,
+        fit_sweep_sequence,
+        fit_max_span,
+        fit_three_site_sweeps,
+        fit_adaptive_sweeps,
+        fit_single_pair_fast_path,
+        target_cutoff,
+        fit_min_iter,
+        fit_rtol,
+        fit_patience,
+        fit_finite_check,
+        timing,
+        timing_sync_device,
+        fit_collect_split_diagnostics,
+        fit_target_strategy,
+        fit_mpo_guess,
+        fit_mpo_guess_order,
+        fit_init_strategy,
+        fit_init_rand_strength,
+        fit_init_seed,
+        fit_overlap_diagnostics,
+        transactional_steps,
+        fit_fallback,
+        G_seq,
+        where_seq,
+        snapshot,
+        fallback_event_count,
+    ):
+        """Run prepared FIT replay, preserving failed records and fallback state.
+
+        The caller captures the snapshot before schedule validation, matching
+        the public run status and timing contract. All numerical work dispatches
+        through the live optimizer so subclass hooks remain active.
+        """
+        dmrg_alias = self._dmrg_mode_alias
+        if dmrg_alias is not None:
+            # Named modes are readable schedule aliases, not separate
+            # compression backends. Their block size is authoritative;
+            # callers tune the warm-up length with fit_adaptive_sweeps.
+            fit_block_size = self._dmrg_alias_block_size(dmrg_alias)
+        if not isinstance(fit_block_size, Integral) or int(fit_block_size) not in {
+            1,
+            2,
+            3,
+        }:
+            raise ValueError("fit_block_size must be 1, 2, or 3.")
+        if (
+            not isinstance(fit_three_site_sweeps, Integral)
+            or int(fit_three_site_sweeps) < 1
+        ):
+            raise ValueError("fit_three_site_sweeps must be a positive integer.")
+        if (
+            dmrg_alias is None
+            and int(fit_block_size) != 3
+            and int(fit_three_site_sweeps) != 1
+        ):
+            raise ValueError(
+                "fit_three_site_sweeps is only configurable when "
+                "fit_block_size=3."
+            )
+        if dmrg_alias is not None:
+            if (
+                not isinstance(n_iter, Integral)
+                or int(n_iter) < 1
+            ):
+                raise ValueError("n_iter must be a positive integer.")
+            if (
+                not isinstance(fit_adaptive_sweeps, Integral)
+                or int(fit_adaptive_sweeps) < 1
+            ):
                 raise ValueError(
-                    "target_cutoff must be a finite non-negative number."
+                    "fit_adaptive_sweeps must be a positive integer."
                 )
-            # Native Symmray FIT uses block-aware target construction and
-            # native SVD splits. It must not take Quimb's eager bond-padding
-            # route, but it otherwise follows the same variational DMRG path
-            # as dense MPOs. ``mode='mpo'`` remains the direct SVD path.
-            try:
-                self._timed_call(
-                    "dmrg.prepare",
-                    self._prepare_dmrg_state,
-                    fit_block_size=fit_block_size,
-                )
-                self._timed_call(
-                    "dmrg.replay",
-                    self._run_dmrg,
-                    G_seq,
-                    where_seq,
-                    n_iter=n_iter,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    k_2q_batch=k_2q_batch,
-                    fidelity_samples=fidelity_samples,
-                    fit_block_size=fit_block_size,
-                    fit_sweep_sequence=fit_sweep_sequence,
-                    fit_max_span=fit_max_span,
-                    fit_three_site_sweeps=int(fit_three_site_sweeps),
-                    target_cutoff=target_cutoff,
-                    adaptive_block_sweeps=adaptive_block_sweeps,
-                    adaptive_until_rank=adaptive_until_rank,
-                    single_pair_fast_path=single_pair_fast_path,
-                    fit_min_iter=None if fit_min_iter is None else int(fit_min_iter),
-                    fit_rtol=fit_rtol,
-                    fit_patience=int(fit_patience),
-                    finite_check=fit_finite_check,
-                    timing=timing,
-                    timing_sync_device=timing_sync_device,
-                    collect_split_diagnostics=bool(fit_collect_split_diagnostics),
-                    fit_target_strategy=fit_target_strategy,
-                    fit_mpo_guess=fit_mpo_guess,
-                    fit_mpo_guess_order=fit_mpo_guess_order,
-                    fit_init_strategy=fit_init_strategy,
-                    fit_init_rand_strength=fit_init_rand_strength,
-                    fit_init_seed=fit_init_seed,
-                    fit_overlap_diagnostics=fit_overlap_diagnostics,
-                    transactional_steps=transactional_steps,
-                    fit_fallback=fit_fallback,
-                )
-            except Exception as exc:
-                self.last_run_status = "failed"
-                self.last_run_error = f"{type(exc).__name__}: {exc}"
-                failed_fit_records = []
-                if snapshot is not None:
-                    failed_fit_records = deepcopy(
-                        [
-                            record
-                            for record in self.fit_diagnostics[
-                                len(snapshot["fit_diagnostics"]):
-                            ]
-                            if record.get("convergence_reason") == "failed"
+            adaptive_block_sweeps = min(
+                2 if dmrg_alias == "dmrg1" else int(fit_adaptive_sweeps),
+                int(n_iter),
+            ) if int(n_iter) >= 2 else None
+            adaptive_until_rank = False
+            # ``fit_three_site_sweeps`` is the legacy generic-DMRG
+            # spelling. Named modes use the common adaptive schedule.
+            fit_three_site_sweeps = 1
+            single_pair_fast_path = bool(fit_single_pair_fast_path)
+        else:
+            # Match the generic MPS DMRG policy: block FIT first grows
+            # attainable bond spaces, then hands the remaining sweep
+            # budget to one-site refinement. Long-range windows opt out
+            # of the rank-until-ready phase below because their terminal
+            # canonical handoff is fixed by the active span.
+            adaptive_block_sweeps = (
+                min(int(fit_adaptive_sweeps), int(n_iter))
+                if int(fit_block_size) in {2, 3} and int(n_iter) >= 2
+                else None
+            )
+            adaptive_until_rank = (
+                int(fit_block_size) in {2, 3}
+                and int(n_iter) >= 2
+            )
+            single_pair_fast_path = bool(fit_single_pair_fast_path)
+        fit_max_span = self._resolve_fit_max_span(
+            fit_max_span,
+            k_2q_batch,
+        )
+        target_cutoff = float(target_cutoff)
+        if not np.isfinite(target_cutoff) or target_cutoff < 0.0:
+            raise ValueError(
+                "target_cutoff must be a finite non-negative number."
+            )
+        # Native Symmray FIT uses block-aware target construction and
+        # native SVD splits. It must not take Quimb's eager bond-padding
+        # route, but it otherwise follows the same variational DMRG path
+        # as dense MPOs. ``mode='mpo'`` remains the direct SVD path.
+        try:
+            self._timed_call(
+                "dmrg.prepare",
+                self._prepare_dmrg_state,
+                fit_block_size=fit_block_size,
+            )
+            self._timed_call(
+                "dmrg.replay",
+                self._run_dmrg,
+                G_seq,
+                where_seq,
+                n_iter=n_iter,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                k_2q_batch=k_2q_batch,
+                fidelity_samples=fidelity_samples,
+                fit_block_size=fit_block_size,
+                fit_sweep_sequence=fit_sweep_sequence,
+                fit_max_span=fit_max_span,
+                fit_three_site_sweeps=int(fit_three_site_sweeps),
+                target_cutoff=target_cutoff,
+                adaptive_block_sweeps=adaptive_block_sweeps,
+                adaptive_until_rank=adaptive_until_rank,
+                single_pair_fast_path=single_pair_fast_path,
+                fit_min_iter=None if fit_min_iter is None else int(fit_min_iter),
+                fit_rtol=fit_rtol,
+                fit_patience=int(fit_patience),
+                finite_check=fit_finite_check,
+                timing=timing,
+                timing_sync_device=timing_sync_device,
+                collect_split_diagnostics=bool(fit_collect_split_diagnostics),
+                fit_target_strategy=fit_target_strategy,
+                fit_mpo_guess=fit_mpo_guess,
+                fit_mpo_guess_order=fit_mpo_guess_order,
+                fit_init_strategy=fit_init_strategy,
+                fit_init_rand_strength=fit_init_rand_strength,
+                fit_init_seed=fit_init_seed,
+                fit_overlap_diagnostics=fit_overlap_diagnostics,
+                transactional_steps=transactional_steps,
+                fit_fallback=fit_fallback,
+            )
+        except Exception as exc:
+            self.last_run_status = "failed"
+            self.last_run_error = f"{type(exc).__name__}: {exc}"
+            failed_fit_records = []
+            if snapshot is not None:
+                failed_fit_records = deepcopy(
+                    [
+                        record
+                        for record in self.fit_diagnostics[
+                            len(snapshot["fit_diagnostics"]):
                         ]
-                    )
-                if fit_fallback is not None:
-                    if snapshot is None:
-                        self._finish_run_timing("failed")
-                        raise RuntimeError(
-                            "fit_fallback requires atomic replay state."
-                        ) from exc
-                    self._restore_run_state(snapshot)
-                    self.fit_diagnostics.extend(failed_fit_records)
-                    if failed_fit_records:
-                        self._last_dmrg_fit_diagnostics = failed_fit_records[-1]
-                    self.last_run_fallback = fit_fallback
-                    try:
-                        direct_runner = self._run_mpo if (
-                            fit_fallback == "mpo"
-                            and not self._has_symmray_data(self.p)
-                        ) else self._run_svd
-                        self._timed_call(
-                            "fallback.replay",
-                            direct_runner,
-                            G_seq,
-                            where_seq,
-                            progbar=progbar,
-                            cutoff=cutoff,
-                            cutoff_mode=cutoff_mode,
-                            fidelity_samples=fidelity_samples,
-                            finite_check=fit_finite_check,
-                        )
-                    except Exception:
-                        self._restore_run_state(snapshot)
-                        self._finish_run_timing("failed")
-                        raise
-                    self.fallback_events.append(
-                        {
-                            "kind": "run_fallback",
-                            "backend": fit_fallback,
-                            "step": None,
-                        }
-                    )
-                    self.last_run_status = "fallback"
-                else:
-                    if snapshot is not None:
-                        self._restore_run_state(snapshot)
-                        self.fit_diagnostics.extend(failed_fit_records)
-                        if failed_fit_records:
-                            self._last_dmrg_fit_diagnostics = failed_fit_records[-1]
+                        if record.get("convergence_reason") == "failed"
+                    ]
+                )
+            if fit_fallback is not None:
+                if snapshot is None:
                     self._finish_run_timing("failed")
-                    raise
-            if self.last_run_status == "running":
-                self.last_run_status = (
-                    "fallback"
-                    if len(self.fallback_events) > fallback_event_count
-                    else "complete"
-                )
-            self._finish_run_timing(self.last_run_status)
-            return self.p
-
-        if self.mode == "svd":
-            try:
-                self._timed_call(
-                    "svd.replay",
-                    self._run_svd,
-                    G_seq,
-                    where_seq,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    fidelity_samples=fidelity_samples,
-                    finite_check=fit_finite_check,
-                    fit_target_strategy=fit_target_strategy,
-                )
-            except Exception as exc:
-                self.last_run_status = "failed"
-                self.last_run_error = f"{type(exc).__name__}: {exc}"
-                if snapshot is not None:
-                    self._restore_run_state(snapshot)
-                self._finish_run_timing("failed")
-                raise
-            self.last_run_status = "complete"
-            self._finish_run_timing(self.last_run_status)
-            return self.p
-
-        if self._is_mpo_mode(self.mode):
-            # ``gate_nonlocal_opt`` creates a dense auxiliary sub-MPO and its
-            # generic compression currently loses multi-sector Symmray bond
-            # metadata. Reuse the block-aware local SVD route for these MPOs.
-            if self._has_symmray_data(self.p):
+                    raise RuntimeError(
+                        "fit_fallback requires atomic replay state."
+                    ) from exc
+                self._restore_run_state(snapshot)
+                self.fit_diagnostics.extend(failed_fit_records)
+                if failed_fit_records:
+                    self._last_dmrg_fit_diagnostics = failed_fit_records[-1]
+                self.last_run_fallback = fit_fallback
                 try:
+                    direct_runner = self._run_mpo if (
+                        fit_fallback == "mpo"
+                        and not self._has_symmray_data(self.p)
+                    ) else self._run_svd
                     self._timed_call(
-                        "svd.replay",
-                        self._run_svd,
+                        "fallback.replay",
+                        direct_runner,
                         G_seq,
                         where_seq,
                         progbar=progbar,
@@ -4821,51 +4926,79 @@ class MpoOptimizer:
                         cutoff_mode=cutoff_mode,
                         fidelity_samples=fidelity_samples,
                         finite_check=fit_finite_check,
-                        fit_target_strategy=fit_target_strategy,
                     )
-                except Exception as exc:
-                    self.last_run_status = "failed"
-                    self.last_run_error = f"{type(exc).__name__}: {exc}"
-                    if snapshot is not None:
-                        self._restore_run_state(snapshot)
+                except Exception:
+                    self._restore_run_state(snapshot)
                     self._finish_run_timing("failed")
                     raise
-                self.last_run_status = "complete"
-                self._finish_run_timing(self.last_run_status)
-                return self.p
-            try:
-                self._timed_call(
-                    f"{mpo_method_override or self._mode_mpo_method(self.mode)}.replay",
-                    self._run_mpo,
-                    G_seq,
-                    where_seq,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    fidelity_samples=fidelity_samples,
-                    finite_check=fit_finite_check,
-                    fit_target_strategy=fit_target_strategy,
+                self.fallback_events.append(
+                    {
+                        "kind": "run_fallback",
+                        "backend": fit_fallback,
+                        "step": None,
+                    }
+                )
+                self.last_run_status = "fallback"
+            else:
+                if snapshot is not None:
+                    self._restore_run_state(snapshot)
+                    self.fit_diagnostics.extend(failed_fit_records)
+                    if failed_fit_records:
+                        self._last_dmrg_fit_diagnostics = failed_fit_records[-1]
+                self._finish_run_timing("failed")
+                raise
+        if self.last_run_status == "running":
+            self.last_run_status = (
+                "fallback"
+                if len(self.fallback_events) > fallback_event_count
+                else "complete"
+            )
+        self._finish_run_timing(self.last_run_status)
+        return self.p
+
+    def _run_compression_replay(
+        self, G_seq, where_seq, *, snapshot, progbar, cutoff, cutoff_mode,
+        fidelity_samples, finite_check, fit_target_strategy,
+        mpo_method_override, compression_seed, compression_opts,
+    ):
+        """Execute direct/SVD replay with one success and rollback boundary."""
+        # Generic layer compression loses native charge-sector metadata.
+        # Native MPOs therefore use the same block-aware route as SVD mode.
+        use_svd = self.mode == "svd" or self._has_symmray_data(self.p)
+        try:
+            replay_options = dict(
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples,
+                finite_check=finite_check,
+                fit_target_strategy=fit_target_strategy,
+            )
+            if use_svd:
+                stage = "svd.replay"
+                runner = self._run_svd
+            else:
+                stage = f"{mpo_method_override or self._mode_mpo_method(self.mode)}.replay"
+                runner = self._run_mpo
+                replay_options.update(
                     method=(
-                        mpo_method_override
-                        if mpo_method_override is not None
+                        mpo_method_override if mpo_method_override is not None
                         else self._mode_mpo_method(self.mode)
                     ),
                     compression_seed=compression_seed,
                     compression_opts=compression_opts,
                 )
-            except Exception as exc:
-                self.last_run_status = "failed"
-                self.last_run_error = f"{type(exc).__name__}: {exc}"
-                if snapshot is not None:
-                    self._restore_run_state(snapshot)
-                self._finish_run_timing("failed")
-                raise
-            self.last_run_status = "complete"
-            self._finish_run_timing(self.last_run_status)
-            return self.p
-
-        supported = ", ".join(sorted(self._ALLOWED_MODES))
-        raise ValueError(f"Unknown mode: {self.mode}. Supported modes: {supported}")
+            self._timed_call(stage, runner, G_seq, where_seq, **replay_options)
+        except Exception as exc:
+            self.last_run_status = "failed"
+            self.last_run_error = f"{type(exc).__name__}: {exc}"
+            if snapshot is not None:
+                self._restore_run_state(snapshot)
+            self._finish_run_timing("failed")
+            raise
+        self.last_run_status = "complete"
+        self._finish_run_timing(self.last_run_status)
+        return self.p
 
     def canonize_mpo(self, p, where):
         """Update canonical form around a one- or two-site gate span.

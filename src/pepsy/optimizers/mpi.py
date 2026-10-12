@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from numbers import Integral
 import hashlib
+import io
 import os
 from pathlib import Path
 import pickle
@@ -22,6 +23,7 @@ import traceback
 from typing import Any, Callable, Mapping
 
 import numpy as np
+import autoray as ar
 
 from .noise import (
     NoisyResult,
@@ -230,6 +232,20 @@ def _validate_bool(value, name):
     return value
 
 
+class _ConfigurationPickler(pickle.Pickler):
+    """Hash backend arrays by contents, including inside plans/dataclasses.
+
+    Ordinary NumPy/Python payloads keep their previous serialization. Device
+    ordinals and Torch storage IDs are process local, not circuit identity.
+    This host transfer occurs once at runner construction, outside replay.
+    """
+
+    def persistent_id(self, obj):
+        if hasattr(obj, "shape") and ar.infer_backend(obj) in {"torch", "cupy", "jax"}:
+            return ("backend-array", _fingerprint_value(ar.to_numpy(obj)))
+        return None
+
+
 def _fingerprint_value(value):
     """Return a stable, compact description for run-configuration hashing."""
     if callable(value):
@@ -276,7 +292,9 @@ def _fingerprint_value(value):
     if isinstance(value, (str, bytes, int, float, bool, type(None))):
         return value
     try:
-        payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        buffer = io.BytesIO()
+        _ConfigurationPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(value)
+        payload = buffer.getvalue()
     except Exception:
         return ("object", type(value).__module__, type(value).__qualname__)
     return (

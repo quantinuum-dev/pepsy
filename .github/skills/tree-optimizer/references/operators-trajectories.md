@@ -120,9 +120,13 @@ for trajectory simulation without forming a density matrix:
 
 - Independent replay samples random-unitary mixtures, Pauli/depolarizing
   channels, and state-dependent Kraus channels. For a Kraus event, the runner
-  applies each branch to a copied TTN, obtains its squared norm, samples the
-  conditional probability, then applies and normalizes the selected branch on
-  the live TTN.
+  evaluates exact local `K†K` expectations on a private TTN wrapper, samples
+  the conditional probability, then applies and normalizes the selected
+  branch on the live TTN. Do not replay compressed or stabilized trial
+  branches to obtain Born weights. Common state exponents cancel, and
+  selected positive branches normalize with `eps=0`, including rare outcomes
+  reached through importance sampling. Preserve the live center, tensor
+  data/proofs, histories and RNG during probability evaluation.
 - Coalesced replay shares deterministic prefixes and branches exact
   mid-circuit `measure`, `reset`, and `measure_reset` events. Tree measurement
   probabilities come from the paired `_measurement_probabilities` protocol,

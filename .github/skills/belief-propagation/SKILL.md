@@ -11,6 +11,11 @@ clusters, and partitioned network expansions (PNE). Keep BP wrappers **thin**
 over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
 [`docs/development/references/belief_propagation.md`](../../../docs/development/references/belief_propagation.md).
 
+`bp/_series_geometry.py` owns loop terms, bounded graph enumeration, and
+corridor discovery. `bp/series.py` retains BP solves, cache orchestration,
+route selection, projectors, contractions, and historical geometry imports.
+Geometry extraction must not change edge-degree limits or native graded routes.
+
 ## When to use
 - Run / wrap / extend BP contraction of a quimb `TensorNetwork` in pepsy.
 - Add or debug a **loop / cluster / generalized** correction to BP.

@@ -16,6 +16,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from .._internal.cutoff import dtype_auto_cutoff
 from .._internal.quimb import (
     quimb_mpo_auto_swap_function,
     require_quimb_gate_option,
@@ -1728,6 +1729,26 @@ def _normalize_gate_entries(
     )
 
 
+def _resolve_gate_cutoff(tn, cutoff):
+    """Resolve policy at the public boundary without converting tensor data."""
+    if isinstance(cutoff, str) and cutoff.strip().lower() == "auto":
+        sample = resolve_backend_sample_data_from_tn(tn)
+        return dtype_auto_cutoff(getattr(sample, "dtype", "complex128"))
+    try:
+        cutoff = float(cutoff)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cutoff must be 'auto' or a non-negative number.") from exc
+    if not np.isfinite(cutoff) or cutoff < 0:
+        raise ValueError("cutoff must be 'auto' or a non-negative number.")
+    return cutoff
+
+
+def _resolve_gate_cutoff_mode(mode):
+    if mode is None or (isinstance(mode, str) and mode.strip().lower() == "auto"):
+        return "rsum2"
+    return mode
+
+
 def gate(tn, gates, where=None, which=None, dagger=False, transpose=False, **kwargs):
     """Apply one or many gates with automatic 1D/2D/3D dispatch.
 
@@ -1759,6 +1780,12 @@ def gate(tn, gates, where=None, which=None, dagger=False, transpose=False, **kwa
         route-local controls ``path_canonize`` / ``path_compress``. Use
         ``max_bond`` for the per-SWAP/per-gate local split truncation;
         ``chi`` is a final whole-network compression pass after the stream.
+        ``cutoff="auto"`` (default) uses the input network dtype: 1e-12 for
+        float64/complex128, 1e-6 for float32/complex64, and 1e-3 for 16-bit
+        data. ``cutoff_mode="auto"`` (default) resolves to ``"rsum2"``.
+        Explicit numeric cutoffs override the dtype policy. ``chi_cutoff``
+        also defaults to ``"auto"``; ``path_compress_cutoff=None`` inherits
+        the resolved gate cutoff, while ``"auto"`` uses the dtype policy.
 
     Returns
     -------
@@ -1811,10 +1838,13 @@ def gate(tn, gates, where=None, which=None, dagger=False, transpose=False, **kwa
         opts["dagger"] = True
     if transpose:
         opts["transpose"] = True
-    opts.setdefault("cutoff_mode", "rsum2")
+    opts["cutoff"] = _resolve_gate_cutoff(tn, opts.get("cutoff", "auto"))
+    opts["cutoff_mode"] = _resolve_gate_cutoff_mode(opts.get("cutoff_mode", "auto"))
+    if opts.get("path_compress_cutoff") is not None:
+        opts["path_compress_cutoff"] = _resolve_gate_cutoff(tn, opts["path_compress_cutoff"])
     inplace = opts.pop("inplace", True)
     chi = opts.pop("chi", None)
-    chi_cutoff = float(opts.pop("chi_cutoff", 1.0e-12))
+    chi_cutoff = _resolve_gate_cutoff(tn, opts.pop("chi_cutoff", "auto"))
     which_default = _normalize_gate_which(which)
     if "gauges" in opts or "renorm" in opts or "smudge" in opts:
         raise TypeError(
@@ -1938,10 +1968,11 @@ def gate_simple(
     which=None,
     ind_id=None,
     renorm=True,
+    strip_exponent=False,
     smudge=1e-12,
     max_bond=None,
-    cutoff=1e-12,
-    cutoff_mode="rsum2",
+    cutoff="auto",
+    cutoff_mode="auto",
     strict_max_bond: bool = False,
     dagger=False,
     transpose=False,
@@ -1974,6 +2005,7 @@ def gate_simple(
     * Dimension-aware, backend-aligned internal SWAP tensors for long-range
       routing through mixed physical dimensions.
     * Optional out-of-place semantics via ``inplace=False``.
+    * Scale-preserving gauge normalization with ``strip_exponent=True``.
 
     The ``gauges`` dictionary is mutated in place by ``gate_simple_`` and is
     the single source of truth for the simple-update bond environment.
@@ -2002,16 +2034,26 @@ def gate_simple(
     renorm : bool, optional
         Whether to renormalize the singular values after the gate. Default True.
         Ignored for one-site gates.
+    strip_exponent : bool, optional
+        Normalize bond gauges to unit RMS while accumulating the removed
+        scale in ``tn.exponent`` (base 10). Requires ``renorm=False`` so no
+        physical scale is discarded. Applies after every two-site update,
+        including routed SWAPs. Existing internal gauges are scaled before
+        the stream. Defaults to False. Nonzero cutoffs must be relative
+        (``rel``, ``rsum1``, or ``rsum2``), since scalar gauge changes alter
+        absolute singular-value thresholds.
     smudge : float, optional
         Small numerical-safety value. Default 1e-12.
     max_bond : int or None, optional
         Maximum bond dimension for each local SWAP/gate simple-update split.
         Default None.
-    cutoff : float, optional
-        Truncation cutoff. Default 1e-12.
-    cutoff_mode : str, optional
+    cutoff : float or {"auto"}, optional
+        Truncation cutoff. Default ``"auto"`` follows the input network dtype:
+        1e-12 for float64/complex128, 1e-6 for float32/complex64, and 1e-3
+        for 16-bit data. Explicit nonnegative numbers override this policy.
+    cutoff_mode : str or {"auto"}, optional
         Cutoff mode passed to ``gate_simple_`` (e.g. ``'rsum2'``, ``'rel'``).
-        Default ``'rsum2'``.
+        Default ``"auto"`` resolves to ``"rsum2"``.
     strict_max_bond : bool, optional
         Enforce ``max_bond`` as a hard *total* block-sparse bond limit even
         when a nonzero cutoff has degenerate singular values at its boundary.
@@ -2048,6 +2090,17 @@ def gate_simple(
         where = None
     if gauges is None:
         raise TypeError("gate_simple() requires a gauges dictionary.")
+    cutoff = _resolve_gate_cutoff(tn, cutoff)
+    cutoff_mode = _resolve_gate_cutoff_mode(cutoff_mode)
+    if path_compress_cutoff is not None:
+        path_compress_cutoff = _resolve_gate_cutoff(tn, path_compress_cutoff)
+    if strip_exponent:
+        if renorm:
+            raise ValueError("strip_exponent=True requires renorm=False to preserve physical scale")
+        if not hasattr(tn, "exponent"):
+            raise TypeError("strip_exponent=True requires tensor-network exponent support")
+        if cutoff and cutoff_mode not in ("rel", "rsum1", "rsum2", 2, 4, 6):
+            raise ValueError("strip_exponent=True requires a relative cutoff or cutoff=0")
     if dagger:
         require_quimb_gate_option("dagger", simple=True)
     if transpose:
@@ -2057,6 +2110,10 @@ def gate_simple(
     entries = _normalize_gate_entries(
         G, where=where, allow_empty=True, allow_which=True
     )
+    if strip_exponent and entries:
+        for index in tuple(gauges):
+            if len(tn_work.ind_map.get(index, ())) == 2:
+                _renorm_gauge_index(tn_work, gauges, index, smudge=0.0)
     which_default = _normalize_gate_which(which)
 
     gate_opts_base = {
@@ -2142,6 +2199,7 @@ def gate_simple(
                     where_norm,
                     gauges,
                     renorm=renorm,
+                    strip_exponent=strip_exponent,
                     smudge=smudge,
                     gate_opts=gate_opts,
                     ind_id=ind_id_one,
@@ -2418,6 +2476,7 @@ def _gate_simple_one(
     gauges,
     *,
     renorm,
+    strip_exponent,
     smudge,
     gate_opts,
     ind_id=None,
@@ -2463,6 +2522,7 @@ def _gate_simple_one(
             where,
             gauges,
             renorm=renorm,
+            strip_exponent=strip_exponent,
             smudge=smudge,
             gate_opts=gate_opts,
             sequence=sequence,
@@ -2482,6 +2542,45 @@ def _gate_simple_one(
             tn_work.site_ind_id = old_site_ind_id
 
 
+@contextmanager
+def _zero_safe_outer_gauges(tn, tags, gauges, smudge):
+    """Ungauge dense zero modes by their support projector, not 1 / 0.
+
+    Only external legs of this update are affected. The original weights
+    remain the physical representation; no small nonzero weight is clipped.
+    Derivatives at changes of the gauge support are not defined by this rule.
+    """
+    saved = []
+    try:
+        if smudge == 0 and gauges:
+            local = tn.select(tags, which="any")
+            for ix in local.outer_inds():
+                g = gauges.get(ix)
+                if g is None or hasattr(g, "blocks"):
+                    continue
+                one = ar.do("ones_like", g)
+                safe = ar.do("where", g == 0, one, g)
+                support = ar.do("where", g == 0, ar.do("zeros_like", g), one)
+                tensor = next(t for t in local.tensors if ix in t.inds)
+                saved.append((ix, g, tensor, support))
+                tensor.multiply_index_diagonal_(ix, support)
+                gauges[ix] = safe
+        yield
+    finally:
+        for ix, g, tensor, support in saved:
+            # A split can populate null coordinates by roundoff. Keep the
+            # Moore-Penrose inverse exactly zero on the excluded support.
+            tensor.multiply_index_diagonal_(ix, support)
+            gauges[ix] = g
+
+
+def _gate_simple_adjacent(tn, gate, *, where, gauges, smudge, **opts):
+    tags = tuple(tn.site_tag(site) for site in where)
+    with _zero_safe_outer_gauges(tn, tags, gauges, smudge):
+        return tn.gate_simple_(gate, where=where, gauges=gauges,
+                               smudge=smudge, **opts)
+
+
 def _gate_simple_one_with_current_site_ind_id(
     tn_work,
     G,
@@ -2489,6 +2588,7 @@ def _gate_simple_one_with_current_site_ind_id(
     gauges,
     *,
     renorm,
+    strip_exponent,
     smudge,
     gate_opts,
     sequence=None,
@@ -2551,12 +2651,14 @@ def _gate_simple_one_with_current_site_ind_id(
             path_canonize_distance=path_canonize_distance,
             path_canonize_opts=path_canonize_opts,
         )
-        tn_work.gate_simple_(
-            G, where=where, gauges=gauges,
+        _gate_simple_adjacent(
+            tn_work, G, where=where, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
             **transform_opts,
             **gate_opts,
         )
+        if strip_exponent:
+            renorm_gauge(tn_work, gauges, where, smudge=0.0)
         _maybe_compress_path(
             tn_work,
             path_pairs,
@@ -2630,19 +2732,23 @@ def _gate_simple_one_with_current_site_ind_id(
             dtype="complex128",
             inferred_converter=inferred_converter,
         )
-        tn_work.gate_simple_(
-            swap_gate, where=pair, gauges=gauges,
+        _gate_simple_adjacent(
+            tn_work, swap_gate, where=pair, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
             **gate_opts,
         )
+        if strip_exponent:
+            renorm_gauge(tn_work, gauges, pair, smudge=0.0)
 
     # Apply the actual gate on the final (now adjacent) pair.
-    tn_work.gate_simple_(
-        G, where=final, gauges=gauges,
+    _gate_simple_adjacent(
+        tn_work, G, where=final, gauges=gauges,
         renorm=renorm, smudge=smudge, inplace=True,
         **transform_opts,
         **gate_opts,
     )
+    if strip_exponent:
+        renorm_gauge(tn_work, gauges, final, smudge=0.0)
 
     # Reverse SWAPs.
     for pair in reversed(swaps):
@@ -2654,11 +2760,13 @@ def _gate_simple_one_with_current_site_ind_id(
             dtype="complex128",
             inferred_converter=inferred_converter,
         )
-        tn_work.gate_simple_(
-            swap_gate, where=pair, gauges=gauges,
+        _gate_simple_adjacent(
+            tn_work, swap_gate, where=pair, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
             **gate_opts,
         )
+        if strip_exponent:
+            renorm_gauge(tn_work, gauges, pair, smudge=0.0)
 
     _maybe_compress_path(
         tn_work,
@@ -2676,8 +2784,10 @@ def _gate_simple_one_with_current_site_ind_id(
 def renorm_gauge(tn, gauges, where, smudge=1e-12):
     """Renormalize the simple-update gauge on the bond between sites in *where*.
 
-    Divides the gauge vector by its RMS norm (with *smudge* for safety)
-    and accumulates the extracted scale into ``tn.exponent`` (if present).
+    Divides the gauge vector by a positive, detached RMS scale and accumulates
+    exactly that scale into ``tn.exponent`` (if present). The RMS is evaluated
+    relative to the largest magnitude to avoid squaring extreme weights.
+    An all-zero gauge uses scale one, preserving its reconstruction derivative.
 
     Works for 1D/2D/3D — finds the bond index between the two site tensors.
 
@@ -2691,8 +2801,11 @@ def renorm_gauge(tn, gauges, where, smudge=1e-12):
         Pair of site coordinates, e.g. ``(3, 4)`` for 1D,
         ``((0,1), (1,1))`` for 2D, ``((0,0,0), (0,0,1))`` for 3D.
     smudge : float
-        Small value for numerical safety.
+        Nonnegative finite floor for a nonzero RMS scale.
     """
+    smudge = float(smudge)
+    if not np.isfinite(smudge) or smudge < 0:
+        raise ValueError("smudge must be nonnegative and finite")
     site_a, site_b = where
     tag_a = tn.site_tag(site_a)
     tag_b = tn.site_tag(site_b)
@@ -2705,13 +2818,31 @@ def renorm_gauge(tn, gauges, where, smudge=1e-12):
             "(no shared bond)."
         )
     ix = next(iter(bond_ix_set))
+    _renorm_gauge_index(tn, gauges, ix, smudge)
+
+
+def _renorm_gauge_index(tn, gauges, ix, smudge):
+    """Extract one gauge's scalar without densifying blocks or detaching data."""
     s = gauges[ix]
-    norm_s = ar.do("sqrt", ar.do("mean", ar.do("abs", s) ** 2))
-    # Stop gradient on the scalar norm — only tensor data carries AD info.
-    norm_s = _stop_gradient(norm_s)
+    # SU singular values can be Symmray BlockVectors. Reduce their backend
+    # blocks directly: Symmray has no mean, and detaching its wrapper does not
+    # necessarily detach the Torch blocks it contains.
+    blocks = tuple(s.blocks.values()) if hasattr(s, "blocks") else (s,)
+    if not blocks:
+        return
+    magnitudes = tuple(ar.do("abs", _stop_gradient(block)) for block in blocks)
+    peak = ar.do("max", ar.do("stack", [ar.do("max", b) for b in magnitudes]))
+    peak_safe = ar.do("where", peak > 0, peak, peak * 0 + 1)
+    count = sum(ar.size(b) for b in magnitudes)
+    square_sum = sum(ar.do("sum", (b / peak_safe) ** 2) for b in magnitudes)
+    norm_s = peak * ar.do("sqrt", square_sum / count)
+    # A nonzero subnormal RMS can round to zero even after relative scaling.
+    norm_s = ar.do("where", norm_s > 0, norm_s, peak_safe)
+    scale = ar.do("where", norm_s > smudge, norm_s, norm_s * 0 + smudge)
+    scale = ar.do("where", peak > 0, scale, peak * 0 + 1)
     if hasattr(tn, "exponent"):
-        tn.exponent = tn.exponent + ar.do("log10", norm_s)
-    gauges[ix] = s / (norm_s + smudge)
+        tn.exponent = tn.exponent + ar.do("log10", scale)
+    gauges[ix] = s / scale
 
 
 def _apply_gate_2d(
@@ -2994,7 +3125,10 @@ def _apply_chi_compression(tn, *, chi=None, chi_cutoff=1.0e-12):
         raise ValueError("chi must be a positive integer when provided.")
 
     if hasattr(tn, "compress"):
-        tn.compress(form="left", max_bond=chi_value, cutoff=chi_cutoff)
+        opts = {"max_bond": chi_value, "cutoff": chi_cutoff}
+        if isinstance(tn, qtn.TensorNetwork1D):
+            opts["form"] = "left"
+        tn.compress(**opts)
     elif hasattr(tn, "compress_all_"):
         tn.compress_all_(max_bond=chi_value, cutoff=chi_cutoff)
 
@@ -3309,7 +3443,7 @@ def _native_gate_stream_info(gate_list, *, allow_charged=False):
 
 def _native_identity_mpo(length, info, *, max_bond, cutoff):
     """Build an identity MPO whose tensors use native fermionic sectors."""
-    from ..tensors.symmetric import (  # pylint: disable=import-outside-toplevel
+    from ._symmetric_mpo import (  # pylint: disable=import-outside-toplevel
         _assemble_symmray_mpo,
     )
 
@@ -3403,6 +3537,7 @@ def build_pepo_from_gates(
     ind_id="k{},{}",
     mapper=None,
     allow_charged=False,
+    cutoff_mode="rsum2",
 ):
     """Build a PEPO from gate-style input on top of a PEPO identity.
 
@@ -3438,7 +3573,7 @@ def build_pepo_from_gates(
         Gate contraction mode. The default uses quimb's reduced two-site split
         path, which is usually cheaper than ``"split"`` for PEPO/PEPS tensors.
     ind_id : str, default="k{},{}"
-        Physical index format used for PEPO ket-family indices.
+        Physical output index format. Gates act on this family in list order.
     mapper : OneDMap | None, optional
         Optional lattice-to-chain mapping used when native Symmray gates are
         supplied. PEPO conversion supports ``snake`` and
@@ -3446,6 +3581,8 @@ def build_pepo_from_gates(
     allow_charged : bool, default=False
         Allow native gates with nonzero operator charge. The returned PEPO
         then carries the accumulated charge of the sequential gate product.
+    cutoff_mode : str, default="rsum2"
+        Truncation policy used for gate splits and fallback compression.
 
     Returns
     -------
@@ -3512,16 +3649,11 @@ def build_pepo_from_gates(
             tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
 
     for gate_op, where_norm in zip(gate_list, where_list):
-        gate_use = (
-            gate_op
-            if native_info is not None
-            else _to_ket_gate_layout(gate_op, len(where_norm))
-        )
-
         gate(
-            pepo, gate_use, where_norm,
+            pepo, gate_op, where_norm,
             max_bond=max_bond, bra=False, contract=contract,
             tags=[], dtype=dtype, cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             sequence=sequence, cyclic=cyclic, Lx=Lx, Ly=Ly, ind_id=ind_id,
             inplace=True,
         )
@@ -3531,35 +3663,11 @@ def build_pepo_from_gates(
                 inplace=True,
                 max_bond=max_bond,
                 canonize_distance=4,
-                cutoff=1e-14,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
             )
 
     return pepo
-
-
-def _to_ket_gate_layout(gate, n_sites):
-    """Map input gate to ket-side index ordering used by PEPO/MPO builders."""
-    if n_sites == 1:
-        return ar.do("transpose", gate, (1, 0))
-
-    if n_sites == 2:
-        shape = getattr(gate, "shape", ())
-        if len(shape) == 2:
-            din, dout = shape
-            if int(din) != int(dout):
-                raise ValueError(
-                    "Two-site gate matrix must be square with shape (d**2, d**2)."
-                )
-            return ar.do("transpose", gate, (1, 0))
-
-        if len(shape) == 4:
-            return ar.do("transpose", gate, (2, 3, 0, 1))
-
-        raise ValueError(
-            "Two-site gate must have shape (d**2, d**2) or (d, d, d, d)."
-        )
-
-    raise ValueError("Each gate location must have one or two sites.")
 
 
 def build_mpo_from_gates(
@@ -3605,7 +3713,7 @@ def build_mpo_from_gates(
         Gate contraction mode. The default uses quimb's reduced two-site split
         path, which is usually cheaper than ``"split"`` for MPO tensors.
     ind_id : str, default="k{}"
-        Physical index format used for MPO ket-family indices.
+        Physical output index format. Gates act on this family in list order.
     allow_charged : bool, default=False
         Allow native gates with nonzero operator charge. The returned MPO
         then carries the accumulated charge of the sequential gate product.
@@ -3650,15 +3758,9 @@ def build_mpo_from_gates(
             tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
 
     for gate_op, where_norm in zip(gate_list, where_list):
-        gate_use = (
-            gate_op
-            if native_info is not None
-            else _to_ket_gate_layout(gate_op, len(where_norm))
-        )
-
         gate(
             mpo,
-            gate_use,
+            gate_op,
             where_norm,
             ind_id=ind_id,
             cutoff=cutoff,
@@ -3904,6 +4006,7 @@ def gate_with_submpo(
     inplace_mpo=True,
     ind_id_k="k{}",
     ind_id_b="b{}",
+    mpo_factorization="qr",
     **compress_opts,
 ):
     """Apply a sub-MPO to the upper (ket) or lower (bra) layer of an MPS/MPO.
@@ -3934,7 +4037,13 @@ def gate_with_submpo(
     inplace : bool, default=False
         Whether to modify ``p`` in place.
     inplace_mpo : bool, default=True
-        Whether to modify ``submpo`` in place during absorption.
+        Whether the applied sub-MPO may be reused without a defensive copy.
+        This does not control whether the operator is applied. The target's
+        mutation is controlled solely by ``inplace``.
+    mpo_factorization : {"qr", "projector"}, default="qr"
+        Projector mode uses paired-factor derivatives throughout dense direct
+        replay. It removes numerical nulls and requires a locally fixed rank
+        and resolved kept/discarded gap. Other backends/methods are rejected.
     ind_id_k : str, default="k{}"
         Format string for ket-family physical index names.
     ind_id_b : str, default="b{}"
@@ -3951,19 +4060,35 @@ def gate_with_submpo(
     if which_norm not in ("upper", "lower"):
         raise ValueError("which must be 'upper' or 'lower' (case-insensitive).")
 
+    if mpo_factorization not in {"qr", "projector"}:
+        raise ValueError("mpo_factorization must be 'qr' or 'projector'")
+    split_method = None
+    if mpo_factorization == "projector":
+        from ._mpo_factorization import (
+            canonicalize_projector, compression_options, projector_method,
+        )
+
+        split_method = projector_method(p, method)
+        compress_opts = compression_options(compress_opts, split_method)
+
     p = p if inplace else p.copy()
     si, sf = min(where), max(where)
 
     # make the region canonical
-    p.canonicalize_((si, sf), info=info)
+    if split_method is None:
+        p.canonicalize_((si, sf), info=info)
+    else:
+        canonicalize_projector(p, (si, sf), info, split_method)
 
-    # lazily absorb the sub-MPO into the selected layer
+    # Quimb's lazy method's inplace flag refers to the target, not submpo.
+    # Always absorb into our already selected working target.
+    submpo_work = submpo if inplace_mpo else submpo.copy()
     if which_norm == "upper":
-        p.gate_upper_with_op_lazy_(submpo, transpose=transpose, inplace=inplace_mpo)
+        p.gate_upper_with_op_lazy_(submpo_work, transpose=transpose)
         ind_id = ind_id_k
         other_prefix = ind_id_b.replace("{}", "").rstrip("{}")
     else:
-        p.gate_lower_with_op_lazy_(submpo, transpose=transpose, inplace=inplace_mpo)
+        p.gate_lower_with_op_lazy_(submpo_work, transpose=transpose)
         ind_id = ind_id_b
         other_prefix = ind_id_k.replace("{}", "").rstrip("{}")
 
@@ -4087,6 +4212,7 @@ def gate_nonlocal_opt(
     inplace=False,
     ind_id_k="k{}",
     ind_id_b="b{}",
+    mpo_factorization="qr",
     **compress_opts,
 ):
     """Apply a nonlocal gate (dense operator) to an MPO layer via sub-MPO compression.
@@ -4126,6 +4252,10 @@ def gate_nonlocal_opt(
     **compress_opts :
         Additional options forwarded to ``tensor_network_1d_compress``
         (e.g. ``max_bond``, ``cutoff``, ``cutoff_mode``).
+    mpo_factorization : {"qr", "projector"}, default="qr"
+        Use paired factors in gate construction, canonicalization and direct
+        compression. Projector mode has the same derivative-chart limits as
+        :func:`gate_with_submpo` and does not change global QR/SVD drivers.
 
     Returns
     -------
@@ -4134,7 +4264,14 @@ def gate_nonlocal_opt(
     """
     if dims is None:
         dims = tuple(p.phys_dim(i) for i in where)
-    submpo = qtn.MatrixProductOperator.from_dense(G, dims=dims, sites=where, L=p.L)
+    split_opts = {}
+    if mpo_factorization == "projector":
+        from ._mpo_factorization import projector_method
+
+        split_opts = {"method": projector_method(p, method), "cutoff": 0.0}
+    elif mpo_factorization != "qr":
+        raise ValueError("mpo_factorization must be 'qr' or 'projector'")
+    submpo = qtn.MatrixProductOperator.from_dense(G, dims=dims, sites=where, L=p.L, **split_opts)
     return gate_with_submpo(
         p,
         submpo,
@@ -4147,5 +4284,6 @@ def gate_nonlocal_opt(
         inplace_mpo=True,
         ind_id_k=ind_id_k,
         ind_id_b=ind_id_b,
+        mpo_factorization=mpo_factorization,
         **compress_opts,
     )

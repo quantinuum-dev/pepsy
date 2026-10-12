@@ -66,11 +66,14 @@ class TorchLinalgConfig:
         for native SVD and ``"scipy_gesvd"`` for stabilized SVD.
     allow_approximate : bool, default=False
         Safety acknowledgement required for CUDA's approximate ``gesvda``.
-    qr_rank_policy : {"warn", "native", "error"}, default="warn"
+    qr_rank_policy : {"warn", "native", "adaptive", "error"}, default="warn"
         Rank-deficiency response for stabilized QR VJPs. ``"warn"`` reports
         the condition and uses the finite regularized rule, ``"native"``
         accepts Torch's native fallback silently, and ``"error"`` stops the
-        optimization.
+        optimization. ``"adaptive"`` preserves finite native VJPs and uses
+        a warned regularized fallback for exactly singular pivots or
+        nonfinite native results.
+        The policy is captured during the forward pass.
     qr_rank_tol_factor : float, default=1.0
         Scale-relative multiplier used by the stabilized real QR rule.
     quimb_split_drivers : bool, default=False
@@ -132,8 +135,8 @@ class TorchLinalgConfig:
                 "svd_driver='gesvda' is approximate; pass "
                 "allow_approximate=True to enable it explicitly."
             )
-        if self.qr_rank_policy not in {"warn", "native", "error"}:
-            raise ValueError("qr_rank_policy must be one of: warn, native, error")
+        if self.qr_rank_policy not in {"warn", "native", "adaptive", "error"}:
+            raise ValueError("qr_rank_policy must be one of: warn, native, adaptive, error")
         try:
             qr_factor = float(self.qr_rank_tol_factor)
         except (TypeError, ValueError) as exc:
@@ -339,6 +342,10 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
     ``requires_grad=False`` (the default); NumPy and other inputs remain
     ordinary non-trainable tensors. Set ``requires_grad=True`` to create or
     re-leaf converted inputs explicitly.
+
+    Read-only NumPy inputs are copied before conversion so the returned
+    tensor can be written safely. Writable NumPy inputs may share storage
+    when the requested device and dtype permit it.
     """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
@@ -376,6 +383,10 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
                 out = out.to(device=device, dtype=dtype)
 
         else:
+            # Torch cannot enforce NumPy's read-only flag on shared storage.
+            # Own a writable copy before exposing that memory as a tensor.
+            if isinstance(x, np.ndarray) and not x.flags.writeable:
+                x = x.copy()
             if dtype is None:
                 out = torch.as_tensor(x, device=device)
             else:
@@ -672,7 +683,7 @@ def register_torch_linalg(
         ``"scipy_gesvd"`` for stabilized SVD.
     allow_approximate : bool, default=False
         Explicitly acknowledge the accuracy tradeoff of ``svd_driver="gesvda"``.
-    qr_rank_policy : {"warn", "native", "error"}, default="warn"
+    qr_rank_policy : {"warn", "native", "adaptive", "error"}, default="warn"
         Response to rank-deficient inputs when stabilized QR is active.
     qr_rank_tol_factor : float, default=1.0
         Multiplier for the scale-aware real-QR rank threshold.
@@ -700,15 +711,21 @@ def register_torch_linalg(
     return config.register()
 
 
-def register_jax_linalg(*, stabilized=False):
-    """Register native or truncation-safe JAX SVD in Autoray.
+def register_jax_linalg(*, stabilized=False, qr_rank_policy="native"):
+    """Register JAX SVD and an explicit QR derivative policy in Autoray.
 
     Parameters
     ----------
     stabilized : bool, default=False
         Keep native thin SVD by default. Set this to ``True`` to install the
         custom VJP that restores cotangents from Quimb fixed-rank truncation.
+    qr_rank_policy : {"native", "adaptive"}, default="native"
+        ``adaptive`` retains finite native reduced-QR derivatives and uses a
+        relative-regularized extension at singular/nonfinite QR charts.
+        This does not resolve degeneracies of the SVD itself.
     """
+    if qr_rank_policy not in ("native", "adaptive"):
+        raise ValueError("qr_rank_policy must be native or adaptive")
     try:
         __import__("jax")
     except ImportError as exc:  # pragma: no cover - optional dependency
@@ -722,6 +739,9 @@ def register_jax_linalg(*, stabilized=False):
         lr.reg_complex_svd_jax()
     else:
         lr.reg_native_svd_jax()
+    qr_function = lr.qr_jax if qr_rank_policy == "adaptive" else lr._NATIVE_QR
+    if ar.get_lib_fn("jax", "linalg.qr") is not qr_function:
+        ar.register_function("jax", "linalg.qr", qr_function)
 
 
 def reset_linalg_registrations(backend="all"):
@@ -798,8 +818,8 @@ def reg_rel_svd_torch():
     """Advanced compatibility helper for stabilized Torch SVD.
 
     The registered autoray ``torch`` SVD uses Townsend's rectangular SVD
-    reverse-mode update, Lorentzian broadening of singular-value denominators
-    from differentiable tensor-network practice, and the complex phase/gauge
+    reverse-mode update, compact relative stabilization of near-zero spectral
+    denominators (exact reciprocals outside that region), and the phase/gauge
     correction for complex-valued SVDs.
     """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
@@ -843,7 +863,7 @@ def reg_real_svd_torch():
     This is the real counterpart of :func:`reg_rel_svd_torch`. It shares the
     robust forward path (``gesvd`` driver on CUDA plus a batched SciPy ``gesvd``
     fallback), the same Townsend rectangular reverse-mode update, and the
-    scale-aware Lorentzian broadening of the singular-value denominators, while
+    compact relative stabilization of the singular-value denominators, while
     dropping the complex phase/gauge correction. It supports rectangular and
     batched real inputs.
     """

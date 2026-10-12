@@ -5,6 +5,43 @@ where the hardware schedule says the channel acts, then choose trajectory
 sampling settings (`shots`, `seed`, independent/coalesced replay, and
 `run_kwargs`) at the runner.
 
+## Choose the workflow and interpret its result
+
+| Need | Entry point | Retained state unit |
+| --- | --- | --- |
+| Stochastic entries or custom channels | `run_trajectory_shots` | One state per shot for independent replay, or one per coalesced leaf |
+| Uniform post-gate Pauli faults | `run_noisy_shots` with `PauliErrorModel` | Independent shots |
+| Stim circuit input | `compile_stim_circuit`, `stim_plan_to_gate_stream`, then `engine.compile` / `engine.run` | Unsampled independent Pauli noise in a reusable Pepsy stream |
+| Native correlated/heralded Stim noise | `compile_stim_circuit`, then `run_stim_shots` | Native Stim shot records |
+| Shared noisy prefixes | `run_coalesced_trajectory_shots` / `run_coalesced_stim_shots` | One state per leaf, with a shot count |
+| Existing prepared optimizer | Shot-aware `optimizer.run(shots=...)` | `NoisyResult` wraps independent or coalesced storage |
+
+These functions are available from `pepsy.optimizers.noise`. Compile a Stim
+plan once and reuse it across runs. Compilation translates circuit syntax;
+the runner makes random choices and evolves optimizer state. Stim is an
+optional dependency loaded when compiling circuit input.
+
+With retained results, `estimate(values)` expects one real scalar per stored
+state: per shot for independent replay, per leaf for coalesced replay.
+For independent trajectories it computes `sum(weight * value) / shots`;
+for coalesced leaves it computes `sum(count * weight * value) / shots`.
+The denominator is the represented shot count, not the sum of weights.
+Weights are target/proposal likelihood ratios, equal to one for ordinary
+unbiased draws. `effective_sample_size` accounts for those ratios and leaf
+counts; it is not an error bar. An empty estimate returns NaN.
+
+`NoisyResult.optimizers`, `counts`, and `weights` are aligned by retained
+state. `shots` can exceed their length when branches are coalesced, and
+retention settings can omit data. Use `retain="all"` when inspecting replay
+history. Terminal bit samples have a separate row per sampled shot; their
+`leaf_indices` identify the source branch.
+
+`NoisyResult.measurement_routing_diagnostics()` summarizes retained STN collapse
+backends and MPS fallback reasons, multiplying coalesced histories by their
+shot counts. It reports unavailable shots when retention omitted histories or
+the engine lacks routing diagnostics. Counts include hidden reset collapse;
+they are neither importance-weighted estimates nor unique shared-prefix work.
+
 Jump to [MPS shots](#shot-aware-mpsoptimizer-api),
 [coalesced ensembles](#exact-coalesced-ensembles-for-rare-noise),
 [MPI](#mpi-shot-ensembles), or
@@ -225,9 +262,27 @@ entangled site also branches its hidden reset outcome before marking the
 placeholder leaked. Branch limits count all live leaves, including retained
 siblings and parents awaiting processing.
 
-Canonical MPS Kraus probabilities use local Gram-operator expectations with
-the optimizer's tracked center. Control norms use that center and the stored
+Dense MPS Kraus probabilities use projected amplitudes with the optimizer's
+tracked center, preserving rare positive outcomes without cancellation in a
+Gram expectation. Nonadjacent supports are gathered on a private MPS using
+untruncated swaps; only the selected physical legs are fused, in the channel's
+declared order. The normalized amplitude block is prepared once per channel,
+and compatible outcomes are applied in bounded batches through Autoray on the
+state's backend (including Torch CUDA and CuPy). Converted operator batches
+are cached by channel, backend, dtype and device. State tensors and projected
+amplitudes remain on that backend; only the outcome norm vector is transferred
+for host sampling, in addition to the existing base-norm scalar check.
+Scaled reductions and host float64 squaring preserve very small probabilities
+without promoting the state arrays. Native symmetric states retain their
+existing Gram route.
+Control norms use the tracked center and the stored
 exponent; exact and simple-update states retain their general norm paths.
+Ordinary tree Kraus probabilities likewise use exact local expectations of
+`K.conj().T @ K` on a private TTN wrapper. Probability evaluation does not
+compress trial branches or apply unitary stabilization, and the common stored
+exponent cancels from the ratios. Only the selected branch is replayed with
+the requested direct/DMRG settings, then physically normalized, including
+very small positive branches selected by importance sampling.
 
 Every trajectory result exposes a lightweight `diagnostics` summary:
 
@@ -238,9 +293,10 @@ print(result.diagnostics.used_kraus_copy_fallback)
 
 `max_kraus_probability_residual` is the largest deviation of the raw Kraus
 branch probabilities from one before the sampler normalizes them. A small
-residual is expected from finite-bond truncation; a large residual indicates
-that the channel, local contraction, or compression settings should be
-checked.
+residual can arise from floating-point contraction error; a large residual
+indicates that the channel or probability calculation should be checked.
+The exact local MPS/tree probability paths do not include trial-branch
+truncation in these weights.
 
 This is normally more useful than `torch.vmap` for rare faults: after a fault
 or collapse, states have different tensor data and often different bond
@@ -297,6 +353,13 @@ the partial tree and restarts the whole ensemble independently. Pass
 instead of silently changing strategy. `auto_max_expected_faults` can tune the
 default `0.1` threshold when profiling a different workload.
 
+The higher-level local `MpsOptimizer.run(strategy="auto")` preserves completed
+prefixes instead: before a possible cap overflow it finishes their remaining
+shots individually, retaining a count-aware result and the requested histories
+and weights. Its memory budget must still accommodate retained final states.
+See [MPS trajectory execution](mps.md) for continuation and GPU gate/SVD batch
+diagnostics. The low-level runners described above retain their restart policy.
+
 ## Rare-event importance sampling
 
 For a logical event much rarer than the physical noise rate, bias the proposal
@@ -323,8 +386,13 @@ print(estimate, result.effective_sample_size)
 ```
 
 The policy mapping can be label-based for every event, event-index keyed, or a
-callable `(event_index, labels, target_probabilities, optimizer)`. Every target
-branch must have nonzero proposal probability. `TrajectoryRecord` exposes both
+callable `(event_index, labels, target_probabilities, optimizer)`. Stateful
+trajectory replay passes the current optimizer to the callback, including each
+parent state in coalesced mixtures. Stream-only sampling has no optimizer state.
+Every positive target branch must have positive proposal probability, including
+arbitrarily rare outcomes. Impossible target branches must have zero proposal
+probability; invalid support raises before applying a branch. `TrajectoryRecord`
+exposes both
 `probability` (physical) and `proposal_probability`, plus `likelihood_ratio`.
 Coalesced leaves carry the product ratio in `leaf.weight`, and
 `CoalescedTrajectoryResult.estimate(...)` includes leaf multiplicities. For the
@@ -332,10 +400,80 @@ Pauli convenience API, pass a proposal `PauliErrorModel` as
 `importance_sampling` to `run_noisy_shots(...)` or
 `run_coalesced_noisy_shots(...)`.
 
+MPS Kraus probability contractions stay on the state's array backend, dtype,
+and device; only scalar probabilities are read out for the host sampler.
+Outcomes reuse the channel's base state norm. With `retain="none"`, independent
+replay aggregates quality diagnostics without storing a snapshot per shot.
+
+For coalesced dense Torch CUDA/CuPy states, compatible one-site channel parents
+also share a bounded probability batch. Shape, dtype and device are checked
+before stacking, and outcome weights keep the scaled-amplitude/host-float64
+rule. Sampling order, branch budgets and importance ratios remain unchanged.
+Callable proposals use the per-parent path. See the [MPS API](mps.md) for the
+workspace scope and `max_kraus_parent_batch` diagnostic.
+
+The optimizer-level local MPS and StabilizerMpsSimulator APIs default to `memory_budget="auto"`,
+which estimates retained-state storage and limits live branches using
+available GPU allocator memory. Independent retained results must fit the
+budget, including when automatic coalescing falls back. This preserves
+retention and sampling probabilities or raises a memory-budget error; it does
+not discard shots. Low-level factory runners retain their explicit branch
+limits and do not perform this optimizer-level memory planning.
+Stabilizer estimates also reserve tableau and classical record storage. Both
+frontends share worker scheduling, memory helpers and execution diagnostics;
+automatic stabilizer replay also continues from counted prefixes at branch
+caps. See the [stabilizer API](stabilizer_tn.md) for its frame-specific Kraus
+path and GPU batching limits.
+
+Library-generated NumPy operators with exactly zero imaginary components keep
+a real MPS dtype, including real Torch states with bit-flip or amplitude-damping
+noise. A genuinely complex operator on a real non-NumPy state raises a clear
+error: initialize that state with `complex64` or `complex128` to run it.
+Dense JAX MPS replay, canonicalization, readout and probability contractions
+use scoped `highest` matmul precision. State dtype/device and the caller's JAX
+precision setting are preserved when the operation returns or raises.
+
+Both `exact` and `exact-batch` support coalesced measurement/reset and `auto`
+selection. Their contracted states are rebuilt without truncation before
+coalesced control probabilities are evaluated. Exact Kraus probabilities act
+on full-state amplitudes and keep exact-mode canonical metadata separate.
+
+To check the complete small-system ensemble and distinguish compression bias
+from sampling error, run the integration references from the repository root
+in your activated development environment:
+
+```bash
+python -m pytest -q -o addopts='' tests/test_mps_trajectory_density_reference.py
+```
+
+These compare all two-qubit Pauli observables with explicit density-matrix
+evolution through successive channels, measurement and feed-forward. Ordinary
+and importance-sampled trajectories use fixed seeds and six standard errors
+computed from an independently enumerated proposal law. A four-qubit reference
+varies `chi`, cutoff and shots, reconstructing the compressed model's ensemble
+from branch probabilities separately from the random shot counts. This checks
+specific small circuits; convergence on a larger circuit still requires its
+own bond-dimension and sampling study.
+
 `max_branches` bounds live coalesced states and `max_branch_factor` bounds the
 number of nonempty children created by any one stochastic event. These are hard
 safety budgets: a bounded coalesced run raises (or `strategy="auto"` restarts
 independently) rather than pruning probability mass.
+
+For stream-local `strategy="auto"`, preflight uses a structural history bound.
+Fixed mixtures without importance sampling can additionally use a rare-event
+estimate: one dominant history plus the expected number of shots departing
+from it, bounded by the sum of per-event non-dominant probabilities. Coalescing
+is attempted when that bound uses at most half the total branch budget.
+Kraus channels, dynamic branching and proposal policies retain conservative
+structural selection. The per-event budget is checked even when
+`max_branches=None`; runtime caps remain authoritative. Planning never samples
+a state or invokes an importance proposal. The Pauli `error_model` convenience
+path retains its `auto_max_expected_faults` rule.
+
+Local `MpsOptimizer.run` also selects workers from backend and workload
+metadata; see [automatic MPS execution](mps.md). Explicit lower-level
+`parallel_workers` retains its existing behavior.
 
 ## Deterministic parallel trajectories
 
@@ -466,7 +604,12 @@ consistent across ranks. `result.reduce_mean(...)` uses the same shot-count
 denominator as the underlying result estimator while combining rank-local
 multiplicities and importance weights. `result.reduce_sum(value)` combines
 already-computed local scalars or arrays. The runner materializes the gate
-stream once, so it can be reused for multiple collective runs. MPI is the
+stream once, so it can be reused for multiple collective runs. Backend gate
+arrays are fingerprinted by dtype, shape and contents, including arrays nested
+in compiled plans. This performs a host transfer at runner construction and
+ignores device ordinals and process-local storage IDs. NumPy-only checkpoint
+fingerprints are unchanged; old backend-array checkpoint fingerprints may
+be rejected and should be regenerated. MPI is the
 outer process-level parallelism; `local_workers` can optionally enable
 the existing thread/GPU runner inside each rank. The direct runner defaults to
 one local worker to avoid oversubscription; pass `local_workers="auto"` to
@@ -475,32 +618,16 @@ rank-zero aggregate bar for independent ordinary, streaming, and checkpointed
 runs; coalesced runs intentionally suppress shot-level progress because their
 work is branch-based rather than one optimizer per shot.
 
-For rank-scaling measurements, use the repository benchmark script and vary
-only the MPI process count between runs:
+For rank-scaling measurements, call `MPIShotRunner.run` from the workload you
+intend to measure and vary only the MPI process count between runs. Record the
+slowest-rank wall time and global completed-shot count. Use
+`local_workers=1` for a process-only baseline and compare independent and local
+coalesced execution separately; coalescing is not rank-count invariant.
 
-```bash
-mpiexec --oversubscribe -n 4 python benchmarks/mpi_shots.py \
-  --shots 10000 --qubits 16 --depth 8
-```
-
-The script defaults to `--workers auto` and reports the slowest-rank wall time
-and global shots per second. Pass `--workers 1` for a process-only baseline.
-Compare independent and local coalesced execution separately; coalescing is
-not rank-count invariant.
-
-For a multi-node Slurm allocation, the repository includes a launcher smoke
-template:
-
-```bash
-sbatch benchmarks/mpi_slurm.sh
-```
-
-It uses `srun` and the cluster's configured PMI/PMIx transport. Set
-`PEPSY_MPI_SHOTS`, `PEPSY_MPI_QUBITS`, `PEPSY_MPI_DEPTH`,
-`PEPSY_MPI_WORKERS`, or `PEPSY_MPI_STRATEGY` in the batch environment to adjust
-the workload; the
-script assumes Pepsy and its MPI-enabled Python environment are already
-available on every node.
+On a scheduler, launch that workload with the site's supported MPI transport
+and ensure Pepsy and its MPI-enabled Python environment are available on every
+node. The repository's multi-process integration tests validate the API
+contract without prescribing a cluster-specific launcher.
 
 ### Resuming a streaming run
 
@@ -629,6 +756,12 @@ one- or multi-qubit `TrajectoryEvent` support. For ordinary MPS or TTN replay,
 replace the factory above with a fresh `MpsOptimizer(initial_mps, ...)` or
 `TreeOptimizer(...)` and pass its usual options through `run_kwargs`.
 
+Tree FIT controls such as `fit_n_iter` are constructor settings, rather than
+`run_kwargs` entries. The default is at most four iterations per fitted gate
+window, each with two directional passes; see [tree FIT controls](tree_fit.md)
+for early stopping and the single-node shortcut. Read the actual count with
+`optimizer.get_fit_diagnostics()["iterations"]` after a fitted update.
+
 For ordinary `MpsOptimizer`, Kraus normalization is tracked automatically in
 the optimizer's norm-survival ledger. The selected branch event retains its
 Born `branch_probability` and is marked as a `physical_boundary`; the expected
@@ -646,6 +779,83 @@ renormalization. The older `total_norm_proxy` key remains as a compatibility
 alias.
 
 ## Reading a Stim circuit
+
+### Translate, analyze, prepare, run
+
+For independent Pauli/depolarizing channels, keep one **unsampled** Pepsy
+stream and let the simulator own all shots:
+
+```python
+from pepsy.optimizers import (
+    StabilizerMpsSimulator, compile_stim_circuit, stim_plan_to_gate_stream,
+    stim_readout_parities,
+)
+
+stim_plan = compile_stim_circuit("""
+R 0 1
+H 0
+CX 0 1
+X_ERROR(0.02) 1
+M 0 1
+DETECTOR rec[-1] rec[-2]
+OBSERVABLE_INCLUDE(0) rec[-1]
+""")
+gate_stream = stim_plan_to_gate_stream(stim_plan)
+
+# Optional analysis: no state mutation, execution or random draws.
+analysis = StabilizerMpsSimulator.analyze_stream(
+    gate_stream, n_qubits=stim_plan.num_qubits,
+)
+engine = StabilizerMpsSimulator(stim_plan.num_qubits, chi=128, mode="direct")
+engine.compile(gate_stream)
+result = engine.run(shots=100, strategy="auto", workers=1, seed=7)
+detectors, observables = stim_readout_parities(stim_plan, result.measurements)
+counts = result.counts
+```
+
+The stages have distinct responsibilities:
+
+- `compile_stim_circuit` expands repeat blocks and parses Stim quantum
+  operations, noise and readout annotations into a `StimCircuitPlan`. Passing
+  an existing plan returns that same object. It does not sample or simulate.
+- `stim_plan_to_gate_stream` accepts that plan and returns an ordinary tuple
+  of Pepsy entries. Gates, resets, measurements and feed-forward retain their
+  order; independent noise remains stochastic. It does not draw faults.
+- `analyze_stream` is optional inspection. Its `trajectory_entries` and
+  `clifford_trajectory_entries` counts distinguish known stochastic channels
+  from opaque entries, including their touched qubits.
+- `engine.compile` prepares the execution queue and validates matrix
+  backend/dtype/device, returning the engine. `set_gates` remains equivalent.
+  For reuse across engines, first call `compile_trajectory_stream(gate_stream)`
+  and pass that `TrajectoryStreamPlan` to `engine.compile`; the plan is reused
+  by identity and is available as `engine.compiled_stream`. Threaded workers
+  reuse it too. This preparation does not mutate the quantum state or RNG.
+- `engine.run(shots=..., strategy=..., workers=...)` samples and executes
+  trajectories internally. Coalesced rows carry multiplicities in `counts`;
+  their count sum is the number of shots, not necessarily their row count.
+
+Translation generates NumPy complex128 ideal matrices. Explicitly convert
+matrix payloads, including nested feed-forward actions, before installing a
+stream on a different backend/dtype/device; preparation checks rather than
+silently converts user-provided streams.
+
+`stim_readout_parities` returns raw uint8 arrays with one row per retained
+shot/leaf. It excludes hidden reset records and XOR-combines repeated
+`OBSERVABLE_INCLUDE` entries into columns indexed by logical observable ID.
+These are raw parities, without Stim reference-sample subtraction or decoder
+correction. Use `result.counts` when averaging coalesced rows.
+
+The unsampled translation supports `X_ERROR`, `Y_ERROR`, `Z_ERROR`,
+`DEPOLARIZE1`, `DEPOLARIZE2`, `PAULI_CHANNEL_1`, `PAULI_CHANNEL_2`, and identity
+noise. Correlated-error chains and heralded channels raise explicitly at this
+translation stage; use the native Stim runners below for those channels.
+The compiler rejects nonzero measurement readout-error arguments, inverted
+measurement results and `MPAD`, whose classical semantics the current replay
+engines cannot represent. These features are never silently discarded.
+Empty detector/observable annotations are retained as zero parities, and
+grouped record-controlled Pauli gates are lowered pair by pair.
+
+### Native Stim shot runners
 
 `compile_stim_circuit(...)` accepts `stim.Circuit` or Stim source text. It
 compiles one- and two-qubit Clifford gates, Pauli measurements/resets, and

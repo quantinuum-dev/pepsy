@@ -407,10 +407,10 @@ def _conditional_support(action):
             raise ValueError("conditional 'measure' action needs pauli and targets.")
         return _normalize_control_where(action[2])
     if name == "reset" or name in _RESET_AXIS_ALIASES:
-        return _parse_reset_tuple(action[1:], _RESET_AXIS_ALIASES.get(name))[2]
+        return _parse_reset_tuple(action, _RESET_AXIS_ALIASES.get(name))[2]
     if name in _MEASURE_RESET_ALIASES or name in _MEASURE_RESET_AXIS_ALIASES:
         return _parse_measure_reset_tuple(
-            action[1:], _MEASURE_RESET_AXIS_ALIASES.get(name)
+            action, _MEASURE_RESET_AXIS_ALIASES.get(name)
         )[2]
     if name == "cap":
         if len(action) < 3:

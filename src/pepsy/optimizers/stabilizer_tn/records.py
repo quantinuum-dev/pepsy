@@ -92,6 +92,8 @@ class NormEventRecord(_TypedRecord):
     cumulative_infidelity: Optional[float] = None
     post_norm: Optional[float] = None
     post_norm_sq: Optional[float] = None
+    measurement_backend: Optional[str] = None
+    measurement_fallback_reason: Optional[str] = None
 
 
 @dataclass
@@ -182,6 +184,8 @@ class StreamAnalysisRecord(_TypedRecord):
     is_clifford_only: bool
     is_clifford_t_like: bool
     warnings: tuple[str, ...] = ()
+    trajectory_entries: int = 0
+    clifford_trajectory_entries: int = 0
 
 
 @dataclass

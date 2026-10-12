@@ -7,6 +7,40 @@ and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
+- [Readability and API review](readability_api_2026_09.md) — Package-wide
+  structural inventory, ranked follow-ups, and corrected vector-sampler contracts.
+
+- [PEPS reusable planner and row-cache policy](peps_sampler_planner_policy.md)
+
+- [9×9 and 10×10 D=4 sampler resource probes](peps_sampler_large_corner_cases.md)
+
+- [PEPS sampler efficiency and bounded batches](peps_sampler_efficiency.md)
+
+- [Real 4×4 D=4 OBC sampler validation](peps_sampler_4x4_validation.md)
+  — 8,192 draws against the full state, truncation, weights, and cache lifecycle.
+
+- [PEPS sampler cache audit](peps_sampler_cache_audit.md)
+  — Boundary/row reuse, rare-prefix scaling, and bounded performance checks.
+
+- [PEPS sampler rho repair and speed](peps_sampler_rho_repair.md)
+  — Optional positive proposals, qubit formula, and measured overhead.
+
+- [PEPS sampler relative-cutoff scaling fix](peps_sampler_boundary_scaling.md)
+  — Follow-up to the maturity audit; backend, scale, and cache regressions.
+
+- [PEPS sampler maturity and Verstraete comparison](peps_sampler_maturity_comparison.md)
+  — Current validation, measured throughput, and complex64 truncation limits.
+
+- [Cluster optimization status](../cluster_optimization_status.md) — Current
+  published backend/downstream capabilities, validation scopes and limitations.
+- [Composed boundary-factor derivatives](2026-09-26-projector-boundary-gradients.md)
+  — Rank-deficient MPS correction, mathematical contract, and regressions.
+- [PEPO product traces](2026-09-26-pepo-product-trace.md) — Product-expansion
+  trace construction and contraction options.
+- [Structural PEPO trace reduction](2026-09-26-structural-pepo-trace.md) —
+  Parameter-independent identity-history reduction and its validation.
+- [Repository organization audit](module_organization_2026_09.md) — Completed
+  sampler, optimizer, and BP splits; remaining design boundaries to review.
 - [`release_readiness_2026_09.md`](release_readiness_2026_09.md) — Release
   compatibility review, migration actions, merge scope, and validation evidence.
 - [`dependency_minimums_2026_09.md`](dependency_minimums_2026_09.md) — Required
@@ -42,56 +76,3 @@ and [tutorials](../../tutorials/index.md).
 - [Session journal](https://github.com/quantinuum-dev/pepsy/blob/develop/history/README.md) — dated handoffs and validation
   records. Historical findings and proposed next steps are not active policy.
 - [User documentation](../../index.md) — installation, workflows, and APIs.
-
-```{toctree}
-:hidden:
-
-release_readiness_2026_09
-package_simplicity_2026_09
-dependency_minimums_2026_09
-ci_compatibility_2026_09
-belief_propagation
-quimb
-quimb_symmray_opportunities_2026_09
-cotengra_2026_09
-autoray_2026_09
-symmray
-symmray_2026_09
-fermionic_mpo
-higher_order_mpo_benchmarks
-mpo_cluster_graph_assembly
-2026-09-15-inhomogeneous-pepo-slots
-2026-09-15-sparse-hessian-trust-region
-boundary_quimb_compression_modes
-contract_flat_backend_scalars
-fit_one_site_qr
-gibbs_mps
-mpo_mps_alignment
-mps_dynamic_controls
-mps_entropy_backend
-mps_final_audit
-mps_fit_copy_validation
-mps_gpu_backend_audit
-mps_layout_scheduler
-mps_quimb_compression_audit
-mps_stab_modes_fit
-mps_to_ttn
-mps_transfer
-pepo_backend_dtype
-stabilizer_gpu_backend_audit
-torch_export_compile_compatibility
-tree_api_consistency
-tree_auto_cutoff
-tree_compact_operators
-tree_entropy
-tree_fit_execution
-tree_fit_incremental
-tree_fit_large_benchmarks
-tree_gpu_backend_audit
-tree_modes_review
-tree_mps_fit_parity
-tree_path_execution
-tree_sampler_symmray
-tree_successive_environments
-tree_zipup_fit
-```

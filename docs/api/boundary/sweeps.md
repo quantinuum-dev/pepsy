@@ -5,6 +5,12 @@ intermediate oversampling from final truncation. The same policy passes
 through boundary metrics and PEPS optimizers; see
 [compression stages](compression.md).
 
+`CompBdy(contraction_opt=None)` builds Pepsy's reusable Cotengra optimizer
+with `build_optimizer` (the current name of `build_contraction`). Local
+boundary FIT uses that same optimizer by default: `fit_contraction_opt=None`
+inherits `contraction_opt`. Explicit overrides remain supported for either
+policy, without an implicit `auto-hq` or `greedy` FIT fallback.
+
 `CompBdy(..., fit_mode="dmrg2")` fits the complete boundary interval with
 `FIT.run_gate(block_size=2)`, using two-site warm-up sweeps followed by
 one-site refinement. The legacy `fit_mode="two-site"` remains fixed

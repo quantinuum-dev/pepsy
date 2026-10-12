@@ -289,9 +289,3 @@ Fermi-Hubbard benchmarks it converges *below* a matched-`chi` TeNPy run: at
 (TeNPy `-2.42962`), energy densities in the `<H>/N - U/4` convention. Use a slow
 `mixer_decay` (default `0.9`) so the mixer stays active across the early sweeps
 and a `mixer_disable_after` budget that leaves a few final clean sweeps.
-
-.. automodule:: pepsy.optimizers.sym_dmrg
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```

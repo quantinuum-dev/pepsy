@@ -1,5 +1,24 @@
 # MPS layout replay and scheduling
 
+## 2026-09-26: layout execution ownership
+
+`mps/_layout_execution.py` now owns 21 layout execution operations. Public
+methods delegate with their original signatures and documentation; private
+methods retain ordinary function/staticmethod binding. The optimizer's class
+hierarchy and state storage are unchanged. Calls through optimizer hooks
+preserve subclass customization, canonical metadata, native swap routing,
+normalization, and stream validation. Geometry search remains in `layout.py`.
+
+Rechecked the same environment used for the
+[September 25 module audit](symmray.md#2026-09-25-model-diagnostic-and-mps-helper-extraction):
+Quimb `1.15.1.dev66+ge927f06e1`, Autoray `0.11.1.dev3+g1b476b305`,
+Cotengra `0.8.3.dev7+g1d7fd333f`, and Symmray `0.4.1.dev8+gc45f91457`.
+Inspected installed `MatrixProductState.swap_site_to_` and `MPS_product_state`
+signatures and reused that same-task upstream review. **Compatibility shim:**
+the original optimizer methods delegate to the new owner. **Defer:** upstream
+behavior changes and dependency upgrades. AST comparison confirms all moved
+operation bodies and the remaining 236 optimizer methods are unchanged.
+
 ## 2026-09-11 implementation note
 
 The MPS layout finder now has two opt-in additions:

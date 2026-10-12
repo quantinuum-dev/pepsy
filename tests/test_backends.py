@@ -200,6 +200,23 @@ def test_torch_backend_preserves_graph_when_dtype_casting_existing_tensor():
     )
 
 
+def test_torch_backend_owns_readonly_numpy_storage():
+    """Writes through converted tensors must not modify read-only inputs."""
+    torch = pytest.importorskip("torch")
+    convert = pepsy.backend_torch(dtype=torch.float64)
+    for dtype in (np.float64, np.complex128):
+        source = np.array([1.0, -2.0], dtype=dtype)
+        source.flags.writeable = False
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("error", UserWarning)
+            converted = convert(source)
+        assert not caught
+        torch.testing.assert_close(converted, torch.tensor([1.0, -2.0], dtype=torch.float64))
+        converted[0] = 7.0
+        np.testing.assert_array_equal(source, [1.0, -2.0])
+        assert not source.flags.writeable
+
+
 def test_to_float_handles_backend_scalar_without_numpy_coercion():
     class BackendScalar:
         shape = ()

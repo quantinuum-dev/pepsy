@@ -31,8 +31,9 @@
 - Discovery regression covers all 12 changed entry namespaces: advertised
   exports and existing attributes remain visible, no imports or attribute
   caching occur during `dir()`, and no warnings are emitted.
-- Both README Python examples and `examples/pauli_mpo_trace_flat_peps.py`
-  executed successfully with the selected local environment.
+- Both README Python examples and the then-current
+  `examples/pauli_mpo_trace_flat_peps.py` executed successfully with the
+  selected local environment. The standalone example was removed later.
 - Ruff passed for `src`, `tests`, and the changed example. All 12 skills passed
   catalog validation; local Markdown link targets and whitespace checks passed.
 - No numerical implementation changed. The full numerical suite was not rerun;

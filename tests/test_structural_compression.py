@@ -5,6 +5,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 import quimb
 import quimb.tensor as qtn
 
@@ -89,6 +90,26 @@ def test_mpo_sweep_preserves_operator_for_both_edge_orientations():
     )
 
 
+def test_reverse_sweep_reduces_a_bond_larger_than_local_physical_rank():
+    """The left endpoint can expose row-rank reductions missed by column tests."""
+    rng = np.random.default_rng(19)
+    arrays = [
+        rng.normal(size=(5, 2, 2)),
+        rng.normal(size=(5, 5, 2, 2)),
+        rng.normal(size=(5, 2, 2)),
+    ]
+    mpo = qtn.MatrixProductOperator(arrays, shape="lrud")
+    reference = mpo.to_dense()
+
+    report = importlib.import_module(
+        "pepsy.operators._structural_compression"
+    )._structural_compress_mpo(mpo)
+
+    assert (0, 5, 4, 1) in report["reductions"]
+    assert int(mpo.bond_sizes()[0]) == 4
+    assert np.allclose(mpo.to_dense(), reference, rtol=1.0e-12, atol=1.0e-12)
+
+
 def test_to_mpo_reduces_exact_automaton_boundary_dependencies():
     """Builder MPOs structurally reduce channels before optional numerical SVD."""
     builder = py.ham_tn(Lx=4, Ly=1, data_type="complex128")
@@ -111,6 +132,7 @@ def test_to_mpo_reduces_exact_automaton_boundary_dependencies():
     )
 
     assert min(mpo.bond_sizes()) < max(mpo.pepsy_automaton.bond_dimensions)
+    assert mpo.pepsy_delinearization["sweeps"] == 2
     assert np.allclose(mpo.to_dense(), reference.to_dense())
 
     records = builder._normalize_automaton_terms(
@@ -120,6 +142,81 @@ def test_to_mpo_reduces_exact_automaton_boundary_dependencies():
     )
     raw_mpo, _ = builder._build_mpo_from_automaton(records, phys_dim=2)
     assert np.allclose(mpo.to_dense(), raw_mpo.to_dense())
+
+
+def test_to_mpo_delinearize_reaches_exact_small_operator_schmidt_ranks():
+    """Two directional sweeps reach exact ranks for a small interaction MPO."""
+    pytest.importorskip("scipy")
+    rng = np.random.default_rng(0)
+    paulis = (
+        np.array([[0.0, 1.0], [1.0, 0.0]]),
+        np.array([[0.0, -1.0j], [1.0j, 0.0]]),
+        np.diag([1.0, -1.0]),
+    )
+    terms = []
+    for _ in range(28):
+        left, right = sorted(map(int, rng.choice(8, 2, replace=False)))
+        op_left = sum(rng.normal() * op for op in paulis)
+        op_right = sum(rng.normal() * op for op in paulis)
+        terms.append(
+            ((op_left, op_right), (left, right), float(rng.normal()))
+        )
+
+    builder = py.ham_tn(shape=8, max_bond=None, data_type="complex128")
+    one_pass = builder.to_mpo(
+        terms,
+        compress="automaton",
+        max_bond=None,
+        delinearize=False,
+    )
+    delinearized = builder.to_mpo(
+        terms,
+        compress="automaton",
+        max_bond=None,
+        delinearize=True,
+    )
+
+    assert tuple(map(int, one_pass.bond_sizes())) == (4, 11, 13, 13, 13, 11, 4)
+    assert tuple(map(int, delinearized.bond_sizes())) == (4, 8, 11, 12, 11, 8, 4)
+    assert delinearized.pepsy_delinearization["sweeps"] == 2
+    dense = one_pass.to_dense().reshape((2,) * 16)
+    exact_ranks = []
+    for cut in range(1, 8):
+        axes = (
+            tuple(range(cut))
+            + tuple(range(8, 8 + cut))
+            + tuple(range(cut, 8))
+            + tuple(range(8 + cut, 16))
+        )
+        unfolding = np.transpose(dense, axes).reshape(4**cut, 4 ** (8 - cut))
+        singular_values = np.linalg.svd(unfolding, compute_uv=False)
+        exact_ranks.append(
+            int(np.count_nonzero(singular_values > 1.0e-10 * singular_values[0]))
+        )
+    assert tuple(map(int, delinearized.bond_sizes())) == tuple(exact_ranks)
+    assert np.allclose(
+        delinearized.to_dense(),
+        one_pass.to_dense(),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
+def test_to_mpo_delinearizes_torch_backend_before_svd_compression():
+    """The structural sweep runs on backend tensors before Quimb compression."""
+    torch = pytest.importorskip("torch")
+    to_backend = py.backend_torch(dtype=torch.complex128)
+    builder = py.ham_tn(shape=4, max_bond=None, to_backend=to_backend)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+
+    mpo = builder.to_mpo(
+        [((x,), (1,), 0.5)],
+        compress="automaton",
+        max_bond=None,
+    )
+
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in mpo)
+    assert mpo.pepsy_delinearization["method"] == "delinearize"
 
 
 def test_term_compression_preconditions_each_sequential_svd(monkeypatch):

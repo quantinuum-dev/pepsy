@@ -410,6 +410,32 @@ def test_static_frame_layout_defaults_to_operator_schmidt_weights():
     ][0]["weight"]
 
 
+def test_static_frame_layout_preserves_control_lifetimes_and_frame_support():
+    sim = StabilizerMpsSimulator(4).set_gates([
+        ("cnot", 0, 2), ("rz", 0.31, 2),
+        ("measure", "Z", 2, None, False), ("reset", 2, "Z"),
+        ("measure_reset", "X", 1), ("rx", 0.23, 3),
+    ])
+    plan = sim.current_frame_layout(order="quality", refine_numba=False)
+    records = plan["frame_events"]
+    assert plan["frame_role_source"] == "coefficient_support_lifetimes"
+    assert plan["frame_lifetime_event_types"] == tuple(
+        r["kind"] if r["kind"] in {"measure", "reset", "measure_reset"}
+        else "submpo" for r in records
+    )
+    # Physical site 2's projector touches coefficient sites 0 and 2.
+    index = next(i for i, r in enumerate(records) if r["kind"] == "measure")
+    assert records[index]["support"] == (0, 2)
+    for site in (0, 2):
+        assert index in plan["site_usage"][site]["measurement_indices"]
+        assert plan["site_usage"][site]["lifetime_count"] > 1
+    assert any(v["reset_indices"] for v in plan["site_usage"].values())
+    assert plan["qubit_roles"]
+    assert plan["event_weights"] == tuple(r["weight"] for r in records)
+    assert sim.measurements == []
+    assert sim.logical_order == [0, 1, 2, 3]
+
+
 def test_static_frame_layout_operator_weight_tracks_rotation_entanglement():
     weak = StabilizerMpsSimulator(2).set_gates([("rzz", 0.1, 0, 1)])
     strong = StabilizerMpsSimulator(2).set_gates(
@@ -1021,7 +1047,7 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
     pre_loss = sim.infidelities[-1]
     pre_norm = sim.norm()
 
-    sim.measure("Z", 0)
+    sim.measure("Z", 0, disentangle=False)
 
     assert sim.infidelities[-1] == pytest.approx(pre_loss)
     assert sim.norm() == pytest.approx(1.0, abs=1e-10)
@@ -1102,7 +1128,8 @@ def test_norm_events_mark_reset_boundaries():
 def test_norm_events_track_projector_compression_loss_separately():
     sim = StabilizerMpsSimulator(2, chi=1)
 
-    sim.measure("XX", (0, 1), outcome=+1)
+    # Explicit fixed basis exercises finite-chi coefficient projector loss.
+    sim.measure("XX", (0, 1), outcome=+1, absorb_basis=False)
 
     event = sim.norm_events[-1]
     assert event["kind"] == "measure"
@@ -2272,11 +2299,9 @@ def test_run_progbar_smoke():
 def test_stabilizermps_backward_alias():
     import pepsy.optimizers.stabilizer_tn as stabilizer_tn
 
-    from pepsy.optimizers.stabilizer_tn import StabilizerMps
     with pytest.warns(DeprecationWarning, match="StabilizerMpsSimulator"):
         old_name = stabilizer_tn.MpsStabOptimizer
 
-    assert StabilizerMps is StabilizerMpsSimulator
     assert old_name is StabilizerMpsSimulator
 
 
@@ -2413,7 +2438,7 @@ def test_measure_absorb_matches_fixed_basis(seed, pauli, where, outcome):
     p_plus = 0.5 * (1 + ref.expectation(pauli, where))
     if (outcome > 0 and p_plus < 1e-6) or (outcome < 0 and (1 - p_plus) < 1e-6):
         pytest.skip("outcome has ~0 probability")
-    m_ref = ref.measure(pauli, where, outcome=outcome)          # fixed-basis
+    m_ref = ref.measure(pauli, where, outcome=outcome, disentangle=False)
     a = StabilizerMpsSimulator(n).apply(stream)
     m_abs = a.measure(pauli, where, outcome=outcome, absorb_basis=True)  # basis-updating
     assert m_abs == m_ref
@@ -2553,7 +2578,7 @@ def test_measure_absorb_localizer_uses_selected_dmrg_backend(mode):
 def test_measure_absorb_rejects_impossible_forced_identity_outcome():
     sim = StabilizerMpsSimulator(2)
 
-    with pytest.raises(ValueError, match="zero probability"):
+    with pytest.raises(ValueError, match="(?:zero|0) probability"):
         sim.measure("II", (0, 1), outcome=-1, absorb_basis=True)
 
     assert sim.measure("II", (0, 1), outcome=+1, absorb_basis=True) == 1
@@ -2679,14 +2704,14 @@ def test_measure_reset_stream_entry_records_then_resets(axis, bits, outcome):
     assert sim.expectation(axis, 0) == pytest.approx(1.0, abs=1e-9)
 
 
-def test_measure_reset_defaults_to_fixed_basis():
+def test_measure_reset_defaults_to_basis_updating():
     sim = StabilizerMpsSimulator.from_bits("0")
 
     sim.measure_reset("Z", 0, outcome=+1)
 
     assert sim.measurements == [("Z", 0, +1)]
     assert sim.expectation("Z", 0) == pytest.approx(1.0, abs=1e-9)
-    assert all(event.kind == "measure" for event in sim.norm_events)
+    assert all(event.kind == "measure_absorb" for event in sim.norm_events)
 
 
 def test_measure_reset_defaults_to_span_order_and_keeps_input_result_order():
@@ -3029,14 +3054,14 @@ def test_absorb_measure_forced_impossible_raises():
 
 
 def test_fixed_basis_forced_impossible_raises():
-    # Same impossible post-selection via the default fixed-basis path: it must
+    # Impossible post-selection via the explicit fixed-basis path must
     # raise on the ~0-norm collapse rather than silently keep a garbage state.
     sim = StabilizerMpsSimulator(2).apply([("h", 0), ("cnot", 0, 1)])
-    sim.measure("Z", 0, outcome=+1)   # collapse to |00>
+    sim.measure("Z", 0, outcome=+1, disentangle=False)   # collapse to |00>
     before = sim.to_statevector()
     before_history = (len(sim.infidelities), len(sim.bond_history), len(sim.measurements))
     with pytest.raises(ValueError, match="0 probability"):
-        sim.measure("Z", 1, outcome=-1)
+        sim.measure("Z", 1, outcome=-1, disentangle=False)
     assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
     assert (len(sim.infidelities), len(sim.bond_history), len(sim.measurements)) == before_history
 
@@ -3257,6 +3282,21 @@ def test_run_with_injection_reset_ancillas_leaves_zero():
     sim.run_with_injection([("t", 0)], ancillas=[1], reset_ancillas=True)
     # ancilla qubit 1 is back to |0> -> <Z_1> = +1
     assert sim.expectation("Z", 1) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_extracted_advice_preserves_subclass_classmethod_dispatch():
+    class HookedSimulator(StabilizerMpsSimulator):
+        analyzed = []
+
+        @classmethod
+        def _analysis_entry_kind(cls, entry):
+            cls.analyzed.append(entry)
+            return super()._analysis_entry_kind(entry)
+
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 0)]
+    advice = HookedSimulator.recommend_settings(stream)
+    assert HookedSimulator.analyzed == stream
+    assert advice == StabilizerMpsSimulator.recommend_settings(stream)
 
 
 def test_magic_strategy_recommends_explicit_clifford_t_execution_modes():

@@ -21,7 +21,35 @@ initialize replay, Gibbs preparation, or MPO optimization; the layout helpers
 still use their own numerical dependencies. `GibbsMps` remains available from
 `pepsy.optimizers` and `pepsy.optimizers.mps`.
 
+Standalone `guess` and `svd_guess` helpers can be imported from
+`pepsy.optimizers.mps` without initializing the replay optimizer. Their owner
+is `pepsy.optimizers.mps.compression`; the previous imports from
+`pepsy.optimizers.mps.optimizer` remain compatible. Replay methods, defaults,
+and canonical-state bookkeeping are unchanged by this module separation.
+
+Layout installation, scheduling, and logical readout remain methods of
+`MpsOptimizer`. Their execution helpers live in a private module; callers and
+subclasses continue to use the same methods and layout-finder hooks.
+
 ## Replay options
+
+Start with the defaults and add options for the part of replay you need:
+
+| Purpose | Main controls | Lifetime |
+| --- | --- | --- |
+| State and bond cap | Constructor `p`, `gates`, `chi`; `set_p`, `set_gates` | Optimizer state and queued stream |
+| Compression algorithm | `mode`, `submpo_method`, `compression_opts`, `compression_seed` | `run(mode=...)` changes the retained mode; other listed run controls apply to that call |
+| Accuracy | `cutoff`, `cutoff_mode` | That replay; independent of the bond cap |
+| Variational FIT | `n_iter`, `fit_single_pair_n_iter`, `fit_rtol`, `fit_patience`, `fit_init_strategy` | That replay; select a DMRG mode first |
+| Layout | `apply_layout(...)`, `logical_order`, `to_dense()` | Persistent physical ordering and logical readout |
+| Diagnostics | `finite_check`, `timing`, `fit_overlap_diagnostics` | Opt-in work for that replay |
+| Shot ensemble | `shots`, `seed`, `strategy`, `run_kwargs`, `retain` | Child trajectories; see the [noise guide](noise.md) |
+
+An ordinary `run()` mutates the optimizer's current state. Calling it again
+replays the queued gates again. Shot execution uses child states; explicit
+`run_kwargs` overrides the numerical settings inherited by those children.
+Use the documented `fit_*` names in new code rather than legacy `mix_fit_*`
+spellings. `finite_check=False` and `timing=False` keep extra diagnostics off.
 
 Quimb replay accepts `run(compression_opts=...)` for independently controlled
 intermediate and final compression. See [compression stages](../boundary/compression.md)
@@ -37,8 +65,23 @@ opt = MpsOptimizer(state, gates, chi=64)  # mode="direct"
 opt.run()
 ```
 
+Use `complex128` as the standard initialization dtype. Pepsy's
+`pepsy.tensors.ps_to_mps(...)` already defaults to it. `MpsOptimizer` inherits
+the supplied state's dtype and device, so explicitly created `complex64`
+states remain complex64.
+
+`run()` defaults to `cutoff="auto"`, resolved from the live state precision:
+
+| State dtype | Automatic cutoff |
+| --- | ---: |
+| `complex128` (or `float64`) | `1e-12` |
+| `complex64` (or `float32`) | `1e-6` |
+
+An explicit numeric cutoff overrides this policy. The same resolution applies
+to trajectory replay; the bond cap `chi` remains independent of the cutoff.
+
 The previous constructor default was `"dmrg"`. Specify `mode="dmrg"` (or a
-named `dmrg1`/`dmrg2`/`dmrg3` schedule) to retain variational FIT replay.
+named `dmrg2`/`dmrg3` schedule) to retain variational FIT replay.
 
 For a normalized base-2 entropy diagnostic, use the middle MPS bond by
 default or pass an explicit bipartition index:
@@ -66,6 +109,28 @@ For finite-temperature preparation from Hamiltonian terms, see the dedicated
 and delegates non-unitary gate replay to this optimizer.
 
 ## Torch SVD policy
+
+For JAX direct replay under `jit`, use `cutoff=0` and a fixed `chi`, and pass
+the packed MPS arrays as runtime arguments. `register_jax_linalg(stabilized=True,
+qr_rank_policy="adaptive")` installs truncation-safe SVD and adaptive QR
+derivatives. The default QR policy remains native. Adaptive QR preserves finite
+native VJPs and supplies a relative-regularized extension at singular charts;
+it does not remove singular-value degeneracies or rank-crossing limitations.
+`reset_linalg_registrations("jax")` restores both native registrations.
+
+Dense Torch/JAX `direct`, `dm` and `zipup` replay with zero cutoff uses a fixed exact operator
+bond for two-site gates, then performs the requested Quimb state compression.
+It avoids a separate value-dependent operator-SVD rank choice. Canonicalization
+establishes the center with a full sweep instead of inspecting backend tensor
+values in Python. JAX runtime zero-norm errors remain checked through a callback.
+Gaugy's prepared global MPSEngine evaluator configures these policies itself.
+
+Adaptive Torch QR also supports FX capture of its first-order VJP with
+fixed-shape masks instead of value-dependent Python branches. Captured MPS
+zero-norm validation uses a runtime tensor assertion. This permits downstream
+capture of a complete forward/VJP program while preserving Pepsy's linalg
+policy; forward-only FX tracing alone does not preserve a custom backward.
+The fixed-rank derivative remains a local approximation at singular charts.
 
 Torch/Autoray SVD dispatch is process-global, so configure it once at
 application startup or use a scoped policy for an experiment:
@@ -151,7 +216,7 @@ initial MPS. For example:
 ```python
 import torch
 
-backend = pepsy.backend_torch(dtype=torch.complex64, device="cuda")
+backend = pepsy.backend_torch(dtype=torch.complex128, device="cuda")
 state.apply_to_arrays(backend)
 opt = pepsy.MpsOptimizer(
     state,
@@ -161,6 +226,11 @@ opt = pepsy.MpsOptimizer(
     to_backend=backend,
 )
 ```
+
+For CuPy, the corresponding converter is
+`pepsy.backends.backend_cupy(device=0, dtype="complex128")`.
+Select complex64 explicitly when its accuracy and performance fit the workload;
+`cutoff="auto"` then uses `1e-6` instead of `1e-12`.
 
 Optional logical-qubit roles can travel with the stream without changing gate
 semantics. Supply a site-to-role mapping (or one role per site), then request a
@@ -280,15 +350,77 @@ Quimb compression family these events are applied with `gate_with_submpo_` and
 compressed to `chi`. DMRG also accepts multi-site sub-MPO events: it
 canonicalizes the active region, aligns the MPO site tags, and keeps the
 operator as a layered FIT target while using the DMRG SRC warm-up guess.
-`svd`, `swap`, `perm`, and `exact` reject sub-MPO stream events; `mix`
+`svd`, `swap`, `perm`, `exact`, and `exact-batch` reject sub-MPO stream events; `mix`
 retains its existing gate-oriented unitary path.
 
 Modes that use canonical MPS metadata require an open-boundary MPS. A cyclic
 MPS has a nontrivial loop environment, so no single tensor norm can equal its
 global norm under the open-chain mixed-canonical identity. Such inputs are
-rejected before optimizer state is mutated. `mode="exact"` does not consume
+rejected before optimizer state is mutated. The `exact` modes do not consume
 canonical metadata and can first contract a cyclic input; switching its
 contracted result back to an MPS mode rebuilds an open MPS.
+
+### Batched exact replay
+
+Use `mode="exact-batch"` for opt-in gate fusion on a fully contracted state.
+`mode="batch-exact"` is an equivalent spelling; both construction and
+`set_mode("batch-exact")` normalize to `exact-batch`:
+
+```python
+from pepsy.optimizers import MpsOptimizer
+
+optimizer = MpsOptimizer(state, gates, chi=256, mode="exact-batch")
+optimizer.run()
+vector = optimizer.to_dense()  # physical/logical site order, not storage order
+```
+
+This remains dense statevector evolution, not MPS truncation: `chi` and
+`cutoff` do not truncate ordinary gate replay. It automatically includes
+single-qubit gates in consecutive dense blocks with at most four qubits, and
+combines consecutive diagonal gates into broadcast factors with at most twelve
+qubits. A diagonal factor has at most 4096 entries, not a full-system diagonal
+matrix. On large NumPy or CuPy qubit states, long diagonal runs can compact
+repeated ZZ edges (including reversed endpoints) and diagonal one-qubit gates
+such as RZ by multiplying their tiny gate coefficients per support. If the
+compacted stream has one or two distinct value pairs, one graph-phase pass
+can cover any number of sites. Two-value runs and GPU runs containing
+one-qubit factors are selected only when the state size and avoided state
+passes justify their setup cost.
+Consecutive parity-preserving gates on the same pair (including RXX/RYY/RZZ)
+can use one two-sector update. The planner keeps the ordinary
+bounded blocks when these patterns are absent or a backend lacks the optional
+kernel. Commuting diagonal factors can be combined within an uninterrupted
+diagonal run; nothing moves across a non-diagonal gate, measurement, reset,
+cap, feed-forward, or trajectory boundary. `k_2q_batch` continues
+to configure DMRG only; no batching option is needed here.
+
+Each block produces a new state array without modifying aliased input arrays.
+Dense contractions retain their natural tensor-index order instead of adding
+a full-state transpose back after every gate. An already-contracted state
+is not contracted again on the next replay. This reduces passes and avoidable
+copies; it does **not** eliminate output allocation or internal contraction
+packing, nor change the exponential statevector memory requirement.
+
+Fusion is enabled for ordinary qubit arrays on NumPy, Torch, and CuPy, preserving
+backend, dtype rules, and device. Other backends, native Symmray/fermionic states,
+and qudits use the existing `exact` kernel without densifying or coercing them.
+Only tiny gate matrices are inspected on the host for exact structural zeros;
+small nonzero entries are never dropped. The structured CPU kernels use
+optional Numba; without it, NumPy uses the original fused blocks. CuPy uses
+small compiled kernels, while Torch stays on differentiable dense fusion.
+Torch matrices requiring gradients use dense fusion even when currently
+diagonal, preserving off-diagonal derivatives. RZZ runs with many
+distinct value pairs keep the existing diagonal blocks because a measured
+unrestricted per-edge one-pass prototype was slower. Operators
+are rebuilt on each replay so changed gate payloads and autograd graphs do
+not become stale.
+
+Floating-point associativity changes, so compare results within dtype-appropriate
+tolerances rather than bitwise. Measurement/control handling uses the existing
+MPS rebuild boundary, which preserves backend and site indices in both exact modes.
+Like `exact`, this mode does not track canonical metadata, accept persistent
+layouts, or provide automatic canonical normalization. The default mode and
+the original `exact` gate kernel are unchanged.
 
 `MpsOptimizer.backend_info()` reports the backend, dtype, and device inferred
 from every live MPS tensor; the same values are also available as the
@@ -297,7 +429,10 @@ Every numeric gate and every tensor in a sub-MPO is checked for matching backend
 device at construction, `set_gates`, `add_gates`, and `set_p`; non-NumPy
 payloads must also match dtype, while NumPy-to-NumPy dtype promotion is
 compatible. Symbolic gates are generated and converted internally as described
-above. A
+above. Dense JAX tracers can have unknown device metadata under `vmap` or
+`grad`; backend and dtype checks still apply, and concrete device mismatches
+are rejected whenever both placements are known. No array conversion is added
+for traced inputs. A
 mismatch raises a `TypeError` with the stream location and preparation guidance;
 `MpsOptimizer` does not silently copy or cast user payloads. Use the same
 explicit converter used to build the state, for example
@@ -309,8 +444,15 @@ blocks. Dense payloads cannot be promoted to native Symmray gates because that
 would lose charge and fermionic metadata; construct those gates with the
 matching Symmray convention instead.
 
+Dense JAX replay, canonicalization, normalization and dense readout use scoped
+`highest` matrix-product precision. This avoids reduced-precision accumulation
+in Born probabilities and canonical transformations while keeping the state
+dtype/device and restoring the caller's JAX setting on every exit.
+
 Rebuilding an MPS after exact replay, including before a control event,
-preserves its dense backend, dtype, device, and physical index names. Dense
+uses zero truncation cutoff and preserves its dense backend, dtype, device,
+and physical index names. Coalesced controls prepare this MPS before reading
+their branch probabilities, including under `strategy="auto"`. Dense
 measurement/reset replay prepares fixed Pauli/Clifford constants once per
 backend/device/dtype and builds projectors and bond-two MPO tensors with
 Autoray operations on that backend. Constants are copied on-device before
@@ -328,6 +470,21 @@ arithmetic, matching the previous Python ledger, except Torch on Apple Metal
 uses float32 because that device does not support float64. JAX respects its
 configured precision. Native Symmray states benefit when their norm reductions return
 one of these backend scalars.
+
+Double-precision ledger arithmetic does not remove roundoff already introduced
+by complex64 contractions and decompositions. Replay respects the registered
+`TorchLinalgConfig`; it does not install a global SVD policy during batching.
+That public configuration defaults to the non-approximate CUDA `gesvd` driver,
+while an unconfigured Torch environment can use Torch's native driver choice.
+Small dense gate-to-MPO factorizations (at most 256 array entries) use a
+double-precision operator workspace on supported backends, then cast the
+factors back before state compression. MPS tensors keep their dtype/device;
+state SVDs, their registered driver and the requested truncation are unchanged.
+This resolves the three previously recorded complex64 ledger comparisons.
+Metal and larger operators keep their original path. JAX eager factorization
+restores its temporary x64 context; traced operators with x64 disabled retain
+the caller's precision so the backward pass remains valid. See the
+[precision and memory audit](../../development/notes/2026-10-05-mps-precision-memory.md).
 
 Optional checks and profiling are disabled by default: `finite_check=False`,
 `fit_overlap_diagnostics=False`, `quality_check_every=False`, `timing=False`,
@@ -427,6 +584,122 @@ when passed directly to `run`. `run_kwargs={...}` remains supported and its
 explicit values override the corresponding top-level per-trajectory options.
 Mode selection and the shot RNG remain parent-level controls.
 
+The defaults `strategy="auto", workers="auto"` select execution from the
+stream, shot count, initial state and backend without trial runs:
+
+| Workload | Automatic execution |
+| --- | --- |
+| Branch histories fit `max_branches` | Share prefixes with coalesced replay |
+| Fixed mixtures dominated by one outcome | Also try coalescing when the expected occupied-history upper bound uses at most half the branch budget |
+| Many possible state-dependent branches or broad mixtures | Independent replay |
+| CUDA, CuPy, or another accelerator device | One local worker |
+| Coalesced or small CPU workload | One local worker |
+| Large independent NumPy/Torch CPU workload | Up to four workers within the available CPU and numerical-library thread budget |
+
+The CPU parallel heuristic requires at least four shots, eight stream entries
+and an initial bond dimension of 64. Unknown CPU thread budgets/backends use
+one worker. These are conservative scheduling heuristics, not a guarantee of
+the fastest setting for every circuit. They do not change the backend, device,
+dtype, compression mode, `chi`, cutoff, or retention policy. Numeric `workers`
+and an explicit `strategy` remain overrides; `parallel_backend="serial"`
+forces one worker.
+
+Importance-sampled streams use structural branch bounds rather than physical
+mixture probabilities. Planning does not evaluate proposal callbacks. Dynamic
+controls and Kraus probabilities are also treated conservatively. For local
+`MpsOptimizer.run(strategy="auto")`, a selected coalesced run checks a
+conservative upper bound before sampling the next split. If it could exceed
+either branch cap, completed prefixes are preserved and their remaining shots
+finish one at a time. This also covers `error_model` and threaded local runs;
+the continuation itself is serial. No sampled histories are discarded.
+Retaining final states still requires memory for all shots. Explicit
+`strategy="coalesced"` keeps its strict cap error. MPI automatic execution
+still chooses independent shots.
+
+Continuation can begin before an actual overflow. It preserves the sampling
+law, weights and control histories, but changes seeded draw ordering relative
+to restarting independently. The returned result stays count-aware
+(`coalesced=True`), with count-one leaves after continuation; the final number
+of retained leaves can exceed `max_branches`. Diagnostics expose
+`continued_from_cap`, `continued_shots` and a descriptive `fallback_reason`.
+
+For local MPS runs, `result.diagnostics` includes `planned_strategy`, `workers`
+(the selected worker budget), `execution_reason` and `fallback_reason`.
+`result.coalesced` reports the representation actually returned. These extra
+diagnostic fields are optional and may be `None` for other runners.
+
+Local shots default to `memory_budget="auto"`. Torch CUDA and CuPy query the
+state's device and include reusable allocator cache; Torch/CuPy allocator
+limits are respected. JAX uses allocator statistics when available. Half of
+the reported available bytes form the budget. CPU and unsupported queries
+leave the existing branch/shot policy in place. An integer supplies a byte
+budget (including on CPU); `None` disables this planner.
+
+The planner estimates MPS storage allowing bond growth up to `chi`, bounded
+by physical dimensions, and never underestimates the initial tensor storage.
+Exact modes use a dense-state estimate. It reserves eight estimated states
+for active work plus 32 MiB for probability batching, then two state copies
+per live branch for parent/child overlap. The resulting capacity tightens
+`max_branches` and automatic worker counts. Explicit numerical settings and
+retention are preserved. Independent `retain="all"`/`"final"` results must fit
+all shots; `retain="none"` needs only the active workers. An insufficient
+budget raises `MemoryError` before independent replay, including after a
+coalesced-cap fallback. Explicit coalesced runs retain the branch-cap error.
+
+Diagnostics add `memory_budget_bytes`, `estimated_state_bytes`,
+`memory_max_branches` and `memory_reason`. This is a conservative planning
+estimate, **not an allocator reservation or an OOM guarantee**: allocator
+fragmentation, other processes, large operator/compression workspaces, cached
+payloads and retained autodiff graphs can exceed its allowance. MPI memory
+planning is not implemented; explicit MPI byte budgets are rejected. MPI's
+existing chunk/retention controls remain available.
+
+Dense Kraus probability evaluation reuses one canonical amplitude block and
+batches outcomes through Autoray on the MPS backend, including Torch CUDA and
+CuPy. Outcome batches are bounded to limit temporary array growth; the state
+and projected tensors stay on-device. Sampling reads the small outcome norm
+vector and the existing base-norm scalar. See the
+[trajectory probability contract](noise.md) for rare-weight and normalization
+semantics. This applies to both independent and coalesced replay.
+
+Coalesced replay also automatically batches one-site Kraus probabilities across
+compatible live branches on Torch CUDA and CuPy. Branches must share backend,
+device, dtype and prepared block shape. Batches use at most 32 parents and a
+conservative 32 MiB temporary-workspace target; larger or incompatible blocks
+use the existing per-parent path. This target excludes retained MPS states,
+operator caches, allocator reserves and autograd storage. Total retained-state
+memory still depends on `max_branches`, `shots` and `retain`.
+
+The sampler reads one small parent-by-outcome norm array per batch, plus the
+existing per-parent state-norm guards. State-dependent proposal callbacks use
+per-parent evaluation to preserve their ordering. Exact/native-symmetry,
+multi-site and CPU probabilities retain their existing implementations.
+`result.diagnostics.max_kraus_parent_batch` reports the largest parent batch
+used, defaulting to one for per-parent execution.
+
+On Torch CUDA/CuPy, coalesced `mode="swap"` replay also batches a deterministic
+segment containing one ascending adjacent two-site gate across compatible
+parents. Gate contractions and SVD run through Autoray; each parent keeps its
+own cutoff-selected rank and `chi` limit, without rank padding. The usual
+optimizer replay maintains norm diagnostics, stabilization, gradients, tags
+and canonical centers. The caller's Torch SVD configuration is preserved.
+Groups are limited to 32 parents and a conservative 32 MiB workspace target.
+Only the small rank vector is downloaded for truncation.
+
+`result.diagnostics.max_gate_parent_batch` reports the largest gate batch.
+Other modes, nonlocal/reversed gates, multi-gate segments, CPU/JAX/native
+symmetry, active layouts, normalization, timing/finite/quality checks and
+multi-worker execution keep their ordinary gate path. No numerical mode is
+changed to obtain batching. Speed depends on matrix size and backend; this
+path is most useful for small compatible matrices.
+
+With `stabilize_unitary=True`, trajectory replay stabilizes unitary gate
+segments and disables that restoration only while applying a selected Kraus
+operator. The Kraus branch retains its physical norm for compression
+accounting, then is normalized before the next segment. Its Born probability
+does not count as compression loss. This also applies to the deprecated
+`fit_stabilize_unitary` alias.
+
 Use `retain="all"` (the default) for final states plus replay metadata,
 `retain="final"` for final states without concrete streams and records, or
 `retain="none"` when only the shot count/side effects matter. The latter keeps
@@ -436,16 +709,18 @@ observables afterward. `dmrg2` is the normal variational production backend;
 DMRG schedules retain multi-site sub-MPOs as layered FIT targets. `svd`, `swap`,
 and the other DMRG schedules use the same
 trajectory contract and should be benchmarked for the workload. `mix` remains a
-gate-oriented/unitary mode, while `exact` also supports state-dependent
+gate-oriented/unitary mode, while the exact modes also support state-dependent
 Kraus branches by evaluating copied dense TensorNetwork leaves. Shot
 replay uses a frozen persistent-layout template when one is installed, but
 still requires a fresh identity-order optimizer for an already-permuted `perm`
 state.
 
 For MPI, use the same optimizer-level API by passing `mpi=True` (or an
-explicit communicator). `workers="auto"` divides the available CPU allowance
-across local MPI ranks, while `workers=1` forces serial execution inside each
-rank. `progress="auto"` shows one aggregate rank-zero shot bar only in an
+explicit communicator). On CPU, `workers="auto"` divides the available CPU
+allowance across local MPI ranks; accelerator states use one local worker per
+rank. MPI keeps `strategy="auto"` as independent replay for rank-invariant shot
+seeds. `workers=1` forces serial execution inside each rank.
+`progress="auto"` shows one aggregate rank-zero shot bar only in an
 interactive terminal; child optimizer bars are suppressed during distributed
 execution:
 
@@ -476,9 +751,9 @@ The practical shot-mode matrix is:
 | `direct` (default) | Quimb direct compression; `mpo` and `quimb` are compatibility aliases |
 | bare `<method>` / `quimb-<method>` | explicitly selected Quimb 1D compressor |
 | `svd`, `swap` | supported ordinary replay paths; benchmark truncation cost |
-| `dmrg`, `dmrg1/2/3` | opt-in variational compressed replay with the selected FIT schedule |
+| `dmrg`, `dmrg2`, `dmrg3` | opt-in variational compressed replay with the selected FIT schedule |
 | `mix` | unitary FIT plus an explicit MPO fallback for Kraus gates; no controls/leakage |
-| `exact` | exact unitary, mixture, control, and state-dependent Kraus replay |
+| `exact`, `exact-batch` (`batch-exact` alias) | exact unitary, mixture, control, and state-dependent Kraus replay |
 | `perm` | fresh identity-order shots only; persistent layouts use the normal MPS modes |
 
 Bare Quimb method names and their `quimb-<method>` qualified forms are passed
@@ -523,116 +798,97 @@ SRC replay requires a newer backend-native compressor. For ordinary dense
 MPS FIT warm starts, Pepsy warns and uses direct compression on those builds;
 the exact FIT target and final accuracy settings are preserved.
 
-`mode="fit"` is a clear alias for the historical `mode="dmrg"`. The
-convenience modes share the DMRG backend but have distinct schedules:
-`"dmrg1"` uses at most two two-site growth sweeps and then fixed-rank one-site
-FIT. If every active bond is already at its attainable ceiling before the fit,
-`"dmrg1"` starts directly with one-site FIT. Once every full-chain bond
-reaches its physical/`chi` ceiling, the optimizer latches one-site updates for
-later windows in the same replay. `"dmrg2"` uses two-site FIT for the required
-warm-up (two sweeps by default) and then one-site FIT; `"dmrg3"` follows the
-same fixed warm-up schedule with three-site FIT, then one two-site transition
-sweep, then one-site FIT. All phases share the `n_iter` budget: with eight
-fixed sweeps the schedules are `2,2,1,1,1,1,1,1` and `3,3,2,1,1,1,1,1`.
-Tolerance comparisons reset whenever the block size changes. The adjacent
-two-site `dmrg2` exact-update exception remains active.
-For dense DMRG windows, FIT starts from a disposable compressed guess. The
-default is `fit_init_strategy="guess-src"`; the exact FIT target and named
-schedules are unchanged. The strategy can be `direct`, `random`,
-`random_expand`, or `guess-<method>`, where `<method>` is one of the Quimb
-compression methods listed below. The underscore spelling remains accepted for
-compatibility. `auto` selects `guess-src` in both the rank-expansion and
-reached-chi phases. Native Symmray and fermionic states use the native
-sector-preserving randomized guess by default as well. The legacy
-`fit_mpo_guess=False` switch still disables the
-default named-mode guess. Both the target and the guess remain separate from
-the live MPS. The fixed expansion handoff remains two two-site sweeps followed
-by one one-site sweep; a window already at its attainable `chi` ceiling uses
-one-site FIT directly.
-`mode="dmrg"` remains the generic spelling and keeps the adaptive two-site
-schedule for local windows. For a long-range window that is wider than the
-selected FIT block, it uses the corresponding fixed block handoff so the
-terminal canonical center remains authoritative for unitary norm tracking;
-the randomized FIT initialization is unchanged. `mode="mix"` is the
-transactional unitary variant: every eligible multi-site gate first builds a
-disposable, chi-capped `guess-direct` state and then runs one-site DMRG/FIT
-against a separately constructed exact target. This path is unchanged between
-the bond-growing and fixed-`chi` phases; the direct guess is never committed
-without the FIT refinement.
-For ordinary DMRG, `fit_block_size=2` grows only bonds visited by the gate
-interval, up
-to `chi`, through the middle-bond SVD; it does not pad the whole MPS and does
-not need an MPO rank warm-up. `fit_block_size=3` uses a three-site effective
-wavefunction and two direction-aware native SVD splits, and is useful when a
-larger local window is worth the extra decomposition cost. An adjacent
-two-site gate span automatically falls back to `fit_block_size=2`. Both block
-sizes preserve native dense and Symmray backends. For block sizes 2 and 3, the
-optimizer's `fit_init_strategy` chooses whether a disposable FIT guess is
-direct, randomly perturbed at fixed rank, randomly expanded on active bonds,
-or `guess-<method>` compressed by Quimb. For native Symmray/fermionic states,
-`guess-src` is implemented by native randomized SVD while the other
-Quimb-specific guess methods retain their native direct fallback. The available methods are
-`direct`, `dm`, `zipup`, `zipup-first`, `zipup-oversample`, `src`,
-`src-first`, `src-oversample`, `srcmps`,
-`srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, and
-`fit-projector`, `fit-oversample`, `sdc`, `sdc-oversample`, `sdcr`, and
-`sdcr-oversample`. The successive modes require a Quimb build containing the
-corresponding compressor. They are also valid FIT warm-start policies as
-`fit_init_strategy="guess-sdc"`, `fit_init_strategy="guess-sdc-oversample"`,
-`fit_init_strategy="guess-sdcr"`, and
-`fit_init_strategy="guess-sdcr-oversample"`.
-For ordinary DMRG, `auto` selects `guess-src` in both phases;
-the current MPS is used directly only when the caller explicitly requests
-`direct` (or a native Symmray/fermionic route requires its native warm-start).
-Native Symmray and fermionic paths use their graded sector-growth route without
-dense random padding. `fit_block_size=1` selects the fixed-rank compatibility
-algorithm in ordinary DMRG. Mixed mode fixes `fit_block_size=1` and
-`fit_init_strategy="guess-direct"`; pass another block size or initialization
-only with `mode="dmrg"`. On native Symmray states, the mixed direct guess uses
-Pepsy's native chi-capped auto-swap/SVD route and does not densify charge
-sectors.
-Standalone one-site gates use the exact direct/MPO
-path; ordinary DMRG target blocks can absorb intervening one-site gates before
-the block's shared compression. Generic `mode="dmrg"` remains rank-adaptive
-on local windows and uses the fixed canonical handoff for long-range windows,
-while named `"dmrg1"` bounds its two-site warm-up at two sweeps and then uses
-one-site FIT for the remaining requested sweeps. The named mode does not
-extend the two-site phase because of rank stagnation. Once all full-chain
-ceilings are reached, it latches one-site updates for later gate windows.
-This keeps the bond spaces opened by the SVD warm-up while avoiding repeated
-GPU SVD truncations. The dense open-chain ceilings are
-`2, 4, 8, ..., chi, ..., 8, 4, 2` (also limited by the current outside-window
-bonds); FIT never pads a bond merely to make it equal to `chi`. Set
-`fit_adaptive_sweeps` to configure the named `dmrg2`/`dmrg3` warm-up; `dmrg1`
-keeps its two-sweep policy. A generic `mode="dmrg"` with `fit_block_size=1`
-remains the fixed-rank one-site compatibility path. `fit_layer_size` is the
-clear name for
-`k_2q_batch`; it counts two-site gates in a contiguous paper-style target
-block. For `fit_block_size=2`, an active window spanning at least three sites
-uses the generic adaptive schedule for local windows and the fixed canonical
-handoff described above for long-range windows; an ordinary two-site gate window
-has a complete local variational problem, but by default it honors the
-requested FIT sweeps and convergence controls. With
-`fit_single_pair_fast_path=True`, `dmrg1`, `dmrg2`, and `dmrg3` immediately
-advance to the next gate after one exact update instead of repeating their
-warm-up or entering one-site refinement.
-The named `dmrg2` schedule is an exception for an adjacent two-site gate: it
-uses one exact update by default, regardless of the general fast-path default.
-`fit_three_site_sweeps` remains a deprecated alias for
-`fit_adaptive_sweeps`.
-`fit_max_span="auto"` also limits the spatial width of a batched
-target, splitting disjoint gates before they create an unnecessarily wide FIT
-window. Set `fit_max_span=None` to restore unrestricted gate-count batching.
-If a DMRG/FIT batch
-raises, produces non-finite data, or exceeds `chi`, the optimizer restores the
-complete pre-batch state (including canonical metadata) and
-replays the batch through MPO. Interrupts restore the trial state and are
-re-raised.
+The MPS variational modes have three schedules:
+
+| Mode | FIT updates |
+| --- | --- |
+| `dmrg` | One-site refinement from the initialized guess, throughout every sweep. |
+| `dmrg2` | Two-site warm-up (two sweeps by default), then one-site refinement. |
+| `dmrg3` | Three-site warm-up (two sweeps by default), one two-site transition sweep, then one-site refinement. |
+
+`dmrg1` has been removed; use `dmrg`. The historical `fit` spelling remains
+an alias of `dmrg`. `dmrg` fixes `fit_block_size=1` and rejects values two or
+three; select `dmrg2` or `dmrg3` for block updates. The one-site FIT refinement
+has no two-site or three-site SVD updates. Target preparation and initial-guess
+construction may still use SVD and may open bond support up to `chi`.
+
+All phases share the `n_iter` budget. With eight fixed sweeps, the schedules
+are `1,1,1,1,1,1,1,1`, `2,2,1,1,1,1,1,1`, and `3,3,2,1,1,1,1,1`.
+`fit_adaptive_sweeps` sets the `dmrg2`/`dmrg3` warm-up length and has no effect
+on one-site `dmrg`. Tolerance comparisons reset whenever the block size changes.
+Three-site updates shorten to two-site updates for an adjacent two-site window.
+
+FIT holds the exact target separate from its disposable initial guess. The
+default initialization is `guess-src` (`fit_init_strategy=None` or `auto`).
+Supported strategies include `direct` (current MPS), `random` (fixed-rank
+perturbation), `random_expand` (active bond expansion), and `guess-<method>`
+(compressed guess). Explicit guess methods apply even at the bond ceiling.
+The underscore spelling remains accepted for compatibility. `fit_init_seed=0`
+seeds randomized guesses; `fit_init_rand_strength=0.0` applies only when an
+explicit dense random strategy is selected.
+
+Guess methods include `direct`, `dm`, `zipup`, `zipup-first`,
+`zipup-oversample`, `src`, `src-first`, `src-oversample`, `srcmps`,
+`srcmps-first`, `srcmps-oversample`, `fit`, `fit-zipup`, `fit-projector`,
+`fit-oversample`, `sdc`, `sdc-oversample`, `sdcr`, and `sdcr-oversample`.
+The successive methods require a Quimb build with the corresponding compressor.
+Native Symmray/fermionic `guess-src` uses a sector-preserving randomized SVD;
+other Quimb-specific guess methods retain their native direct fallback.
+The legacy `fit_mpo_guess=False` switch disables the default `dmrg3` guess;
+use `fit_init_strategy` to select an explicit policy.
+
+Two-site FIT grows only visited bonds through its middle-bond SVD, up to
+`chi`; three-site FIT uses two direction-aware splits. These block updates
+preserve native backends and do not pad the whole MPS. Dense open-chain
+ceilings are `2, 4, 8, ..., chi, ..., 8, 4, 2`, also limited by the current
+outside-window bonds.
+
+`mode="mix"` uses a disposable `guess-direct` state followed by one-site FIT
+against the exact target. Its block size and guess policy are fixed, both
+before and after reaching `chi`. Failed transactions roll back before the
+direct/MPO fallback. Native guesses preserve charge sectors and grading.
+
+`fit_layer_size` aliases `k_2q_batch` and counts two-site circuit gates in a
+target block. This is independent of how many MPS tensors FIT updates at once.
+Standalone one-site gates are applied directly; intervening one-site gates can
+be absorbed into a batched target. `fit_max_span="auto"` also limits spatial
+width; `None` restores unrestricted gate-count batching. If a batch fails,
+becomes non-finite or exceeds `chi`, rollback restores the pre-batch state and
+canonical metadata before MPO fallback. Interrupts restore and re-raise.
+
+All modes respect the sweep budget and convergence controls for adjacent
+windows. Explicit `fit_single_pair_fast_path=True` enables a single exact
+two-site update in `dmrg2`/`dmrg3`. It never converts `dmrg` to a block update.
+`fit_three_site_sweeps` remains a deprecated alias of `fit_adaptive_sweeps`.
 
 For ordinary DMRG and mixed DMRG, `n_iter` is a maximum rather than an
 unconditional sweep count. `fit_min_iter`, `fit_rtol`, and `fit_patience`
 control adaptive stopping from FIT's final retained-center norm change. The
 public `MpsOptimizer.run` defaults are `n_iter=8` and `fit_rtol="auto"`.
+DMRG defaults to `fit_single_pair_n_iter=None`, which inherits `n_iter` for
+each replay. Unless explicitly overridden, adjacent two-site windows have
+the same sweep budget as longer windows, including in named `dmrg2`.
+Setting a positive pair cap makes a window spanning exactly two adjacent
+MPS sites use at most `min(n_iter, fit_single_pair_n_iter)` sweeps, while
+larger windows retain the full `n_iter` budget. This depends
+on the complete window span, not `fit_block_size` or the number of gate
+endpoints. A non-adjacent two-qubit gate uses the larger budget; batched
+gates use their combined spatial span. Both layered and materialized targets,
+measurement windows, and shot replay preserve this control.
+
+```python
+opt.run(
+    n_iter=8,                       # longer windows
+    fit_single_pair_n_iter=5,        # explicitly lower the adjacent-pair cap
+    fit_single_pair_fast_path=False,
+    fit_rtol="auto",                 # either budget may stop early
+)
+```
+
+Change the pair cap to another positive integer, or omit it/pass `None` to
+inherit `n_iter`. This cap is ignored outside DMRG modes. Opt-in FIT timing records
+include `requested_sweeps` for each window's effective budget.
+
 The automatic tolerance selects `1e-3`, `1e-5`, or `1e-9` for 16-,
 32-/complex64-, or higher-precision data. Pass an explicit numeric tolerance
 to choose another threshold, or `fit_rtol=None` for fixed iterations.
@@ -648,21 +904,21 @@ norm once per sweep. Its native finite checks reduce active tensor blocks and
 transfer those flags together with the optional tolerance norm as one compact
 vector. Adaptive rank-growing windows require `n_iter >= 2`; a
 shorter request raises before fitting, except for the adjacent two-site exact
-fast path. An under-capacity, non-adjacent `mode="dmrg1"` window requires
-`n_iter >= 3`, reserving its first two sweeps for two-site rank growth and at
-least one later sweep for one-site refinement. An already-capped `dmrg1`
-window has no growth reservation and uses all requested sweeps as one-site
-updates.
+fast path. One-site `dmrg` accepts any positive `n_iter`; it has no
+reserved growth phase.
 At least two adaptive block sweeps are required whenever the active window
 needs rank growth, regardless of `fit_rtol`; an adjacent two-site interval is
 a structural special case whose only pair is
 the complete variational problem. The default
-`fit_single_pair_fast_path=False` honors `n_iter` and `fit_rtol`; set it to
+`fit_single_pair_fast_path=False` honors the window's budget and `fit_rtol`; set it to
 `True` to stop after one effective-tensor SVD, even when `fit_rtol=None`.
+This shortcut requires a two-site FIT block, as selected by
+`dmrg2` or an adjacent `dmrg3` window; it does not change one-site FIT into a
+two-site update.
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
-non-finite sweep; for compatibility, non-unitary DMRG retains fixed sweeps
-when `fit_rtol="auto"`, while an explicit numeric tolerance enables
-adaptive stopping there too. With `finite_check=True`, mixed DMRG and its
+non-finite sweep. Non-unitary MPS DMRG keeps the dtype-aware automatic
+tolerance because convergence uses relative norm change; use `fit_rtol=None`
+to request fixed sweeps. With `finite_check=True`, mixed DMRG and its
 direct/MPO exact or fallback transactions validate the retained
 canonical-center norm and represented exponent before commit. Default replay
 skips that validation; enable
@@ -672,7 +928,7 @@ checks are needed. Transactional MPO fallbacks are norm-checked only when
 scalar results on the device, and transfer one Boolean to the host.
 
 `run(finite_check=False)` disables runtime non-finite detection by default
-in every MpsOptimizer mode, including DMRG1/2/3, mixed, MPO/direct/SRC/SDC,
+in every MpsOptimizer mode, including DMRG/DMRG2/DMRG3, mixed, MPO/direct/SRC/SDC,
 swap/permutation/SVD, and exact replay. This is an optional diagnostic
 feature, not a requirement for normal optimization. Leave it off to avoid
 extra validation work and possible accelerator synchronization.
@@ -710,8 +966,7 @@ layout changes, mode changes, and explicit canonical resynchronization clear
 cached metadata, and a changed `chi` or chain length forces new ceilings.
 Mixed replay prepares each FIT window once and reuses its validated final
 maximum bond for history and the next transaction. Quality checks invalidate
-that maximum because repair may change dimensions. DMRG1 skips rank checks
-used solely to validate a sweep budget when `n_iter >= 3` already suffices.
+that maximum because repair may change dimensions.
 
 Backend/symmetry classification uses weak references to actual networks,
 propagated only through owned backend-preserving copies. It does not retain
@@ -724,7 +979,7 @@ The expensive direct FIT-target overlap contraction is opt-in through
 `fit_overlap_infidelity`; the default `False` leaves those fields as `None`
 while retaining the ordinary FIT convergence metadata. If enabled, the
 contraction is performed after each successful DMRG FIT update, including
-DMRG1/2/3 schedules. Mixed-mode transactions retain the existing behavior of
+DMRG/DMRG2/DMRG3 schedules. Mixed-mode transactions retain the existing behavior of
 omitting this target-overlap calculation.
 If the optional contraction fails or returns NaN/infinity, both overlap values
 remain `None` and `fit_overlap_error` explains the failure. This does not reject
@@ -734,9 +989,9 @@ it does not enable per-sweep `finite_check` scans.
 The DMRG/FIT update follows the variational update described in
 the [Ayral *et al.* PRX Quantum paper](https://doi.org/10.1103/PRXQuantum.4.020304):
 the effective tensor is built from cached contractions on the left and right,
-then the MPS is swept repeatedly. Recommended `fit_block_size=2` forms a
+then the MPS is swept repeatedly. `dmrg2` forms a
 local wavefunction with the two outer virtual legs and both sites' physical
-groups, then splits its middle bond with `Tensor.split`. `fit_block_size=3`
+groups, then splits its middle bond with `Tensor.split`. `dmrg3`
 forms the analogous three-site tensor and splits it twice, absorbing singular
 values toward the sweep direction. Both dispatch to configured dense SVD
 drivers and, crucially, Symmray's native block SVD for U1, U1xU1, and fermionic
@@ -748,10 +1003,9 @@ before each split, and restores the physical ket afterward. Thus `R`, `L`, and
 `RL` are honored exactly without dense conversion or Jordan-Wigner
 bosonization.
 
-The named `dmrg1`, `dmrg2`, and `dmrg3` schedules are backend-independent:
-native U1, U1xU1, and Z2 fermionic states use the same schedules as ordinary
-arrays. `dmrg1` uses its bounded two-sweep warm-up and sticky one-site phase,
-while `dmrg2` and `dmrg3` perform their fixed block warm-up before one-site
+The `dmrg`, `dmrg2`, and `dmrg3` schedules apply to native U1, U1xU1,
+and Z2 fermionic states as well as ordinary arrays. `dmrg` uses one-site FIT, while `dmrg2` and `dmrg3` perform their fixed
+block warm-up before one-site
 refinement, with one intervening two-site sweep for `dmrg3`.
 Ordinary dense MPS replay keeps the exact gate target `p_g` separate
 from FIT's initial state. For a two- or three-site growth window,
@@ -878,7 +1132,7 @@ including `branch_probability`, `physical_boundary`, and `renormalized`. Their
 expected norm includes the Born probability, so a normal physical branch has
 zero compression infidelity. Renormalization closes the current raw-norm
 baseline but does not erase the cumulative compression ledger. The same norm
-contract is used by DMRG1/2/3 and the MPO, SVD, swap/perm, and mixed backends.
+contract is used by DMRG/DMRG2/DMRG3 and the MPO, SVD, swap/perm, and mixed backends.
 
 Unitary compression also validates that the retained canonical-center norm
 does not materially exceed its pre-compression norm. The raw overshoot remains
@@ -917,7 +1171,7 @@ accumulation remains logarithmic and numerically stable.
 The progress-bar descriptor shows only the active mode: `src`, `zipup`, and
 other Quimb compression modes are displayed without the internal `quimb-` or
 legacy `mpo-` prefix, while the `quimb` and `mpo` aliases display as `direct`.
-Named DMRG schedules display as `dmrg1`, `dmrg2`, or `dmrg3`; generic `dmrg`
+Named DMRG schedules display as `dmrg2` or `dmrg3`; generic `dmrg`
 and its `fit` alias display as `dmrg`.
 
 Replay timing is opt-in and does not print by itself:
@@ -977,8 +1231,7 @@ optimizer-owned state. `get_fit_diagnostics()` returns a copy of the last
 DMRG/FIT record or `None` before a FIT update and for modes that do not use
 FIT. The record
 includes the iteration count, convergence reason, relative change, active block
-size, adaptive and one-site sweep counts, and the DMRG1 one-site lock state
-when applicable. The record also includes `fit_overlap_diagnostics` so callers
+size, and adaptive and one-site sweep counts. The record also includes `fit_overlap_diagnostics` so callers
 can distinguish a disabled overlap calculation from a backend failure.
 
 Ordinary runs retain no per-gate timer or timing-record overhead. Enabled
@@ -1023,7 +1276,7 @@ use a compatibility overlap contraction instead.
 
 Normalization uses the same canonical-center contract as gate application. For a non-unitary run with `normalize_every` enabled, the optimizer reuses an authoritative one-site center inside the active span, normalizes that tensor, and stores the removed scale in `p.exponent`. Only a genuinely broad tracked center is collapsed to one site. Thus `p.norm()` restores the represented norm, while a copy with `exponent=0` exposes the normalized working data. For DMRG, a multi-gate batch is one replay step for this purpose. Non-unitary DMRG keeps the adaptive `fit_rtol="auto"` policy; the exact target norm need not be one because convergence is measured relatively.
 
-Use `get_normalizations()` for scale events, `get_quality_checks()` for optional finite/canonical health records, and `get_fit_diagnostics()` for the latest DMRG/FIT convergence record. `mode="exact"` deliberately skips canonical metadata; switching back to an MPS mode rebuilds and canonicalizes the contracted state. Exact replay preserves operator scale directly, while automatic normalization options remain unavailable in exact mode.
+Use `get_normalizations()` for scale events, `get_quality_checks()` for optional finite/canonical health records, and `get_fit_diagnostics()` for the latest DMRG/FIT convergence record. Both exact modes deliberately skip canonical metadata; switching back to an MPS mode rebuilds and canonicalizes the contracted state. Exact replay preserves operator scale directly, while automatic normalization options remain unavailable in exact modes.
 
 For a logical gate stream whose site order has not been chosen yet,
 `MpsOptimizer.LayoutFinder(gates, L=...)` or

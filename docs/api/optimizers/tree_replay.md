@@ -20,6 +20,24 @@ construct-then-run sequence.
 
 ## Replay modes
 
+### Find the option you need
+
+| Purpose | Where to configure it | Lifetime |
+| --- | --- | --- |
+| Geometry and state | Constructor `tree`, `state`, `chi`, `run=False` | Retained optimizer state |
+| Truncation | Constructor `cutoff`, `cutoff_mode` | Defaults for later replay |
+| Algorithm | `run(mode=...)`, `run(compression_mode=...)` | Persistent overrides on ordinary replay |
+| Randomized compression | `compression_seed`, `max_bond_oversample`, `cutoff_oversample` | Supplied run values persist on ordinary replay |
+| Variational fitting | Constructor `fit_*` settings | See [TreeFIT options](tree_fit.md) |
+| Scale handling | Run `non_unitary`, `normalize_every`, `normalize_final` | That replay; automatic normalization requires `non_unitary=True` |
+| Diagnostics | Run `finite_check`, `track_infidelity`; constructor `track_truncation` | Finite checks apply to that run; the other settings are retained |
+| Shots | `shots`, `strategy`, `run_kwargs`, `retain` | Child trajectories preserve the parent; see [noise](noise.md) |
+
+MPS, MPO, and tree optimizers share concepts but keep their representation's
+own defaults and supported modes. In particular, tree cutoff/FIT defaults
+are constructor settings. Use this table when porting an MPS workflow rather
+than copying its entire `run()` argument list.
+
 Gates are absorbed into the tree according to the selected optimizer mode:
 
 - **ordinary `apply_gate` entries** in `auto`, `direct`, `dm`, `sdc`,
@@ -78,7 +96,13 @@ the complete operator in an isometric environment.
 A compact one-site unitary is absorbed directly in every mode, preserving
 the incoming canonical center or region and local isometry metadata. The
 current small physical matrix is checked at arithmetic precision, including
-even native operators; nonunitary and odd native operators retain the general
+even native operators. Torch certification is reused in a bounded cache while
+the array's storage/view and mutation version remain unchanged; tracked
+in-place edits invalidate it. NumPy, native arrays, and Torch inference tensors
+without version counters are checked directly. For writes through external
+storage or `.data`, mark the Torch tensor with
+`torch.autograd.graph.increment_version` or reinstall the stream with
+`set_gates` before replay. Nonunitary and odd native operators retain the general
 route. This exact absorption skips FIT and clears its latest diagnostic record.
 Native `compression_mode="dm"` raises before update accounting or state
 changes; use `"direct"` for native graded compression.
@@ -236,8 +260,13 @@ incoming tracked center, with structural node id breaking ties; this routing
 order never changes the gate's logical argument order. Off-path branches
 remain canonical boundaries with their existing virtual dimensions. Explicit
 subtree-operator and sub-MPO paths use the same directional compression.
-Branched regions retain their tree sweep. Finite-cap results can change from
-the previous interior-hub order.
+Branched direct/DM regions retain their depth-first cut order. The center
+returns toward the hub only when another branch remains to be processed;
+after the final cut it stays at the last visited tensor. The state-owned
+canonical center and local `left_inds` proofs track this endpoint, so local
+norm readout and the next update can use it directly. Omitting the final
+lossless return preserves the completed update up to roundoff. The different
+incoming center can change a later sweep's direction and finite-bond result.
 
 SRC/SDC/SDCR and their oversampled variants likewise use an endpoint hub on paths, building only the complementary
 environments needed for the opposite projection sweep. Zipup uses a directional
@@ -394,14 +423,32 @@ implemented by these modes.
 
 The default replay configuration is intended for production evolution:
 `mode="auto"` uses the true TreeMPO route on every ordinary gate support,
-while `threads=1` avoids
-oversubscribing the small tree contractions, `subtree_workers=1` keeps the
+while `threads=None` leaves ambient CPU thread settings unchanged,
+`subtree_workers=1` keeps the
 serial path free of thread-pool overhead, `profile=False` avoids timing overhead, and
 `track_truncation=False` avoids full-spectrum diagnostic SVDs, while
 `track_bond_diagnostics=False` avoids live-bond scans. `record_history` and
 `track_infidelity` retain the established API defaults; the latter enables the
 cheap canonical-centre norm ledger and its progress-bar readout. It does not
 enable spectrum probes.
+
+`stabilize_unitary=True` restores the incoming norm after each unitary
+compression, by rescaling the canonical centre. The compression ledger records
+loss before restoration; discarded weight is not stored in `tn.exponent`.
+Restoration and retained-fidelity ratios use stripped norms and exponent
+differences, so finite working tensors remain usable with stored exponents
+such as `400` or `-400`. Represented norm readouts can still overflow or
+underflow the host floating-point range without invalidating those ratios.
+The package default is False, matching MpsOptimizer. A per-replay
+`run(stabilize_unitary=...)` override is scoped to that replay and propagates
+to shots unless their `run_kwargs` override it. Non-unitary replay and
+`track_norm=False` updates retain physical scale changes.
+
+For long runs, `record_history=False` omits accumulated norm, FIT, edge and
+update histories. The latest FIT record and cumulative compression scalar
+remain available. `norm_diagnostics(include_history=False)` reads a bounded
+summary without rebuilding earlier events; it does not add contractions for
+an exact target overlap. Unit-norm restoration works with tracking disabled.
 
 `fit_finite_check=False` keeps optional FIT finite scans off. MPI shot replay
 also defaults to `collect_diagnostics=False`; pass
@@ -410,8 +457,10 @@ also defaults to `collect_diagnostics=False`; pass
 For Torch, JAX, and CuPy, ordinary replay retains detached norm and
 log-fidelity scalars on the array backend. `norm()`, `get_norm_events()`,
 `norm_diagnostics()`, diagnostic reports, and progress display are explicit
-host readout boundaries. A nonzero extracted `tn.exponent` retains Python
-double scale bookkeeping to avoid losing its range on float32-only devices.
+host readout boundaries. An unchanged extracted `tn.exponent` cancels before
+the backend ratio calculation. If an operator changes that exponent, the
+ledger uses host double scalar bookkeeping to preserve very small fidelities
+on float32-only devices; stabilization still uses Autoray backend scalars.
 Norm tracking remains enabled by default. FIT convergence/local reports,
 measurement decisions, native QR safety checks, and upstream truncation rank
 selection can still synchronize; disabling optional diagnostics does not
@@ -466,15 +515,11 @@ snapshots before and after the update. The records are also available through
   QR bond-threading and double-bond fusion of the general geodesic route and is
   the common case in a locality-aware layout.
 
-- **Thread cap.** Tree tensors are moderate-rank (set by local arity and the
-  optional root physical leg, with dimensions bounded by `chi`), so
-  multi-threaded BLAS/OpenMP linear algebra is dominated by thread launch and
-  synchronisation overhead. `TreeOptimizer` caps threads to `1` around gate
-  application and the heavy read-outs by default (`threads=1`), which makes
-  replay both markedly faster and stable in wall-clock time; pass
-  `threads=None` to leave the ambient thread count untouched (worthwhile only
-  in a large-`chi` regime where a single contraction is itself large). Thread
-  limiting uses `threadpoolctl` when available and is a no-op otherwise.
+- **Optional thread cap.** `TreeOptimizer` and `TreeSampler` default to
+  `threads=None`, preserving ambient CPU settings. Explicit `threads=1` can
+  reduce overhead for small CPU contractions; measure the relevant workload
+  before choosing a cap. Explicit limits use `threadpoolctl` when available
+  and do not set CUDA kernel parallelism.
 - **Lazy canonical centre.** A freshly built product state has every virtual
   bond at dimension 1, so it is already canonical with the root as
   orthogonality centre; `from_plan` records that centre on the network rather

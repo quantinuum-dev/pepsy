@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
+
 import numpy as np
 import autoray as ar
 
@@ -16,6 +18,66 @@ _NUMPY_DTYPE_MAP = {
     "int64": np.int64,
     "int32": np.int32,
 }
+
+
+@contextmanager
+def _high_precision_matmul(like):
+    """Scope accurate JAX dot accumulation without changing array precision."""
+    if ar.infer_backend(like) != "jax":
+        yield
+        return
+    import jax  # Imported only for an existing JAX array.
+
+    with jax.default_matmul_precision("highest"):
+        yield
+
+
+@contextmanager
+def _small_matrix_precision(array):
+    """Use double precision for small dense operator factorizations only.
+
+    The caller casts factors back before applying them to a state. No host
+    transfer or global linear-algebra registration is involved.
+    """
+    backend = ar.infer_backend(array)
+    if backend not in {"numpy", "torch", "cupy", "jax"}:
+        yield array
+        return
+    dtype = ar.get_dtype_name(array)
+    if (dtype not in {"float32", "complex64"}
+            or ar.size(array) > 256
+            or getattr(getattr(array, "device", None), "type", None) == "mps"):
+        yield array
+        return
+    context = nullcontext()
+    if backend == "jax":
+        import jax
+
+        # A temporary x64 scope cannot outlive a traced SVD's backward pass.
+        # Keep the caller's precision for transforms when x64 is disabled.
+        if isinstance(array, jax.core.Tracer) and not jax.config.x64_enabled:
+            yield array
+            return
+        enable = getattr(jax, "enable_x64", None)
+        if enable is None:
+            from jax.experimental import enable_x64 as enable
+        context = enable()
+    with context:
+        yield ar.astype(array, "complex128" if dtype == "complex64" else "float64")
+
+
+def _real_if_compatible(array, like):
+    """Keep exactly real NumPy constants compatible with a real state.
+
+    Generated operators commonly use complex storage even when their values
+    are real. Inspect only those host constants, never download a device array
+    or silently discard a nonzero imaginary component.
+    """
+    if (isinstance(array, np.ndarray) and np.iscomplexobj(array)
+            and "complex" not in ar.get_dtype_name(like)
+            and not np.any(array.imag)):
+        return array.real
+    return array
 
 
 def _array_namespace(like):
@@ -86,6 +148,11 @@ def to_float(value, *, real=True):
         If ``False``, complex values follow Python's normal ``float(...)``
         rules and therefore raise when they are not real.
     """
+    if ar.infer_backend(value) == "torch":
+        if value.shape != ():
+            raise TypeError(f"Expected a scalar-like value, got shape {value.shape}.")
+        # Avoid np.real on Dynamo's symbolic Python scalar after a graph break.
+        return float((value.real if real else value).item())
     scalar = _backend_scalar(value)
     if real:
         scalar = np.real(scalar)
@@ -294,8 +361,11 @@ def infer_backend_and_dtype(sample_data):
     if sample_data is None:
         raise ValueError("Cannot infer backend: sample_data is None.")
 
-    dtype_name = ar.get_dtype_name(sample_data)
     backend = ar.infer_backend(sample_data)
+    # Autoray probes ``dtype.name`` and catches AttributeError on Torch.
+    # Dynamo cannot trace that probe; Torch's public string form is stable.
+    dtype_name = (str(sample_data.dtype).removeprefix("torch.") if backend == "torch"
+                  else ar.get_dtype_name(sample_data))
     return backend, dtype_name
 
 

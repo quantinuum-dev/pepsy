@@ -519,8 +519,10 @@ class QuimbMpsBoundaryStore:  # pylint: disable=protected-access,too-many-instan
             )
         envs = _call_with_accepted_kwargs(
             compute_fn,
-            envs={},
-            **self._compute_kwargs(tn=tn, progress=progress),
+            **quimb_2d_options(
+                compute_fn,
+                dict(envs={}, **self._compute_kwargs(tn=tn, progress=progress)),
+            ),
         )
 
         self.clear(axis)

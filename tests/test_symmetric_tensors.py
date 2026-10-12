@@ -5,7 +5,10 @@ import pytest
 import quimb.tensor as qtn
 
 import pepsy
-from pepsy._internal.quimb import quimb_ctmrg_projector_canonize_available
+from pepsy._internal.quimb import (
+    call_quimb_2d,
+    quimb_ctmrg_projector_canonize_available,
+)
 from pepsy.optimizers import sym_dmrg as sym_dmrg_mod
 from pepsy.operators import gate, gate_simple
 from pepsy.optimizers.sym_dmrg import (
@@ -19,7 +22,6 @@ from pepsy.tensors import (
     FermionLatticeSetup,
     OneDMap,
     SpinfulFermion,
-    SpinfulFermionHubbard,
     SymmFermions,
     SymGateStream,
     SymHamiltonian,
@@ -66,7 +68,6 @@ def test_spinful_fermion_helper_bundles_symmetry_aware_building_blocks(
     """The convenience helper should cover the native U1 and U1U1 workflows."""
     fermions = SpinfulFermion(symmetry=symmetry)
 
-    assert SpinfulFermionHubbard is SpinfulFermion
     assert not hasattr(fermions, "t")
     assert not hasattr(fermions, "U")
     assert not hasattr(fermions, "V")
@@ -114,7 +115,6 @@ def test_spinful_fermion_helper_bundles_symmetry_aware_building_blocks(
 
 def test_spinful_fermion_compatibility_constructors_enforce_spinful_space():
     """Legacy spellings must not accidentally construct a spinless helper."""
-    assert SpinfulFermionHubbard is SpinfulFermion
     assert SpinfulFermion(symmetry="U1").spinful
     assert SymmFermions.spinful(symmetry="U1").spinful
 
@@ -3963,7 +3963,7 @@ def test_u1u1_fermionic_mps_optimizer_two_site_fit_stays_native():
         state.tn.copy(),
         gates,
         chi=16,
-        mode="dmrg",
+        mode="dmrg2",
     )
     out = optimizer.run(
         progbar=False,
@@ -4258,7 +4258,7 @@ def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
         state.tn.copy(),
         nearest_gates,
         chi=4,
-        mode="dmrg",
+        mode="dmrg2",
     ).run(progbar=False, fit_block_size=2)
     assert _all_tensor_data_symmray(grown)
     assert grown.max_bond() <= 4
@@ -4272,13 +4272,20 @@ def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
             mode="dmrg",
         ).run(progbar=False, fit_target_strategy="layered")
 
-    with pytest.raises(ValueError, match="fit_block_size=2"):
-        pepsy.MpsOptimizer(
-            state.tn.copy(),
-            nonlocal_gates,
-            chi=4,
-            mode="dmrg",
-        ).run(progbar=False, fit_block_size=1)
+    # Native one-site FIT uses its sector-preserving guess without dense padding.
+    one_site = pepsy.MpsOptimizer(
+        state.tn.copy(), nonlocal_gates, chi=4, mode="dmrg",
+    )
+    refined = one_site.run(progbar=False, fit_block_size=1)
+    reference = pepsy.MpsOptimizer(
+        state.tn.copy(), nonlocal_gates, chi=4, mode="mpo",
+    ).run(progbar=False)
+    assert one_site.get_fit_diagnostics()["block_size"] == 1
+    assert _all_tensor_data_symmray(refined)
+    assert refined.max_bond() <= 4
+    assert float(np.real(pepsy.tn_fidelity(
+        refined, reference, contraction_opt="greedy",
+    ))) == pytest.approx(1.0, abs=1e-10)
 
 
 @pytest.mark.parametrize(
@@ -4301,12 +4308,12 @@ def test_symmps_mps_optimizer_symmray_dmrg_grows_with_native_two_site_fit():
 @pytest.mark.parametrize(
     ("mode", "expected_blocks"),
     [
-        ("dmrg1", [1, 1, 1]),
+        ("dmrg", [1, 1, 1]),
         ("dmrg2", [2, 2, 1]),
         ("dmrg3", [3, 3, 2]),
     ],
 )
-def test_symmps_mps_optimizer_dmrg_aliases_preserve_native_rank_schedule(
+def test_symmps_mps_optimizer_dmrg_modes_preserve_native_rank_schedule(
     model,
     symmetry,
     site_charge,
@@ -4314,7 +4321,7 @@ def test_symmps_mps_optimizer_dmrg_aliases_preserve_native_rank_schedule(
     mode,
     expected_blocks,
 ):
-    """Native U1/U1U1 aliases follow their schedules without densifying."""
+    """Native U1/U1U1 modes follow their schedules without densifying."""
     state = SymMPS.random_unitary_for_model(
         model,
         3,
@@ -4476,7 +4483,8 @@ def test_sympeps_measure_delegates_to_quimb_boundary_modes():
     z_op = np.diag([1.0, -1.0])
     z_sym = state.operator_from_dense(z_op)
 
-    direct_quimb = state.tn.compute_local_expectation(
+    direct_quimb = call_quimb_2d(
+        state.tn.compute_local_expectation,
         {(1, 1): z_sym},
         max_bond=8,
         normalized=True,
@@ -4510,7 +4518,8 @@ def test_sympeps_measure_delegates_to_quimb_boundary_modes():
 
     norm = state.tn.make_norm()
     exact_norm = norm.contract(all, optimize="auto-hq")
-    ctmrg_norm = norm.contract_ctmrg(
+    ctmrg_norm = call_quimb_2d(
+        norm.contract_ctmrg,
         max_bond=8,
         mode="projector",
         final_contract=True,
@@ -4560,7 +4569,9 @@ def test_native_fermionic_ctmrg_matches_exact_on_small_double_layer(
     exact = norm.contract(all, optimize="auto-hq")
     ctmrg = pepsy.contract_flat(
         norm,
-        chi=2,
+        # The doubled bond has dimension D**2. A cap of D=2 truncates
+        # nonzero sectors on current Quimb and is not an exact reference.
+        chi=4,
         method="ctmrg",
         progress=False,
         cutoff=1.0e-10,

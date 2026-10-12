@@ -12,8 +12,1183 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Added
+
+- Dense direct MPO replay supports `mpo_factorization="projector"` for
+  paired-factor derivatives with fixed-rank/gap validation. Unsupported charts
+  raise `pepsy.backends.ProjectorDerivativeError`; the QR default is unchanged.
+
+- PEPS row/column sweeps support `optimizer="als"`: fixed-rank one-site
+  least-squares solves with independent inner forward/backward budgets,
+  directional environment reuse, default explicit Hermitian metrics with
+  iterative CG, true-residual checks and overlap acceptance. Matrix-free CG,
+  direct factorization and spectral pseudoinverse are explicit alternatives,
+  with no automatic CG fallback. Assembled matrices retain size guards. Native
+  NumPy/Torch/CuPy are supported; existing L-BFGS defaults are unchanged.
+  Optional one-site `linear_solver="dense-lbfgs"` / `"lbfgs"` replaces CG
+  with analytic-gradient L-BFGS using explicit / matrix-free Hermitian
+  environments. SciPy manages host vectors while contractions remain on the
+  input backend/device. Budget-limited candidates retain convergence diagnostics
+  and the original overlap acceptance check; the default stays `"dense-cg"`.
+  Explicit CG fallback reports retain the final direct solution's residual
+  separately from the failed CG residual (`cg_relative_residual`).
+  Initial and candidate norm checks use the same Hermitian metric as the
+  site solver, so imaginary boundary-compression residuals no longer reject
+  all site updates before optimization.
+
+- `PepsOptimizer` defaults direct boundary compressors (`direct`, `zipup`,
+  SRC/SDC and related modes) to separate BRA then KET absorption with
+  compression after each layer. DMRG/FIT modes retain a joint uncontracted
+  target; explicit layer policies still take precedence.
+
+- `FIT([T1, T2, ...], p=guess)` fits tensor-network sums using separate cached
+  overlap environments and one combined local update, without materializing
+  sum bonds. Supports MPS/MPO targets, layered terms, weighted cancellation,
+  one-/two-/three-site sweeps, and native Symmray arrays. Cached target-block
+  selections and a shared fitted bra avoid repeated construction; optional
+  verbose target norms reuse Hermitian cross terms once per run.
+
+- Two-site PEPS fits now expose `tensor_mode="reduced"` (default) and opt-in
+  `tensor_mode="full"` with joint L-BFGS on both full site tensors. Reduced
+  tensors also support `solver="lbfgs"`. Environment gauges remain off by
+  default. Full mode uses Torch autodiff of cached scalar Cotengra contractions
+  with a fixed environment TN and explicit gate, without a full norm matrix.
+  Two-site full-update defaults are reduced ALS, one boundary cap `2*chi**2`
+  shared by normalization/evaluation, cached DMRG boundary MPS, and no
+  automatic boundary-convergence probes or evaluation cap retries.
+  The FU engine defaults to local fidelity reporting and accumulated local
+  fidelity, with independent global pre/post checks and outer acceptance off.
+  Explicit diagnostic settings remain available.
+  A local SVD warm start whose numerical rank fits the PEPS cap is accepted
+  directly with local fidelity one, skipping FU environment/solver work
+  (`skip_exact=True`). Same-cap boundary retuning preserves cached DMRG cuts.
+
+- Opt-in fixed-layer PEPS refinement (`refine_scope="layer"`) fits full site
+  tensors over rows and columns against one bounded exact gate-window target,
+  with independent whole-cycle checks and rollback. Native Torch/CuPy
+  `refine_solver="pinv"` solves on the Hermitian norm's positive numerical
+  support without environment gauges. Directional strip environments use
+  linear many extensions per sweep; a configurable local matrix-size guard
+  skips expensive dense refinement while retaining pair FU.
+
+- Opt-in `gate_order="smart"` for dense PEPS: Pauli commutation dependencies,
+  strip-aware traversal, native single-qubit fusion, and complete original
+  gate IDs. Full-update refinement can retain an exact strip target across
+  absorbed local rotations. Single-qubit NumPy gates are converted to the
+  Torch/CuPy PEPS backend before absorption.
+
+- Optional native Torch/CuPy strip ALS refinement after two-site PEPS full
+  updates, with fixed exact block targets, norm/overlap environment reuse,
+  and rollback. Per-gate positive-environment fidelities are always retained;
+  optional log-space accumulation reports a local infidelity proxy.
+
+- Fixed-shape FX capture for adaptive Torch QR VJPs and deferred MPS norm
+  validation, preserving first-order derivatives across changing singular-chart
+  masks. Zero-cutoff two-site Torch/JAX gate replay also uses an exact fixed
+  operator bond for native Quimb `dm` and `zipup` compression.
+
+- Dense CuPy full-update ALS with native GPU norm projection, gauges and solves.
+  Boundary/strip caches validate CuPy mutations with device-side snapshots.
+  Row/column traversal also sorts disjoint non-diagonal two-qubit layers and
+  finishes each orientation before switching to transverse strips.
+
+- Opt-in adaptive JAX QR VJP through `register_jax_linalg(qr_rank_policy="adaptive")`,
+  retaining native finite derivatives and a regularized singular-chart extension.
+  Dense direct MPS replay with zero cutoff supports fixed operator bonds and
+  traceable canonical initialization; JAX retains runtime zero-norm checks.
+
+- PEPS `update_style` explicitly selects row/column fitting or reduced two-site
+  ALS within sweep mode. Optional column/row gate traversal reorders only
+  contiguous fixed diagonal two-qubit gates and preserves ordering barriers.
+  Two-site updates reuse Pepsy's reduced-pair preparation, PSD projection and
+  Quimb/weighted-QR ALS with an externally contracted environment.
+
+- Optional dense Torch PEPS `mode="full-update"`: gate-by-gate reduced
+  two-site QR/LQ update, positive norm-environment projection, environment
+  gauges, and alternating least-squares solves with rollback and diagnostics.
+  Adaptive boundary checks and selected-chi output normalization are retained.
+- Dense Torch adaptive PEPS fits can reuse checked boundary MPS and valid
+  directional cuts. Slice/predecessor versions and compression settings
+  invalidate affected cuts in both sweep directions; fresh convergence
+  confirmation remains independent. Disable with
+  `boundary_convergence={"reuse_environments": False}`.
+
+### Fixed
+
+- PEPS full-update environment gauge conditioning now defaults to off;
+  Hermitian positive norm projection remains active. The existing explicit
+  `gauge=True` pair-update option is retained.
+
+- PEPS full-update strip refinement honors separate norm and overlap boundary
+  caps, including the complete adaptive calibration pair. Checked overlap
+  handles and target labels are carried into refinement with cache signatures
+  refreshed after bra-index alignment; diagnostics report both caps.
+- Confirm BP's final residual after an upstream pending-queue early stop,
+  within the requested iteration budget; preserve explicit rolling stops.
+- Resolve compact-channel transpose/einsum dispatch before Torch graph capture.
+- Support unfused native fermionic bond axes in the scoped CTMRG projector
+  adapter, and retain one explicit boolean readback for MPS norm validation.
+- PEPS full-update strip refinement accepts NumPy and mismatched-dtype gates
+  through the same native conversion as pair updates. Single-site gates honor
+  target normalization even when final normalization is disabled. Smart gate
+  scheduling updates readiness incrementally, removing cubic predecessor-copy
+  work on overlapping queues while preserving the ordering heuristic.
+
+- MPS replay accepts mixed concrete and traced JAX arrays under eager `vmap`
+  and `grad`, while retaining backend, dtype and known-device mismatch checks.
+
+- Full-update ALS uses dtype-aware `rtol="auto"`, normalized complete-sweep
+  stopping, and actual iteration/convergence diagnostics. Public Quimb native
+  ALS solves and open overlap networks are reused with QR/LQ regauging between
+  sweeps. PEPS arrays, norm matrices, and linear algebra stay on Torch.
+- PEPS adaptive convergence rejects fixed `fit_max_bond` overrides that would
+  otherwise repeat one approximation at every probe chi. Full updates accept
+  paired normalization caps, honor nonunitary target normalization, and base
+  acceptance on raw valid infidelities measured at matching effective caps.
+- Full updates reuse validated exact prefix/suffix contractions inside the
+  active row or column, in addition to boundary MPS cuts, with Cotengra
+  planning and separate strip-cache diagnostics.
+
+- Two-site PEPS output normalization keeps the calibrated chi even with custom
+  normalization options. Failed zero-norm calibration probes discard stale
+  boundary handles and report nonconvergence without a cache-handoff error.
+- Fixed-chi two-site PEPS updates use `boundary_chi` for the reduced norm
+  environment independently of overlap-evaluation caps, and retain validated
+  boundary cuts across gates even when adaptive calibration is disabled.
+
+- PEPS sweep refinement now checks norm/overlap convergence at increasing
+  boundary chi by default, reuses measured norms and the cap floor, and warns
+  with explicit diagnostics when its configurable ceiling is insufficient.
+  Probes now scale as D squared, 2 D squared, 3 D squared up to 8 D squared,
+  require two stable increases, and confirm reused DMRG boundary guesses
+  with fresh contractions. Selected caps are fixed during fitting and final
+  normalization; reports include actual ranks, thresholds and stop reasons.
+  Imaginary norm residuals now use the requested relative accuracy with a
+  dtype roundoff floor, rather than forcing machine precision on approximate
+  contractions. Reports distinguish converged selection from a ceiling fallback.
+  Set `boundary_convergence=False` for the previous fixed-cap policy.
+
+- PEPS sweep clipping no longer turns negative approximate losses into
+  perfect-fit convergence or best-state scores. Clipped outer prechecks still
+  invoke refinement. Sweeps with every local update rejected report failure
+  and preserve raw invalid-slice diagnostics instead of claiming optimization.
+
+- CuPy exact-vector sampling also uses float64 inverse-CDF accumulation
+  and uniforms, avoiding float32 interval loss in `RandomState.choice`.
+  State precision, returned Born weights, and device placement are preserved.
+
+- Large Torch exact-vector sampling uses float64 inverse-CDF accumulation
+  and random draws, avoiding biased low-order bits for complex64 states.
+  The CDF uses its accumulated total for normalization. Historical shots
+  from the float32 route need resampling; seeded draw sequences change.
+
+- Native JAX optimizers use the correct complex-gradient descent direction,
+  validate near-real scalar losses, and reject unsupported constraints.
+  Torch and finite-difference Adam score the final update before restoration;
+  unbounded Torch best-state snapshots stay on their source device.
+- SciPy and finite-difference SciPy honor explicit iteration aliases, use TNC's
+  `maxfun` control, support `trust-constr` callbacks, and distinguish invalid
+  objectives from successful convergence. PEPS local sweeps retain explicit
+  SciPy limits. qMERA energy solves accept negative best energies by default.
+- Native solvers reject nonfinite gradients; JAX skips invalid-loss updates.
+  Torch terminal costs retain support for objectives using autograd internally.
+  NLopt variants propagate scalar/real loss errors, distinguish invalid
+  objectives and actual termination reasons, and report the returned state's
+  evaluated loss. Unsupported `max_step` callback clipping now raises explicitly.
+
+- PEPS automatic batches stop on actual target bond growth, rather than
+  shared gate endpoints. A nearest-neighbor RZZ layer with one gate per bond
+  now builds one target within `2*chi` before compression/refinement. Gate
+  order, single-site gates, and exact look-ahead rollback remain preserved.
+
+- Compact PEPS sweep diagnostics retain raw initial/final losses clipped above
+  one as well as below zero. Document that clipping permits continuation and
+  can skip refinement; it is not evidence of boundary-contraction accuracy.
+
+- Torch-backed gradient and finite-difference solvers now own their parameter
+  storage, preserving caller tensors and NumPy inputs during in-place trial
+  updates. Rejected PEPS sweeps therefore restore the unchanged normalized
+  warm start instead of a snapshot contaminated by solver writes.
+
+### Added
+
+- Sweep optimization accepts `compute_initial_loss=False` to skip its separate
+  initial whole-state diagnostic. Combined with `compute_final_loss=False`,
+  this retains local objective checks without separate whole-state overlaps.
+  Defaults and explicitly supplied initial losses retain their existing checks.
+
+- PEPS row/column sweep objectives default to Pepsy's reusable Cotengra
+  `build_optimizer` helper (formerly `build_contraction`). One search cache is
+  shared across slices, gate batches, and successive driver runs. Explicit
+  `local_contraction_opt` overrides remain available; boundary presets are
+  configured independently.
+  PEPS and standalone sweep normalization/overlap/global defaults also use
+  this helper; boundary FIT inherits the selected optimizer instead of a
+  separate `auto-hq` fallback. Explicit overrides retain precedence.
+
+- Torch PEPS global norm/overlap contractions default to `cutoff=1e-10`,
+  separately from gate/warm-start truncation. Explicit metric options win.
+  JAX global objectives retain `cutoff=0`, JIT enabled, and Pepsy's registered
+  SVD derivative; Torch retains the registered stabilized SVD/QR policy.
+
+- PEPS sweeps reuse matching direct-boundary prechecks and avoid duplicate
+  final diagnostics when the driver performs the acceptance check. Direct
+  boundary containers initialize lazily; local contraction paths are reused
+  within unchanged slice topology/shapes. Cost estimates and boundary-MPS norm
+  reports are opt-in. Solver budgets and the final acceptance check are retained.
+
+- `PepsOptimizer(evaluation_negative_tol=1e-3)` warns and continues for small
+  out-of-range approximate infidelity estimates, clipping to [0,1] for bookkeeping while
+  preserving raw values in evaluation and batch diagnostics. Set zero to
+  restore roundoff-only handling. Exact metrics and larger invalid estimates
+  keep their existing safeguards.
+  Sweep diagnostics apply the same configurable allowance and backend-native
+  Autoray clipping, retain raw local losses, and leave gradients unclipped.
+  Global and sweep optimizer return values use the same allowance before outer
+  acceptance checks; small inner errors no longer abort the gate stream.
+
+- `PepsOptimizer.run(timing=True)` records target construction, compression,
+  normalization, fidelity checks, and sweep/global optimization phase times.
+  Batch records retain phase deltas and sweep summaries retain boundary/local
+  solve timings per slice. `get_timing()` reports the last run, including failed
+  runs; `timing_sync_device=True` adds opt-in outer-phase accelerator barriers.
+  An optional `step_callback` streams detached completed-batch diagnostics.
+
+- `PepsOptimizer(mode="global")` now defaults to `jit_fn=True` and loss
+  options `cutoff=0`, `strip_exponent=False` when JAX autodiff is selected.
+  Explicit global overrides take precedence. Boundary bond caps and outer
+  normalization settings retain their existing behavior.
+  Global JAX optimization also registers Pepsy's truncation-safe SVD
+  derivative before loss construction/JIT tracing; QR uses native JAX.
+
+- `PepsOptimizer.run(k_2q_batch="auto")` now defaults to ordered batches of
+  disjoint two-site gates, absorbing one-site gates in place and limiting
+  multi-gate target bonds to `2*chi` for diagonal qubit gates such as RZZ,
+  or `4*chi` for other gates. Exact single-gate targets may exceed
+  that budget; integer batch sizes retain count-based behavior. Batch records
+  expose stopping reasons and target caps. NLopt local defaults are explicit:
+  `LD_LBFGS`, 50 evaluations, objective/parameter tolerances `1e-9`,
+  and best-iterate restoration.
+  Dense nearest-neighbor diagonal gates use their exact `2*current_bond`
+  rank ceiling. Unitary targets are no longer rescaled by default; retained
+  outputs use `normalize_chi` for normalization, including direct targets
+  and standalone one-site output. `non_unitary=True` enables target
+  normalization, with explicit `normalize_target` overrides supported.
+  Default unitary fidelity checks assume target norm one and skip the target
+  norm contraction. Explicit `infidelity_kwargs={"norm_target": None}`
+  restores measurement; nonunitary runs and runs without final normalization
+  measure target norms by default.
+
+- Export `pepsy.backends.register_projector_split` for custom dense boundary
+  algorithms to reuse the existing paired-factor Quimb split registration.
+  The decomposition and its derivative contracts are unchanged.
+
+- Public `stim_plan_to_gate_stream` translates compiled Stim plans into
+  unsampled independent Pauli-noise streams; `stim_readout_parities` resolves
+  raw detector and indexed logical-observable parities. StabilizerMpsSimulator
+  exposes explicit `compile` preparation and `compiled_stream` access, while
+  retaining `set_gates`. Analysis recognizes trajectory channels and support.
+
+### Performance
+
+- StabilizerMpsSimulator uses native Stim measurement/reset collapse when the
+  live coefficient state or mapped support region is certified exactly
+  as separated single-qubit Pauli eigenstates. Mixed magic support retains the MPS path;
+  explicit fixed-basis measurement remains available. Norm events report
+  the collapse backend and fallback reason. Simulator and shot-result routing
+  summaries preserve coalesced multiplicities and report omitted histories;
+  compilation remains free of state execution.
+
+- StabilizerMpsSimulator shares ordinary MPS trajectory CPU scheduling,
+  allocator-aware memory planning and execution diagnostics. Automatic local
+  replay continues from counted prefixes at branch caps. Frame Kraus outcomes
+  reuse normalized Pauli expectations without parent-norm underflow; sampled
+  positive rare branches normalize below the forced-projector tolerance.
+
+- Local automatic MPS trajectories continue from completed shared prefixes
+  before a possible branch-cap overflow, preserving counts, weights and
+  controls. Pauli error models and threaded local runs are supported;
+  explicit coalesced runs retain strict caps.
+- Torch CUDA/CuPy coalesced swap-mode trajectories batch compatible adjacent
+  two-site gate contractions and SVDs through Autoray. Independent truncation
+  ranks, norm accounting and caller-selected Torch gradient policy are kept.
+  Diagnostics expose continuation and the largest gate batch used.
+- MPI configuration hashing now compares backend gate-array contents instead
+  of process-local Torch storage serialization, including compiled plans.
+- Local MPS trajectories automatically budget retained states from available
+  GPU allocator memory and projected bond growth. Explicit byte budgets and
+  diagnostic estimates are supported. Memory-limited coalescing preserves
+  retention and validates independent fallback before allocating its results.
+- Coalesced MPS trajectories automatically batch compatible one-site Kraus
+  parent states on Torch CUDA/CuPy through Autoray. Shape/dtype/device grouping,
+  a bounded temporary workspace and conservative fallbacks preserve sampling,
+  gradients and rare outcome weights. Diagnostics expose the largest parent
+  batch used.
+- MPS trajectory `workers="auto"` now uses one accelerator worker, avoids
+  threads for small/shared-prefix CPU jobs, and bounds large independent CPU
+  jobs by existing numerical-library thread settings. Stream-local automatic
+  coalescing recognizes rare fixed mixtures without trial runs. Local MPS
+  diagnostics report the planned strategy, worker budget and cap fallback.
+- Dense MPS trajectories prepare one amplitude block per Kraus channel and
+  batch outcome applications/reductions through Autoray on NumPy, Torch,
+  CuPy and JAX. Backend operator batches are cached and temporary batch sizes
+  are bounded. Scaled norms and host float64 squaring retain rare probabilities
+  while reducing device readbacks, without changing state dtype or device.
+
+### Fixed
+
+- Global PEPS optimization restores the input array backend, dtype, and device
+  before normalization and fidelity checks, including native Symmray blocks.
+  The PEPS driver now owns final normalization and honors its opt-out without
+  a duplicate delegated contraction. NLopt cleanup restores the best finite
+  evaluated vector and reports early-stop/recovery status separately from the
+  raw loss history. Standalone `GlobalOptimizer.normalize()` now honors its
+  independently configured normalization options.
+
+- PEPS sweep cleanup no longer treats a substantially negative or nonfinite
+  initial infidelity as convergence. Failed cleanup retains the warm start
+  with explicit diagnostics. Invalid local solver parameters or losses are
+  rejected before slice writeback, preserving the previous tensors without
+  changing boundary caps or measuring the unitary target norm.
+
+- `PepsOptimizer` now reuses the known target norm in delegated sweep
+  diagnostics, eliminating the two internal target-norm contractions still
+  present in unitary runs. Already-normalized warm starts skip duplicate
+  sweep-constructor normalization. When fidelity measurement is disabled,
+  optimization measures an unknown target norm once instead of silently
+  assuming one for nonunitary targets. Explicit normalization and diagnostic
+  overrides remain supported.
+
+- Gradient solvers reject mixed Torch/JAX parameter mappings and native
+  solver/backend mismatches before array conversion or loss evaluation.
+  SciPy/NLopt still select native autodiff from the input arrays; NumPy/scalar
+  inputs retain their existing conversion behavior and solver defaults.
+- JAX/Optax solvers associate best losses with the evaluated parameters,
+  rather than the subsequent update. A final forward evaluation scores the
+  last update and makes the returned parameters and `final_loss` consistent;
+  this additional evaluation is included in `n_evals`.
+
+- Standalone PEPS fidelity evaluation recomputes both norms and can retry invalid
+  estimates at larger, equal caps (two bounded, warned retries by default;
+  disable with `evaluation_max_retries=0`). Effective caps and raw attempts
+  are recorded, acceptance uses common caps, and the measured target norm
+  reaches variational cleanup. Exact-target protection now covers `bond_dim`;
+  physical-index gates, sweep FIT diagnostic collection, and temporary
+  `run(mode=...)` overrides follow their documented behavior.
+
+- Small dense MPS gate-to-MPO factorizations use a bounded double-precision
+  operator workspace and cast factors back before applying them. This resolves
+  the recorded Torch CUDA/JAX complex64 ledger comparisons without changing
+  state dtype, SVD registration or test tolerances; unsupported precision and
+  JAX transformations with x64 disabled retain their existing factorization.
+- Automatic trajectory planning respects per-event branch caps without a
+  total cap and accounts conservatively for importance proposals and dynamic
+  controls. Conditional tuple-form resets and measure-resets retain their
+  event name when parsing support, fixing rejected feed-forward instructions.
+- MPS trajectories rebuild exact-mode states before coalesced controls, retain
+  rare multi-site Kraus weights using projected amplitudes, and accept real
+  Torch states for real-valued generated noise operators. Dense JAX MPS
+  operations use scoped high-precision accumulation without changing the
+  state dtype/device or the caller's global precision policy.
+- Coalesced trajectory branches preserve native measurement prefixes for
+  feed-forward and readout, including STN copies that reset public history.
+  StabilizerMpsSimulator automatic local dispatch uses host CPU budgets or one
+  automatic accelerator worker, preserving explicit worker/backend overrides.
+
+- STN frame-layout search retains measurement/reset lifetime hints for the
+  shared MPS finder's lifetime and role candidates without changing projector
+  operator costs. Queued STN advice reuses installed trajectory plans.
+
+- Threaded trajectory shots reuse prepared stream plans rather than reparsing
+  the complete stream per shot. Stim parsing supports grouped record-controlled
+  gates and empty readout annotations, and rejects unsupported readout-noise,
+  inverted measurement results and `MPAD` instead of discarding their effects.
+
+- Dense `gate_simple(..., smudge=0)` preserves exact-zero external bond
+  support during adjacent and routed updates without dividing by zero.
+  Nonzero weights and requested truncation controls are unchanged.
+
+- StabilizerTreeSimulator exposes TreeOptimizer's DMRG/FIT and compression
+  algorithms and controls through the shared coefficient engine. Copies,
+  shots, frame-layout changes and cap reconstruction preserve named FIT
+  schedules and live compression policies. Generic DMRG remains one-node;
+  larger-block growth requires `dmrg2` or `dmrg3`.
+  Coefficient localizers share ordinary compact gate routing; full and compact
+  tree operators share `apply_sub_mpotree`. Physical caps reconstruct exactly
+  before selected-engine compression, honoring relative cutoff conventions.
+  Public threaded TreeStab shot replay initializes Stim's NumPy matrix
+  bridge before dispatch, avoiding a reproduced first-use deadlock.
+
+- Trajectory importance sampling rejects omitted positive target branches,
+  however rare, and proposal mass on impossible outcomes before replay.
+  Callable coalesced mixture proposals receive each live parent optimizer.
+  One-site exact MPS Kraus Gram contractions preserve the state backend;
+  MPS outcomes reuse the base norm, and discarded-shot diagnostics aggregate
+  without retaining a dictionary per shot.
+
+- StabilizerMpsSimulator `dmrg2` adjacent-pair compression honors the requested
+  FIT sweep budget and convergence controls, matching MpsOptimizer. The
+  one-update shortcut requires explicit `fit_single_pair_fast_path=True`.
+
+- StabilizerMpsSimulator `dmrg`/`fit` now fixes one-site FIT, matching ordinary
+  MpsOptimizer; select `dmrg2`/`dmrg3` for multi-site growth. Added the shared
+  adjacent-window `fit_single_pair_n_iter` cap and dense Quimb
+  `compression_opts` controls, with shot propagation and per-run restoration.
+  Legacy STN `dmrg1` retains its previous growth schedule.
+
+- MPO structural reductions check individual bond-channel reconstruction and
+  opposing tensor scales, preserving order-one terms carried by unbalanced
+  local factors. Delinearization retains trainable Torch/JAX-traced channels
+  so zero-initialized coefficients keep their derivatives, and skips
+  unsupported decomposition dtypes such as Torch float16 without changing
+  the MPO's dtype. Skipped passes report their reason.
+
+- Dense TreeSampler normalizes its accumulated conditional CDF endpoint,
+  preventing draws near one from selecting trailing zero-weight physical
+  codes when cumulative probabilities round below one. Applies to both
+  strategies, chunked and unchunked, on NumPy, Torch and CuPy.
+
+- Native Symmray scalar extraction preserves Torch gradients and CuPy arrays,
+  unwrapping only tensor-network containers. Native normalization and scoring
+  keep their backend graphs; canonical capture normalizes its graded root
+  directly and clears an extracted positive global scale.
+
+- Gradient solver shorthand resolution uses a separate table from SciPy method
+  normalization: `lbfgs` now selects SciPy L-BFGS-B as documented. Use
+  `torch-lbfgs` to select Torch's optimizer explicitly. Returning JAX results
+  works when the optional Torch dependency is unavailable.
+
+- TreeSampler rescales dense conditional messages to prevent long-tree
+  complex64 sampling bias and scores probabilities with float64 scale
+  bookkeeping. Dense root normalization handles extreme finite scales,
+  retains Torch gradients, and rejects invalid norms. Scoring rejects invalid
+  physical codes before indexing; native Symmray flip ratios return one
+  independently flipped column per site. Zero uniform draws skip zero-weight
+  branches.
+
+### Added
+
+- Native `TreeSampler(..., backend="native", strategy="factor")` shares
+  measurement prefixes using exact, sector-preserving canonical factors.
+  Graded centre norms preserve fermionic phases, physical codes are remapped
+  after unreachable sectors disappear, and prefixes are normalized with
+  float64 sample-probability bookkeeping. NumPy, Torch CPU/CUDA and CuPy retain
+  blocks and device; Torch fixed-configuration scores retain gradients.
+  `cache_bytes` bounds retained payloads within a call; single-chunk native
+  requests skip unused prefix-cache retention. `workspace_bytes`
+  continues to tile dense kernels rather than native QR.
+
+- Dense factor sampling reuses the virtual root's unconditioned first-child
+  density across chunks when its cache budget admits it. Cache growth merges
+  sorted keys by direct scatter, avoiding full density concatenation and
+  permutation copies; cache-disabled and exhausted paths remain exact.
+
+- `GradientOptimizer` SciPy/NLopt callbacks support native JAX parameters and
+  autodiff, preserving shape, dtype and device, including complex parameters.
+  `lbfgs`, `scipy-lbfgs`, and `LD_LBFGS` work with Torch or JAX scalar losses.
+  SciPy Hessian and Hessian-vector callbacks also support JAX.
+
+- Exact `TreeSampler(strategy="factor")` retains compact mixed
+  factors, groups repeated prefixes/subtree messages and caches child densities
+  within one call. Cache exhaustion reuses computed misses; large remainder
+  gathers and projections are tiled, and oversized grouped remainders retry
+  smaller chunks with unchanged uniform draws. NumPy, Torch CPU/CUDA and CuPy
+  preserve dtype/device and Torch gradients; integer-key overflow has an exact
+  row-grouping fallback. `cache_bytes` and `workspace_bytes` control retained
+  cache storage and intermediate targets, not total memory. The default
+  strategy is now factor for dense and native Symmray sampling; the previous
+  algorithms remain available with explicit `strategy="standard"`.
+
+- Dense `TreeSampler` carries exact amplitude vectors for structurally pure
+  conditional environments, avoiding unnecessary squared-bond densities.
+  Mixed sibling environments retain the density route, with physical draw
+  ordering, precision, and exact Born probabilities preserved.
+
+- `PepsSampler(amplitude_mode="proposal")` names sampling without separate
+  amplitude evaluation. `"none"` remains a compatible alias, including its
+  existing result metadata. Both return q, `ps=None`, and equal averaging
+  weights. `"proposal"` is now the default; amplitude corrections require
+  explicit `"boundary"` or `"exact"`. Chunk-size defaults are unchanged.
+
+- Optional `TreeSampler(chunk_size=...)` bounds dense shot batches and tiles
+  first-child density environments to avoid quartic bond allocations.
+  The default remains unchunked, with native outputs and seeded draw ordering
+  preserved. Total requested sample counts are unchanged. Chunk collection
+  fills one native output allocation and promptly releases completed chunk
+  buffers; single-chunk requests reuse their outputs. CuPy sampling and scoring
+  honor the captured tree device independently of the current CUDA device.
+
+- `PepsSampler.sample_batch` and `iter_samples` accept `chunk_size="auto"`
+  to bound shared-prefix groups using the row-cache estimate (at most 32).
+  Exact proposals and disabled/insufficient caches use one history at a time.
+  Explicit integer sizes and the existing defaults retain their draw order.
+  Unsplit reference groups avoid network copies, and completed conditional
+  networks are released before optional amplitude contractions. Streams release
+  discarded results before constructing the next chunk. Saved PEPS
+  proposal records now reject malformed probabilities even when equal-weight
+  proposal-only averages are requested.
+
+- `PepsSampler(amplitude_mode="boundary", amplitude_chi=...)` evaluates
+  projected amplitudes with a capped boundary-MPS sweep, preserving scaled
+  values and phase without a full-network exact amplitude plan. Results and
+  weight diagnostics identify approximate weights. Both amplitude methods are
+  opt-in; full exact amplitudes require `amplitude_mode="exact"`.
+  `amplitude_mode="none"` skips amplitude contractions, returns `ps=None`, and
+  uses equal weights for ordinary proposal averages with explicit diagnostics.
+
+- TreeOptimizer's `dmrg`, `fit`, and deprecated `dmrg1` now require
+  `fit_block_size=1`, matching MPS one-site DMRG. Larger blocks are rejected
+  at construction and replay; use `dmrg2` or `dmrg3` for block updates.
+
+- TreeOptimizer's `dmrg1` is now a deprecated alias of `dmrg`: both default
+  to one-site refinement from the initialized guess, without a two-node
+  warm-up. Explicit FIT settings are honored identically. Selecting `dmrg1`
+  warns to use `dmrg`.
+
+- `TreeOptimizer(mode="dmrg")` now defaults to `fit_block_size=1`, refining
+  only one tree node at a time from its initialized guess without multi-node
+  FIT warm-up. The four-iteration budget still allows eight directional passes;
+  explicit larger block sizes and named DMRG schedules remain available.
+
+- Public `gate` and `gate_simple` now default to dtype-aware `cutoff="auto"`
+  (1e-12 for complex128/float64, 1e-6 for complex64/float32, 1e-3 for 16-bit)
+  and `cutoff_mode="auto"` (rsum2), sharing the MPS policy. Numeric overrides
+  remain supported. Roughening forwards the policy to these package APIs.
+
+- `gate_simple(..., renorm=False, strip_exponent=True)` keeps simple-update
+  gauges at unit RMS and retains their scale in the tensor-network exponent,
+  including routed SWAPs. Exact and BP contractions can recover the physical
+  norm or return it as mantissa/exponent. Active absolute cutoffs are rejected;
+  the default gate behavior is unchanged.
+
+- Cluster-MPO facades now accept `preparation="frontier"` or `"automaton"`
+  with fixed uncapped construction, plus `delinearize=True` for integrated
+  NumPy QR dependency removal. Single and ordered-product calls preserve the
+  cluster target and avoid collection enumeration. `ClusterChannelPlan.exp`
+  and `trace_exp` support the same opt-in QR step; `delinearize_opts` controls
+  its tolerance, zero policy and sweep count. Evaluation reports distinguish
+  channel bonds from final bonds. Defaults and static autodiff maps are unchanged.
+
+- Constructed PEPO traces now reject sparse-budget/materialized-contraction
+  combinations instead of silently ignoring a control, and require mapping
+  contraction options. Compact channel reports distinguish exact structural
+  plans from QR projections and count reference evaluations. Exact
+  symbolic/algebraic preparation with an uncapped or nonbinding cap skips
+  numerical reference residual builds. Exact reference/frontier/automaton plans
+  still perform their required base build but skip unused optional references.
+
+- Compact dense Pauli MPO plans accept `preparation="automaton"`: reachable
+  frontier states plus exact rational elimination of operator-aware linear
+  transition dependencies. Full channels avoid SVD/QR and preserve the whole
+  declared parameter family. Replay uses fixed Pauli projections and fused
+  contractions. Native sectors use frontier preparation; smaller caps remain
+  approximations, and global minimality or universal bond reduction is not
+  claimed. Both 1D cluster notebooks compare this mode explicitly.
+
+- Compact graph/square Pauli PEPO plans accept `preparation="algebraic"`.
+  Closed Pauli spans and exact rational edge-slice delinearisation preserve
+  the declared parameter family without SVD/QR for full channels. Replay uses
+  fixed projections and contractions; Torch CPU/CUDA gradients, JAX trace JIT
+  and Torch assembly capture are covered. Optional reference QR caps remain
+  approximations. This is local reduction, not global minimality, and it does
+  not remove dense local exponential work.
+
+- `pepsy.operators.delinearize_mpo` and `MPODelinearizationReport` provide
+  opt-in numerical dependency removal for open-chain dense NumPy MPOs.
+  Column/transfer sweeps use pivoted QR without SVD, with explicit residual
+  and zero-preservation policies. This is separate from symbolic sharing,
+  has no best-rank guarantee, and rejects native/autodiff arrays explicitly.
+
+- Compact graph/square PEPO plans accept `preparation="symbolic"`. Exact
+  edge-slice sharing reduces graph channels before square routing, then
+  shares routed channels; reference/tangent samples reuse linear templates.
+  Replay folds both quotients into constant maps, preserving Torch/JAX
+  derivatives without SVD/QR. Full channels retain the selected cluster
+  target; tight-cap accuracy can change with the gauge. Remaining routed
+  blocks are still enumerated once. Square wire labels now use mixed-radix
+  arithmetic instead of Cartesian dictionaries.
+
+- Experimental `prepare_cluster_channels` / `ClusterChannelPlan` for fixed
+  MPO and fixed graph/square PEPO construction into compact virtual
+  spaces. Multi-reference and finite-difference tangent snapshots select
+  charge-preserving bases with host QR; Torch/JAX replay fuses local factors
+  into compact tensors without expanded histories, product cores, SVD or QR.
+  `pack_residuals` / `bind_assembler` expose the complete assembly kernel for
+  explicit Torch compilation. Recursive MPO sources require exact reference
+  topology within their collection budget. Square plans use graph residuals
+  and wire routing; their projected gauge can differ from earlier plans.
+  Reduced spaces are approximate objectives.
+- Compact MPO plans now merge equal symbolic prefix/suffix transitions within
+  charge sectors before QR selection. Sum/select endpoint maps preserve
+  multiplicity for independent residual entries, including zero coefficients.
+  `structural_reuse=False` retains the previous MPO gauge; capped plans can
+  change with the new default gauge. PEPO symbolic sharing is opt-in as above.
+- Compact MPO plans accept `preparation="frontier"` to share completed
+  histories before allocation. Reachable active-cluster transitions replace
+  full collection enumeration, including crossing/gapped supports and native
+  sectors. `frontier_state_budget` is an explicit guard; exactness does not
+  depend on a collection-count cap. Bounded/auto graph targets keep reference
+  preparation. Full symbolic minimality is not claimed.
+- Graph PEPO materialization now relabels channels independently per edge,
+  removing global padding exactly. Physical Pauli transforms preserve
+  single-precision complex dtype through fixed square construction.
+
+- Native Abelian cluster MPOs now factor residuals by charge sector and
+  preserve virtual charges through direct interval and graph assembly.
+  Conserved hopping and zero-cutoff null channels work for single and joint
+  exponentials; rank caps apply across the combined sector spectrum. Native
+  MPO dense export also preserves physical basis ordering with repeated
+  charges. Exact fixed-sector construction now preserves Torch/JAX gradients,
+  including zero coefficients and JAX tracing. Native recursive/streaming
+  assembly and semantic adaptive compression preserve sectors on NumPy/Torch;
+  Torch uses paired-factor projector derivatives within fixed rank charts.
+  Native fixed-rank compression rejects unspecified sector allocations, and
+  JAX intermediate adaptive compression remains unsupported.
+
+- Joint PEPO evaluation now rejects Quimb compression keywords when
+  `compress=False` and rejects incompatible materialization options before
+  coefficient callbacks run. Joint MPO/PEPO and downstream Gaugy checks now
+  include CPU/CUDA values and gradients, with no adaptive-rank guarantee.
+
+- PEPO `trace_exp` now constructs and traces the selected PEPO, including
+  rank caps and compression. Public `trace_pepo` and active-block `.trace()`
+  measure existing square/graph operators with sparse virtual contraction
+  and backend gradients. `partition_trace_exp` explicitly retains the old
+  uncompressed scalar shortcut. Short periodic axes now use finite-lattice
+  construction to preserve wrapped clusters and repeated bond occurrences.
+
+- Explicit square layouts now route diagonal, long-range, higher-body and
+  other dense graph interactions onto square virtual bonds without changing
+  cluster supports. Ordered PEPO builders add reference-based
+  `prepare_compression` and `compression=plan` for smaller fixed subspaces
+  with Torch/JAX gradients through the projected operator. Materialization
+  reports now count actual exponential batches, product reuse and lower
+  contractions. Automatic layout selection is unchanged; rank/subspace
+  selection is outside autodiff.
+
+- Ordered graph PEPO construction now preserves Torch/JAX gradients through
+  active blocks and explicit materialization. Graph factories accept fixed
+  factorization; uncapped backend auto construction also uses exact fixed
+  splits, while NumPy auto keeps numerical SVD compression. Tensor zero
+  blocks retain their derivatives. Square and graph ordered products now
+  reuse individual factor exponentials when complete-product symmetry is
+  broken by other factors, with evaluation-local numerical caches.
+
+- Shared PEPO `from_plan` factories now select the existing square 2D builder
+  for compatible nearest-neighbor Pauli plans, with explicit `layout="square"`
+  and `"graph"` controls. The square adapter preserves term slots, ordered
+  factors, parameter identities, OBC/PBC metadata and repeated periodic terms,
+  reuses the shared inventory, and supports fixed-channel Torch/JAX
+  materialization. Active square blocks expose explicit `to_dense()`.
+
+- TreeOptimizer adds opt-in `stabilize_unitary` at construction and replay,
+  restoring incoming unitary norms while retaining compression loss and
+  preserving explicitly non-unitary scale changes. TreeOptimizer and
+  TreeSampler now default to `threads=None`. Disabling tree replay history
+  also disables accumulated norm/FIT records; compact norm queries are
+  available through `norm_diagnostics(include_history=False)`. Automatic
+  cutoff and cutoff-mode defaults remain unchanged.
+
+- Add `pepsy.operators.ClusterPlan` for inferred interaction graphs, lazy cached
+  cluster inventories, exact partition/collection counts and verified local
+  symmetry reuse. MPO and graph PEPO share `from_plan` factories; general graph
+  products support nonuniform and higher-body terms. Graph materialization
+  preserves asymmetric complex operators and mixed-block dtypes; graph traces
+  and residuals preserve backend gradients. See the interaction-cluster guide.
+
+- `MpsOptimizer.run(fit_single_pair_n_iter=None)` inherits `n_iter` by
+  default; a positive integer caps adjacent two-site DMRG windows separately.
+  Larger and batched
+  windows use their full span to select the budget; convergence stopping,
+  measurement/shot replay, and timing records preserve it. Named DMRG2
+  honors the same budget policy; explicit `fit_single_pair_fast_path=True`
+  still selects one update.
+
+- Common cluster API conventions across MPO, PEPO and Gaugy: PEPO plans and
+  builders accept `cluster_size` as an alias for spatial `order`; dense PEPO
+  plans expose `compile_exp().exp(step)` with `build(-step)` semantics.
+  MPO products expose `from_bases`, positional runtime `parameters`, and
+  per-factor term `coefficients` in compiled and one-shot evaluations, plus
+  `materialize=True` on reusable evaluators for direct Quimb MPO output. Their
+  cached vector-binding plans preserve independent coefficient gradients.
+
+- `ham_tn.to_mpo(..., delinearize=True)` rank-reveals automaton channels in
+  two directional passes on dense NumPy, Torch, CuPy, or JAX arrays before
+  optional SVD compression. The result includes a bond reduction report.
+
+- Compiled connected-cluster MPO and Pauli PEPO products now expose
+  `trace_exp(..., normalized=False, state_budget=100000)`. It evaluates
+  complete chosen-order ordered-product traces from scalar connected
+  residuals and compatible-cluster subset recursion, without MPO/PEPO
+  assembly or SVD. Single `PauliPEPOBasis` instances expose the same method.
+  Tests cover noncommuting products, periodic parallel bonds, Torch gradients
+  and JAX JIT gradients.
+
+### Changed
+
+- `StabilizerMpsSimulator.measure`, `measure_many`, `measure_reset`, and
+  `StabilizerMpsSampler` now default to `disentangle=True`: certified native
+  tableau collapse followed by basis-updating MPS collapse when needed.
+  Omitted and `None` stream flags use the same default. Explicit `False`
+  retains the fixed-basis projector and disables native collapse.
+
+- Dense `TreeSampler` now defaults to the exact factor strategy, retaining
+  compact factors and sharing repeated prefixes within each sampling call.
+  Select `strategy="standard"` explicitly for the previous strategy, which
+  can use less memory on small-bond trees. Chunk, cache/workspace, backend and
+  thread defaults are unchanged; native Symmray sampling is unchanged.
+
+- Dense `TreeSampler` shares the incoming density across shots until physical
+  conditioning distinguishes them, and contracts shared first-child transfers
+  without a quartic environment. Chunked and unchunked sampling retain exact
+  Born probabilities, native backends, and uniform-draw order, with unchanged
+  canonical-center handling.
+
+- `PepsOptimizer.run` now defaults `cutoff`, `cutoff_mode`, and `infidelity_tol`
+  to `"auto"`, resolved from the current PEPS dtype on each run. Complex128
+  uses cutoff 1e-12 and infidelity threshold 1e-9; complex64 uses 1e-6 and
+  1e-5, respectively. Automatic cutoff mode is `rsum2`. Explicit settings
+  retain precedence, exact targets remain untruncated, and step records save
+  the resolved values. Invalid cutoffs/tolerances fail before normalization.
+
+- `PepsOptimizer` now defaults omitted `boundary_chi`, `normalize_chi`, and
+  `evaluation_chi` to `(4*D, 5*D)` for norm/overlap contractions, with `D=chi`.
+  Normalization uses only the first entry. All three accept scalar or pair
+  overrides; `peps_infidelity` and `peps_normalize` support the same convention.
+  Sweep infidelity diagnostics preserve separate norm/overlap caps.
+  Automatic normalization and evaluation caps resolve independently of
+  environment cap overrides. The normalization cap is passed to delegated
+  sweep/global normalization as well. Explicit caps retain precedence.
+
+- `PepsOptimizer` now defaults to SRC boundary-FIT initialization
+  (`fit_init_strategy="guess-src"`), retaining `n_iter=10`. The shared policy
+  reaches normalization, local-infidelity checks, and sweep environments;
+  explicit constructor or `boundary_kwargs` settings still override it.
+
+- Removed `MpsOptimizer(mode="dmrg1")`; use `mode="dmrg"` for one-site
+  FIT refinement from the initialized guess. `dmrg` rejects block sizes two
+  and three; select `dmrg2` or `dmrg3` for multi-site updates. DMRG2/3 schedules
+  are unchanged. Removed the old DMRG1 growth reservation and latch diagnostic;
+  mixed-mode reasons now use `guess_direct_dmrg`.
+
+- Generic `MpsOptimizer` modes `dmrg` and `fit` now default to one-site FIT
+  (`fit_block_size=1`), avoiding two-site SVD updates during refinement.
+  Use the named `dmrg2`/`dmrg3` schedules for multi-site updates;
+  target preparation and guess construction may still use SVD.
+  Native one-site preparation preserves charge sectors without attempting
+  dense bond padding.
+
+- Enabled `delinearize` by default for NumPy-backed MPO builds. Builder-level
+  backend conversion now supports the dense backend sweep instead of skipping
+  it.
+
+- Branched tree direct/DM compression keeps the canonical center at the final
+  visited tensor, skipping the final QR return to the hub. Cut order and
+  required returns between branches are preserved. Later finite-bond sweeps
+  can take a different direction because their incoming center has changed.
+
+- Tree DMRG reuses unchanged non-differentiable Torch exterior branches as
+  identity environments and combines the target norm with its first required
+  convergence readout. Single-site Torch unitary checks use a bounded cache
+  guarded by storage/view and mutation versions, with direct-check fallbacks
+  for unversioned arrays. Sweep budgets, stopping rules, and cutoffs are unchanged.
+
+- Graph MPO runtime coefficient vectors retain the original graph-support
+  contract, including interactions connected through intermediate sites.
+  Graph active-block materialization preserves Torch storage metadata and
+  gradients, including isolated sites. Shared-plan factories reject invalid
+  term indices with an explicit validation error.
+
+- Shared cluster bindings now accept `None` factor vectors on MPO products,
+  matching PEPO/Gaugy defaults, and reject conflicting parameter/coefficient
+  containers before evaluating PEPO callbacks. The dense PEPO cutoff alias
+  preserves `dataclasses.replace(plan, order=...)` by storing only `order`.
+
+- Joint located PEPO products now avoid building unused homogeneous
+  Hamiltonian component maps. Independent noncommuting square-lattice
+  set-partition checks cover joint MPO/PEPO orders two through four with
+  symmetry reuse on/off; two-site fixed joint JAX JIT gradients are checked
+  against dense ordered exponentials.
+
+- Finite NumPy MPO compression matrices that trigger SVD nonconvergence now
+  retry with SciPy `gesvd` when SciPy is installed. Other backends,
+  nonfinite inputs and requested bond ranks keep their existing policies.
+
+- Located Pauli PEPO construction now reuses lower-order support
+  contractions under the same verified Hamiltonian and geometry symmetry
+  plan used for exact targets. Residuals and sparse block insertion remain
+  per placement; no numerical values persist between evaluations.
+
+- Fixed cluster JAX evaluation is regression-tested through complete
+  three-site MPO/PEPO construction and a 2×2 square at order four under
+  `jit(value_and_grad)`, including zero parameters/time and complex-time
+  two-site cases. Torch full-graph
+  capture is verified for the local exponential/fixed-split numeric path.
+  Native Torch identity and scalar promotion avoid two Autoray tracing
+  failures, and the PEPO tree uses Python shape products during capture;
+  complete Torch builder capture remains unsupported.
+
+- Explicit post-compression of fixed-channel cluster MPOs now has a runnable
+  chi/error benchmark. Dense numerical MPO error estimates QR-canonicalize the
+  difference before its Frobenius contraction, avoiding cancellation when the
+  compression error is small. This is an opt-in diagnostic and leaves
+  SVD-free fixed construction unchanged.
+
+- Fixed cluster MPOs align evaluated targets before residual subtraction,
+  supporting host-valued time steps with positional parameters and callable
+  coefficients without extra callback evaluations. Cluster MPO parameters
+  now honor declared defaults when no parameter container is supplied.
+
+- Cluster MPO and Pauli PEPO APIs accept `factorization="fixed"` for exact,
+  SVD-free construction with parameter-independent channel shapes. Trainable
+  zero MPO residuals retain their derivatives; generic homogeneous PEPO trees
+  use fixed index splits and cached topology. Internal compression is rejected
+  in this mode; the existing numerical policy remains the default.
+- `spatial_symmetries` accepts verified finite-site permutations alongside
+  automatic term-aware cluster reuse. Invalid geometry/term/parameter claims
+  raise; independent coefficient overrides retain separate reuse plans.
+- Mixed Python/Torch Pauli PEPO coefficients retain the trainable slots'
+  precision instead of rounding constants through the default Torch dtype.
+
+
+- Graph cluster MPOs support `assembly="recursive"`: shared remaining-site
+  MPOs retain every disjoint residual collection, adding and compressing
+  branches without enumerating collections. `assembly_state_budget` guards
+  structural work and raises without an approximation fallback. Reports expose
+  subproblem counts, live cache peaks and assembly rank reductions.
+- Streaming graph MPOs on direct plans now retain products of separated
+  residuals. Intermediate assembly compression prepares an orthonormal
+  environment before truncation, avoiding gauge-dependent loss of large terms.
+
+
+- Cluster MPOs and `PauliPEPOBasis` default to conservative
+  `spatial_reuse=True`: proven translations/rotations and graph relabelings
+  share local ordered targets, with structural plans cached at compilation.
+  Parameter identity, directed/parallel bonds, factor order and gradients are
+  preserved. Cache reports expose reuse; `spatial_reuse=False` enables
+  unreduced comparisons. Residual and collection/truncation policies remain
+  unchanged.
+
+- Compiled cluster MPOs reuse their callable, expose `last_report`, and accept
+  `return_report=True` to return the resolved construction report alongside
+  the semantic MPO. Compiled PEPO calls expose cache and shape inventories;
+  ordered PEPO diagnostics include each factor's preparation state.
+
+- `PauliPEPOBasis.compile_exp()` prepares located operator maps and tree
+  topology, and homogeneous higher-order source maps, before evaluation.
+  Translated clusters share static local maps while preserving independent
+  coefficients and directed/parallel bonds. Mixed ordered products compile
+  all factors for their actual evaluation route.
+
+- Cluster PEPO plans and Pauli bases expose `cluster_inventory` with per-size
+  oriented and C4 shape counts, split into trees and loops. Bounded geometry
+  caches reuse smaller shape levels across cutoffs and finite translated
+  embeddings across builds; numerical residuals and gradients remain dynamic.
+
+- Removed duplicate backend and linalg exports from `pepsy.tensors` and
+  `pepsy.tensors.core`; import them from `pepsy.backends`. Also removed unused
+  compatibility aliases for `experimental.mera`, `QMeraParametricEnergyOptimizer`,
+  `MpsStabSampler`, `StabilizerMps`, `SpinfulFermionHubbard`, and
+  `hrps_to_ttn`. See the [API migration guide](docs/development/api-migration.md).
+
+### Added
+
+- Torch boundary VMC exposes bounded stage/error records for recovered
+  connected-amplitude and proposal retries, plus the latest sparse-cutoff
+  retry reason. Numerical retry policies remain unchanged.
+
+- Boundary PepsSampler now defaults to FIT-style factored numerical row
+  environments with a 64 MiB estimated cache budget and independent auto-hq
+  local contractions. Right suffixes are reused and left prefixes advance
+  after each draw. Explicit zero-budget reference and dense modes remain.
+
+- PEPS full-network contractions now default to Pepsy's reusable Cotengra
+  `build_optimizer(parallel=False)`; cached-row steps use `auto-hq`. Explicit
+  full/row optimizer overrides remain supported. Optional exact-amplitude
+  intermediate-size/cost limits reject oversized plans before execution,
+  with estimates exposed through `amplitude_plan_info`.
+
+- Direct PEPS sampling supports `iter_samples` and optional `sample_batch`
+  chunking to bound live prefix states, stable normalized weights/ESS and
+  compact rho diagnostics, reusable scaled exact-amplitude plans, and
+  factored row suffix caches. A reproducible evolved-state CPU/GPU benchmark
+  reports stage costs and memory. Factored caches are the boundary default,
+  retain an explicit reference fallback, and do not truncate amplitudes.
+
+- `PepsSampler(..., rho_positivity="clip" | "absolute")` optionally repairs
+  the Hermitian local proposal spectrum. Default sampling explicitly uses
+  the Hermitian part with its existing diagonal policy. Qubit repairs use a
+  batched 2×2 formula; larger physical dimensions use native `eigh`. All paths
+  record repaired proposal probabilities and report the relative correction,
+  while preserving original PEPS amplitudes and rejecting NaN/Inf input.
+
+- Opt-in `contract_flat(..., method="mps", mps_factorization="projector")`
+  for dense 2D direct boundary compression. A composed isometric-factor Torch
+  VJP handles redundant virtual directions without singular QR inverses or
+  regularized singular-vector derivatives. It supports first-order,
+  gauge-invariant losses on locally fixed-rank, spectrally gapped subspaces;
+  unsupported singular charts raise instead of returning a surrogate.
+
+- `ActivePEPOBlocks.to_trace_network()` closes physical blocks before dense
+  materialization, returning an unnormalized `TensorNetwork2D` with preserved
+  NumPy/Torch/JAX values. `trace_nbytes` reports its dense site storage.
+
+- `PepsSampler` exposes `chi` (future double-layer cap) and `chi_prime`
+  (conditioned ket cap); `marginal_chi` and `sample_chi` remain compatible
+  aliases with conflict checks. Automatic mode selection keeps uncapped calls
+  exact and selects boundary sampling when caps are supplied. Explicit
+  `ket_compression=None` permits an uncapped ket boundary. `PEPSSampleResult`
+  adds natural-log `log_probabilities`, `log_abs_amplitudes`, and `log_weights`
+  NumPy views of its scaled values.
+
+- `PepsSampler(..., to_backend=callable)` converts a private PEPS copy;
+  omitting the converter infers the source array backend, dtype, and device.
+  Local density matrices, identity caps, probabilities, and categorical draws
+  now stay on NumPy, Torch, or JAX. This fixes mixed NumPy/Torch identity caps
+  when `marginal_chi=0`, respects float32 roundoff in conditional validation,
+  and reuses the final amplitude for identical batch configurations.
+  JAX array creation and RNG use a scoped source-device context.
+
+- `QMeraBuilder.estimate_contraction_cost(...)` reports pre-run complex FLOPs
+  and peak forward contraction bytes for dense qMERA local cones, with log10
+  and log2 summaries. Its cache reuses unsliced Cotengra paths at compilation.
+
+- `QMeraBuilder.compiled_parametric_loss_fn(torch_fullgraph=True)` now returns
+  a Torch-only dense-spin energy callable with frozen Cotengra paths. It
+  reuses each scheduled gate across local terms and supports
+  `torch.compile(..., fullgraph=True)` with AOT eager. The
+  `QMeraEnergyOptimizer` compiled loss and Torch solver can use the same mode.
+
+- Opt-in `QMeraBuilder(hierarchy="retained")` builds a 2D spin qMERA
+  hierarchy with retained qubit registers, x/y boundary disentanglers,
+  inspectable coarse-grid blocks, and coarse-to-fine preparation order.
+  Rectangular and square covering blocks absorb odd one-cell edge tails.
+
+- `TreePlan.from_alternating_lattice((Lx, Ly))` and the
+  `TreeLayoutFinder(order="alternating-xy")` / `map_mode` preset build an
+  actual x-then-y recursive pairing hierarchy, preserving physical labels
+  and odd edge blocks with a strictly binary root. Existing layout defaults
+  and `coarse-*` traversal semantics are unchanged.
+
+- Added opt-in `MpsOptimizer(mode="exact-batch")` (`batch-exact` is an alias).
+  It fuses bounded one- and two-qubit gate runs, compacts repeated Z/ZZ
+  supports, and applies one- or two-value diagonal phases in grouped passes.
+  Supported NumPy/CuPy states also fuse consecutive same-pair parity-preserving
+  gates. Dense replay preserves backend, device, and operator scale; unsupported
+  states use the reference path. Numba acceleration is optional.
+
+### Changed
+
+- `PepsSampler` defaults to `cutoff="auto", cutoff_mode="auto"`, sharing
+  the MPS dtype policy (complex64: `1e-6`, complex128: `1e-12`) and `rsum2`
+  truncation convention. Resolution follows conversion and refresh; explicit
+  numeric cutoffs and Quimb modes remain available. Both policies are passed
+  to future-boundary preparation and conditioned ket compression.
+
+- `PepsSampler` retains the simple conditioned-boundary reference sweep
+  (`row_cache_max_bytes=0`) and explicit dense row transfers, alongside the
+  default factored environment cache and its memory fallback. Future preparation builds
+  only the required side; DMRG boundaries are initialized lazily. The new
+  `log_probability(config)` returns a natural-log likelihood, with scaled
+  contractions for exact/reference-boundary evaluation. Configuration values,
+  finite cutoffs, missing future caches, and unsupported periodic boundary
+  sweeps are validated explicitly. Prefix batches validate probabilities and draw all active groups
+  together once per site, reducing host readbacks. Local-rho contractions copy
+  only the tensors that need reindexing; row bonds, identity caps, and traced
+  column contractions are reused. Scaled Hermiticity diagnostics avoid
+  complex64 norm overflow. Grouped seeded sequences can differ from previous
+  releases; same-backend/device/method reproducibility is preserved.
+
+- The downstream roughening PEPS runner now defaults to initial SU gauge
+  equilibration only (`--peps-gauge-every 0`). Periodic equilibration remains
+  available with `--peps-gauge-every N`; gate updates still update bond gauges.
+
+- The 1D qMERA clean schematic now draws a single left-to-right circuit
+  across RG scales. It separates stage headings from gate markers, outlines
+  isometry blocks, curves long pair links around intervening wires, and keeps
+  explicit-mode wire labels distinct.
+
+- The qMERA `draw_schematic(style="clean")` view now follows actual gate
+  direction: retained circuits show coarse-to-fine W then D, while site
+  schedules show fine-to-coarse D then W. It marks 1D periodic seams,
+  isometry blocks, retained/product wires, and 2D parent registers. The 2D
+  panels now mark each scheduled pair gate within its covering block;
+  `style="register"` remains available.
+
+- Existing 2D site-retention qMERA schedules now absorb a trailing one-cell
+  axis segment into the previous covering block when a lattice dimension is
+  odd; the default 2D hierarchy remains site retention.
+
+- The main spin 1D `QMeraBuilder` uses retained-register blocks, ternary odd
+  tails, boundary disentanglers, and coarse-to-fine gate execution. It accepts
+  bond width and retention policy, with `system_size=N` as the 1D site count
+  (`shape=N` remains accepted). `structure="ladder"` closes each isometry or
+  disentangler block and repeats the complete pair sequence at each
+  `circuit_depth`. The 2D and explicit-mode fermion schedules retain their
+  existing behavior.
+- Spin 1D qMERA exposes `pair_ansatz` with five global-X Z₂-preserving
+  templates and an unrestricted Pauli template. `spin_symmetry` declares the
+  symmetry contract separately from `initial_state`; descriptive ansatz names
+  such as `z2_zz_yy_rx` and `z2_rx_zz_yy_xx_rx` identify gate order, while
+  old names remain accepted. `QMeraPairSpec.rotation_sequence` reports the
+  ordered rotations and pair wires.
+
+### Fixed
+
+- Dense TreeSampler amplitude/probability scoring clears its recursive
+  traversal closure on success and failure, releasing discarded snapshots
+  without waiting for cyclic garbage collection.
+
+- Gradient-based SciPy solvers now return the actual termination message in
+  `OptimizationResult.convergence_reason` instead of always reporting
+  `"maxiter"`. Pepsy's `"patience"` and `"bad_max"` callback reasons retain
+  precedence.
+
+- Named PEPS normalization/evaluation caps now override stored option mappings;
+  per-call mapping caps retain precedence. Run records and delegated
+  normalization defaults use the resolved caps. Exact PEPS targets disable
+  inherited final gate `chi` and reject explicit target caps.
+  Explicit metric mapping `chi=None` remains supported for exact contraction
+  and existing boundary handles.
+- Final `gate(..., chi=...)` compression no longer sends the 1D-only `form`
+  option to PEPS/PEPO lattice compression.
+
+- Sweep constructor normalization now honors `normalize_kwargs["chi"]`
+  independently of the environment cap. This preserves `PepsOptimizer`'s
+  automatic or explicit `normalize_chi` during sweep initialization; explicit
+  `renormalize_kwargs["chi"]` retains precedence for the initial call.
+
+- Tree Kraus sampling computes exact local Born weights before branch
+  compression or stabilization, preserving unequal and zero probabilities
+  and cancelling common stored scales. Importance-sampled positive branches
+  are normalized even when their amplitude is below the default norm threshold.
+
+- MPS trajectories disable unitary stabilization only during selected Kraus
+  updates, avoiding conflicting non-unitary options while preserving branch
+  probabilities, normalization, and stabilization of surrounding unitary gates.
+  Independent and coalesced replay also handle the deprecated stabilization alias.
+
+- Tree DMRG and mixed replay use Autoray-compatible scalar clipping when
+  preparing target norms with tracking disabled or extracted state scales.
+  Unitary stabilization and compression loss now keep norms and exponents
+  separate, preserving finite working states at extreme stored scales.
+  TreeFIT scalar readout also preserves CuPy arrays for Autoray conversion
+  instead of unwrapping their device memory pointers.
+
+- Ordinary `hrs_to_mps`, `hrs_to_peps`, and `hrs_to_ttn` now reject real
+  storage, which previously discarded Haar phases and could reduce the norm.
+  Use a complex dtype, or `ps_to_*` for real product states. Native fermion
+  random constructors retain their existing dtype support.
+- Real stabilizer single-site Y rotations avoid zero-imaginary casts;
+  local coefficient operators requiring complex storage now raise clearly.
+- D2 edge-loop suppression validates norm weights before using Quimb's real
+  solver, accepting roundoff-sized imaginary residues and rejecting larger
+  ones instead of losing them through implicit casts.
+
+- Torch conversion copies read-only NumPy storage before creating a tensor,
+  preventing writes through the tensor from changing an immutable source.
+- Cold PEPS environment sweeps and MPS trajectory norm fallbacks select the
+  installed Quimb `method`/`route` keywords without deprecated calls.
+- BP reduced-update metric factorization falls back after numerical failures
+  while allowing unrelated type errors to propagate.
+
+- Torch VMC convergence estimates now resolve the `tau` property correctly.
+  BP Metropolis sweeps report acceptance/proposal totals across every requested
+  sweep. Unsupported local-move statistics raise a descriptive `ValueError`
+  before drawing BP proposals.
+
+- Tree-PEPS two-layer compression now initializes transient bond diagnostics
+  consistently. Enabling `track_bond_diagnostics=True` no longer raises
+  `UnboundLocalError` after applying the operator.
+- `PepsOptimizer` now builds untruncated two-site targets before deciding that
+  they fit within `chi`, forwards the selected cutoff mode to all warm-start
+  compression paths, and rejects non-finite or substantially negative
+  infidelity estimates. Explicit truncating target gate overrides now raise.
+- `PepsSampler.sample_batch` gives each returned shot its own configuration
+  list even when prefix grouping reuses its proposal and exact amplitude.
+
+- PEPS amplitude cache initialization can be retried after preparation fails.
+  Sample-result log and weight accessors reject mismatched field lengths rather
+  than silently broadcasting; weight diagnostics avoid duplicate host transfers.
+  Sampler API comments clarify cache ownership and diagnostic lifetimes.
+
+- `PepsSampler` rescales within-row transfers and running prefixes/
+  suffixes, fixing rare-configuration log probabilities that could underflow
+  inside the cache. It reuses the initial-row cache until `refresh()`, counts
+  that retained memory in the budget estimate, releases unused center networks,
+  and skips terminal prefix contractions. Later rows remain conditioned on
+  each incoming sampled prefix; the default factored-cache budget is 64 MiB.
+
+- `PepsSampler` rescales private boundaries before relative-cutoff compression
+  and equalizes Quimb future sweeps, preventing complex64 squared-singular-value
+  overflow from spuriously collapsing retained ranks. This covers conditioned
+  Quimb compression and FIT guesses while preserving absolute-cutoff semantics,
+  source tensors, physical amplitudes, and cached-future reuse.
+
+- Reduce complete traces of located exact Pauli-history PEPOs to certified
+  identity-subtree sectors before dense allocation. Preserve the full PEPO,
+  coefficient gradients, and parameter-independent trace topology; rank-capped
+  and uncertified builders retain all sectors.
+- Inspect active PEPO dense-storage size with differentiable Torch blocks
+  without converting them to NumPy. Use Python integer products for dense
+  size estimates so large virtual dimensions cannot overflow a machine integer.
+- Batch located equal-size cluster products, preserving factor order and
+  coefficient gradients while avoiding repeated scalar exponential dispatch.
+  This also avoids measured small-matrix Torch exponential inaccuracies in
+  the covered batches; local targets and cluster orders are unchanged.
+
+- Preserve resolved Torch SVD derivatives under `stabilized=True`: replace
+  global Lorentzian damping with compact relative stabilization, retaining
+  the same gap threshold and finite singular-case extension. Use the
+  dtype/shape numerical-rank threshold for inverse singular values, separately
+  from the singular-gap threshold.
+  Applies to both real/complex Autoray and native Symmray split paths.
+- Renormalize native Symmray SU gauge vectors over their backend blocks,
+  preserving Torch gradients and stable exponent accounting without densifying
+  the vectors or calling an unsupported Symmray mean.
+- Forward `cutoff_mode` through PEPO gate construction and its fallback
+  compression, which also now respects the requested `cutoff`. Expose optional
+  cutoff-mode selection for compressed hyper-contraction.
+- Preserve simple-update gauge values and first derivatives when extracting
+  their RMS scale: divide and restore the same detached positive scale, avoid
+  overflow/underflow in norm evaluation, and keep zero gauges finite.
+- Capture Torch QR rank policy during forward so backward remains consistent
+  after a scoped configuration exits. Add opt-in `qr_rank_policy="adaptive"`
+  to preserve finite native VJPs and warn when a singular/nonfinite block
+  needs the regularized fallback.
+- Build dense MPO/PEPO gate streams in Quimb's operator convention: upper
+  `k...` indices are outputs, lower `b...` indices are inputs, and later gates
+  multiply on the left. Remove the legacy per-gate transpose. `tns_align`
+  now applies this convention by default, with `transpose=True` available
+  for explicitly transposed operators. Rebuild old general gate streams;
+  transposing their final operator alone may not fix their order.
+- Apply lazy sub-MPOs when `gate_with_submpo(..., inplace_mpo=False)`;
+  this flag controls the applied operator's defensive copy, not application.
+- Correct the bra/ket orientation in native MPS sampling and probability
+  evaluation with complex right environments. NumPy, Torch, and CuPy use
+  the corrected Born-weight contraction; complex-state sample distributions
+  can change compared with earlier versions.
+
 ### Development
 
+- Remove obsolete standalone operator, PEPS-sampling, MPI-launcher, and MPS
+  compression benchmark scripts. Current guides now point to maintained APIs
+  and regression tests, and nightly MPI validation uses its integration suite.
+- Separate sampler engines and records, MPS controls and norm bookkeeping,
+  stabilizer advice and layout planning, and BP loop geometry into their
+  owning modules. Preserve public APIs, historical serialization paths, and
+  numerical implementations.
+- Move symmetric MPO assembly and local-term factorization into a private
+  operator module, preserving Hamiltonian APIs and historical helper imports.
+- Extract MPS layout execution into a private module while retaining optimizer
+  method signatures, documentation, subclass hooks, and class hierarchy.
+- Separate native symmetry diagnostics and fermion model helpers from the
+  shared Hamiltonian/conversion layer. Move MPS stream preparation and
+  stateless compression adapters into focused modules. Preserve public imports,
+  historical serialization paths, numerical implementations, and replay defaults.
+- Separate symmetric MPS/PEPS state construction, evolution, and measurement
+  into their owning module. Preserve existing namespace imports and serialized
+  state-class paths; model and operator imports keep state loading lazy.
 - Import contraction and fidelity helpers directly from their owning modules
   throughout fitting, boundary sweeps, optimizers, and sampling. Legacy
   `tensors.core` entry points retain their compatibility hooks.

@@ -1,5 +1,65 @@
 # `pepsy.optimizers.mpo.optimizer`
 
+## Minimal replay and option groups
+
+```python
+import quimb as qu
+import quimb.tensor as qtn
+from pepsy.optimizers import MpoOptimizer
+
+opt = MpoOptimizer(
+    qtn.MPO_identity(2),
+    gates=[(qu.CNOT(), (0, 1))],
+    chi=4,
+)
+result = opt.run(cutoff=0.0)
+```
+
+`run()` updates the current MPO and returns it. Another call replays the same
+queue on that updated MPO. The operator retains its absolute scale.
+
+| Purpose | Controls | What to keep in mind |
+| --- | --- | --- |
+| Compression | `mode`, `submpo_method`, `compression_opts`, `compression_seed` | `mode` persists; compression overrides apply to this call |
+| Accuracy | Constructor `chi`; run `cutoff`, `cutoff_mode` | Bond cap and truncation rule are separate |
+| FIT schedule | `n_iter`, `fit_block_size`, `fit_adaptive_sweeps`, `fit_rtol` | Named DMRG modes determine their block schedule |
+| FIT target and guess | `target_cutoff`, `fit_target_strategy`, `fit_init_strategy` | The disposable guess does not replace the exact target |
+| Layout | `layout`, `layout_allow_lossy_reorder` | Installing a layout changes persistent ordering |
+| Failure recovery | `atomic`, `transactional_steps`, `fit_fallback` | Run rollback, local FIT rollback, and full replay fallback are distinct |
+| Diagnostics | `finite_check`, `timing`, `fit_overlap_diagnostics` | Disabled by default; enabling adds work |
+
+`atomic=True` restores optimizer state if numerical replay fails. With
+`inplace=True`, external references can already have observed changes to the
+original MPO. `transactional_steps=True` protects individual FIT updates when
+whole-run atomicity is disabled. `fit_fallback="direct"` or `"svd"` restores
+the pre-replay snapshot and replays the full queue through that backend.
+Layout installation occurs before the replay snapshot; run rollback does not
+undo an installed layout. Inspect `last_run_status`, `last_run_error`, and
+`last_run_fallback` after an attempted replay.
+
+Use `finite_check` in new code. The retained `fit_finite_check` alias is
+resolved at the public call boundary; explicitly conflicting values raise.
+
+## Supported representations and compression
+
+Dense direct replay accepts `run(mpo_factorization="projector")` to use
+paired-factor derivatives in gate construction, canonicalization and every
+compression split. This avoids differentiating arbitrary singular vectors
+within a retained degenerate subspace. It reuses canonical-center metadata
+and preserves the requested `chi`, cutoff, dtype, device and operator scale.
+The compatibility default is `"qr"`.
+
+The mode applies the existing cutoff rule followed by numerical-null removal
+at `max(m,n) * eps * s_max`. It supports dense NumPy/Torch and first-order
+Torch derivatives. A locally fixed rank and resolved kept/discarded gap are
+required. Noninvariant or numerically unresolved factor cotangents raise
+`pepsy.backends.ProjectorDerivativeError` (a `RuntimeError` subclass).
+Passing a forward check alone does not establish derivative accuracy.
+Native symmetry arrays, cyclic MPO storage, other compressors, channel
+streams, layout changes and fallback replay are rejected explicitly.
+Global QR/SVD registrations are unchanged. See the
+[implementation and numerical evidence](../../development/notes/2026-10-10-mpo-paired-gradients.md).
+
 Dense Quimb gate replay accepts `run(compression_opts=...)` for both MPO
 physical layers. See [compression stages](../boundary/compression.md) for
 intermediate/final settings and the restrictions on native and channel replay.
@@ -185,12 +245,12 @@ shape. Passing `fit_block_size` does not override a named mode; the mode's
 block size is authoritative. `fit_single_pair_fast_path=False` is the default,
 matching `MpsOptimizer`; `dmrg2` still enables the automatic shortcut for an
 adjacent two-site window, while setting the option to `True` enables it for
-every DMRG schedule. The generic `mode="dmrg"` path now follows the MPS
-schedule as well: two- or three-site FIT uses `fit_adaptive_sweeps` as an
-adaptive block warm-up and hands the remaining `n_iter` budget to one-site
-refinement. For a long-range window, the generic schedule uses the fixed
-canonical handoff after the block phase, matching the MPS behavior. As in
-`MpsOptimizer`, an under-capacity `dmrg1` window spanning at least three sites
+every DMRG schedule. The generic MPO `mode="dmrg"` path supports two- or
+three-site FIT with `fit_adaptive_sweeps` as an adaptive block warm-up, handing
+the remaining `n_iter` budget to one-site refinement. For a long-range window,
+it uses a fixed canonical handoff after the block phase. This is separate from
+`MpsOptimizer`, whose `mode="dmrg"` is strictly one-site refinement.
+For `MpoOptimizer`, an under-capacity `dmrg1` window spanning at least three sites
 requires `n_iter >= 3` so its two growth sweeps have room for one-site
 refinement.
 

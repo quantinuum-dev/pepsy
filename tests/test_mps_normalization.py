@@ -668,7 +668,7 @@ def test_standalone_compression_modes_honor_unitary_stabilization(mode):
     assert stabilized.get_run_timing()["stages"][f"{timing_name}.stabilize"]["calls"] == 1
 
 
-@pytest.mark.parametrize("mode", ["dmrg1", "dmrg2", "dmrg3"])
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2", "dmrg3"])
 def test_dmrg_schedules_record_automatic_norm_survival(mode):
     """All named DMRG schedules use the same automatic norm ledger."""
     opt = py.MpsOptimizer(

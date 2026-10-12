@@ -1,5 +1,107 @@
 # `pepsy.fitting.local`
 
+Import the solver from its owning namespace:
+
+```python
+import quimb.tensor as qtn
+from pepsy.fitting import FIT
+
+target = qtn.MPS_computational_state("01")
+fit = FIT(target, p=target.copy(), range_int=(0, 1))
+fit.run_gate(n_iter=2, max_bond=2, rtol=None)
+compressed = fit.p
+```
+
+The target and guess describe the same physical sites and index spaces.
+MPS tensors have one physical index per site; MPO tensors have input/output
+indices. Their virtual bond dimensions can differ. FIT follows the arrays'
+backend and dtype, including native symmetry tensors. The constructor's
+`backend` argument is compatibility metadata, not an array-conversion request.
+
+All chain FIT sweep methods return `None`; read the result from `fit.p`.
+`inplace=False` copies the guess, while `inplace=True` updates the supplied
+guess. `copy_target=True` protects the supplied target. With `False`, FIT
+can reindex and retag that target during setup. Fitting preserves absolute
+scale and does not normalize the result.
+
+## Controls shared by the fitting APIs
+
+| Control or result | Chain `FIT` | `TreeFIT` |
+| --- | --- | --- |
+| Working state | `fit.p` | `fit.p` |
+| Sweep-method return | `None` | The solver (`self`) |
+| Active region | Constructor `range_int=(start, stop)`, inclusive | `run_gate(region)` with connected tree nodes |
+| Iteration unit | One directional pass | Both inward/outward passes |
+| Direction | `R`, `L`, or a sequence such as `RL` | `inward-outward` or `outward-inward` |
+| Bond cap and cutoff | `run_gate` / `run_eff`: `max_bond`, `cutoff`; constructor fallback `cutoffs` | Constructor `max_bond`, `cutoffs` |
+| Default gate stopping | `rtol="auto"` | `rtol=None` |
+| Full-chain/tree default | One-site updates with fixed sweeps | One-node updates with fixed iterations |
+| Optional stopping | Explicit `rtol` on `run_eff`; gate default is adaptive | Explicit `rtol` |
+
+These existing contracts are retained. Read `fit.p` consistently in code that
+uses both solvers. A matching keyword name does not make chain and tree
+iteration counts interchangeable. See [tree FIT](../optimizers/tree_fit.md)
+for tree-specific region and diagnostic meanings.
+
+## Fitting a sum of target networks
+
+Pass a non-empty list or tuple to fit the sum without building its combined
+MPS/MPO bonds:
+
+```python
+from pepsy.fitting import FIT
+
+fit = FIT([T1, T2, T3], p=guess, cutoffs=0.0)
+fit.run_eff(n_iter=4, block_size=2, max_bond=chi, cutoff=0.0)
+result = fit.p
+```
+
+At each update, FIT contracts the fitted bra with each target separately,
+omitting the active fitted tensor(s), and adds the resulting effective
+tensors. One shared local update/SVD follows. Thus cancellation happens
+**before** truncation, and the bond cap applies to the combined result.
+The fitted-state norm metric is shared; individual terms are neither
+normalized nor separately compressed. For weights or subtraction, pass
+`[T1, alpha * T2, -T3]`.
+
+Each term must have the same physical outer indices and dimensions as
+`guess`, compatible array backends/native symmetry spaces, and one site tag
+per tensor. Terms can have different internal bonds and can be layered
+networks with several tensors at each site. Use `retag=True` to infer site
+tags where appropriate. Multi-site gate tensors must first be factored into
+site-tagged layers, as for ordinary cached FIT. Nested lists are not accepted.
+
+All three entry points accept sums. One-site sweeps retain the guess's
+available rank; two-/three-site updates can grow bonds up to `max_bond`.
+For a partial `run_gate()` window, set `range_int=(start, stop)` on the
+constructor, and ensure the guess is canonical outside that interval
+(for example, `guess.canonize(start)`). Sum fitting contracts each term's
+actual outside overlaps, including coefficients there. The dense outside
+fitted tensors are untouched; native fermionic fitting retains its existing
+graded canonical-gauge preparation.
+
+Cached environments are separate for each term and reused across compatible
+sweep reversals, including transitions from three-site to two-/one-site
+updates. Target tensor selections and their ordering are cached lazily for
+each visited block. All terms share one freshly constructed fitted bra per
+environment-site update. The cache retains references to target factors;
+it does not allocate contracted target blocks. Fitted-state environments are
+rebuilt at the start of each run, since the fitted state changes.
+Their work/storage grows with the terms' individual
+contraction costs, without allocating a direct-sum target bond. Normal fitting
+does not compute target-target overlaps. Optional `verbose=True` fidelity
+includes every cross term in the target norm. It evaluates only one triangle
+of the Hermitian overlap matrix and caches that norm within the run. This
+adds quadratic work in the number of terms once per run, with linear overlap
+work per verbose sweep; normalized fidelity is undefined for a zero sum.
+The diagnostic cache is reset between runs to avoid stale values or autodiff
+graphs. Target structure and indices must remain fixed for a FIT instance.
+Default ownership protects the supplied targets and guess. `fit.tn` and
+`fit.prepared_target` are tuples for sum targets; `copy_target=False` transfers
+ownership of each term just as for a single target.
+
+## Choose a sweep method
+
 `FIT.run_gate(finite_check=False)` skips per-sweep active-array finite scans
 and scalar non-finite detection by default. These optional diagnostics are
 not required for normal optimization. Enabling `finite_check=True` (or a
@@ -123,7 +225,9 @@ ownership safely.
 For circuit compression, set `range_int=(xmin, xmax)` and use:
 
 ```python
-fit = pepsy.FIT(
+from pepsy.fitting import FIT
+
+fit = FIT(
     target,
     p=current,
     range_int=(xmin, xmax),
@@ -170,9 +274,9 @@ Direct `FIT.run_gate()` defaults to `n_iter=8`, `block_size=2`,
 `1e-5` for float32/complex64, and `1e-9` for higher precision.
 Split diagnostics default to `False`; callers that need them must enable
 `collect_split_diagnostics=True`. `rtol=None` requests fixed sweeps.
-Standalone FIT does not classify the gate as unitary or non-unitary; unlike
-MpsOptimizer's non-unitary replay policy, it always resolves `rtol="auto"`
-to a numeric tolerance.
+Standalone FIT resolves `rtol="auto"` to a numeric tolerance for both unitary
+and non-unitary targets. MpsOptimizer also retains automatic tolerance
+during non-unitary replay.
 With `block_size=3`, `two_site_transition_sweeps=1` inserts one two-site sweep
 after the three-site phase, before one-site refinement. Set it to zero for
 the previous direct handoff. The transition consumes the same `n_iter` budget.
@@ -184,12 +288,9 @@ exit. Remaining requested sweeps use one-site FIT. One-site refinement
 preserves the bond dimensions opened by the larger block and is cheaper than
 repeating the larger SVD block.
 
-The MPS optimizer passes `adaptive_block_sweeps=fit_adaptive_sweeps` and enables
-`adaptive_until_rank` only for eligible generic `dmrg` windows.
-Before constructing a `dmrg1` fit, the optimizer checks the active
-attainable bond ceilings: an already-capped window starts with one-site FIT,
-while an under-capacity non-adjacent window requires `n_iter >= 3` for two
-two-site growth sweeps and at least one one-site refinement sweep. `dmrg2`
+The MPS optimizer's `dmrg` mode uses only one-site refinement from the
+initialized guess and rejects larger `fit_block_size` values. The removed
+`dmrg1` spelling raises a migration error. `dmrg2`
 and `dmrg3` use exactly the configured two- or three-site block warm-up (two
 sweeps by default); `dmrg3` adds one two-site transition sweep. Both then
 refine with one-site FIT. The direct FIT
@@ -289,13 +390,13 @@ sweep only rebuilds the same environments. That terminal update constructs no
 active-window environments; native fermionic outside-window environments stay
 intact. The default is `False` on direct
 `FIT.run_gate` calls and in `MpsOptimizer`, preserving fixed-sweep
-compatibility. Set it to `True` to make named `dmrg1`, `dmrg2`, and `dmrg3`
-windows of two sites perform one two-site update and advance to the next gate
+compatibility. With a two-site FIT block selected, set it to `True` to make
+DMRG windows of two sites perform one two-site update and advance to the next gate
 without one-site refinement; `n_iter` and tolerance controls cannot add a
 second sweep while the fast path is enabled. `collect_split_diagnostics=False`
 omits per-SVD truncation dictionaries when only the fitted state and retained
-norm are needed. `MpsOptimizer` additionally keeps the named `dmrg2`
-nearest-neighbor schedule at one update by default.
+norm are needed. Named `dmrg2` also requires an explicit fast-path request;
+its default respects the sweep budget and convergence controls.
 
 `sweep_sequence` uses Quimb direction names: `"R"` is left-to-right, `"L"` is
 right-to-left, and `"RL"` alternates. Native fermionic `run_gate` executes the
@@ -373,8 +474,8 @@ FIT also exposes
 `convergence_reason`, allowing an optimizer to reuse the known canonical
 center without a redundant sweep.
 
-Those adaptive stopping and detailed timing fields belong to `run_gate()`. The
-`run()` and `run_eff()` solvers remain fixed-sweep numerical paths and are not
-silently changed by the gate-window controls. PEPS boundary results describe
-them as `convergence_reason="fixed_sweeps"` and can collect one coarse elapsed
-time per boundary fit without altering either solver's update sequence.
+Detailed per-site timing belongs to `run_gate()`. `run()` uses fixed sweeps;
+`run_eff()` defaults to fixed sweeps and supports explicit `rtol` stopping
+and block warm-up controls as described above. Gate-window options do not
+change either full-chain solver implicitly. Boundary integrations can collect
+coarse elapsed time and report the actual stopping policy and iterations.

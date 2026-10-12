@@ -6,6 +6,52 @@ import sys
 
 import pytest
 
+# Numerical references assume full float32 accumulation, including on GPUs
+# where JAX otherwise permits reduced-precision matrix products. Set this
+# before optional JAX imports; explicit caller settings still take precedence.
+os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
+# Let the full backend matrix share a GPU without JAX reserving most memory.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+
+@pytest.fixture(autouse=True)
+def restore_jax_mesh():
+    """Do not let an optional NetKet import pin later tests to its mesh."""
+    jax = sys.modules.get("jax")
+    get_mesh = getattr(getattr(jax, "sharding", None), "get_mesh", None)
+    previous = get_mesh() if callable(get_mesh) else None
+    yield
+    jax = sys.modules.get("jax")
+    set_mesh = getattr(getattr(jax, "sharding", None), "set_mesh", None)
+    if callable(set_mesh):
+        set_mesh(previous)
+
+
+@pytest.fixture(autouse=True)
+def restore_torch_linalg_policy():
+    """Keep process-global registrations local to each numerical test.
+
+    Optimizers can install a real-only policy as well as explicit backend
+    tests. Do not import Torch or Pepsy in dependency-light test runs.
+    """
+    config = sys.modules.get("pepsy.backends.config")
+    previous = config.get_torch_linalg_config() if config is not None else None
+    yield
+    config = sys.modules.get("pepsy.backends.config")
+    if config is not None and "torch" in sys.modules:
+        config.reset_linalg_registrations(backend="torch")
+        if previous is not None:
+            previous.register()
+
+
+@pytest.fixture(autouse=True)
+def close_test_figures():
+    """Release test-created figures without importing an optional backend."""
+    yield
+    pyplot = sys.modules.get("matplotlib.pyplot")
+    if pyplot is not None:
+        pyplot.close("all")
+
 
 def pytest_runtest_logreport(report):
     """Expose CI failures as annotations even when raw job logs are unavailable."""
@@ -46,7 +92,6 @@ if str(SRC) not in sys.path:
 # ``pytest -o addopts=''`` when an extended validation pass is needed.
 _SMOKE_MODULES = frozenset(
     {
-        "test_backends.py",
         "test_contraction_dependencies.py",
         "test_import_boundaries.py",
         "test_package_layout.py",
@@ -79,6 +124,9 @@ _INTEGRATION_MODULES = frozenset(
 _CORE_MODULES = frozenset(
     {
         *_SMOKE_MODULES,
+        # Keep the optional-backend contract tests in the broader core tier,
+        # while leaving their numerical matrix out of routine smoke runs.
+        "test_backends.py",
         "test_energy_tree.py",
         "test_factorized_pair_mpo.py",
         "test_gate.py",

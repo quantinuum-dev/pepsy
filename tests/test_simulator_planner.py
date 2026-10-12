@@ -78,7 +78,7 @@ def test_planner_exposes_chain_windows_and_tree_steiner_sizes():
 
 def test_planner_marks_unprepassable_stabilizer_streams_unavailable():
     """A dynamic-width stream should retain only safely priced candidates."""
-    stream = [("h", 0), ("cap", (0,), "left")]
+    stream = [("h", 0), ("cap", (0,), (1., 0.), "left")]
 
     advice = SimulatorPlanner(stream, n_qubits=2, chi=4).recommend()
 

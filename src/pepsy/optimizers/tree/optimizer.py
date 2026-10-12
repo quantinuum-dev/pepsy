@@ -50,7 +50,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from ..._internal.cutoff import dtype_auto_cutoff
+from ..._internal.cutoff import dtype_auto_cutoff, resolve_fit_rtol
 from ...fitting import TreeFIT
 from ...fitting.tree import (
     _build_layered_operator_state_target,
@@ -88,7 +88,9 @@ from .layout import (
 from ._application import (
     _same_tree_plan, operator_local_tensors, peel_order, plan_operator_application,
 )
-from ._diagnostics import diagnostic_to_host, norm_event, summarize_update, truncation_event
+from ._diagnostics import (
+    diagnostic_to_host, norm_event, represented_norm, summarize_update, truncation_event,
+)
 from ._readout import product_pauli_probabilities, single_pauli_probabilities
 from ._policy import (
     COPY_SETTINGS,
@@ -394,8 +396,8 @@ class TreeOptimizer:
 
     The constructor defaults are performance-oriented: ordinary gate entries
     are converted to a TreeMPO and routed through ``apply_sub_mpotree`` on
-    their active canonical Steiner region, small tree contractions are capped
-    to one BLAS/OpenMP thread (``threads=1``), and full singular-spectrum
+    their active canonical Steiner region, CPU thread settings remain
+    unchanged (``threads=None``), and full singular-spectrum
     diagnostics are disabled
     (``track_truncation=False``). Enable those diagnostics explicitly when
     collecting truncation reports; the one-time warning in that case is
@@ -461,8 +463,11 @@ class TreeOptimizer:
         the effective guess/block policy, without overwriting stored FIT
         options. Failed FIT raises without installing the guess.
         ``"dmrg"`` and ``"dmrg1"``/``"dmrg2"``/``"dmrg3"`` select the
-        tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg1`` can use
-        two-node warm-up blocks to grow missing ranks; ``dmrg2`` starts with
+        tree-native :class:`pepsy.fitting.TreeFIT` engine. ``dmrg`` requires
+        one-node refinement of the initialized guess, without a multi-node
+        FIT warm-up. Selecting ``dmrg1`` emits a ``FutureWarning`` recommending
+        ``dmrg`` and uses exactly the same FIT settings and schedule.
+        ``dmrg2`` starts with
         two-node blocks and ``dmrg3`` with three-node blocks. Their schedules
         transition to one-node refinement within the iteration budget.
         Hyphenated spellings such as ``"tree-mpo-dm"`` are accepted, as are
@@ -530,14 +535,10 @@ class TreeOptimizer:
         ``TreePlan.root_qubit``.
     dtype : numpy dtype
         Data type of the initial product state (default ``complex128``).
-    threads : int or None
-        BLAS/OpenMP thread cap applied around gate application and the heavy
-        contraction read-outs.  Tree tensors are small (rank ``<= 3``, bounded
-        by ``chi``), so multi-threaded linear algebra is dominated by thread
-        launch/synchronisation overhead: capping to ``1`` (the default) makes
-        replay both markedly faster and stable in wall-clock time.  Pass
-        ``None`` to leave the ambient thread count untouched (worthwhile only in
-        a large-``chi`` regime where a single contraction is itself large).
+    threads : int or None, default=None
+        Leave ambient CPU thread settings unchanged by default. A positive
+        integer explicitly caps BLAS/OpenMP during gate application and heavy
+        readouts. This controls CPU libraries, not CUDA kernel parallelism.
     seed : int or None
         Seed for the internal random generator used by :meth:`measure` and
         :meth:`reset`.
@@ -550,6 +551,11 @@ class TreeOptimizer:
         its norm-based progress readout. This is enabled by default for
         compatibility with direct TreeOptimizer use, but can be disabled for
         non-unitary transfer-operator streams where norm changes are physical.
+    stabilize_unitary : bool, default=False
+        Restore the incoming represented norm after unitary compression by
+        scaling only the canonical centre. Compression loss is recorded before
+        restoration when tracking is enabled; it is not added to the physical
+        exponent. Non-unitary replay and track_norm=False updates are excluded.
     compression_seed : int, optional
         Seed forwarded to randomized tree-edge compression when
         ``compression_mode`` is ``'src'``, ``'sdcr'``, or an oversampled
@@ -567,9 +573,14 @@ class TreeOptimizer:
     cutoff_mode_oversample : str or {"auto"}, optional
         Cutoff convention for the intermediate SDC or zipup pass. The
         default is ``"rel"``, matching Quimb's oversampling default.
-    fit_block_size : {1, 2, 3}, default=2
-        Generic ``dmrg`` local block size. Named aliases select their own
-        warm-up size; ``dmrg1`` uses two-node growth before one-node DMRG.
+    fit_block_size : {1, 2, 3}, default=1
+        Generic ``dmrg`` local block size. The default refines one node at a
+        time, retaining initialized bond support without multi-node FIT updates.
+        Guess construction may still split tensors and open bond support.
+        ``dmrg`` (including ``fit`` and ``dmrg1``) requires this to be one;
+        use ``dmrg2`` or ``dmrg3`` for larger-block updates.
+        ``dmrg1`` is an alias of ``dmrg`` and honors the same settings.
+        ``dmrg2`` and ``dmrg3`` select their own warm-up size.
         ``mix`` always uses one-node refinement, without a growth warm-up.
     fit_n_iter : int, default=4
         Maximum TreeFIT iterations per fitted gate window. Each iteration
@@ -604,8 +615,8 @@ class TreeOptimizer:
         Routine fitting uses the terminal canonical-centre norm for convergence
         and does not scan tensor entries or revalidate every tree isometry.
     fit_adaptive_sweeps : int, default=2
-        Number of larger-block warm-up sweeps for generic ``dmrg``. Named
-        ``dmrg1`` uses two warm-up sweeps, matching MpsOptimizer.
+        Number of larger-block warm-up iterations for named ``dmrg2``/``dmrg3``.
+        Inactive for default one-node ``dmrg`` and its ``dmrg1`` alias.
     fit_two_site_transition_sweeps : int, default=1
         Two-node iterations between three-node warm-up and one-node refinement
         in named ``dmrg3``, within ``fit_n_iter``. Zero skips this transition.
@@ -667,6 +678,27 @@ class TreeOptimizer:
     """
 
     _normalize_mode = staticmethod(normalize_mode)
+
+    @staticmethod
+    def _validate_fit_mode(mode, alias, block_size):
+        """Keep generic DMRG one-site at construction and replay boundaries."""
+        if mode == "dmrg" and alias in {None, "dmrg1"} and block_size != 1:
+            raise ValueError(
+                f"mode='{alias or mode}' fixes fit_block_size=1; use mode='dmrg2' "
+                "or mode='dmrg3' for block updates."
+            )
+
+    @staticmethod
+    def _warn_legacy_dmrg1(alias):
+        """Explain the one-node replacement when callers select legacy DMRG1."""
+        if alias == "dmrg1":
+            warnings.warn(
+                "TreeOptimizer mode='dmrg1' is a deprecated alias; use "
+                "mode='dmrg' for one-site refinement. Both names now use "
+                "the same FIT settings and schedule.",
+                FutureWarning,
+                stacklevel=3,
+            )
 
     _PROGBAR_COLORS = {
         # Keep the two primary colors aligned with MpsOptimizer. The tree
@@ -779,26 +811,8 @@ class TreeOptimizer:
 
     def _resolve_fit_rtol(self, value):
         """Resolve the same dtype-aware stopping tolerance as MpsOptimizer."""
-        if value == "auto":
-            dtype = str(self.backend_dtype).lower()
-            if "16" in dtype:
-                return 1e-3
-            if "32" in dtype or "complex64" in dtype:
-                return 1e-5
-            return 1e-9
-        if value is None:
-            return None
-        try:
-            value = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "fit_rtol must be 'auto', a non-negative number, or None."
-            ) from exc
-        if not np.isfinite(value) or value < 0.0:
-            raise ValueError(
-                "fit_rtol must be 'auto', a non-negative number, or None."
-            )
-        return value
+        dtype = self.backend_dtype if value == "auto" else None
+        return resolve_fit_rtol(value, dtype=dtype)
 
     def __init__(self, gates=None, n=None, *, chi=64,
                  cutoff=_DEFAULT_CUTOFF,
@@ -807,7 +821,7 @@ class TreeOptimizer:
                  compression_seed=None,
                  max_bond_oversample=None, cutoff_oversample=0.0,
                  cutoff_mode_oversample="rel",
-                 fit_block_size=2, fit_n_iter=4, fit_adaptive_sweeps=2,
+                 fit_block_size=1, fit_n_iter=4, fit_adaptive_sweeps=2,
                  fit_two_site_transition_sweeps=1,
                  fit_min_iter=2, fit_rtol="auto", fit_patience=1,
                  fit_init_strategy="auto",
@@ -825,9 +839,10 @@ class TreeOptimizer:
                  layout_time_window=None, layout=None, tree=None,
                  map_mode=None,
                  root_qubit=None,
-                 dtype=complex, threads=1, subtree_workers=1, seed=None,
+                 dtype=complex, threads=None, subtree_workers=1, seed=None,
                  run=True, tn=None,
                  state=None, track_truncation=False, track_infidelity=True,
+                 stabilize_unitary=False,
                  max_intermediate_bond=None,
                  max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
                  max_subtree_nodes=_DEFAULT_MAX_SUBTREE_NODES,
@@ -999,6 +1014,7 @@ class TreeOptimizer:
         self.mode, self.compression_mode, self._dmrg_mode_alias = self._resolve_replay_mode(
             raw_mode, compression_mode
         )
+        self._warn_legacy_dmrg1(self._dmrg_mode_alias)
 
         self.chi = self._normalize_max_bond(chi)
         self.cutoff = cutoff
@@ -1010,6 +1026,7 @@ class TreeOptimizer:
                 or int(fit_block_size) not in {1, 2, 3}):
             raise ValueError("fit_block_size must be 1, 2, or 3.")
         self.fit_block_size = int(fit_block_size)
+        self._validate_fit_mode(self.mode, self._dmrg_mode_alias, self.fit_block_size)
         if (isinstance(fit_n_iter, bool) or not isinstance(fit_n_iter, Integral)
                 or int(fit_n_iter) < 1):
             raise ValueError("fit_n_iter must be a positive integer.")
@@ -1064,6 +1081,9 @@ class TreeOptimizer:
         self.fit_single_node_fast_path = bool(fit_single_node_fast_path)
         self.fit_overlap_diagnostics = bool(fit_overlap_diagnostics)
         self.fit_finite_check = bool(fit_finite_check)
+        self.stabilize_unitary = bool(stabilize_unitary)
+        self._defer_stabilization_checks = False
+        self._pending_stabilization_error = None
         self._finite_check_enabled = False
         self._finite_check_warning_handled = False
         self.fit_diagnostics = []
@@ -1135,6 +1155,7 @@ class TreeOptimizer:
         # large backend arrays. Entries retain the payload object so Python id
         # reuse cannot return a stale factorization.
         self._gate_factor_cache = {}
+        self._unitary_matrix_cache = {}
         self._gate_factor_cache_limit = 64
         # Gate supports recur frequently in circuit streams. Cache only the
         # immutable geometry path; centre-dependent source orientation is
@@ -1145,6 +1166,8 @@ class TreeOptimizer:
         self._update_counter = 0
         self._truncation_log_survival = 0.0
         self._norm_log_survival = 0.0
+        self._norm_event_count = 0
+        self._last_norm_event = None
         self._norm_tracking_enabled = True
 
         if tree is None:
@@ -1883,6 +1906,7 @@ class TreeOptimizer:
         # Gate factors include TreeMPOs mounted on the previous TreePlan.
         # Even a same-size replacement can change geometry or site order.
         self._gate_factor_cache.clear()
+        self._unitary_matrix_cache.clear()
         self.tn.validate()
         self.n = self.tn.nqubits
         self._logical_qubits = list(range(self.n))
@@ -1954,6 +1978,9 @@ class TreeOptimizer:
         self._last_fit_diagnostics = None
         self._truncation_log_survival = 0.0
         self._norm_log_survival = 0.0
+        self._norm_event_count = 0
+        self._last_norm_event = None
+        self._pending_stabilization_error = None
         self._update_counter = 0
         self._attach_profile_sink()
         return self
@@ -2483,6 +2510,7 @@ class TreeOptimizer:
             self.plan = result["plan"]
             self._two_site_path_cache.clear()
             self._gate_factor_cache.clear()
+            self._unitary_matrix_cache.clear()
             self.tn = self._remount_product_state(self.tn)
             self.center = self.plan.root
             self.layout_finder = finder
@@ -2746,12 +2774,14 @@ class TreeOptimizer:
         # MPS compression event. It deliberately does not inspect singular
         # spectra; that extra per-edge work remains behind track_truncation.
         if (
-            self.track_infidelity
+            (self.track_infidelity or self.stabilize_unitary)
             and bool(track_norm)
             and self._norm_tracking_enabled
             and str(kind) in {"gate", "subtree", "submpo", "subtreempo"}
         ):
-            self._active_update["norm_before"] = self._ledger_norm()
+            norm, exponent = self._ledger_norm()
+            self._active_update["norm_before"] = norm
+            self._active_update["norm_before_exponent"] = exponent
         return True
 
     def _record_transient_bond(self, dimension, *, phase, edge=None):
@@ -2780,13 +2810,86 @@ class TreeOptimizer:
         self._active_update = None
 
     def _finish_norm_update(self, active):
-        """Record path-level norm survival independently of edge spectra."""
+        """Record compression loss before optionally restoring unitary scale."""
         if not active.get("track_norm", True) or active.get("norm_before") is None:
             return
-        self._norm_log_survival, event = norm_event(
-            active, self._ledger_norm(), self._norm_log_survival,
-        )
-        self.norm_events.append(event)
+        observed, observed_exponent = self._ledger_norm()
+        if self.track_infidelity:
+            self._norm_log_survival, event = norm_event(
+                active, observed, self._norm_log_survival,
+                observed_exponent=observed_exponent,
+            )
+            self._last_norm_event = event
+            self._norm_event_count += 1
+            if self.record_history:
+                self.norm_events.append(event)
+        if self.stabilize_unitary:
+            self._restore_unitary_norm(
+                active["norm_before"], observed,
+                expected_exponent=active["norm_before_exponent"],
+                observed_exponent=observed_exponent,
+            )
+
+    def _restore_unitary_norm(self, expected, observed, *, expected_exponent=0.,
+                              observed_exponent=0.):
+        """Restore the incoming norm at the canonical centre, without exponent loss.
+
+        Unitary truncation loss belongs in the compression ledger, not in the
+        represented state's physical exponent. Keep device scalar arithmetic
+        on its backend and combine zero checks until the replay boundary.
+        """
+        if not np.isfinite(expected_exponent) or not np.isfinite(observed_exponent):
+            raise FloatingPointError(
+                "Cannot stabilize a unitary tree state with a zero or non-finite norm."
+            )
+        backend = ar.infer_backend(observed)
+        if backend in {"torch", "jax", "cupy"}:
+            observed = ar.do("stop_gradient", ar.do("abs", observed))
+            if ar.infer_backend(expected) != backend:
+                expected = ar.do("full_like", observed, expected)
+            expected = ar.do("stop_gradient", ar.do("abs", expected))
+            invalid = ar.do("logical_or", observed == 0, expected == 0)
+            if self._finite_check_enabled or self.fit_finite_check:
+                invalid = ar.do("logical_or", invalid, ar.do(
+                    "logical_not", ar.do("logical_and",
+                                          ar.do("isfinite", observed),
+                                          ar.do("isfinite", expected)),
+                ))
+            self._pending_stabilization_error = (
+                invalid if self._pending_stabilization_error is None else
+                ar.do("logical_or", self._pending_stabilization_error, invalid)
+            )
+            observed = ar.do("where", invalid, 1., observed)
+        else:
+            expected, observed = float(expected), float(observed)
+            if (expected <= 0. or observed <= 0.
+                    or not np.isfinite(expected) or not np.isfinite(observed)):
+                raise FloatingPointError(
+                    "Cannot stabilize a unitary tree state with a zero or non-finite norm."
+                )
+        exponent_delta = expected_exponent - observed_exponent
+        if exponent_delta == 0.:
+            ratio = expected / observed
+        else:
+            # Cancel the common stored scale before constructing any factor.
+            ratio = ar.do("exp", ar.do("log", expected) - ar.do("log", observed)
+                          + exponent_delta * np.log(10.))
+        if not self._defer_stabilization_checks:
+            self._check_unitary_stabilization()
+        if self.center is None:
+            region = self.tn.canonical_region
+            self._move_center(min(region) if region else self.plan.root)
+        tensor = self.tn.tensor_map[self._tid(self.center)]
+        tensor.modify(data=tensor.data * ratio)
+        self._invalidate_state_norm_cache()
+
+    def _check_unitary_stabilization(self):
+        pending = self._pending_stabilization_error
+        self._pending_stabilization_error = None
+        if pending is not None and bool(to_float(pending, real=True)):
+            raise FloatingPointError(
+                "Cannot stabilize a unitary tree state with a zero or non-finite norm."
+            )
 
     def _finish_update(self):
         """Commit one gate-level truncation aggregation."""
@@ -2943,12 +3046,11 @@ class TreeOptimizer:
     def _fit_block_size(self):
         """Resolve a named FIT preset to its requested initial block size."""
 
-        if self._dmrg_mode_alias is not None:
-            # DMRG1 is the MPS-compatible one-site algorithm with a bounded
-            # two-site growth warm-up. DMRG2/3 retain their requested larger
-            # local blocks before the common one-site refinement phase.
-            # MIX refines a direct guess with one-node blocks from the start.
-            return {"dmrg1": 2, "dmrg2": 2, "dmrg3": 3, "mix": 1}[self._dmrg_mode_alias]
+        self._validate_fit_mode(self.mode, self._dmrg_mode_alias, self.fit_block_size)
+        if self._dmrg_mode_alias not in {None, "dmrg1"}:
+            # DMRG1 is a compatibility spelling of generic DMRG. Only the
+            # larger named schedules and MIX override the caller's block size.
+            return {"dmrg2": 2, "dmrg3": 3, "mix": 1}[self._dmrg_mode_alias]
         return self.fit_block_size
 
     def _fit_guess_strategy(self):
@@ -3074,14 +3176,15 @@ class TreeOptimizer:
         node = next(iter(application.region))
         strategy = self._fit_guess_strategy()
         active = self._active_update
-        represented_norm = (
+        incoming_norm = (
             None if active is None else active.get("norm_before")
         )
         target_norm_available = bool(track_norm and self._norm_tracking_enabled)
         norm_pair = (
-            None if represented_norm is None
-            else (represented_norm, 0.0)
+            None if incoming_norm is None
+            else (incoming_norm, active["norm_before_exponent"])
         )
+        norm_value = None if norm_pair is None else represented_norm(*norm_pair)
         fit_rtol = (
             None
             if self._fit_rtol_requested == "auto" and not target_norm_available
@@ -3092,22 +3195,22 @@ class TreeOptimizer:
             "converged": True,
             "convergence_reason": "single_node_exact",
             "relative_change": None,
-            "final_norm": represented_norm,
+            "final_norm": norm_value,
             "final_norm_mantissa": (
                 None if norm_pair is None else norm_pair[0]
             ),
             "final_norm_exponent": (
                 None if norm_pair is None else norm_pair[1]
             ),
-            "local_norm": represented_norm,
+            "local_norm": norm_value,
             "local_norm_trace": (
-                () if represented_norm is None else (represented_norm,)
+                () if norm_value is None else (norm_value,)
             ),
             "local_norm_stripped_trace": (
                 () if norm_pair is None else (norm_pair,)
             ),
             "sweep_norm_trace": (
-                () if represented_norm is None else (represented_norm,)
+                () if norm_value is None else (norm_value,)
             ),
             "local_fidelity": 1.0 if target_norm_available else None,
             "local_infidelity": 0.0 if target_norm_available else None,
@@ -3150,9 +3253,10 @@ class TreeOptimizer:
             "guess_backend": "single_node",
         }
         self._last_fit_diagnostics = diagnostics
-        self.fit_diagnostics.append(deepcopy(diagnostics))
+        if self.record_history:
+            self.fit_diagnostics.append(deepcopy(diagnostics))
         if active is not None:
-            active["fit_diagnostics"] = deepcopy(diagnostics)
+            active["fit_diagnostics"] = diagnostics
 
     def _run_tree_fit(self, target, region, support, *, operator=None, target_norm=None,
                       path_order=None, max_bond=None, cutoff=None):
@@ -3207,27 +3311,6 @@ class TreeOptimizer:
         )
         active_block_size = min(block_size, len(region))
         fit._finite_check_warning_handled = self._finite_check_warning_handled
-        if (
-            self._dmrg_mode_alias == "dmrg1"
-            and block_size == 2
-            and fit._active_bonds_at_rank_targets(region, state=self.tn)
-        ):
-            active_block_size = 1
-        if (
-            self._dmrg_mode_alias == "dmrg1"
-            and active_block_size == 2
-            and len(region) > 2
-            and not fit._active_bonds_at_rank_targets(region, state=self.tn)
-            and self.fit_n_iter < 3
-        ):
-            raise ValueError(
-                "mode='dmrg1' requires fit_n_iter >= 3 for an under-capacity "
-                "tree window: two block-growth sweeps and one-site refinement."
-            )
-        adaptive_sweeps = (
-            2 if self._dmrg_mode_alias == "dmrg1"
-            else self.fit_adaptive_sweeps
-        )
         fit_rtol = (
             None if self._fit_rtol_requested == "auto" and (
                 target_norm is None or not self._norm_tracking_enabled
@@ -3243,13 +3326,13 @@ class TreeOptimizer:
             patience=self.fit_patience,
             single_node_fast_path=self.fit_single_node_fast_path,
             _path_order=path,
-            adaptive_block_sweeps=adaptive_sweeps,
+            adaptive_block_sweeps=self.fit_adaptive_sweeps,
             two_site_transition_sweeps=(
                 self.fit_two_site_transition_sweeps
                 if self._dmrg_mode_alias == "dmrg3" else 0
             ),
             adaptive_until_rank=(
-                self._dmrg_mode_alias is None
+                self._dmrg_mode_alias in {None, "dmrg1"}
                 and not (
                     active_block_size in {2, 3}
                     and len(region) > active_block_size
@@ -3290,9 +3373,11 @@ class TreeOptimizer:
         self._invalidate_state_norm_cache()
         self.plan = self.tn.plan
         self._last_fit_diagnostics = diagnostics
-        self.fit_diagnostics.append(deepcopy(diagnostics))
+        if self.record_history:
+            self.fit_diagnostics.append(deepcopy(diagnostics))
         if self._active_update is not None:
-            self._active_update["fit_diagnostics"] = deepcopy(diagnostics)
+            self._active_update["fit_diagnostics"] = diagnostics
+        if self._active_update is not None and self.track_bond_diagnostics:
             target_edges = tuple(
                 (node0, node1)
                 for node0 in sorted(region)
@@ -3583,6 +3668,7 @@ class TreeOptimizer:
         normalize_every=False,
         normalize_final=False,
         normalize_eps=1e-15,
+        stabilize_unitary=None,
         finite_check=False,
         seed=None,
         track_infidelity=None,
@@ -3634,9 +3720,11 @@ class TreeOptimizer:
             with successive deterministic, randomized-SVD, or product-noise
             complementary-environment compression, respectively; the
             ``*-oversample`` variants add a direct final round after a larger
-            intermediate sketch. ``"dmrg"`` selects TreeFIT with the
-            configured adaptive block schedule. ``"dmrg1"`` and ``"dmrg2"``
-            use two-node warm-up blocks, while ``"dmrg3"`` uses three-node
+            intermediate sketch. ``"dmrg"`` selects TreeFIT with
+            one-node refinement and requires ``fit_block_size=1``.
+            Use ``"dmrg2"`` or ``"dmrg3"`` for block updates. ``"dmrg1"`` is a
+            deprecated alias of ``"dmrg"``. ``"dmrg2"`` uses two-node warm-up
+            blocks, while ``"dmrg3"`` uses three-node
             warm-up blocks followed by its configured two-node transition;
             each named schedule then performs one-node refinement.
             ``"zipup-oversample"`` (alias ``"zipup-first"``) performs larger
@@ -3675,6 +3763,9 @@ class TreeOptimizer:
             ``non_unitary=True``.
         normalize_eps : float, default=1e-15
             Zero-state threshold used by automatic normalization.
+        stabilize_unitary : bool or None, default=None
+            Override unitary norm restoration for this replay only. None uses
+            the constructor setting. Shot run_kwargs can override this value.
         seed : int | None, default=None
             Reseed measurement/reset sampling before replay.
         track_infidelity : bool | None, default=None
@@ -3715,6 +3806,9 @@ class TreeOptimizer:
             current_compression=self.compression_mode,
             current_alias=self._dmrg_mode_alias,
         )
+        if mode is not None:
+            self._warn_legacy_dmrg1(next_alias)
+        self._validate_fit_mode(next_mode, next_alias, self.fit_block_size)
         if compression_seed is not None:
             if isinstance(compression_seed, bool) or not isinstance(
                 compression_seed, Integral
@@ -3799,6 +3893,8 @@ class TreeOptimizer:
             child_kwargs.setdefault("track_infidelity", track_infidelity)
             child_kwargs.setdefault("progbar", progbar)
             child_kwargs.setdefault("finite_check", finite_check)
+            if stabilize_unitary is not None:
+                child_kwargs.setdefault("stabilize_unitary", stabilize_unitary)
             stream = self._trajectory_gate_stream() if gates is None else gates
             return self._run_shots(
                 stream,
@@ -3854,6 +3950,7 @@ class TreeOptimizer:
         if normalized is not None:
             self.G, self.where, self.event_types = normalized
             self._gate_factor_cache.clear()
+            self._unitary_matrix_cache.clear()
         self._warn_track_truncation_slow()
         # The complete stream was validated at installation. Replay therefore
         # uses the caller's payload objects without a second scan or cast.
@@ -3882,6 +3979,8 @@ class TreeOptimizer:
         control_count = 0
         submpo_count = 0
         previous_norm_tracking = self._norm_tracking_enabled
+        previous_stabilization = self.stabilize_unitary
+        previous_defer_checks = self._defer_stabilization_checks
         previous_finite_check = self._finite_check_enabled
         previous_finite_warning = self._finite_check_warning_handled
         # A non-unitary stream changes the physical norm for reasons other
@@ -3891,6 +3990,9 @@ class TreeOptimizer:
         self._norm_tracking_enabled = not non_unitary
 
         try:
+            if stabilize_unitary is not None:
+                self.stabilize_unitary = bool(stabilize_unitary)
+            self._defer_stabilization_checks = True
             self._finite_check_enabled = bool(finite_check)
             self._finite_check_warning_handled = bool(finite_check or self.fit_finite_check)
             if self._finite_check_warning_handled:
@@ -3977,8 +4079,12 @@ class TreeOptimizer:
                 )
             if finite_check:
                 TreeFIT._check_state_finite(self.tn, self.plan.nodes())
+            self._check_unitary_stabilization()
         finally:
             self._norm_tracking_enabled = previous_norm_tracking
+            self.stabilize_unitary = previous_stabilization
+            self._defer_stabilization_checks = previous_defer_checks
+            self._pending_stabilization_error = None
             self._finite_check_enabled = previous_finite_check
             self._finite_check_warning_handled = previous_finite_warning
             if pbar is not None:
@@ -3991,6 +4097,7 @@ class TreeOptimizer:
         self._validate_gate_stream_backend(normalized[0], normalized[2])
         self.G, self.where, self.event_types = normalized
         self._gate_factor_cache.clear()
+        self._unitary_matrix_cache.clear()
         return self
 
     def add_gates(self, gates):
@@ -4001,6 +4108,7 @@ class TreeOptimizer:
         self.where.extend(where_new)
         self.event_types.extend(event_types_new)
         self._gate_factor_cache.clear()
+        self._unitary_matrix_cache.clear()
         return self
 
     @staticmethod
@@ -5274,6 +5382,7 @@ class TreeOptimizer:
         Direct/DM prepare a path endpoint and compress once to the other end.
         On branches, start at ``hub`` and descend. Compressing ``node -> child``
         advances the center; a lossless QR returns it before the next branch.
+        After the last cut, leave the center at the final visited tensor.
         Each direct/DM cut sees the completed update with canonical boundaries.
         """
         snodes = frozenset(snodes)
@@ -5324,13 +5433,13 @@ class TreeOptimizer:
                 max_bond=max_bond, cutoff=cutoff,
             )
 
-        def descend(node, parent):
+        def descend(node, parent, *, return_to_node):
             children = sorted(
                 neighbor
                 for neighbor in self._neighbors(node)
                 if neighbor in snodes and neighbor != parent
             )
-            for child in children:
+            for index, child in enumerate(children):
                 child_cutoff = edge_cutoff(node, child)
                 reduced, reduction_proven = self._edge_reduction(
                     node, child, max_bond=max_bond, cutoff=child_cutoff,
@@ -5343,7 +5452,14 @@ class TreeOptimizer:
                     reduced=reduced,
                     reduction_proven=reduction_proven,
                 )
-                descend(child, node)
+                # Return only if this node or an ancestor has another branch
+                # to process. The final descent needs no QR walk back to hub.
+                needs_return = return_to_node or index < len(children) - 1
+                final_center = descend(
+                    child, node, return_to_node=needs_return,
+                )
+                if not needs_return:
+                    return final_center
                 canonize_bond = int(
                     self.tn.ind_size(self.tn.bond(child, node))
                 )
@@ -5361,8 +5477,9 @@ class TreeOptimizer:
                         ),
                     )
 
-        descend(hub, None)
-        self.center = hub
+            return node
+
+        self.center = descend(hub, None, return_to_node=False)
 
     def _qr_route_message(self, tensor, left_inds, *, bond_ind):
         """Split one subtree message losslessly while carrying operator legs."""
@@ -5742,12 +5859,39 @@ class TreeOptimizer:
         # backend scalar. Both retain the full matrix on its device.
         return bool(to_float(ar.do("allclose", gram, identity, rtol=rtol, atol=atol), real=True))
 
+    def _cached_is_unitary_matrix(self, matrix, *, rtol=0., atol=1e-12):
+        """Reuse Torch certification only while its tracked storage is unchanged.
+
+        Views share their base tensor's mutation counter. NumPy, native arrays,
+        and inference tensors without version counters retain direct checking.
+        Hold the source strongly in this bounded cache to prevent id reuse.
+        """
+        if ar.infer_backend(matrix) != "torch":
+            return self._is_unitary_matrix(matrix, rtol=rtol, atol=atol)
+        source = matrix._base
+        if source is None:
+            source = matrix
+        try:
+            version = matrix._version
+        except (AttributeError, RuntimeError):
+            return self._is_unitary_matrix(matrix, rtol=rtol, atol=atol)
+        key = (id(source), matrix.data_ptr(), tuple(matrix.shape),
+               tuple(matrix.stride()), matrix.dtype, matrix.device, rtol, atol)
+        cached = self._unitary_matrix_cache.get(key)
+        if cached is not None and cached[0] is source and cached[1] == version:
+            return cached[2]
+        unitary = self._is_unitary_matrix(matrix, rtol=rtol, atol=atol)
+        if key not in self._unitary_matrix_cache and len(self._unitary_matrix_cache) >= 64:
+            self._unitary_matrix_cache.pop(next(iter(self._unitary_matrix_cache)))
+        self._unitary_matrix_cache[key] = (source, version, unitary)
+        return unitary
+
     def _apply_compact_one_site_unitary(self, operator, application, *, cutoff=None,
                                         max_bond=None, track_norm=True):
         """Absorb a certified local unitary without changing the state gauge.
 
-        Certification reads the current small physical matrix, so edits to a
-        supplied operator cannot leave a stale unitary flag. No state or
+        Certification is reused for version-tracked unchanged Torch matrices;
+        edits through Torch invalidate it. Other arrays are checked directly. No state or
         multi-site operator is densified. Native odd operators retain their
         general graded application path.
         """
@@ -5772,7 +5916,7 @@ class TreeOptimizer:
         # user's truncation cutoff (which can be arbitrarily loose).
         real_dtype = np.result_type(ar.get_dtype_name(ar.do("real", matrix)), np.float32)
         tolerance = 8 * np.finfo(real_dtype).eps
-        if not self._is_unitary_matrix(matrix, atol=tolerance):
+        if not self._cached_is_unitary_matrix(matrix, atol=tolerance):
             return False
         region = self.tn.canonical_region
         left_inds = self.tn.node_tensor(node).left_inds
@@ -5885,7 +6029,15 @@ class TreeOptimizer:
                 if track_norm and self._norm_tracking_enabled:
                     if self.center is None:
                         self._move_center(min(region))
-                    target_norm = TreeFIT._center_norm_stripped(self.tn)[:2]
+                    active = self._active_update
+                    if active is not None and active.get("norm_before") is not None:
+                        target_norm = (active["norm_before"], active["norm_before_exponent"])
+                    else:
+                        squared, exponent, _ = TreeFIT._center_norm_squared_backend(self.tn)
+                        target_norm = (
+                            ar.do("sqrt", ar.do("clip", ar.do("real", squared), 0.0, None)),
+                            exponent,
+                        )
                 self._run_tree_fit(
                     target,
                     region,
@@ -7374,13 +7526,10 @@ class TreeOptimizer:
         return float(np.sqrt(abs(to_float(squared, real=True)))) * scale
 
     def _ledger_norm(self):
-        # Preserve Python-double exponent range on JAX without x64 and Metal.
-        # Explicit extracted-scale bookkeeping remains a host boundary, as it
-        # is for non-unitary normalization. Ordinary unitary replay has scale 1.
-        if float(getattr(self.tn, "exponent", 0.0)) != 0.0:
-            return self.norm()
-        value = self._norm_backend()
-        return value if ar.infer_backend(value) == "builtins" else ar.do("stop_gradient", value)
+        """Return a detached backend norm and its unmaterialized exponent."""
+        squared, exponent = self._norm_components_backend(strip_exponent=True)
+        value = ar.do("sqrt", ar.do("abs", ar.do("real", squared)))
+        return ar.do("stop_gradient", value), exponent
 
     def _norm_backend(self):
         """Compute the represented norm without materializing a host scalar."""
@@ -7389,23 +7538,32 @@ class TreeOptimizer:
             return float(np.sqrt(abs(to_float(squared, real=True)))) * scale
         return ar.do("sqrt", ar.do("abs", ar.do("real", squared))) * scale
 
-    def _norm_components_backend(self):
-        """Return a backend norm square and its separate host scale factor."""
+    def _norm_components_backend(self, *, strip_exponent=False):
+        """Return a backend norm square and a host scale factor or exponent."""
         center = self.center
+        network = self.tn
+        exponent = float(getattr(network, "exponent", 0.0))
+        if strip_exponent and center is None and exponent != 0.:
+            # A full contraction includes the network exponent. Strip it on
+            # an independent wrapper, preserving live data and canonicality.
+            network = network.copy()
+            network.exponent = 0.
         if self.tn.fermionic:
             with self._thread_ctx():
-                val = self.tn._fermionic_center_norm_squared()
+                val = network._fermionic_center_norm_squared()
             val = val.data if isinstance(val, qtn.Tensor) else val
+            if strip_exponent:
+                return val, exponent
             return val, self._represented_scale() if center is not None else 1.0
         if center is not None:
             t = self.tn.tensor_map[self._tid(center)]
             val = qtn.tensor_contract(t.H, t, output_inds=[])
             val = val.data if isinstance(val, qtn.Tensor) else val
-            return val, self._represented_scale()
+            return val, exponent if strip_exponent else self._represented_scale()
         with self._thread_ctx():
-            val = (self.tn.H & self.tn).contract(output_inds=[])
+            val = (network.H & network).contract(output_inds=[])
         val = val.data if isinstance(val, qtn.Tensor) else val
-        return val, 1.0
+        return val, exponent if strip_exponent else 1.0
 
     def _represented_scale(self):
         """Return Quimb's extracted global base-10 state scale."""
@@ -7733,6 +7891,7 @@ class TreeOptimizer:
             self.top_arity = self.plan.top_arity if self.plan.top_arity >= 2 else None
             self._two_site_path_cache.clear()
             self._gate_factor_cache.clear()
+            self._unitary_matrix_cache.clear()
             self.n = self.tn.nqubits
             remaining = [label for label in self._logical_qubits if label != logical_q]
             if compact_labels:
@@ -7791,6 +7950,8 @@ class TreeOptimizer:
         other._update_counter = self._update_counter
         other._truncation_log_survival = self._truncation_log_survival
         other._norm_log_survival = self._norm_log_survival
+        other._norm_event_count = self._norm_event_count
+        other._last_norm_event = deepcopy(self._last_norm_event)
         return other
 
     def copy(self):
@@ -7950,7 +8111,7 @@ class TreeOptimizer:
         """
         return diagnostic_to_host(self.norm_events)
 
-    def norm_diagnostics(self):
+    def norm_diagnostics(self, *, include_history=True):
         """Return canonical norm-based compression diagnostics.
 
         ``cumulative_fidelity`` is the log-accumulated product of the
@@ -7964,12 +8125,14 @@ class TreeOptimizer:
         ``state_norm`` and ``norm`` are the live represented Tree norm.
         ``cumulative_norm`` is instead the square root of
         ``cumulative_fidelity`` and is only a retained-compression proxy.
+        ``include_history=False`` returns constant-size scalar summaries.
+        ``record_history=False`` disables accumulated norm/FIT/update records
+        while preserving the latest FIT record and cumulative scalar ledger.
         """
-        valid = [event for event in self.get_norm_events() if event.get("valid")]
-        current = valid[-1] if valid else None
+        current = diagnostic_to_host(self._last_norm_event)
         cumulative_fidelity = (
             None
-            if not valid
+            if current is None
             else fidelity_from_log(to_float(self._norm_log_survival, real=True))
         )
         cumulative_infidelity = (
@@ -7978,12 +8141,12 @@ class TreeOptimizer:
             else infidelity_from_log(to_float(self._norm_log_survival, real=True))
         )
         state_norm = float(self.norm())
-        return {
+        result = {
             "tracking": bool(self.track_infidelity),
             "norm_tracking": bool(self.track_infidelity),
             "truncation_tracking": bool(self.track_truncation),
-            "events": len(self.norm_events),
-            "completed_events": len(valid),
+            "events": self._norm_event_count,
+            "completed_events": self._norm_event_count,
             "current_valid": current is not None,
             "current_fidelity": (
                 None if current is None else current["local_fidelity"]
@@ -8031,8 +8194,10 @@ class TreeOptimizer:
             # as a compatibility alias; ``cumulative_norm`` is the retained
             # norm proxy shared with the MPS diagnostics.
             "norm": state_norm,
-            "norm_events": self.get_norm_events(),
         }
+        if include_history:
+            result["norm_events"] = self.get_norm_events()
+        return result
 
     def get_projection_diagnostics(self):
         """Return projection norm/support/span/bond diagnostics in order."""

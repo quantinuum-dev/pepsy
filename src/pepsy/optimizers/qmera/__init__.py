@@ -7,6 +7,9 @@ _SYMBOL_MODULES = {
     "QMeraAnsatz": ".builders",
     "QMeraBuilder": ".builders",
     "QMeraContractionPathCache": ".cache",
+    "QMeraConeCost": ".cost",
+    "QMeraContractionReport": ".cost",
+    "estimate_qmera_contraction_cost": ".cost",
     "build_qmera_contraction_optimizer": ".cache",
     "QMeraCompiledLightconeChunk": ".compiled",
     "compile_qmera_parametric_lightcone": ".compiled",
@@ -20,6 +23,11 @@ _SYMBOL_MODULES = {
     "symmray_majorana_gate_registry": ".fermions",
     "GateRegistry": ".gates",
     "GateSpec": ".gates",
+    "QMeraPairSpec": ".gates",
+    "available_qmera_pair_ansatzes": ".gates",
+    "available_qmera_pair_ansatze": ".gates",
+    "get_qmera_pair_ansatz": ".gates",
+    "qmera_pair_gate_spec": ".gates",
     "UserGateFamily": ".gates",
     "default_gate_registry": ".gates",
     "resolve_gate_spec": ".gates",
@@ -46,7 +54,6 @@ _SYMBOL_MODULES = {
     "select_lightcone": ".lightcones",
     "site_tags_for_where": ".lightcones",
     "QMeraEnergyOptimizer": ".parametric",
-    "QMeraParametricEnergyOptimizer": ".parametric",
     "QMeraPrototypeLayout": ".prototype",
     "load_qmera_prototype_layout": ".prototype",
     "QMeraBlockSpec": ".schedules",
@@ -70,6 +77,7 @@ _SUBMODULES = (
     "builders",
     "cache",
     "compiled",
+    "cost",
     "fermions",
     "gates",
     "geometry",
@@ -90,7 +98,9 @@ __all__ = [
     "QMeraBlockSpec",
     "QMeraBuilder",
     "QMeraCompiledLightconeChunk",
+    "QMeraConeCost",
     "QMeraContractionPathCache",
+    "QMeraContractionReport",
     "QMeraDisentanglerSpec",
     "QMeraEnergyOptimizer",
     "QMeraGatePlacement",
@@ -104,7 +114,7 @@ __all__ = [
     "QMeraLightconeTN",
     "QMeraLightconeGroup",
     "QMeraParametricLightconeChunk",
-    "QMeraParametricEnergyOptimizer",
+    "QMeraPairSpec",
     "QMeraPrototypeLayout",
     "QMeraSchedule",
     "QMeraScaleSpec",
@@ -112,6 +122,8 @@ __all__ = [
     "QMeraSymmrayFermionBackend",
     "QMeraUnitarySpec",
     "UserGateFamily",
+    "available_qmera_pair_ansatzes",
+    "available_qmera_pair_ansatze",
     "build_qmera_contraction_optimizer",
     "build_qmera_lightcone_chunks",
     "build_qmera_parametric_lightcone_chunks",
@@ -122,6 +134,8 @@ __all__ = [
     "contract_qmera_lightcone_group",
     "default_gate_registry",
     "draw_qmera_schedule",
+    "estimate_qmera_contraction_cost",
+    "get_qmera_pair_ansatz",
     "group_qmera_parametric_lightcone_chunks",
     "local_qmera_compiled_lightcone_expectation",
     "local_qmera_parametric_lightcone_expectation",
@@ -134,6 +148,7 @@ __all__ = [
     "qmera_parametric_lightcone_state",
     "qmera_parametric_state",
     "qmera_parametric_lightcone_tn",
+    "qmera_pair_gate_spec",
     "qmera_schematic_blocks",
     "qmera_symmray_fermi_hubbard_terms",
     "qmera_symmray_majorana_terms",
@@ -172,6 +187,11 @@ if TYPE_CHECKING:
         local_qmera_compiled_lightcone_expectation,
         qmera_compiled_parametric_energy,
     )
+    from .cost import (  # noqa: F401
+        QMeraConeCost,
+        QMeraContractionReport,
+        estimate_qmera_contraction_cost,
+    )
     from .fermions import (  # noqa: F401
         QMeraSymmrayFermionBackend,
         qmera_symmray_fermi_hubbard_terms,
@@ -182,8 +202,13 @@ if TYPE_CHECKING:
     from .gates import (  # noqa: F401
         GateRegistry,
         GateSpec,
+        QMeraPairSpec,
         UserGateFamily,
+        available_qmera_pair_ansatzes,
+        available_qmera_pair_ansatze,
         default_gate_registry,
+        get_qmera_pair_ansatz,
+        qmera_pair_gate_spec,
         resolve_gate_spec,
     )
     from .geometry import QMeraGeometry  # noqa: F401
@@ -212,7 +237,7 @@ if TYPE_CHECKING:
         select_lightcone,
         site_tags_for_where,
     )
-    from .parametric import QMeraEnergyOptimizer, QMeraParametricEnergyOptimizer  # noqa: F401
+    from .parametric import QMeraEnergyOptimizer  # noqa: F401
     from .prototype import QMeraPrototypeLayout, load_qmera_prototype_layout  # noqa: F401
     from .schedules import (  # noqa: F401
         QMeraBlockSpec,

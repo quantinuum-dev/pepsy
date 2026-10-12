@@ -1,7 +1,24 @@
 # Exponential API: MPO and PEPO
 
-This page is the short usage guide for the two higher-order exponential
-builders. The rule is simple:
+For arbitrary interaction graphs and a common MPO/PEPO/Pauli plan, see the
+[shared interaction-cluster guide](interaction_clusters.md).
+
+This page is the short usage guide for MPO and PEPO exponential builders.
+Select the mathematical approximation separately from the tensor layout:
+
+| Construction | Spatial connectivity | Approximation control |
+| --- | --- | --- |
+| Higher-order MPO history | Terms mapped to an MPO chain | Taylor/history `order` |
+| Connected-cluster MPO | Chain intervals, or an explicit physical graph | Spatial `cluster_size` plus graph assembly and rank controls |
+| Connected-cluster PEPO | Physical lattice graph | Spatial `cluster_size` (`order` alias) plus rank controls |
+
+For 2D cluster MPOs, use `graph="square"` or an explicit `ClusterLattice`;
+`OneDMap`/snake ordering alone does not select square-lattice clusters. The
+[MPO compile example](mpo_cluster.md#repeated-evaluations) shows both inputs.
+
+For repeated MPO/PEPO autodiff with a fixed virtual cap, see experimental
+[compact channel plans](cluster_channels.md). Their trace measures the
+constructed projected operator for either representation.
 
 For the longer-term ownership map, canonical vocabulary, and staged
 refactoring roadmap, see the [operator and exponential API plan](../../development/plans/operator_api.md).
@@ -9,6 +26,92 @@ refactoring roadmap, see the [operator and exponential API plan](../../developme
 > Use `exp(step, ...)` for the operator exponential. Use `compile_exp(...)`
 > when the operator topology is reused. The `step` is the scalar in
 > `exp(step * H)`; it is not automatically a physical time.
+
+## Shared connected-cluster calls
+
+The MPO, Pauli PEPO, and Gaugy Pauli cluster front ends use the following
+common evaluation vocabulary. Pick the spatial cutoff explicitly when
+comparing representations:
+
+| Operation | MPO | Pauli PEPO | Gaugy Pauli |
+| --- | --- | --- | --- |
+| Single generator | `MPOClusterProductExpansion.from_mpo_basis(basis, cluster_size=p)` | `PauliPEPOBasis(lx, ly, terms, cluster_size=p)` | `PauliClusterBasis(lx, ly, terms, cluster_size=p)` |
+| Ordered product | `MPOClusterProductExpansion.from_bases(bases, cluster_size=p)` | `PEPOClusterProductExpansion.from_bases(bases)` | `PauliClusterProductExpansion.from_bases(bases)` |
+| Reusable evaluator | `plan.compile_exp()` | `plan.compile_exp()` | `plan.compile_exp()` |
+| Exponential | `compiled.exp(step, parameters=None, coefficients=None)` | Same | Same |
+| Trace | `compiled.trace_exp(step, parameters=None, coefficients=None, normalized=False)` (scalar partition) | Same signature, constructs and traces the PEPO | Same as PEPO |
+| Explicit scalar partition trace | `compiled.trace_exp(...)` | `compiled.partition_trace_exp(...)` | `compiled.partition_trace_exp(...)` |
+| Spatial cutoff metadata | `plan.cluster_size` | `plan.cluster_size` | `plan.cluster_size` |
+
+`coefficients` and `normalized` are keyword-only; `parameters` may also be
+positional. A product represents `exp(step*s0*H0) @ exp(step*s1*H1) @ ...`
+in the supplied algebraic order. `from_bases(..., coefficients=scales)` sets
+factor scales `s0, s1, ...`. By contrast, `exp(..., coefficients=values)` and
+`trace_exp(..., coefficients=values)` override the **term** coefficients:
+use one flat vector for one factor, or a sequence of vectors for a product.
+A `None` entry in a product retains that factor's default term coefficients.
+`parameters` binds declared `MPOParameter`/callable slots instead. The two
+runtime binding arguments are mutually exclusive, including an all-`None`
+coefficient sequence. Required parameterized
+factor scales therefore use the `parameters` route.
+
+Existing defaults are preserved: MPO `cluster_size=2`, Pauli PEPO/Gaugy
+`cluster_size=4`, and fixed dense PEPO plans `cluster_size=3`. PEPO/Gaugy
+also accept the established `order` spelling; supplying both requires equal
+values. On the dense square dataclass, `order` remains the stored field for
+`dataclasses.replace(plan, order=p)`; `cluster_size` is a constructor/property
+alias. This alias denotes spatial size, independent of the history/Taylor
+`order` on higher-order MPO APIs. PEPO products inherit their cutoff from
+matching constituent bases. MPO cutoffs are capped by the finite site count;
+PEPO supports the existing range 1–9. MPO terms must fit the selected cutoff;
+PEPO/Gaugy size one retains onsite terms and omits edge terms.
+
+Return types remain specific to the representation. MPO calls return a
+semantic `FirstDegreeMPO` with `.to_mpo()`; `materialize=True` returns the
+Quimb MPO directly. A single Pauli PEPO basis returns
+active blocks by default; a PEPO product retains its materialized default
+(use `materialize=False` for active blocks). Gaugy returns a bound
+`PauliClusterOperator` with local Pauli channels and `.to_pepo()`. Its
+`connected_trace_exp` is a separate connected-log approximation. PEPO and
+Gaugy `trace_exp` construct the PEPO and measure its actual trace, including
+rank caps and requested `compression=plan`. Use `partition_trace_exp` for
+their old uncompressed scalar shortcut. MPO `trace_exp` retains its scalar
+partition meaning. All default to the raw trace; `normalized=True` divides
+by the Hilbert-space dimension.
+
+The fixed dense `ClusterExpansionPlan` and `GraphClusterExpansionPlan` also
+expose `compile_exp().exp(step, materialize=False)`, with
+`exp(step) == build(-step)`. Their numerical generators are fixed matrices;
+runtime term vectors, autodiff and trace-only evaluation belong to the Pauli
+or MPO paths. Existing `build(beta)` and one-shot `build_*` functions keep
+the `exp(-beta*H)` convention and materialized default. Those dense builders
+also accept `cluster_size` alongside `order`; the real-time convenience
+builder retains its default cutoff of five.
+
+For Gaugy details, see its
+[Pauli cluster guide](https://github.com/rezaquant/gaugy/blob/develop/learning/pauli_cluster_api.md).
+
+### Single and joint cluster parity
+
+The cluster product engine supports a single factor and an ordered list of
+factors with the same spatial cutoff, bindings, backend, factorization and
+assembly controls. Construct a shared graph from every factor's supports.
+For each cluster, restrict every complete generator, multiply its local
+exponentials in the requested order, then perform connected subtraction.
+Setting the extra factors to zero recovers the single-exponential result.
+
+The current dense NumPy/Torch/JAX paths have independent small-system tests
+for noncommuting products, finite-cutoff residuals, repeated evaluation,
+step/factor-scale/term gradients, and zero parameters. PEPO frozen compression,
+trace-on-operator and work reports apply to joint products too. Quimb
+compression keywords require `compress=True`; they are rejected if they would
+otherwise be ignored. Native symmetry and large-system performance have
+separate limits: see the [joint-product review](../../development/notes/2026-09-29-joint-product-parity.md).
+
+This parity concerns connected-cluster exponentials. The separate MPO
+Taylor/history modes and their legacy convenience methods are not the same
+approximation. MPO scalar `trace_exp`, PEPO operator trace, and Gaugy's
+connected-log endpoints retain their explicit meanings above.
 
 ## Choose the analytical construction mode
 
@@ -57,14 +160,14 @@ The semantic result records `requested_mode`, `mode`,
 | One-shot connected-cluster MPO | `exp_mpo_cluster(terms, step, ...)` | Quimb MPO or semantic cluster MPO |
 | One-shot ordered MPO cluster product | `exp_mpo_cluster_product(factors, step, ...)` | Quimb MPO or semantic joint cluster MPO |
 | Native Trotter gate-product MPO | `exp_trotter(terms, step, ...)` | Quimb `MatrixProductOperator` |
-| Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO assembled from local connected residuals |
+| Connected/joint MPO clusters | `MPOClusterProductExpansion` / `MPOGraphClusterProductExpansion` | One MPO, or a scalar full trace via `trace_exp` |
 | Product of two existing MPOs | `compress_mpo_product(A, B, ...)` | Lazy `A @ B`, then one ordinary compressed MPO |
 | Raw MPO tensors for a compiled kernel | `basis.compile_exp(...).exp_arrays(step, ...)` | Backend-native tensor tuple |
 | Quimb MPO interoperability | `semantic_mpo.to_mpo()` | Quimb `MatrixProductOperator` |
 | One fixed-channel square-lattice PEPO | `PauliPEPOBasis.compile(...)` | Reusable `PauliPEPOBasis` |
 | One PEPO exponential | `basis.exp(step, ...)` | `ActivePEPOBlocks` by default |
 | Repeated PEPO exponentials | `basis.compile_exp().exp(step, ...)` | Cached `CompiledPEPOExp` call |
-| Ordered PEPO product | `PEPOClusterProductExpansion.from_bases(...)` | One composed PEPO |
+| Ordered PEPO product | `PEPOClusterProductExpansion.from_bases(...)` | One PEPO from joint local residuals |
 | Dense PEPO materialization | `active_blocks.to_pepo()` or `materialize=True` | Quimb `PEPO` |
 | Coefficient-dependent real-time PEPO | `build_real_time_cluster_expansion_pepo(...)` | Quimb `PEPO` or active blocks |
 | Fractional-step PEPO composition | `compose_cluster_expansion_pepo(...)` | Quimb `PEPO` |
@@ -72,6 +175,15 @@ The semantic result records `requested_mode`, `mode`,
 The MPO and PEPO APIs deliberately have the same top-level vocabulary. They
 do not have the same output layout: an MPO is a 1D semantic operator, while a
 PEPO is first kept as sparse active virtual-sector blocks.
+
+Both cluster families offer `factorization="fixed"` for exact construction
+without parameter-dependent SVDs. Use `cutoff=0.0, max_bond=None` for MPOs and
+`max_tree_rank=None` for Pauli PEPOs. Fixed construction rejects internal
+compression; compress its result separately if desired. Geometry and verified
+term-aware symmetry plans are cached, while coefficient/time gradients remain
+fresh. See [MPO autodiff](mpo_cluster.md#exact-construction-for-autodiff-without-svd)
+and [PEPO autodiff](cluster_expansion.md#svd-free-differentiable-construction)
+for backend, memory and supplied-symmetry contracts.
 
 For graph-aware MPO clusters, `graph_assembly="auto"` protects the 1D
 materialization boundary: a cutwidth-aware chain-frontier dynamic program
@@ -82,6 +194,15 @@ reported bounded one-cluster approximation when its finite
 `graph_assembly="bounded"` with `max_collection_order` when a controlled
 approximation is preferable. This control is specific to graph cluster
 products and is independent of the local `cluster_size` cutoff.
+
+For complete graph collections without explicit enumeration, use
+`assembly="recursive"`: it shares remaining-site MPO subproblems, adds their
+branches, and compresses each sum to `assembly_chi`. Its
+`assembly_state_budget` raises at compilation if too many subproblems are
+needed; `collection_budget` is unused. With no assembly/local/final rank
+truncation this retains the full chosen spatial expansion. See
+[complete recursive assembly](mpo_cluster.md#complete-recursive-assembly-add-mpo-branches-and-compress)
+for limitations and diagnostics.
 
 For wide graph MPOs, `assembly="streaming"` provides a separate working-memory
 boundary. It inserts local graph-path cores directly into the accumulator in
@@ -589,3 +710,12 @@ New code should use `exp`, `compile_exp`, `CompiledMPOExp`, and
 `compile_evolution`, `evaluate`, and `CompiledMPOEvolution` remain available
 as compatibility shims so existing programs do not break. They are not the
 recommended vocabulary for new code.
+
+### Spatial reuse for repeated cluster construction
+
+The MPO cluster family and `PauliPEPOBasis` accept `spatial_reuse=True` by
+default. They cache proven site relabelings of local ordered Hamiltonians and
+evaluate each representative once per call, keeping coefficient bindings and
+gradients fresh. Disable it for unreduced comparisons. See the
+[MPO rules and counters](mpo_cluster.md#reusing-lattice-and-hamiltonian-symmetries)
+and [Pauli PEPO rules and counters](cluster_expansion.md#hamiltonian-aware-reuse-in-pauli-pepos).

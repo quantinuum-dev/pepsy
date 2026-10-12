@@ -525,8 +525,12 @@ def quimb_ctmrg_projector_compat():
                     **compress_opts,
                 )
 
+            # Newer Quimb keeps the bond axes unfused for native arrays.
+            # Contract them directly to preserve graded axis ordering.
+            nbond = Rl.ndim - 1
             Ut, st, VHt = oblique_globals["array_split"](
-                Rl @ Rr,
+                ar.do("tensordot", Rl, Rr,
+                      (tuple(range(1, nbond + 1)), tuple(range(nbond)))),
                 max_bond=-1 if max_bond is None else max_bond,
                 cutoff=cutoff,
                 absorb=None,
@@ -548,13 +552,13 @@ def quimb_ctmrg_projector_compat():
                 return out
 
             inverse_sqrt.apply_to_arrays(_inverse_sqrt)
-            Pl = Rr @ oblique_globals["rdmul"](
+            Pl = ar.do("tensordot", Rr, oblique_globals["rdmul"](
                 oblique_globals["dag"](VHt), inverse_sqrt
-            )
-            Pr = oblique_globals["ldmul"](
+            ), ((nbond,), (0,)))
+            Pr = ar.do("tensordot", oblique_globals["ldmul"](
                 inverse_sqrt,
                 oblique_globals["dag"](Ut),
-            ) @ Rl
+            ), Rl, ((1,), (0,)))
 
             # If an entire charge block is empty, both projectors above are
             # zero in that block. Keep a finite identity block so subsequent
@@ -900,6 +904,18 @@ def _validate_chi(chi):
     return int(chi)
 
 
+def _split_metric_chi(chi):
+    """Resolve scalar or (norm, overlap) caps for PEPS metrics."""
+    if isinstance(chi, (tuple, list)):
+        if len(chi) != 2:
+            raise ValueError("chi must have length 2: (chi_norm, chi_overlap).")
+        if any(value is None for value in chi):
+            raise TypeError("chi pair entries must be positive integers.")
+        return _validate_chi(chi[0]), _validate_chi(chi[1])
+    value = _validate_chi(chi)
+    return value, value
+
+
 def _normalize_contraction_method(method):
     """Normalize PEPS metric contraction method names."""
     key = str(method).strip().lower().replace("-", "_")
@@ -1146,6 +1162,21 @@ def _unpack_bdy_handle(handle, name):
     return obj, holder
 
 
+def _boundary_at_geometric_capacity(mps, chi):
+    """Whether every open-MPS bond already spans its possible cut space."""
+    if getattr(mps, 'cyclic', False):
+        return False
+    outer = set(mps.outer_inds())
+    dims = [math.prod(mps[i].ind_size(ix) for ix in mps[i].inds if ix in outer)
+            for i in range(mps.L)]
+    left, right = 1, math.prod(dims)
+    for i, dim in enumerate(dims[:-1]):
+        left, right = left * dim, right // dim
+        if mps.bond_size(i, i + 1) < min(chi, left, right):
+            return False
+    return True
+
+
 def _retune_bdy_to_chi(obj, chi, name, *, expand_growth=True):
     """Retune an existing boundary object to the requested chi.
 
@@ -1157,6 +1188,12 @@ def _retune_bdy_to_chi(obj, chi, name, *, expand_growth=True):
         return
     cur = getattr(obj, "chi", None)
     if cur is None or int(cur) == chi:
+        return
+    # Canonicalization can reduce actual rank below the requested cap. Do not
+    # pad these same-cap boundaries again: that needlessly mutates valid cached
+    # cuts (and the rank will shrink again on the next fit).
+    if (int(cur) < chi and getattr(obj, '_chi_target', None) == chi
+            and all(_boundary_at_geometric_capacity(mps, chi) for mps in obj.mps_b.values())):
         return
     if int(cur) < chi and not expand_growth:
         # Preserve a low-rank warm start. The caller passes ``chi`` directly
@@ -1192,6 +1229,7 @@ def _contract_quimb_double_layer(  # pylint: disable=R0912,R0913,R0914,R0915
     ctmrg_compress_opts=None,
     ctmrg_reduce_opts=None,
     ctmrg_gauge_smudge=None,
+    mps_factorization="qr",
 ):
     """Contract an already-built double-layer TN with a quimb-style method."""
     if method == "exact":
@@ -1227,6 +1265,18 @@ def _contract_quimb_double_layer(  # pylint: disable=R0912,R0913,R0914,R0915
             equalize_norms=equalize_norms,
             inplace=False,
         )
+        if mps_factorization == "projector":
+            from ..backends.projector_split import register_projector_split
+
+            split_method = register_projector_split()
+            # Use the same composed-factor derivative in canonicalization,
+            # both reductions, and the actual truncated split. Leaving one
+            # QR/SVD-vector backward in the chain reintroduces singular charts.
+            kwargs["canonize_opts"] = {"method": split_method}
+            kwargs["compress_opts"] = {
+                "method": split_method,
+                "reduce_opts": {"method": split_method},
+            }
         if around is not None:
             kwargs["around"] = around
             kwargs["final_contract"] = False
@@ -1457,6 +1507,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     ctmrg_compress_opts=None,
     ctmrg_reduce_opts=None,
     ctmrg_gauge_smudge=None,
+    mps_factorization="qr",
 ):
     """Contract a double-layer PEPS norm/overlap network by the selected method."""
     method = _normalize_contraction_method(method)
@@ -1584,6 +1635,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
         ctmrg_compress_opts=ctmrg_compress_opts,
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
+        mps_factorization=mps_factorization,
     )
     return BoundaryContractResult(
         cost=cost,
@@ -1627,6 +1679,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     preserve_backend=False,
     mode_=None,
     compression_mode=None,
+    mps_factorization="qr",
     sequence=None,
     boundary_direction=None,
     middle_slices=None,
@@ -1724,6 +1777,13 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         Compression kernel for ``method="mps"``, such as ``"direct"``,
         ``"dm"``, or ``"sdc"``. This is the readable spelling of the
         compatibility argument ``mode_``; do not supply both.
+    mps_factorization : {"qr", "projector"}, default="qr"
+        The projector route replaces singular QR charts and SVD-vector VJPs
+        with a composed isometric-factor derivative. Dense NumPy/Torch 2D
+        direct boundary contraction only; first derivatives, locally fixed
+        retained rank and an open kept/discarded spectral gap are required.
+        Numerical null directions are removed at matrix-size times machine
+        precision. This does not change chi, cutoff, or the cost formula.
     boundary_direction : str | None, default=None
         Readable contraction schedule. One-sided choices are ``"bottom-up"``,
         ``"top-down"``, ``"left-to-right"``, and ``"right-to-left"``;
@@ -1777,6 +1837,18 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         if method != "mps":
             raise ValueError("compression_mode applies only to method='mps'.")
         mode_ = compression_mode
+
+    if mps_factorization not in ("qr", "projector"):
+        raise ValueError("mps_factorization must be 'qr' or 'projector'")
+    if mps_factorization == "projector":
+        if method != "mps" or _infer_lattice_ndim(tn) != 2:
+            raise ValueError("projector factorization requires 2D method='mps'")
+        if mode_ not in (None, "mps", "direct"):
+            raise ValueError("projector factorization requires direct boundary compression")
+        if _uses_symmray_arrays(tn) or any(
+            ar.infer_backend(t.data) not in {"numpy", "torch"} for t in tn
+        ):
+            raise TypeError("projector factorization supports dense NumPy/Torch networks only")
 
     if boundary_direction is not None and sequence is not None:
         raise ValueError("Supply only one of boundary_direction and sequence.")
@@ -1869,6 +1941,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         ctmrg_compress_opts=ctmrg_compress_opts,
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
+        mps_factorization=mps_factorization,
     )
     if middle_axis is not None:
         result = replace(result, direction=f"middle-out-{middle_axis}")
@@ -2121,6 +2194,10 @@ def build_bra_ket(
     ket_tagged.add_tag("KET")
     bra_tagged.add_tag("BRA")
     norm_tagged = bra_tagged | ket_tagged
+    # Private provenance is consumed only by explicitly enabled environment
+    # caches. Ordinary contractions and unsupported backends are unchanged.
+    from ._reuse import layer_sources
+    layer_sources(ket, ket if auto_bra else bra, norm_tagged)
     return ket_tagged, norm_tagged
 
 
@@ -2291,6 +2368,8 @@ def contract_boundary(
 
     retag = bool(retag)
     norm_tagged = norm.copy()
+    if hasattr(norm, '_pepsy_boundary_sources'):
+        norm_tagged._pepsy_boundary_sources = norm._pepsy_boundary_sources
 
     comp_bdy = CompBdy(
         norm_tagged,
@@ -2502,8 +2581,9 @@ def peps_normalize(
     ----------
     p : qtn.TensorNetwork
         Input PEPS state.
-    chi : int | None, default=None
-        Boundary MPS bond dimension used when ``bdy`` is not provided.
+    chi : int | tuple[int, int] | None, default=None
+        Boundary MPS cap, or ``(norm cap, overlap cap)`` pair. Normalization
+        uses only the first entry. Required when ``bdy`` is not provided.
     bdy : pepsy.boundary.states.BdyMPS | dict | None, default=None
         Boundary handle:
 
@@ -2619,7 +2699,7 @@ def peps_normalize(
     """
     if p is None:
         raise ValueError("p must not be None.")
-    chi = _validate_chi(chi)
+    chi, _ = _split_metric_chi(chi)
 
     contract_kwargs = dict(
         chi=chi,
@@ -3083,9 +3163,10 @@ def peps_infidelity(
         Trial PEPS state.
     p_target : qtn.TensorNetwork
         Target PEPS state.
-    chi : int | None, default=None
-        Boundary MPS bond dimension. Required when the corresponding
-        ``bdy*`` argument is not supplied.
+    chi : int | tuple[int, int] | None, default=None
+        Boundary MPS cap, or ``(norm cap, overlap cap)`` pair. Both state
+        norms use the first entry; their overlap uses the second. A scalar
+        sets both caps. Required when the corresponding ``bdy*`` is absent.
     norm : complex | float | None, default=None
         Known value of :math:`\langle p | p \rangle`.  When provided the
         :math:`\langle p | p \rangle` boundary contraction is skipped
@@ -3207,13 +3288,12 @@ def peps_infidelity(
         raise ValueError("p must not be None.")
     if p_target is None:
         raise ValueError("p_target must not be None.")
-    chi = _validate_chi(chi)
+    chi_norm, chi_overlap = _split_metric_chi(chi)
     method = _normalize_contraction_method(method)
 
     # Shared contraction kwargs
     _kw = dict(
         method=method,
-        chi=chi,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
         fit_layer_mode=fit_layer_mode,
@@ -3259,6 +3339,7 @@ def peps_infidelity(
         _, norm_tn = build_bra_ket(ket=p, bra=None)
         norm_result, bdy_obj = _contract_peps_double_layer(
             norm_tn,
+            chi=chi_norm,
             bdy=bdy,
             single_layer=single_layer,
             bdy_name="bdy",
@@ -3278,6 +3359,7 @@ def peps_infidelity(
         _, norm_target_tn = build_bra_ket(ket=p_target, bra=None)
         norm_target_result, bdy_target_obj = _contract_peps_double_layer(
             norm_target_tn,
+            chi=chi_norm,
             bdy=bdy_target,
             single_layer=single_layer,
             bdy_name="bdy_target",
@@ -3294,6 +3376,7 @@ def peps_infidelity(
     _, overlap_tn = build_bra_ket(ket=p, bra=p_target)
     overlap_result, bdy_overlap_obj = _contract_peps_double_layer(
         overlap_tn,
+        chi=chi_overlap,
         bdy=bdy_overlap,
         single_layer=single_layer,
         bdy_name="bdy_overlap",

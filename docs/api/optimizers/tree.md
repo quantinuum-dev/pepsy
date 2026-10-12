@@ -110,6 +110,10 @@ See [Tree state class](tree_state.md#tree-state-class).
 
 See [Tree structure](tree_layout.md#tree-structure).
 
+## Alternating spatial x/y hierarchy
+
+See [Alternating spatial x/y hierarchy](tree_layout.md#alternating-spatial-xy-hierarchy).
+
 ## Fixed-plan refinement and Nevergrad search
 
 See [Fixed-plan refinement and Nevergrad search](tree_layout.md#fixed-plan-refinement-and-nevergrad-search).
@@ -129,14 +133,3 @@ See [Readout](tree_readout.md#readout).
 ## Performance and stability
 
 See [Performance and stability](tree_replay.md#performance-and-stability).
-
-```{toctree}
-:hidden:
-
-tree_layout
-tree_state
-tree_operators
-tree_replay
-tree_fit
-tree_readout
-```

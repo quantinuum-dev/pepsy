@@ -1058,7 +1058,7 @@ def test_optimizer_defaults_to_congestion_layout_for_replay_performance():
     assert opt.layout_objective == "congestion"
     assert opt.layout_finder.objective == "congestion"
     assert opt.mode == "auto"
-    assert opt.threads == 1
+    assert opt.threads is None
     assert opt.subtree_workers == 1
     assert opt.track_truncation is False
     assert opt.track_infidelity is True

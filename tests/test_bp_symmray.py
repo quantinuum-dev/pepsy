@@ -2225,6 +2225,7 @@ def test_cyclic_native_route_skips_open_edge_enumeration(monkeypatch):
     assert np.isfinite(value)
 
 
+@pytest.mark.filterwarnings("error:Casting complex values to real")
 def test_explicit_edge_loop_series_preserves_dense_edge_degree_terms():
     """Edge-degree terms are distinct from the local-region cutoff API."""
     state = qtn.PEPS.rand(2, 2, bond_dim=2, seed=1906, dtype="complex128")
@@ -2252,6 +2253,25 @@ def test_explicit_edge_loop_series_preserves_dense_edge_degree_terms():
     assert info["edge_rho_terms"]
     assert all(len(term.edges) <= 4 for term in info["edge_rho_terms"])
     np.testing.assert_allclose(value, np.trace(rho @ gate))
+
+
+def test_edge_suppression_rejects_nonreal_norm_weights():
+    options = dict(num_tensors=4, multi_excitation_correct=True,
+                   tol_correction=1e-14, maxiter_correction=100)
+    edge = ("a", "b", "c", "d")
+    for dtype in (np.complex64, np.complex128):
+        eps = np.finfo(np.empty((), dtype=dtype).real.dtype).eps
+        close = {edge: dtype(-0.07 + 2j * eps)}
+        result = bp_series._edge_series_suppression(close, **options)
+        reference = bp_series._edge_series_suppression({edge: dtype(-0.07).real}, **options)
+        np.testing.assert_allclose(result[edge], reference[edge])
+        assert close[edge].imag != 0  # Validation must leave caller data intact.
+    for value in (complex(-0.07, 0.01), complex(np.nan, 0), complex(0, np.inf)):
+        with pytest.raises(ValueError, match="finite real norm weights"):
+            bp_series._edge_series_suppression({edge: value}, **options)
+    assert bp_series._edge_series_suppression(
+        {edge: -0.07 + 0.01j}, **{**options, "multi_excitation_correct": False}
+    ) == {edge: 1.0}
 
 
 def test_explicit_edge_loop_series_rejects_multisite_fermionic_q_terms():

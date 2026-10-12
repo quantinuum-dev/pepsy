@@ -54,6 +54,16 @@ _GATE_EXPORTS = [
     "fsimg",
 ]
 _SYMBOL_MODULES = {name: ".gates" for name in _GATE_EXPORTS}
+_SYMBOL_MODULES["GraphPEPOClusterProductExpansion"] = ".graph_pepo_product"
+_SYMBOL_MODULES["SquarePEPOClusterProductExpansion"] = ".square_pepo_product"
+_SYMBOL_MODULES["ClusterCompressionPlan"] = ".cluster_compression"
+_SYMBOL_MODULES["ClusterChannelPlan"] = ".cluster_channels"
+_SYMBOL_MODULES["prepare_cluster_channels"] = ".cluster_channels"
+_SYMBOL_MODULES["delinearize_mpo"] = ".mpo_delinearize"
+_SYMBOL_MODULES["MPODelinearizationReport"] = ".mpo_delinearize"
+_SYMBOL_MODULES["trace_pepo"] = ".pepo_trace"
+_SYMBOL_MODULES["ClusterPlan"] = ".cluster_plan"
+_SYMBOL_MODULES["ClusterSymmetryPlan"] = ".cluster_plan"
 _SYMBOL_MODULES["ham_tn"] = ".hamiltonians"
 _SYMBOL_MODULES["build_cluster_expansion_pepo"] = ".pepo_cluster"
 _SYMBOL_MODULES["build_model_cluster_expansion_pepo"] = ".pepo_cluster"
@@ -149,6 +159,7 @@ _SYMBOL_MODULES["PauliCompressionReport"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliBondCompressionReport"] = ".pauli_mpo"
 _SUBMODULES = (
     "cluster",
+    "cluster_plan",
     "gates",
     "hamiltonians",
     "mpo",
@@ -177,6 +188,12 @@ __all__ = [
     "generate_connected_cluster_shapes",
     "build_graph_cluster_expansion_pepo",
     *_CLUSTER_EXPORTS,
+    "GraphPEPOClusterProductExpansion",
+    "SquarePEPOClusterProductExpansion",
+    "ClusterCompressionPlan",
+    "trace_pepo",
+    "ClusterPlan",
+    "ClusterSymmetryPlan",
     "ham_tn",
     *_AUTOMATON_EXPORTS,
     *_MPO_EXPORTS,

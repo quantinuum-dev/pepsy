@@ -21,6 +21,53 @@ def _loss_with_target(params, *, target):
     return (diff.conj() * diff).real.sum()
 
 
+@pytest.mark.parametrize("solver", ["scipy", "nlopt", "torch-lbfgs", "torch-adam", "fd-scipy"])
+@pytest.mark.parametrize("backend", ["torch", "numpy"])
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+@pytest.mark.parametrize("strided", [False, True])
+def test_solver_owns_parameters_without_mutating_inputs(solver, backend, dtype, strided):
+    """Trial iterates must not write through views into caller/rollback data."""
+    if solver == "nlopt":
+        pytest.importorskip("nlopt")
+    base = np.array([2 + .5j, -3 + .2j, 1 - .3j, 4 + .1j], dtype=dtype)
+    if backend == "torch":
+        base = torch.tensor(base, requires_grad=True)
+        before = base.detach().clone()
+    else:
+        before = base.copy()
+    initial = base[::2] if strided else base
+
+    def assert_input_unchanged():
+        if backend == "torch":
+            torch.testing.assert_close(base, before, atol=0., rtol=0.)
+            assert base.requires_grad
+            assert base.grad is None
+        else:
+            np.testing.assert_array_equal(base, before)
+
+    def loss(params):
+        assert_input_unchanged()
+        return _loss_quadratic(params)
+
+    options = {"lr": .1} if solver.startswith("torch-") else {}
+    if solver == "nlopt":
+        options["algorithm"] = "LD_LBFGS"
+    if solver == "fd-scipy":
+        options["fd_eps"] = 1e-3
+    result = GradientOptimizer(solver=solver, n_steps=10, options=options).run(
+        params_init={"x": initial}, loss_fn=loss,
+    )
+    assert_input_unchanged()
+    out = result.params["x"]
+    reference = torch.as_tensor(initial).detach()
+    assert out.dtype == reference.dtype
+    assert out.device == reference.device
+    assert out.shape == reference.shape
+    assert _loss_quadratic({"x": out}) < _loss_quadratic({"x": reference})
+    out.zero_()
+    assert_input_unchanged()
+
+
 def test_supported_solvers_exports_expected_backends():
     """Supported solver list should expose only canonical names."""
     assert set(SUPPORTED_SOLVERS) == {
@@ -29,6 +76,21 @@ def test_supported_solvers_exports_expected_backends():
         "fd-adam", "fd-scipy", "fd-nlopt",
         "jax-adam", "jax-adamw", "jax-sgd", "jax-rmsprop",
     }
+
+
+@pytest.mark.parametrize("solver", ["lbfgs", "scipy-lbfgs", "LD_LBFGS"])
+def test_lbfgs_aliases_use_host_solver_with_torch(solver):
+    pytest.importorskip("nlopt" if solver == "LD_LBFGS" else "scipy")
+    initial = torch.tensor([2., -3.], dtype=torch.float64)
+    result = GradientOptimizer(solver=solver, n_steps=30).run(
+        params_init={"x": initial.clone()}, loss_fn=_loss_quadratic,
+    )
+    assert result.solver == ("nlopt" if solver == "LD_LBFGS" else "scipy")
+    assert isinstance(result.params["x"], torch.Tensor)
+    assert result.params["x"].device == initial.device
+    assert result.params["x"].dtype == initial.dtype
+    torch.testing.assert_close(result.params["x"], torch.zeros_like(initial), atol=1e-8, rtol=0.)
+    torch.testing.assert_close(initial, torch.tensor([2., -3.], dtype=torch.float64))
 
 
 def test_fdsolver_default_reduces_quadratic():
@@ -212,6 +274,69 @@ def test_scipy_solver_reduces_quadratic_if_available():
     assert result.history
     assert result.history[-1] < result.history[0]
     assert abs(float(result.params["x"].detach().item())) < 1e-6
+
+
+@pytest.mark.parametrize(
+    ("method", "n_steps", "options", "success", "status"),
+    [
+        ("L-BFGS-B", 100, {}, True, 0),
+        ("BFGS", 100, {}, True, 0),
+        ("L-BFGS-B", 1, {}, False, 1),
+        ("L-BFGS-B", 100, {"maxfun": 1}, False, 1),
+        ("L-BFGS-B", 100, {"maxls": 1}, False, 2),
+    ],
+)
+def test_scipy_solver_reports_actual_termination(
+    monkeypatch, method, n_steps, options, success, status,
+):
+    """Convergence, budget limits and failed line searches keep SciPy's reason."""
+    scipy = pytest.importorskip("scipy")
+    real_minimize = scipy.optimize.minimize
+    raw_results = []
+
+    def capture_minimize(*args, **kwargs):
+        raw_result = real_minimize(*args, **kwargs)
+        raw_results.append(raw_result)
+        return raw_result
+
+    monkeypatch.setattr(scipy.optimize, "minimize", capture_minimize)
+
+    def rosenbrock(params):
+        x, y = params["x"]
+        return (1 - x) ** 2 + 100 * (y - x ** 2) ** 2
+
+    result = GradientOptimizer(
+        solver="scipy", n_steps=n_steps,
+        options={"algorithm": method, **options},
+    ).run(
+        params_init={"x": torch.tensor([-1.2, 1.0], dtype=torch.float64)},
+        loss_fn=rosenbrock,
+    )
+    raw_result = raw_results[0]
+    assert bool(raw_result.success) is success
+    assert raw_result.status == status
+    assert result.convergence_reason == str(raw_result.message)
+
+
+@pytest.mark.parametrize("control", ["patience", "bad_max"])
+def test_scipy_solver_preserves_pepsy_stop_reason(control):
+    """SciPy's callback message must not hide Pepsy's early-stop controls."""
+    pytest.importorskip("scipy")
+
+    def loss_fn(params):
+        x = params["x"]
+        if control == "bad_max" and x.item() < 1.5:
+            return x * float("nan")
+        return x ** 2
+
+    options = {"patience": 0} if control == "patience" else {
+        "bad_max": 1, "penalty_on_bad": 0.0,
+    }
+    result = GradientOptimizer(solver="scipy", n_steps=100, options=options).run(
+        params_init={"x": torch.tensor(2.0, dtype=torch.float64)}, loss_fn=loss_fn,
+    )
+    assert result.convergence_reason == control
+    assert result.n_steps == 1
 
 
 def test_scipy_solver_consumes_nlopt_tolerance_aliases_if_available(monkeypatch):

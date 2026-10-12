@@ -7,18 +7,17 @@ from copy import deepcopy
 import numpy as np
 
 from ..optimizers.stabilizer_tn.paulis import _resolve_measurement_disentangle
-from .samplers import (
-    MpsBatchSampleResult,
+from .results import MpsBatchSampleResult, _configs_to_sample_result
+from .mps import _normalize_mps_sampler_backend
+from ._common import _validate_one_d_to_two_d
+from .vector import (
     _basis_selection_probability,
-    _configs_to_sample_result,
-    _normalize_mps_sampler_backend,
     _resolve_measurement_basis,
-    _validate_one_d_to_two_d,
     _validate_sample_chunk_size,
     _validate_sample_count,
 )
 
-__all__ = ["StabilizerMpsSampler", "MpsStabSampler"]
+__all__ = ["StabilizerMpsSampler"]
 
 
 _DEFAULT_SAMPLE_CHUNK_SIZE = 4096
@@ -31,11 +30,10 @@ class StabilizerMpsSampler:
     The sampler accepts either a live :class:`StabilizerMpsSimulator` or the pair
     ``(C, nu)`` directly. It uses the tableau frame to map every requested
     local X/Y/Z measurement into a Pauli projector on the coefficient MPS.
-    ``strategy="auto"`` currently resolves to this frame-projector path,
-    which shares collapsed prefixes between shots just like the native MPS
-    sampler. Set ``disentangle=True`` to use the basis-updating Lemma-3
-    measurement on each copied branch. The optimizer state is never mutated by
-    sampling.
+    Both strategies share collapsed prefixes between shots. By default,
+    ``disentangle=True`` uses certified native collapse or the basis-updating
+    Lemma-3 measurement on each copied branch. Set ``disentangle=False`` to
+    keep the tableau fixed. Sampling never mutates the source optimizer.
 
     Parameters
     ----------
@@ -52,14 +50,14 @@ class StabilizerMpsSampler:
         Coordinate map used by the returned ``MpsSampleResult``-compatible
         helpers. By default logical qubit ``q`` maps to ``(q, 0)``.
     strategy : {"auto", "frame"}, default="auto"
-        Sampling strategy. Both names currently select frame-mapped Pauli
-        projectors; the explicit spelling makes the selected route visible to
-        callers and leaves room for future alternatives.
-    absorb_basis : bool, default=False
+        Sampling strategy. Both names use frame-mapped shared-prefix sampling;
+        ``disentangle`` selects the collapse representation.
+    absorb_basis : bool, default=True
         If ``True``, use the basis-updating measurement path on each copied
         sampling branch. The frame is locally transformed so the measured
         Pauli becomes ``+/- Z_k``, then the coefficient site is projected.
-        Localizing Clifford gates and any resulting projector compression use
+        Certified Pauli-product states collapse natively through Stim first.
+        Otherwise localizing gates and any resulting projector compression use
         the ``chi``, ``mode``, and ``cutoff`` settings of the underlying
         optimizer. Since the frame changes after every absorbed measurement,
         frame images are recomputed per branch rather than cached globally.
@@ -130,7 +128,7 @@ class StabilizerMpsSampler:
         self.absorb_basis = _resolve_measurement_disentangle(
             absorb_basis,
             disentangle,
-            default=False,
+            default=True,
         )
         self.disentangle = self.absorb_basis
         self.resolved_strategy = (
@@ -1206,6 +1204,3 @@ class StabilizerMpsSampler:
                 shuffle=shuffle,
                 chunk_size=count,
             )
-
-
-MpsStabSampler = StabilizerMpsSampler

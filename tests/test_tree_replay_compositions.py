@@ -145,8 +145,12 @@ def test_mix_refines_direct_guess_against_original_target(backend, dtype, monkey
     tolerance = 3e-5 if dtype == "complex64" else 1e-10
     assert np.linalg.norm(seen[0][2] - opt.to_dense().reshape(-1)) <= seen[0][1] + tolerance
     assert opt.tn.is_canonical_form(tol=tolerance)
-    # The preset leaves the caller's generic FIT settings intact for later modes.
-    opt.run(mode="dmrg")
+    # MIX retains configured controls; larger blocks require a named block mode.
+    with pytest.raises(ValueError, match="fixes fit_block_size=1"):
+        opt.run(mode="dmrg")
+    assert opt._dmrg_mode_alias == "mix"
+    assert opt.fit_block_size == 3 and opt.fit_init_strategy == "guess_src"
+    opt.run(mode="dmrg3")
     assert opt._fit_block_size() == 3 and opt._fit_guess_strategy() == "guess_src"
 
 

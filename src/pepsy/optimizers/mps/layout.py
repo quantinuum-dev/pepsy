@@ -15,6 +15,11 @@ import numpy as np
 
 from ...operators.gates import _normalize_gate_entries
 from .._layout_orders import normalize_fixed_order
+from .._stream_events import (
+    _normalize_event_name,
+    _normalize_submpo_where,
+    _submpo_event_parts,
+)
 from .._layout_visualization import (
     coordinate_lattice_edge_keys,
     coordinate_lattice_edges,
@@ -27,7 +32,6 @@ from ...tensors.maps import OneDMap
 
 __all__ = ["MpsGateStreamLayoutFinder", "MpsGateStreamSchedule"]
 
-_SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
 _MISSING = object()
 _NUMBA_GATE_STREAM_REFINE = None
 
@@ -47,55 +51,6 @@ class MpsGateStreamSchedule:
     site_order: tuple
     layout_plan: Mapping | None = None
     metadata: Mapping | None = None
-
-
-def _normalize_event_name(name):
-    """Normalize a stream event name for matching."""
-    return str(name).replace("-", "_").strip().lower()
-
-
-def _normalize_submpo_where(where):
-    """Normalize sub-MPO support sites to a non-empty tuple of 1D ints."""
-    if isinstance(where, Integral):
-        return (int(where),)
-    if (
-        isinstance(where, (tuple, list))
-        and len(where) > 0
-        and all(isinstance(site, Integral) for site in where)
-    ):
-        return tuple(int(site) for site in where)
-    raise ValueError(
-        "subMPO event where must be a non-empty sequence of 1D sites."
-    )
-
-
-def _submpo_event_parts(entry):
-    """Return ``(mpo, where)`` if ``entry`` is a sub-MPO event, else ``None``."""
-    if (
-        isinstance(entry, tuple)
-        and len(entry) == 3
-        and isinstance(entry[0], str)
-        and _normalize_event_name(entry[0]) in _SUBMPO_EVENT_NAMES
-    ):
-        return entry[1], entry[2]
-
-    if not isinstance(entry, Mapping):
-        return None
-
-    kind = entry.get("kind", entry.get("type", entry.get("event", _MISSING)))
-    if kind is _MISSING or _normalize_event_name(kind) not in _SUBMPO_EVENT_NAMES:
-        return None
-
-    mpo = entry.get(
-        "mpo",
-        entry.get("submpo", entry.get("operator", entry.get("payload", _MISSING))),
-    )
-    where = entry.get("where", entry.get("sites", _MISSING))
-    if mpo is _MISSING or where is _MISSING:
-        raise ValueError(
-            "subMPO stream event mappings must contain 'mpo' and 'where'."
-        )
-    return mpo, where
 
 
 def _is_submpo_event(entry):
@@ -2687,29 +2642,7 @@ class MpsGateStreamLayoutFinder:
             self.sites,
             self.event_weights,
         )
-        self.site_usage = _gate_stream_site_usage(
-            self.sites,
-            self.supports,
-            self.event_types,
-            site_roles=self.qubit_roles,
-        )
-        self.inferred_site_roles, self.role_evidence = _infer_site_roles(
-            self.sites,
-            self.supports,
-            self.event_types,
-        ) if not self.qubit_roles else ({}, {})
-        self.effective_site_roles = (
-            dict(self.qubit_roles)
-            if self.qubit_roles
-            else dict(self.inferred_site_roles)
-        )
-        if self.effective_site_roles:
-            self.site_usage = _gate_stream_site_usage(
-                self.sites,
-                self.supports,
-                self.event_types,
-                site_roles=self.effective_site_roles,
-            )
+        self._set_usage_metadata(self.supports, self.event_types)
         self.inferred_site_coords = None
         self.coordinate_source = "provided" if self.site_coords is not None else None
         if self.site_coords is None:
@@ -2724,6 +2657,39 @@ class MpsGateStreamLayoutFinder:
         self._replay_supports = ()
         self._replay_event_types = ()
         self._replay_event_indices = ()
+
+    def _set_usage_metadata(self, supports, event_types):
+        """Share lifetime/role inference while preserving operator event types.
+
+        Frame projectors are multi-site coefficient operators, so their cost
+        type remains sub-MPO even when their lifetime hint is measure/reset.
+        These hints never authorize scheduling or physical-qubit relabeling.
+        """
+        self._usage_supports = tuple(supports)
+        self._usage_event_types = tuple(event_types)
+        self.site_usage = _gate_stream_site_usage(
+            self.sites,
+            self._usage_supports,
+            self._usage_event_types,
+            site_roles=self.qubit_roles,
+        )
+        self.inferred_site_roles, self.role_evidence = _infer_site_roles(
+            self.sites,
+            self._usage_supports,
+            self._usage_event_types,
+        ) if not self.qubit_roles else ({}, {})
+        self.effective_site_roles = (
+            dict(self.qubit_roles)
+            if self.qubit_roles
+            else dict(self.inferred_site_roles)
+        )
+        if self.effective_site_roles:
+            self.site_usage = _gate_stream_site_usage(
+                self.sites,
+                self._usage_supports,
+                self._usage_event_types,
+                site_roles=self.effective_site_roles,
+            )
 
     @classmethod
     def from_optimizer(
@@ -2804,29 +2770,7 @@ class MpsGateStreamLayoutFinder:
         )
         finder._replay_event_types = tuple(optimizer.event_types)
         finder._replay_event_indices = tuple(replay_event_indices)
-        finder.site_usage = _gate_stream_site_usage(
-            finder.sites,
-            finder._replay_supports,
-            finder._replay_event_types,
-            site_roles=finder.qubit_roles,
-        )
-        finder.inferred_site_roles, finder.role_evidence = _infer_site_roles(
-            finder.sites,
-            finder._replay_supports,
-            finder._replay_event_types,
-        ) if not finder.qubit_roles else ({}, {})
-        finder.effective_site_roles = (
-            dict(finder.qubit_roles)
-            if finder.qubit_roles
-            else dict(finder.inferred_site_roles)
-        )
-        if finder.effective_site_roles:
-            finder.site_usage = _gate_stream_site_usage(
-                finder.sites,
-                finder._replay_supports,
-                finder._replay_event_types,
-                site_roles=finder.effective_site_roles,
-            )
+        finder._set_usage_metadata(finder._replay_supports, finder._replay_event_types)
         if finder.site_coords is None:
             finder.inferred_site_coords = _gate_stream_graph_coords(
                 finder.sites,
@@ -2916,10 +2860,10 @@ class MpsGateStreamLayoutFinder:
                 "installed; create a fresh optimizer copy."
             )
         mode = getattr(optimizer, "mode", None)
-        if mode in {"exact", "perm"}:
+        if mode in {"exact", "exact-batch", "perm"}:
             raise ValueError(
                 "objective='replay' requires a fixed-layout MPS compression "
-                "mode, not mode='exact' or mode='perm'."
+                "mode, not mode='exact', mode='exact-batch', or mode='perm'."
             )
 
         stream = tuple(self._replay_stream)
@@ -2951,7 +2895,9 @@ class MpsGateStreamLayoutFinder:
         replay_mode = run_kwargs.get("mode", mode)
         if replay_mode is None:
             replay_mode = mode
-        if str(replay_mode).strip().lower() in {"exact", "perm"}:
+        if str(replay_mode).strip().lower() in {
+            "exact", "exact-batch", "batch-exact", "perm"
+        }:
             raise ValueError(
                 "objective='replay' requires a fixed-layout MPS compression "
                 "mode in replay_kwargs."
@@ -3334,26 +3280,14 @@ class MpsGateStreamLayoutFinder:
             candidates = _gate_stream_layout_candidates(
                 self.sites,
                 pair_weights,
-                supports=(
-                    self._replay_supports
-                    if self._optimizer is not None
-                    else self.supports
-                ),
-                event_types=(
-                    self._replay_event_types
-                    if self._optimizer is not None
-                    else self.event_types
-                ),
+                supports=self._usage_supports,
+                event_types=self._usage_event_types,
                 include_lifetime=(
                     role_order is not None
                     or bool(site_roles)
                     or any(
                         event_type in _LIFETIME_BOUNDARY_EVENT_TYPES
-                        for event_type in (
-                            self._replay_event_types
-                            if self._optimizer is not None
-                            else self.event_types
-                        )
+                        for event_type in self._usage_event_types
                     )
                     or order_name in {
                         "lifetime",

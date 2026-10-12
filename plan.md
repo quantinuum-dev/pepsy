@@ -1,5 +1,9 @@
 # Native fermionic PEPO plan
 
+This is a scoped proposal. Use the
+[plan index](docs/development/plans/README.md) for package-wide planning and the
+[Markdown policy](docs/development/markdown_policy.md) when revising this design.
+
 Status: deferred design item. No implementation is planned until this work is
 prioritized.
 

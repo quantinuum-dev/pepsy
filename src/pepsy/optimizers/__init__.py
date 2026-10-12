@@ -23,7 +23,6 @@ _SYMBOL_MODULES = {
     "QMeraLayoutFinder": ".qmera",
     "QMeraLayoutReport": ".qmera",
     "QMeraLayoutScore": ".qmera",
-    "QMeraParametricEnergyOptimizer": ".qmera",
     "QMeraPrototypeLayout": ".qmera",
     "QMeraScaleSpec": ".qmera",
     "QMeraUnitarySpec": ".qmera",
@@ -94,6 +93,8 @@ _SYMBOL_MODULES = {
     "TrajectorySample": ".noise",
     "TrajectoryShotResult": ".noise",
     "compile_stim_circuit": ".noise",
+    "stim_plan_to_gate_stream": ".noise",
+    "stim_readout_parities": ".noise",
     "compile_trajectory_stream": ".noise",
     "run_coalesced_noisy_shots": ".noise",
     "run_coalesced_stim_shots": ".noise",
@@ -151,7 +152,6 @@ _SUBMODULES = (
 __all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 
 _DEPRECATED_ALIASES = {
-    "QMeraParametricEnergyOptimizer": "QMeraEnergyOptimizer",
     "MpsStabOptimizer": "StabilizerMpsSimulator",
     "TreeStabOptimizer": "StabilizerTreeSimulator",
 }

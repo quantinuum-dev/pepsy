@@ -6,6 +6,31 @@ PePsY (“PEPS in Python”) is a tensor-network library for circuit simulation,
 contraction, optimization, sampling, and variational Monte Carlo.
 The Python package is named `pepsy`.
 
+Pepsy is independent of downstream packages such as Gaugy. Graph planning,
+tensor-network construction, contraction, compression and general solvers
+live here; downstream packages call these public APIs for their own domain
+algorithms. See [package ownership](docs/development/package_layout.md#pepsy-and-downstream-packages).
+
+Cluster PEPO `trace_exp` constructs and traces the selected PEPO, including
+rank caps and compression. Use `pepsy.operators.trace_pepo(pepo)` to measure
+an existing result; `partition_trace_exp` is the explicit uncompressed scalar
+shortcut. See the [trace contract](docs/api/operators/cluster_expansion.md#trace-of-the-constructed-pepo).
+
+Native bosonic cluster MPOs support exact Torch/JAX autodiff and sector-preserving
+NumPy/Torch compressed assembly. See the [construction and gradient limits](docs/api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos).
+
+For repeated spin-cluster evaluations, experimental
+[`prepare_cluster_channels`](docs/api/operators/cluster_channels.md) assembles
+compact MPO/PEPO tensors directly from local factors with frozen QR-prepared
+bases, avoiding expanded histories and numerical decomposition during
+autodiff. MPO preparation first shares formally equivalent transitions;
+further numerical reductions define an explicit approximate operator.
+For exact graph MPOs, `preparation="frontier"` also avoids enumerating
+complete collections by retaining only clusters crossing the current cut.
+For graph/square PEPOs, `preparation="symbolic"` shares exact graph channels
+before routing and reuses a linear reference template. Full channels preserve
+the chosen expansion; capped accuracy and speed must be measured.
+
 Version **0.5.0** · Python **3.12+** · [Changelog](CHANGELOG.md)
 
 ## Install from GitHub
@@ -53,12 +78,13 @@ shows how to collect fidelity diagnostics.
 | Upgrade from 0.4.1 | [Migration guide](docs/development/api-migration.md) |
 | Check compatibility guarantees | [API stability](docs/stability.md) |
 | Contribute or run tests | [Contributing](CONTRIBUTING.md) |
+| Track cluster PEPO / downstream optimization | [Development status](docs/development/cluster_optimization_status.md) |
 | Find implementation notes | [Development documentation](docs/development/README.md) |
+| Plan work or write mathematical Markdown | [Plan index](docs/development/plans/README.md) and [writing policy](docs/development/markdown_policy.md) |
 
 Prefer imports from the owning namespace, such as `pepsy.tensors` or
 `pepsy.optimizers`. The top-level `pepsy` aliases remain available for
 compatibility.
 
-Documentation lives in [docs/](docs/index.md). See the
-[build instructions](docs/installation.md#build-the-documentation) for a
-searchable HTML site with generated API pages.
+Documentation lives in [docs/](docs/index.md) as linked Markdown pages;
+reading it requires no documentation builder or extra packages.

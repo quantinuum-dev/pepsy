@@ -22,12 +22,62 @@ density-matrix compression. Hyphenated spellings such as
 `mode="tree-mpo-dm"`, and the compatibility alias `mode="tree_mpo_dem"`, are
 accepted.
 
-TreeStab also forwards `compression_mode="direct"` or `"dm"` to its coefficient
+TreeStab also forwards `compression_mode` to its coefficient
 `TreeOptimizer`. DM mode selects the density-matrix-equivalent local
 `svd:eig` decomposition after the complete coefficient operator and tree
 state have been fused. It does not canonicalize or compress the operator
 separately, and it does not build a global dense state. `mode="dm"` remains a
 compatibility shorthand for TreeMPO-DM routing.
+
+Other TreeOptimizer algorithms are available through the same coefficient
+engine: `mode="dmrg"` (alias `"fit"`), `"dmrg2"`, `"dmrg3"`, `"mix"`,
+`"src"`, `"sdc"`, `"sdcr"`, `"zipup"`, and their supported oversampling
+variants. `dmrg1` remains the ordinary tree's deprecated alias of `dmrg`.
+The default remains `tree_mpo_direct`. TreeStab maps physical operators into
+the coefficient frame before applying the selected tree algorithm; Clifford
+frame updates still leave the coefficient state untouched.
+
+DMRG uses TreeOptimizer's exact layered target and separate disposable guess,
+not a precompressed target or a direct-compression substitute. All `fit_*`
+constructor controls have the same defaults and validation as TreeOptimizer.
+Generic `dmrg`/`fit` requires `fit_block_size=1`; choose `dmrg2` or `dmrg3`
+for block growth. With the default four iterations, their block schedules
+are `(2, 2, 1, 1)` and `(3, 3, 2, 1)`. Each iteration has an inward and an
+outward pass. The default `fit_init_strategy="auto"` selects `guess-src`
+for these dense coefficient trees. The guess method and local
+`compression_mode` are independent. `get_fit_diagnostics()` delegates to
+the engine's latest FIT record and returns `None` outside FIT.
+
+TreeStab exposes `compression_seed`, `max_bond_oversample`,
+`cutoff_oversample`, `cutoff_mode_oversample`, and `stabilize_unitary` with
+the ordinary tree semantics. Copies and shot templates preserve the live
+settings; frame-layout replacement and dense physical cap reconstruction
+also retain the FIT schedule, compression controls and diagnostic policies.
+Coefficient localizers use `TreeOptimizer.apply_gate`, including its compact
+SubTreeMPO construction, validation and factorization cache. Explicit full
+TreeMPO and compact SubTreeMPO events use `apply_sub_mpotree` directly.
+Physical caps first construct the reduced tree losslessly, then compress it
+through the same dispatcher using a bond-one identity over the complete tree.
+This honors the selected algorithm and cutoff convention without constructing
+a dense identity matrix. Dense physical-state reconstruction remains guarded.
+TreeStab also forwards `max_intermediate_bond`, `subtree_workers`,
+`record_history`, `profile`, `profile_sync` and `track_bond_diagnostics`.
+FIT settings are constructor controls, not `run()` overrides.
+Public threaded shot replay initializes Stim's small NumPy matrix classifier
+before dispatching workers, avoiding a first-use import deadlock reproduced
+with the installed Stim build. This does not change the simulated state.
+
+```python
+from pepsy.optimizers import StabilizerTreeSimulator
+
+sim = StabilizerTreeSimulator(
+    6, mode="dmrg3", chi=32, fit_n_iter=4,
+    fit_init_strategy="guess-src", fit_init_seed=7,
+    fit_rtol="auto", exact_cooling=False,
+)
+sim.apply([("rot", 0.37, "XYZ", (0, 2, 5))])
+print(sim.get_fit_diagnostics()["block_size_trace"])
+```
 
 Dense non-Clifford gates are Pauli-decomposed through ``C† G C`` in the
 coefficient frame, then compiled into compact Tree-native ``TreeMPO``/TTNO
@@ -219,6 +269,8 @@ full `2**(n-1) x 2**(n-1)` replacement operator. Scalable DEM-style capping
 should still use structured weighted-XOR or coin streams. A cap resets the
 stabilizer frame to identity and cannot be combined with a static STN frame
 layout.
+Its factorization does not truncate; the rebuilt TreeOptimizer performs
+compression with the configured `chi`, `cutoff`, `cutoff_mode` and algorithm.
 
 An entry such as ``("submpo", mpo, where)`` acts directly on the coefficient
 state ``|p>`` in the same way as the MPS STN API; it is not conjugated through

@@ -5,6 +5,28 @@ these namespaces, and the obsolete flat module paths were removed in 0.4.
 Top-level convenience symbols such as `pepsy.SweepOptimizer` and `pepsy.rx`
 still work, but new submodule imports should use the canonical layout.
 
+## Pepsy and downstream packages
+
+Pepsy is the independent tensor-network foundation. It owns general graph
+and lattice planning, tensor-network construction and contraction, MPO/PEPO
+cluster materialization, numerical compression, backend support, diagnostics,
+and general tensor-network solvers and optimizers. Its implementations and
+tests must work without Gaugy installed.
+
+Gaugy is a downstream package. It owns sparse Pauli algebra and cluster
+expansions, Pauli connected-log objectives, gauge/color ansaetze, and the
+associated application-specific optimization workflows. Gaugy calls public
+Pepsy APIs when it needs graph plans or tensor-network operations. A Pepsy
+Pauli term input or PEPO basis is a tensor-network construction interface;
+it does not import Gaugy's sparse Pauli engine.
+
+The dependency is one-way: `gaugy -> pepsy`. Each algorithm lives in its
+owning package; there is no joint source package, sibling-checkout import,
+or reverse dependency. A graph plan reused by a Gaugy adapter is a public
+Pepsy object, not shared implementation ownership. Integration tests that
+import Gaugy belong in Gaugy's test suite. Pepsy checks its own public
+workflows with downstream imports blocked.
+
 ## Namespace ownership
 
 ```text

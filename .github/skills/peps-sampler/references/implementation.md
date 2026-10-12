@@ -4,8 +4,10 @@
 
 Resolve source paths from the current Pepsy repository root.
 
-- Direct sampler: `src/pepsy/sampling/samplers.py`, class `PepsSampler`.
-- Existing BP sampler: the neighboring class `PepsBpSampler` in the same file.
+- Direct sampler: `src/pepsy/sampling/peps.py`, class `PepsSampler`.
+- BP proposal sampler: `src/pepsy/sampling/bp.py`, class `PepsBpSampler`.
+- Shared records: `src/pepsy/sampling/results.py`; historical imports remain
+  available through `src/pepsy/sampling/samplers.py`.
 - Public sampling exports: `src/pepsy/sampling/__init__.py` and
   `src/pepsy/__init__.py`.
 - Tagged ket/norm construction: `src/pepsy/boundary/metrics.py`,
@@ -156,6 +158,6 @@ the source PEPS tags, indices, and tensor data are unchanged. Run:
 pytest -o addopts='' -q tests/test_peps_sampler.py
 pytest -o addopts='' -q tests/test_sampler.py
 pytest -o addopts='' -q tests/test_public_api.py
-ruff check src/pepsy/sampling/samplers.py tests/test_peps_sampler.py
+ruff check src/pepsy/sampling tests/test_peps_sampler.py
 pytest -q
 ```

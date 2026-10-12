@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import quimb.tensor as qtn
 
-from pepsy import hrs_to_peps, id_to_pepo, ps_to_3dpeps, ps_to_peps
+from pepsy import id_to_pepo, ps_to_3dpeps, ps_to_peps
 from pepsy.operators.gates import (
     build_mpo_from_gates,
     build_pepo_from_gates,
@@ -991,7 +991,9 @@ def test_gate_accepts_string_index_selectors(monkeypatch):
     )
 
     assert out is tn
-    assert calls == [(("k1", "k2"), {"contract": False, "inplace": True, "cutoff_mode": "rsum2"})]
+    assert calls == [(("k1", "k2"), {
+        "contract": False, "inplace": True, "cutoff": 1e-12, "cutoff_mode": "rsum2"
+    })]
 
 
 def test_gate_1d_general_tn_without_l_uses_gate_inds(monkeypatch):
@@ -1026,7 +1028,9 @@ def test_gate_1d_general_tn_without_l_uses_gate_inds(monkeypatch):
     )
 
     assert out is tn
-    assert calls == [(("b1",), {"contract": False, "inplace": True, "cutoff_mode": "rsum2"})]
+    assert calls == [(("b1",), {
+        "contract": False, "inplace": True, "cutoff": 1e-12, "cutoff_mode": "rsum2"
+    })]
 
 
 def test_apply_gates_accepts_mixed_site_and_edge_specs():
@@ -1101,6 +1105,59 @@ def test_apply_gates_runs_final_compress_when_chi_given():
     out = apply_gate(dummy, [], chi=2, chi_cutoff=1.0e-12)
     assert out is dummy
     assert dummy.called == (2, 1.0e-12)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_peps_final_gate_compression_uses_lattice_api(backend):
+    """Final PEPS compression keeps the dominant Schmidt term and input intact."""
+    state = qtn.PEPS.product_state([[np.array([1., 0.], dtype="complex128")] * 2] * 2)
+    x = np.array([[0., 1.], [1., 0.]])
+    angle = .3
+    payload = np.cos(angle) * np.eye(4) - 1j * np.sin(angle) * np.kron(x, x)
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        state.apply_to_arrays(torch.as_tensor)
+        payload = torch.as_tensor(payload)
+    result = apply_gate(
+        state, payload, ((0, 0), (0, 1)), cutoff=0., chi=1,
+        chi_cutoff=0., inplace=False,
+    )
+    assert result.max_bond() == 1
+    expected = np.zeros(16, dtype="complex128")
+    expected[0] = np.cos(angle)
+    if backend == "torch":
+        assert all(t.data.dtype == torch.complex128 and t.data.device.type == "cpu"
+                   for t in result)
+        dense = result.to_dense().detach().numpy()
+        initial = state.to_dense().detach().numpy()
+    else:
+        dense, initial = result.to_dense(), state.to_dense()
+    np.testing.assert_allclose(dense.reshape(-1), expected, atol=1e-12)
+    expected[0] = 1.
+    np.testing.assert_allclose(initial.reshape(-1), expected, atol=1e-12)
+
+
+def test_native_pepo_final_gate_compression_preserves_operator():
+    """Lattice compression preserves an uncapped native fermionic operator."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion
+
+    fermion = Fermion(spinful=False, symmetry="U1")
+    edge = ((0, 0), (0, 1))
+    term = fermion.operator_term(
+        [(1., ((edge[0], "create"), (edge[1], "annihilate")))],
+        sites=edge, add_hc=True,
+    )
+    state = fermion.to_pepo(
+        {edge: term}, Lx=2, Ly=2, mapper=OneDMap(2, 2, mode="snake-row-major"),
+        max_bond=16, compress=False,
+    )
+    result = apply_gate(state, [], chi=16, chi_cutoff=0., inplace=False)
+    assert all(type(t.data).__name__ == "U1FermionicArray" for t in result)
+    norm = complex(state.norm())
+    assert complex(result.norm()) == pytest.approx(norm, abs=1e-12)
+    overlap = (state.H & result).contract(all, optimize="greedy")
+    assert complex(overlap) == pytest.approx(norm ** 2, abs=1e-12)
 
 
 def test_apply_gates_invalid_chi_raises():
@@ -1362,8 +1419,8 @@ def test_build_pepo_from_gates_forwards_smart_max_bond_api(monkeypatch):
     assert kwargs["ind_id"] == "k{},{}"
 
 
-def test_build_pepo_from_gates_preserves_k_input_and_b_output_families():
-    """PEPO builders should leave upper/input k and lower/output b legs visible."""
+def test_build_pepo_from_gates_preserves_k_output_and_b_input_families():
+    """PEPO builders leave upper/output k and lower/input b legs visible."""
     x_gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
     pepo = build_pepo_from_gates(x_gate, where=((1, 1),), max_bond=8)
 
@@ -1430,7 +1487,8 @@ def test_gate_simple_2d_routes_swaps_with_real_torch_dtype():
     """Internal SWAP tensors should match real torch PEPS dtype."""
     torch = pytest.importorskip("torch")
 
-    peps = hrs_to_peps(2, 3, dtype="float64", chi=2)
+    peps = ps_to_peps(2, 3, dtype="float64", theta=0.31)
+    peps.expand_bond_dimension_(2)
     peps.apply_to_arrays(lambda x: torch.as_tensor(x, dtype=torch.float64))
     gate = torch.eye(4, dtype=torch.float64).reshape(2, 2, 2, 2)
     gauges = {}

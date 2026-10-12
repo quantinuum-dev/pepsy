@@ -1,5 +1,38 @@
 # Tensor constructors
 
+## Haar states and real product states
+
+`hrs_to_mps`, `hrs_to_peps`, and `hrs_to_ttn` create ordinary products of
+single-qubit Haar states when `fermion` is omitted. Like `haar_random_state`,
+they require a complex dtype: a real cast would discard relative phases and
+can change the norm. The same rule applies to explicit `haar_params`.
+Complex seeded samples retain their existing values. Native `fermion=...`
+random-state constructors retain their own dtype rules.
+
+For a real product state, use the corresponding `ps_to_*` constructor:
+
+```python
+from pepsy.tensors import hrs_to_peps, ps_to_peps
+
+haar = hrs_to_peps(2, 3, dtype="complex128", seed=7)
+real_product = ps_to_peps(2, 3, dtype="float64", theta=0.31)
+```
+
+`ps_to_*` uses the local vector `[cos(theta), sin(theta)]`; it does not
+sample the complex Haar ensemble. Older real-dtype `hrs_to_*` calls that
+discarded phases now raise `TypeError` with this alternative.
+
+## Lazy operator alignment
+
+`tns_align(state, operator)` joins labelled tensor networks without flattening
+them or mutating either input. State physical indices use `k...`; operator
+outputs use `k...` and inputs use `b...`. The result retains the state's
+physical output names. Both networks must carry their lattice/site tags.
+
+`transpose=True` instead connects the state to the operator's `k...` legs,
+applying the transposed operator. Use it only for an intentionally transposed
+representation; it does not repair ordering errors in older gate streams.
+
 ## Explicit MPS-to-TTN conversion
 
 `pepsy.tensors.mps_to_ttn` (also `pepsy.mps_to_ttn`) converts an existing

@@ -21,7 +21,7 @@ __all__ = [
     "ps_to_peps", "ps_to_3dpeps", "bell_to_mps", "ps_to_mps", "ps_to_ttn",
     "hrs_to_ttn",
     "ps_to_pepo", "ps_to_mpo", "random_haar_qubit", "haar_random_state",
-    "hrs_to_peps", "hrs_to_mps", "hrps_to_peps", "hrps_to_mps", "hrps_to_ttn",
+    "hrs_to_peps", "hrs_to_mps", "hrps_to_peps", "hrps_to_mps",
 ]
 
 
@@ -286,12 +286,12 @@ def id_to_mpo(L, phys_dim=2, dtype="complex128", cyclic=False, chi=1, rand_stren
     return mpo
 
 
-def tns_align(p, pepo):
+def tns_align(p, pepo, *, transpose=False):
     r"""Apply a PEPO operator to a PEPS ket: :math:`\hat{O}|\psi\rangle`.
 
-    The PEPO ``k``-indices contract with the PEPS ``k``-indices on join.
-    The PEPO ``b``-indices (output legs) are renamed to ``k``-indices so
-    the result has the same physical index convention as a standard PEPS.
+    The PEPO lower/input ``b`` indices contract with the PEPS ``k`` indices.
+    Its upper/output ``k`` indices become the result's physical indices,
+    matching Quimb's operator convention. Neither input is modified.
 
     Parameters
     ----------
@@ -302,6 +302,9 @@ def tns_align(p, pepo):
         PEPO operator :math:`\hat{O}`.  Outer indices must follow the
         ``k<int>[,<int>...]`` and ``b<int>[,<int>...]`` convention.
         This matches :func:`pepsy.operators.gates.build_pepo_from_gates` output.
+    transpose : bool, optional
+        Apply the transpose instead, contracting operator ``k`` inputs and
+        exposing ``b`` outputs. Use explicitly for legacy transposed operators.
 
     Returns
     -------
@@ -313,29 +316,19 @@ def tns_align(p, pepo):
     validate_tensor_network_tags(p)
     validate_tensor_network_tags(pepo)
 
-    tn = p & pepo
-    # Only randomize the physical k-indices (shared between p and pepo).
-    # Virtual bond indices must NOT be renamed — they must stay stable so
-    # the Y-cut outer indices of the double-layer TN match the stored
-    # boundary MPS across repeated calls to _prepare_current_double_layers.
-    # Use non-mutating reindex to avoid modifying the original p/pepo tensors
-    # (quimb's & shares tensor objects, so reindex_ would mutate the originals).
-    contracted_k = {
-        idx: qtn.rand_uuid()
-        for idx in tn.inner_inds()
-        if isinstance(idx, str) and idx.startswith("k")
-    }
-    if contracted_k:
-        tn.reindex_(contracted_k)
-    # Rename PEPO output b-indices -> k-indices (physical convention)
-    b_to_k = {
-        idx: f"k{idx[1:]}"
-        for idx in tn.outer_inds()
-        if idx.startswith("b")
-    }
-    if b_to_k:
-        tn.reindex_(b_to_k)
-    return tn
+    # Keep generic labelled TN inputs supported, and change only physical
+    # indices. All remapping happens on copies before joining the networks.
+    state_map = {}
+    operator_map = {}
+    input_prefix, output_prefix = ("k", "b") if transpose else ("b", "k")
+    for ind in p.outer_inds():
+        if isinstance(ind, str) and ind.startswith("k"):
+            suffix = ind[1:]
+            inner = qtn.rand_uuid()
+            state_map[ind] = inner
+            operator_map[f"{input_prefix}{suffix}"] = inner
+            operator_map[f"{output_prefix}{suffix}"] = ind
+    return p.reindex(state_map) & pepo.reindex(operator_map)
 
 
 
@@ -448,9 +441,9 @@ def ps_to_peps(
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
             Fermion,
-            SymPEPS,
             site_charge_from_occupations,
         )
+        from .symmetric_states import SymPEPS
 
         if not isinstance(fermion, Fermion):
             raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
@@ -810,10 +803,10 @@ def ps_to_mps(
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
             Fermion,
-            SymMPS,
             _apply_to_tensor_network_arrays,
             site_charge_from_occupations,
         )
+        from .symmetric_states import SymMPS
 
         if not isinstance(fermion, Fermion):
             raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
@@ -1129,6 +1122,9 @@ def hrs_to_ttn(
 ):
     """Create a random product or charge-preserving Symmray TTN.
 
+    Ordinary product Haar states require a complex ``dtype`` to preserve
+    relative phases. Use :func:`ps_to_ttn` for a real product state.
+
     With ``fermion=`` the physical sites receive the model's charge sectors,
     while virtual-only internal nodes are neutral and every virtual tree edge
     is a conjugate pair of Symmray charge-sector indices. ``root_qubit`` places
@@ -1243,6 +1239,7 @@ def hrs_to_ttn(
         raise ValueError("occupations and site_charge require fermion=...")
     if to_backend is not None:
         raise ValueError("to_backend requires fermion=...")
+    _require_complex_haar_dtype(dtype)
     ttn = TreeTensorNetwork.from_plan(plan, dtype=dtype)
     if haar_params is not None:
         if len(haar_params) != n:
@@ -1385,6 +1382,15 @@ def ps_to_mpo(
     return mpo
 
 
+def _require_complex_haar_dtype(dtype):
+    """Reject storage that would discard a Haar sample's relative phase."""
+    if np.dtype(dtype).kind != "c":
+        raise TypeError(
+            "Ordinary Haar states require a complex dtype; "
+            "use ps_to_mps, ps_to_peps, or ps_to_ttn for real product states."
+        )
+
+
 def random_haar_qubit(seed=None, perturb=0.0):
     """Generate one random single-qubit Haar sample as ``(theta, phi)``.
 
@@ -1460,8 +1466,7 @@ def haar_random_state(
         )
 
     dtype = np.dtype(dtype)
-    if dtype.kind != "c":
-        raise TypeError("dtype must be a complex numpy dtype.")
+    _require_complex_haar_dtype(dtype)
 
     real_dtype = np.float32 if dtype == np.dtype("complex64") else np.float64
     rng = np.random.default_rng(seed)
@@ -1498,7 +1503,8 @@ def hrs_to_peps(
 ):
     """Create a random product or Fermion-symmetric PEPS.
 
-    Without ``fermion``, each site is an independent single-qubit Haar state.
+    Without ``fermion``, each site is an independent single-qubit Haar state
+    and requires a complex ``dtype`` to preserve its relative phase.
     With ``fermion``, construct a native charge-preserving random PEPS instead:
     ``method="direct"`` uses Symmray's direct block-filled random PEPS, with
     ``chi`` controlling the virtual bond dimension. The direct state is
@@ -1579,9 +1585,9 @@ def hrs_to_peps(
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
             Fermion,
-            SymPEPS,
             site_charge_from_occupations,
         )
+        from .symmetric_states import SymPEPS
 
         if not isinstance(fermion, Fermion):
             raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
@@ -1653,6 +1659,7 @@ def hrs_to_peps(
     if to_backend is not None:
         raise ValueError("to_backend requires fermion=...")
 
+    _require_complex_haar_dtype(dtype)
     peps = ps_to_peps(
         Lx=Lx,
         Ly=Ly,
@@ -1720,7 +1727,8 @@ def hrs_to_mps(
 ):
     """Create a random product or Fermion-symmetric MPS.
 
-    Without ``fermion``, each site is an independent single-qubit Haar state.
+    Without ``fermion``, each site is an independent single-qubit Haar state
+    and requires a complex ``dtype`` to preserve its relative phase.
     With ``fermion``, construct a native charge-preserving random MPS instead:
     ``method="unitary"`` (the default) starts from a random product state and
     applies random charge-preserving two-site unitaries, while
@@ -1793,9 +1801,9 @@ def hrs_to_mps(
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
             Fermion,
-            SymMPS,
             site_charge_from_occupations,
         )
+        from .symmetric_states import SymMPS
 
         if not isinstance(fermion, Fermion):
             raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
@@ -1878,6 +1886,7 @@ def hrs_to_mps(
     if to_backend is not None:
         raise ValueError("to_backend requires fermion=...")
 
+    _require_complex_haar_dtype(dtype)
     mps = ps_to_mps(
         L=L,
         dtype=dtype,
@@ -1921,4 +1930,3 @@ def hrs_to_mps(
 # Backwards-compatible aliases for the original longer spelling.
 hrps_to_peps = hrs_to_peps
 hrps_to_mps = hrs_to_mps
-hrps_to_ttn = hrs_to_ttn

@@ -10,6 +10,21 @@ Use this skill for `pepsy.MpsOptimizer` and its implementation in
 [`docs/api/optimizers/mps.md`](../../../docs/api/optimizers/mps.md) and the closest
 tests before editing.
 
+`mps/_streams.py` owns stream snapshots, symbolic gate resolution, and queue
+normalization. `mps/compression.py` owns stateless Quimb compression adapters,
+method option groups, and disposable `guess`/`svd_guess` helpers. Replay, FIT
+targets, rollback, and canonical-state bookkeeping remain on
+`MpsOptimizer`; old helper imports from `optimizer.py` remain compatible.
+`mps/_layout_execution.py` owns layout installation, mapping, reordering,
+schedule installation, and logical readout. It receives the live optimizer
+explicitly and calls its hooks; preserve subclass dispatch through `self`.
+Keep public signatures/docstrings on `MpsOptimizer` and keep geometry search
+in `mps/layout.py`. Do not introduce a second copy of layout or canonical state.
+`mps/_controls.py` owns measurement/reset/cap/conditional execution;
+`mps/_norm.py` owns local normalization, represented scale, and norm diagnostics.
+These helpers likewise receive the live optimizer and dispatch through its
+hooks. The empty `normalization.py` import path remains dependency-free.
+
 ## Decision guide
 
 Make decisions in this order; each choice owns a different invariant:
@@ -22,8 +37,8 @@ Make decisions in this order; each choice owns a different invariant:
 2. **Compression route.** `direct` is the constructor default and preferred
    public name for Quimb direct compression. `mpo` is a silent compatibility
    alias, not a separate algorithm. Use `dmrg2` for explicit variational
-   replay, `dmrg1` when the fixed two-site-growth/one-site-refinement schedule is
-   required, and `dmrg3` when a three-site warm-up is useful. Use
+   replay, `dmrg` (also `fit`) for one-site FIT from the initialized
+   guess by default, and `dmrg3` when a three-site warm-up is useful. Use
    `quimb-<method>` (or its bare method alias) when benchmarking a specific
    Quimb compressor, `svd` for a transparent local split reference, and
    `swap`/`perm` when endpoint movement is the intended representation.
@@ -51,23 +66,23 @@ than hiding policy in a mode-specific helper.
 
 ## Execution modes
 
-- `fit` / `dmrg` / `dmrg1` / `dmrg2` / `dmrg3`: local variational compression;
-  `dmrg1` uses at most two two-site growth sweeps followed by one-site
-  refinement, then latches one-site updates after all full-chain attainable
-  bond ceilings are reached. `dmrg2` uses its required two-site warm-up (two
+- `fit` / `dmrg` / `dmrg2` / `dmrg3`: local variational compression;
+  `dmrg1` is removed. `dmrg` fixes one-site FIT; reject larger block overrides.
+  `dmrg2` uses its required two-site warm-up (two
   sweeps by default) followed by one-site refinement, and `dmrg3` uses the
   same fixed warm-up policy with three-site updates, then one two-site
-  transition sweep before one-site refinement. Generic `dmrg` remains
-  rank-adaptive until its active-bond ceilings are reached; rank stagnation is
-  not an early exit there. A `dmrg1` window already at its attainable ceilings
-  starts directly with one-site FIT. An under-capacity non-adjacent `dmrg1`
-  window requires `n_iter >= 3`: two block sweeps plus at least one refinement
-  sweep. Its default `fit_patience=2` is a two-sample same-phase norm window,
-  i.e. one stable comparison. A two-site window is a structural special case for
-  `dmrg2` by default, or other schedules with `fit_single_pair_fast_path=True`:
-  perform exactly one two-site update, no
-  one-site refinement, then advance to the next gate without consuming the
-  remaining `n_iter` budget. Compose with
+  transition sweep before one-site refinement. `dmrg`/`fit` performs fixed-rank one-site FIT without block SVD updates;
+  target preparation and guess construction may still use SVD. Select `dmrg2`
+  or `dmrg3` for multi-site updates. One-site FIT accepts any positive `n_iter`.
+  Its default `fit_patience=2` is a two-sample same-phase norm window,
+  i.e. one stable comparison. Adjacent two-site windows inherit `n_iter` when
+  `fit_single_pair_n_iter` is omitted or None; a positive cap selects
+  `min(n_iter, fit_single_pair_n_iter)`. Every DMRG mode, including `dmrg2`,
+  honors that budget and its convergence controls by default.
+  `fit_single_pair_fast_path=True` explicitly requests one exact two-site
+  update when a two-site FIT block is selected, without warm-up repetition
+  or one-site refinement, before advancing
+  to the next gate. Compose with
   [`tensor-fitting`](../tensor-fitting/SKILL.md) for FIT kernel, target, rank
   growth, symmetry, stability, or profiling changes.
 - `direct` (default), or another bare/`quimb-<method>` name: native Quimb
@@ -89,21 +104,32 @@ than hiding policy in a mode-specific helper.
   after reaching `chi`. One-site gates remain exact/direct, and failed FIT
   transactions restore the committed state before direct/MPO fallback.
   `fit_block_size` is fixed at `1` and `fit_init_strategy` at `guess-direct`;
-  use ordinary `dmrg` for other block sizes or initialization policies.
+  use `dmrg` for other initialization policies and `dmrg2`/`dmrg3` for block updates.
 - `exact`: fully contracted TensorNetwork replay, without MPS canonical metadata.
   Exact replay preserves operator scale directly; `non_unitary=True` is only
   needed for compressed MPS scale bookkeeping and is accepted in exact
   trajectory paths for compatibility. Automatic normalization remains an MPS
   canonicalization feature.
+- `exact-batch`: opt-in fully contracted replay; `batch-exact` normalizes to
+  this same mode at construction and `set_mode`. It fuses bounded one-/two-site
+  gates, compact diagonal blocks, repeated-support Z/ZZ diagonal runs with
+  one or two value pairs after compaction, and consecutive parity-preserving
+  gates on one pair where the array backend supports them. A mixed Z/ZZ run
+  must group two-class masks by class even if the gates interleave. Two-value
+  layers and GPU runs with one-qubit factors require enough saved full-state
+  passes.
+  It retains exact-mode restrictions and falls back to the reference kernel
+  for unsupported arrays. See the [exact-batch audit](../../../docs/development/notes/mps_exact_batch.md).
 
 Simple-update evolution is not an `MpsOptimizer` mode. Use the dedicated
 `pepsy.gate_simple` or PEPS simple-update APIs when that gauge-based algorithm
 is required.
 
-Keep `exact` separate from MPS code. When switching from exact to an MPS mode,
-rebuild an MPS from the explicit physical indices and canonicalize it. Do not
-switch a persistent-layout optimizer into exact mode because that would lose
-the physical/logical layout contract.
+Keep both exact modes separate from MPS code. When switching from either
+exact mode to an MPS mode, rebuild an MPS from the explicit physical indices
+on the same array backend and canonicalize it. Do not switch a
+persistent-layout optimizer into an exact mode because that would lose the
+physical/logical layout contract.
 
 ## Persistent layouts
 
@@ -320,8 +346,9 @@ loss.
 
 Before changing `optimizer.py`, verify the following ownership boundaries:
 
-- `_normalize_mode` may canonicalize public aliases, but the DMRG alias must
-  remain available to select its schedule.
+- `_normalize_mode` rejects removed `dmrg1` and canonicalizes `fit` to
+  one-site `dmrg`. Preserve named DMRG2/3 schedule metadata; prevent a run
+  option from turning `dmrg` into a multi-site FIT schedule.
 - `_execute_mode` receives backend-prepared payloads and dispatches only gate
   or sub-MPO events. `_run_segmented` owns control-event boundaries.
 - Conditional actions reuse the full validated segment settings. Never replace

@@ -1,0 +1,874 @@
+{
+  "versions": {
+    "pepsy": "0.5.0",
+    "stim": "1.16.0",
+    "quimb": "1.15.1.dev66+ge927f06e1",
+    "autoray": "0.11.1.dev3+g1b476b305",
+    "cotengra": "0.8.3.dev7+g1d7fd333f",
+    "symmray": "0.4.1.dev8+gc45f91457",
+    "torch": "2.9.1"
+  },
+  "timing_note": "Percentages use nested wall timers; cProfile cumulative totals are incomplete in this installation.",
+  "cases": [
+    {
+      "backend": "numpy",
+      "workload": "measurement",
+      "strategy": "independent",
+      "qubits": 6,
+      "entries": 54,
+      "shots": 16,
+      "seed": 37,
+      "workers": 1,
+      "chi": 32,
+      "cutoff": 1e-12,
+      "mode": "direct",
+      "exact_cooling": false,
+      "compile_seconds": 0.024055666002823273,
+      "run_seconds": [
+        0.2605587079997349,
+        0.26023979199817404,
+        0.2620105419991887
+      ],
+      "median_run_seconds": 0.2605587079997349,
+      "warmups": 1,
+      "repetitions": 3,
+      "retained_leaves": 16,
+      "routing": {
+        "counts": {
+          "stim": 4,
+          "stim_region": 196,
+          "mps": 152
+        },
+        "fallback_reasons": {
+          "uncertified_local_state": 8,
+          "uncertified_entanglement": 144
+        },
+        "total": 352,
+        "represented_shots": 16,
+        "unavailable_shots": 0
+      },
+      "max_final_coefficient_bond": 2,
+      "max_recorded_coefficient_bond": 2,
+      "timed_run_seconds": 0.2662964170012856,
+      "wall_stages": {
+        "gate_with_submpo_": {
+          "calls": 64,
+          "inclusive_seconds": 0.015802536974661052,
+          "exclusive_seconds": 0.015802536974661052
+        },
+        "_evolve_p": {
+          "calls": 64,
+          "inclusive_seconds": 0.027148127024702262,
+          "exclusive_seconds": 0.01134559005004121
+        },
+        "_pauli_expectation": {
+          "calls": 280,
+          "inclusive_seconds": 0.04535341305381735,
+          "exclusive_seconds": 0.04535341305381735
+        },
+        "_trajectory_kraus_probabilities": {
+          "calls": 64,
+          "inclusive_seconds": 0.016385458009608556,
+          "exclusive_seconds": 0.0025858339758997317
+        },
+        "_make_norm_event": {
+          "calls": 416,
+          "inclusive_seconds": 0.009324909009592375,
+          "exclusive_seconds": 0.009324909009592375
+        },
+        "_apply_operator_sum": {
+          "calls": 64,
+          "inclusive_seconds": 0.06540487799065886,
+          "exclusive_seconds": 0.06540487799065886
+        },
+        "_apply_dense_gate": {
+          "calls": 64,
+          "inclusive_seconds": 0.06761229199400987,
+          "exclusive_seconds": 0.002207414003351005
+        },
+        "_canonize_p": {
+          "calls": 216,
+          "inclusive_seconds": 0.0012599539804796223,
+          "exclusive_seconds": 0.0012599539804796223
+        },
+        "_commit_norm_event": {
+          "calls": 416,
+          "inclusive_seconds": 0.012988431015401147,
+          "exclusive_seconds": 0.012988431015401147
+        },
+        "_product_states": {
+          "calls": 1004,
+          "inclusive_seconds": 0.019061374990997138,
+          "exclusive_seconds": 0.019061374990997138
+        },
+        "_simulator": {
+          "calls": 196,
+          "inclusive_seconds": 0.0019433319903328083,
+          "exclusive_seconds": 0.0019433319903328083
+        },
+        "measure": {
+          "calls": 224,
+          "inclusive_seconds": 0.06081782602268504,
+          "exclusive_seconds": 0.01036395106348209
+        },
+        "_apply_projector": {
+          "calls": 95,
+          "inclusive_seconds": 0.00801512800171622,
+          "exclusive_seconds": 0.0040950020047603175
+        }
+      }
+    },
+    {
+      "backend": "numpy",
+      "workload": "measurement",
+      "strategy": "coalesced",
+      "qubits": 6,
+      "entries": 54,
+      "shots": 16,
+      "seed": 37,
+      "workers": 1,
+      "chi": 32,
+      "cutoff": 1e-12,
+      "mode": "direct",
+      "exact_cooling": false,
+      "compile_seconds": 0.00038558300002478063,
+      "run_seconds": [
+        0.2609267500010901,
+        0.26289345799887087,
+        0.2624299589988368
+      ],
+      "median_run_seconds": 0.2624299589988368,
+      "warmups": 1,
+      "repetitions": 3,
+      "retained_leaves": 16,
+      "routing": {
+        "counts": {
+          "stim": 16,
+          "stim_region": 192,
+          "mps": 144
+        },
+        "fallback_reasons": {
+          "uncertified_entanglement": 128,
+          "uncertified_local_state": 16
+        },
+        "total": 352,
+        "represented_shots": 16,
+        "unavailable_shots": 0
+      },
+      "max_final_coefficient_bond": 2,
+      "max_recorded_coefficient_bond": 2,
+      "timed_run_seconds": 0.2652908749987546,
+      "wall_stages": {
+        "gate_with_submpo_": {
+          "calls": 37,
+          "inclusive_seconds": 0.009042916011821944,
+          "exclusive_seconds": 0.009042916011821944
+        },
+        "_evolve_p": {
+          "calls": 37,
+          "inclusive_seconds": 0.0110955849995662,
+          "exclusive_seconds": 0.002052668987744255
+        },
+        "_pauli_expectation": {
+          "calls": 398,
+          "inclusive_seconds": 0.07518828503089026,
+          "exclusive_seconds": 0.07518828503089026
+        },
+        "_trajectory_kraus_probabilities": {
+          "calls": 37,
+          "inclusive_seconds": 0.009831871979258722,
+          "exclusive_seconds": 0.0014964509755373001
+        },
+        "_make_norm_event": {
+          "calls": 341,
+          "inclusive_seconds": 0.0076830759971926454,
+          "exclusive_seconds": 0.0076830759971926454
+        },
+        "_apply_operator_sum": {
+          "calls": 41,
+          "inclusive_seconds": 0.042351168995082844,
+          "exclusive_seconds": 0.042351168995082844
+        },
+        "_apply_dense_gate": {
+          "calls": 41,
+          "inclusive_seconds": 0.04376333299660473,
+          "exclusive_seconds": 0.0014121640015218873
+        },
+        "_canonize_p": {
+          "calls": 163,
+          "inclusive_seconds": 0.0011075399779656436,
+          "exclusive_seconds": 0.0011075399779656436
+        },
+        "_commit_norm_event": {
+          "calls": 341,
+          "inclusive_seconds": 0.01059355299003073,
+          "exclusive_seconds": 0.01059355299003073
+        },
+        "_product_states": {
+          "calls": 1810,
+          "inclusive_seconds": 0.045761604964354774,
+          "exclusive_seconds": 0.045761604964354774
+        },
+        "_simulator": {
+          "calls": 443,
+          "inclusive_seconds": 0.004314501988119446,
+          "exclusive_seconds": 0.004314501988119446
+        },
+        "_measurement_probabilities": {
+          "calls": 187,
+          "inclusive_seconds": 0.029825661025824957,
+          "exclusive_seconds": 0.0023254199950315524
+        },
+        "measure": {
+          "calls": 196,
+          "inclusive_seconds": 0.054360386024200125,
+          "exclusive_seconds": 0.008572863065637648
+        },
+        "_apply_projector": {
+          "calls": 80,
+          "inclusive_seconds": 0.006857666019641329,
+          "exclusive_seconds": 0.00345604100584751
+        }
+      }
+    },
+    {
+      "backend": "numpy",
+      "workload": "entangling",
+      "strategy": "independent",
+      "qubits": 12,
+      "entries": 146,
+      "shots": 16,
+      "seed": 37,
+      "workers": 1,
+      "chi": 32,
+      "cutoff": 1e-12,
+      "mode": "direct",
+      "exact_cooling": false,
+      "compile_seconds": 0.0004969589972461108,
+      "run_seconds": [
+        1.7790135830000509,
+        1.794366332997015,
+        1.7874819579992618
+      ],
+      "median_run_seconds": 1.7874819579992618,
+      "warmups": 1,
+      "repetitions": 3,
+      "retained_leaves": 16,
+      "routing": {
+        "counts": {
+          "stim": 0,
+          "stim_region": 0,
+          "mps": 192
+        },
+        "fallback_reasons": {
+          "uncertified_entanglement": 192
+        },
+        "total": 192,
+        "represented_shots": 16,
+        "unavailable_shots": 0
+      },
+      "max_final_coefficient_bond": 1,
+      "max_recorded_coefficient_bond": 32,
+      "timed_run_seconds": 1.7777959580016613,
+      "wall_stages": {
+        "gate_with_submpo_": {
+          "calls": 965,
+          "inclusive_seconds": 1.2459845670236973,
+          "exclusive_seconds": 1.2459845670236973
+        },
+        "_evolve_p": {
+          "calls": 965,
+          "inclusive_seconds": 1.299897614026122,
+          "exclusive_seconds": 0.04975953997200122
+        },
+        "_pauli_expectation": {
+          "calls": 320,
+          "inclusive_seconds": 0.11370741899008863,
+          "exclusive_seconds": 0.11370741899008863
+        },
+        "_trajectory_kraus_probabilities": {
+          "calls": 64,
+          "inclusive_seconds": 0.032017419012845494,
+          "exclusive_seconds": 0.0030235020094551146
+        },
+        "_make_norm_event": {
+          "calls": 256,
+          "inclusive_seconds": 0.006141719972220017,
+          "exclusive_seconds": 0.006141719972220017
+        },
+        "_apply_dense_gate": {
+          "calls": 64,
+          "inclusive_seconds": 0.16973520802275743,
+          "exclusive_seconds": 0.0038460800278699026
+        },
+        "_canonize_p": {
+          "calls": 128,
+          "inclusive_seconds": 0.008177252988389228,
+          "exclusive_seconds": 0.008177252988389228
+        },
+        "_commit_norm_event": {
+          "calls": 256,
+          "inclusive_seconds": 0.0084706270499737,
+          "exclusive_seconds": 0.0084706270499737
+        },
+        "_apply_operator_sum": {
+          "calls": 43,
+          "inclusive_seconds": 0.14904400100567727,
+          "exclusive_seconds": 0.14904400100567727
+        },
+        "_product_states": {
+          "calls": 768,
+          "inclusive_seconds": 0.030325918040034594,
+          "exclusive_seconds": 0.030325918040034594
+        },
+        "_apply_projector": {
+          "calls": 192,
+          "inclusive_seconds": 0.1605005400160735,
+          "exclusive_seconds": 0.015555754020169843
+        },
+        "measure": {
+          "calls": 192,
+          "inclusive_seconds": 0.28550920601264806,
+          "exclusive_seconds": 0.005227569992712233
+        }
+      }
+    },
+    {
+      "backend": "numpy",
+      "workload": "entangling",
+      "strategy": "coalesced",
+      "qubits": 12,
+      "entries": 146,
+      "shots": 16,
+      "seed": 37,
+      "workers": 1,
+      "chi": 32,
+      "cutoff": 1e-12,
+      "mode": "direct",
+      "exact_cooling": false,
+      "compile_seconds": 0.0005130839999765158,
+      "run_seconds": [
+        0.9558212920019287,
+        0.9849765830003889,
+        0.9540724159996898
+      ],
+      "median_run_seconds": 0.9558212920019287,
+      "warmups": 1,
+      "repetitions": 3,
+      "retained_leaves": 16,
+      "routing": {
+        "counts": {
+          "stim": 0,
+          "stim_region": 0,
+          "mps": 192
+        },
+        "fallback_reasons": {
+          "uncertified_entanglement": 192
+        },
+        "total": 192,
+        "represented_shots": 16,
+        "unavailable_shots": 0
+      },
+      "max_final_coefficient_bond": 1,
+      "max_recorded_coefficient_bond": 32,
+      "timed_run_seconds": 0.9864322920002451,
+      "wall_stages": {
+        "gate_with_submpo_": {
+          "calls": 401,
+          "inclusive_seconds": 0.608932911996817,
+          "exclusive_seconds": 0.608932911996817
+        },
+        "_evolve_p": {
+          "calls": 401,
+          "inclusive_seconds": 0.6286474530097621,
+          "exclusive_seconds": 0.015464749008970102
+        },
+        "_pauli_expectation": {
+          "calls": 381,
+          "inclusive_seconds": 0.15839982798934216,
+          "exclusive_seconds": 0.15839982798934216
+        },
+        "_trajectory_kraus_probabilities": {
+          "calls": 18,
+          "inclusive_seconds": 0.009847375004028436,
+          "exclusive_seconds": 0.000842999026644975
+        },
+        "_make_norm_event": {
+          "calls": 197,
+          "inclusive_seconds": 0.004834707000554772,
+          "exclusive_seconds": 0.004834707000554772
+        },
+        "_apply_operator_sum": {
+          "calls": 13,
+          "inclusive_seconds": 0.05948854299640516,
+          "exclusive_seconds": 0.05948854299640516
+        },
+        "_apply_dense_gate": {
+          "calls": 21,
+          "inclusive_seconds": 0.06708054299815558,
+          "exclusive_seconds": 0.0013827490038238466
+        },
+        "_canonize_p": {
+          "calls": 71,
+          "inclusive_seconds": 0.005155125010787742,
+          "exclusive_seconds": 0.005155125010787742
+        },
+        "_commit_norm_event": {
+          "calls": 197,
+          "inclusive_seconds": 0.006657122983597219,
+          "exclusive_seconds": 0.006657122983597219
+        },
+        "_product_states": {
+          "calls": 1042,
+          "inclusive_seconds": 0.04598256796452915,
+          "exclusive_seconds": 0.04598256796452915
+        },
+        "_measurement_probabilities": {
+          "calls": 169,
+          "inclusive_seconds": 0.09138741899005254,
+          "exclusive_seconds": 0.0028963410113647114
+        },
+        "_apply_projector": {
+          "calls": 176,
+          "inclusive_seconds": 0.163247208995017,
+          "exclusive_seconds": 0.014836635000392562
+        },
+        "measure": {
+          "calls": 176,
+          "inclusive_seconds": 0.27925074599988875,
+          "exclusive_seconds": 0.004740388008940499
+        }
+      }
+    },
+    {
+      "backend": "torch",
+      "workload": "measurement",
+      "strategy": "independent",
+      "qubits": 6,
+      "entries": 54,
+      "shots": 16,
+      "seed": 37,
+      "workers": 1,
+      "chi": 32,
+      "cutoff": 1e-12,
+      "mode": "direct",
+      "exact_cooling": false,
+      "compile_seconds": 0.00039654099964536726,
+      "run_seconds": [
+        0.34734345799734,
+        0.3434343750013795,
+        0.36570491699967533
+      ],
+      "median_run_seconds": 0.34734345799734,
+      "warmups": 1,
+      "repetitions": 3,
+      "retained_leaves": 16,
+      "routing": {
+        "counts": {
+          "stim": 4,
+          "stim_region": 196,
+          "mps": 152
+        },
+        "fallback_reasons": {
+          "uncertified_local_state": 8,
+          "uncertified_entanglement": 144
+        },
+        "total": 352,
+        "represented_shots": 16,
+        "unavailable_shots": 0
+      },
+      "max_final_coefficient_bond": 2,
+      "max_recorded_coefficient_bond": 2,
+      "timed_run_seconds": 0.3588413750003383,
+      "wall_stages": {
+        "gate_with_submpo_": {
+          "calls": 64,
+          "inclusive_seconds": 0.026100540981133236,
+          "exclusive_seconds": 0.026100540981133236
+        },
+        "_evolve_p": {
+          "calls": 64,
+          "inclusive_seconds": 0.036800085988943465,
+          "exclusive_seconds": 0.01069954500781023
+        },
+        "_pauli_expectation": {
+          "calls": 280,
+          "inclusive_seconds": 0.046976132991403574,
+          "exclusive_seconds": 0.046976132991403574
+        },
+        "_trajectory_kraus_probabilities": {
+          "calls": 64,
+          "inclusive_seconds": 0.018249000007926952,
+          "exclusive_seconds": 0.003115957009867998
+        },
+        "_make_norm_event": {
+          "calls": 416,
+          "inclusive_seconds": 0.012034677016345086,
+          "exclusive_seconds": 0.012034677016345086
+        },
+        "_apply_operator_sum": {
+          "calls": 64,
+          "inclusive_seconds": 0.11437841796578141,
+          "exclusive_seconds": 0.11437841796578141
+        },
+        "_apply_dense_gate": {
+          "calls": 64,
+          "inclusive_seconds": 0.11698241600242909,
+          "exclusive_seconds": 0.002603998036647681
+        },
+        "_canonize_p": {
+          "calls": 216,
+          "inclusive_seconds": 0.003047912035981426,
+          "exclusive_seconds": 0.003047912035981426
+        },
+        "_commit_norm_event": {
+          "calls": 416,
+          "inclusive_seconds": 0.01427125298869214,
+          "exclusive_seconds": 0.01427125298869214
+        },
+        "_product_states": {
+          "calls": 1004,
+          "inclusive_seconds": 0.02839870200114092,
+          "exclusive_seconds": 0.02839870200114092
+        },
+        "_simulator": {
+          "calls": 196,
+          "inclusive_seconds": 0.0020571710338117555,
+          "exclusive_seconds": 0.0020571710338117555
+        },
+        "measure": {
+          "calls": 224,
+          "inclusive_seconds": 0.0745516599927214,
+          "exclusive_seconds": 0.011818246981420089
+        },
+        "_apply_projector": {
+          "calls": 95,
+          "inclusive_seconds": 0.011520492007548455,
+          "exclusive_seconds": 0.005546573014726164
+        }
+      }
+    },
+    {
+      "backend": "torch",
+      "workload": "measurement",
+      "strategy": "coalesced",
+      "qubits": 6,
+      "entries": 54,
+      "shots": 16,
+      "seed": 37,
+      "workers": 1,
+      "chi": 32,
+      "cutoff": 1e-12,
+      "mode": "direct",
+      "exact_cooling": false,
+      "compile_seconds": 0.0003938749978260603,
+      "run_seconds": [
+        0.34009870899899397,
+        0.3358064160020149,
+        0.3648603750007169
+      ],
+      "median_run_seconds": 0.34009870899899397,
+      "warmups": 1,
+      "repetitions": 3,
+      "retained_leaves": 16,
+      "routing": {
+        "counts": {
+          "stim": 16,
+          "stim_region": 192,
+          "mps": 144
+        },
+        "fallback_reasons": {
+          "uncertified_entanglement": 128,
+          "uncertified_local_state": 16
+        },
+        "total": 352,
+        "represented_shots": 16,
+        "unavailable_shots": 0
+      },
+      "max_final_coefficient_bond": 2,
+      "max_recorded_coefficient_bond": 2,
+      "timed_run_seconds": 0.3410635000000184,
+      "wall_stages": {
+        "gate_with_submpo_": {
+          "calls": 37,
+          "inclusive_seconds": 0.014040457004739437,
+          "exclusive_seconds": 0.014040457004739437
+        },
+        "_evolve_p": {
+          "calls": 37,
+          "inclusive_seconds": 0.01752233000297565,
+          "exclusive_seconds": 0.003481872998236213
+        },
+        "_pauli_expectation": {
+          "calls": 398,
+          "inclusive_seconds": 0.07539591396198375,
+          "exclusive_seconds": 0.07539591396198375
+        },
+        "_trajectory_kraus_probabilities": {
+          "calls": 37,
+          "inclusive_seconds": 0.010054917987872614,
+          "exclusive_seconds": 0.0016592959946137853
+        },
+        "_make_norm_event": {
+          "calls": 341,
+          "inclusive_seconds": 0.009839207046752563,
+          "exclusive_seconds": 0.009839207046752563
+        },
+        "_apply_operator_sum": {
+          "calls": 41,
+          "inclusive_seconds": 0.07317658300962648,
+          "exclusive_seconds": 0.07317658300962648
+        },
+        "_apply_dense_gate": {
+          "calls": 41,
+          "inclusive_seconds": 0.07473020700854249,
+          "exclusive_seconds": 0.0015536239989160094
+        },
+        "_canonize_p": {
+          "calls": 163,
+          "inclusive_seconds": 0.0024294599679706153,
+          "exclusive_seconds": 0.0024294599679706153
+        },
+        "_commit_norm_event": {
+          "calls": 341,
+          "inclusive_seconds": 0.011927136009035166,
+          "exclusive_seconds": 0.011927136009035166
+        },
+        "_product_states": {
+          "calls": 1810,
+          "inclusive_seconds": 0.06821044899697881,
+          "exclusive_seconds": 0.06821044899697881
+        },
+        "_simulator": {
+          "calls": 443,
+          "inclusive_seconds": 0.004410122000990668,
+          "exclusive_seconds": 0.004410122000990668
+        },
+        "_measurement_probabilities": {
+          "calls": 187,
+          "inclusive_seconds": 0.0351955050136894,
+          "exclusive_seconds": 0.0024607120685686823
+        },
+        "measure": {
+          "calls": 196,
+          "inclusive_seconds": 0.06596569998873747,
+          "exclusive_seconds": 0.00939399491835502
+        },
+        "_apply_projector": {
+          "calls": 80,
+          "inclusive_seconds": 0.009540582017507404,
+          "exclusive_seconds": 0.004474660021514865
+        }
+      }
+    },
+    {
+      "backend": "torch",
+      "workload": "entangling",
+      "strategy": "independent",
+      "qubits": 12,
+      "entries": 146,
+      "shots": 16,
+      "seed": 37,
+      "workers": 1,
+      "chi": 32,
+      "cutoff": 1e-12,
+      "mode": "direct",
+      "exact_cooling": false,
+      "compile_seconds": 0.0005230000024312176,
+      "run_seconds": [
+        2.625181125000381,
+        2.6227511659999436,
+        2.6397660420007014
+      ],
+      "median_run_seconds": 2.625181125000381,
+      "warmups": 1,
+      "repetitions": 3,
+      "retained_leaves": 16,
+      "routing": {
+        "counts": {
+          "stim": 0,
+          "stim_region": 0,
+          "mps": 192
+        },
+        "fallback_reasons": {
+          "uncertified_entanglement": 192
+        },
+        "total": 192,
+        "represented_shots": 16,
+        "unavailable_shots": 0
+      },
+      "max_final_coefficient_bond": 1,
+      "max_recorded_coefficient_bond": 32,
+      "timed_run_seconds": 2.616318540996872,
+      "wall_stages": {
+        "gate_with_submpo_": {
+          "calls": 965,
+          "inclusive_seconds": 1.8880426599389466,
+          "exclusive_seconds": 1.8880426599389466
+        },
+        "_evolve_p": {
+          "calls": 965,
+          "inclusive_seconds": 1.9662509900481382,
+          "exclusive_seconds": 0.0735771201470925
+        },
+        "_pauli_expectation": {
+          "calls": 320,
+          "inclusive_seconds": 0.14149192700278945,
+          "exclusive_seconds": 0.14149192700278945
+        },
+        "_trajectory_kraus_probabilities": {
+          "calls": 64,
+          "inclusive_seconds": 0.04224370799784083,
+          "exclusive_seconds": 0.003480697989289183
+        },
+        "_make_norm_event": {
+          "calls": 256,
+          "inclusive_seconds": 0.007859326993639115,
+          "exclusive_seconds": 0.007859326993639115
+        },
+        "_apply_dense_gate": {
+          "calls": 64,
+          "inclusive_seconds": 0.27754316500067944,
+          "exclusive_seconds": 0.004303202993469313
+        },
+        "_canonize_p": {
+          "calls": 128,
+          "inclusive_seconds": 0.022718956010066904,
+          "exclusive_seconds": 0.022718956010066904
+        },
+        "_commit_norm_event": {
+          "calls": 256,
+          "inclusive_seconds": 0.009508538925729226,
+          "exclusive_seconds": 0.009508538925729226
+        },
+        "_apply_operator_sum": {
+          "calls": 43,
+          "inclusive_seconds": 0.24412408501302707,
+          "exclusive_seconds": 0.24412408501302707
+        },
+        "_product_states": {
+          "calls": 768,
+          "inclusive_seconds": 0.02990782298729755,
+          "exclusive_seconds": 0.02990782298729755
+        },
+        "_apply_projector": {
+          "calls": 192,
+          "inclusive_seconds": 0.263170878024539,
+          "exclusive_seconds": 0.018772592018649448
+        },
+        "measure": {
+          "calls": 192,
+          "inclusive_seconds": 0.4079716279702552,
+          "exclusive_seconds": 0.005973518964310642
+        }
+      }
+    },
+    {
+      "backend": "torch",
+      "workload": "entangling",
+      "strategy": "coalesced",
+      "qubits": 12,
+      "entries": 146,
+      "shots": 16,
+      "seed": 37,
+      "workers": 1,
+      "chi": 32,
+      "cutoff": 1e-12,
+      "mode": "direct",
+      "exact_cooling": false,
+      "compile_seconds": 0.0005413330000010319,
+      "run_seconds": [
+        1.3623678330004623,
+        1.3723800000007031,
+        1.391259791002085
+      ],
+      "median_run_seconds": 1.3723800000007031,
+      "warmups": 1,
+      "repetitions": 3,
+      "retained_leaves": 16,
+      "routing": {
+        "counts": {
+          "stim": 0,
+          "stim_region": 0,
+          "mps": 192
+        },
+        "fallback_reasons": {
+          "uncertified_entanglement": 192
+        },
+        "total": 192,
+        "represented_shots": 16,
+        "unavailable_shots": 0
+      },
+      "max_final_coefficient_bond": 1,
+      "max_recorded_coefficient_bond": 32,
+      "timed_run_seconds": 1.4017608340000152,
+      "wall_stages": {
+        "gate_with_submpo_": {
+          "calls": 399,
+          "inclusive_seconds": 0.8630413310020231,
+          "exclusive_seconds": 0.8630413310020231
+        },
+        "_evolve_p": {
+          "calls": 399,
+          "inclusive_seconds": 0.8909510089360992,
+          "exclusive_seconds": 0.023345635934674647
+        },
+        "_pauli_expectation": {
+          "calls": 377,
+          "inclusive_seconds": 0.22283466698718257,
+          "exclusive_seconds": 0.22283466698718257
+        },
+        "_trajectory_kraus_probabilities": {
+          "calls": 18,
+          "inclusive_seconds": 0.012580079994222615,
+          "exclusive_seconds": 0.0010085379835800268
+        },
+        "_make_norm_event": {
+          "calls": 195,
+          "inclusive_seconds": 0.00600536699857912,
+          "exclusive_seconds": 0.00600536699857912
+        },
+        "_apply_operator_sum": {
+          "calls": 13,
+          "inclusive_seconds": 0.08826554199913517,
+          "exclusive_seconds": 0.08826554199913517
+        },
+        "_apply_dense_gate": {
+          "calls": 21,
+          "inclusive_seconds": 0.10058829100671574,
+          "exclusive_seconds": 0.0015350830144598149
+        },
+        "_canonize_p": {
+          "calls": 71,
+          "inclusive_seconds": 0.015951339017192367,
+          "exclusive_seconds": 0.015951339017192367
+        },
+        "_commit_norm_event": {
+          "calls": 195,
+          "inclusive_seconds": 0.007304539991309866,
+          "exclusive_seconds": 0.007304539991309866
+        },
+        "_product_states": {
+          "calls": 1030,
+          "inclusive_seconds": 0.04564886890875641,
+          "exclusive_seconds": 0.04564886890875641
+        },
+        "_measurement_probabilities": {
+          "calls": 167,
+          "inclusive_seconds": 0.10567170699505368,
+          "exclusive_seconds": 0.003390336045413278
+        },
+        "_apply_projector": {
+          "calls": 174,
+          "inclusive_seconds": 0.2660602140094852,
+          "exclusive_seconds": 0.0181103329960024
+        },
+        "measure": {
+          "calls": 174,
+          "inclusive_seconds": 0.43095842000911944,
+          "exclusive_seconds": 0.0047973420478228945
+        }
+      }
+    }
+  ]
+}

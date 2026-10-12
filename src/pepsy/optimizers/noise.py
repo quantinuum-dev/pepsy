@@ -4,7 +4,7 @@ Pepsy's native design is stream-local: users can place stochastic instructions
 such as ``("depolarize1", p, q)`` or ``("amplitude_damping", gamma, q)`` exactly
 where the hardware schedule says the channel acts. The trajectory runners
 sample a *concrete* branch for each shot and replay the resulting ordinary gate
-stream with either :class:`MpsOptimizer` or :class:`StabilizerMpsSimulator`. The older
+stream with MPS, tree, or stabilizer tensor-network optimizers. The older
 ``PauliErrorModel`` helpers remain convenience macros for inserting uniform
 post-gate Pauli faults into a clean deterministic stream.
 """
@@ -20,10 +20,18 @@ from typing import Any, Callable, Mapping, Optional
 
 import autoray as ar
 import numpy as np
+import quimb.tensor as qtn
 
 from ..backends import to_float as _backend_to_float
+from ..backends.convert import (
+    _array_namespace,
+    _high_precision_matmul,
+    _real_if_compatible,
+)
+from .._internal.quimb import quimb_callable_option_supported
 from .mps.optimizer import MpsOptimizer
 from ._stream_events import _resolve_conditional
+from . import _stim_compile
 from .tree.optimizer import TreeOptimizer
 
 __all__ = [
@@ -56,6 +64,8 @@ __all__ = [
     "TrajectorySample",
     "TrajectoryShotResult",
     "compile_stim_circuit",
+    "stim_plan_to_gate_stream",
+    "stim_readout_parities",
     "compile_trajectory_stream",
     "run_coalesced_noisy_shots",
     "run_coalesced_stim_shots",
@@ -142,56 +152,12 @@ _CONTROL_NAMES = frozenset(
         "submpo",
     }
 )
-_STIM_NOISE_NAMES = frozenset(
-    {
-        "DEPOLARIZE1",
-        "DEPOLARIZE2",
-        "E",
-        "ELSE_CORRELATED_ERROR",
-        "HERALDED_ERASE",
-        "HERALDED_PAULI_CHANNEL_1",
-        "II_ERROR",
-        "I_ERROR",
-        "PAULI_CHANNEL_1",
-        "PAULI_CHANNEL_2",
-        "X_ERROR",
-        "Y_ERROR",
-        "Z_ERROR",
-    }
-)
-_STIM_IGNORED_NAMES = frozenset(
-    {
-        "DETECTOR",
-        "MPAD",
-        "OBSERVABLE_INCLUDE",
-        "QUBIT_COORDS",
-        "SHIFT_COORDS",
-        "TICK",
-    }
-)
-_STIM_SINGLE_MEASUREMENTS = {
-    "M": "Z",
-    "MX": "X",
-    "MY": "Y",
-}
-_STIM_SINGLE_MEASURE_RESETS = {
-    "MR": "Z",
-    "MRX": "X",
-    "MRY": "Y",
-}
-_STIM_PAIR_MEASUREMENTS = {
-    "MXX": "XX",
-    "MYY": "YY",
-    "MZZ": "ZZ",
-}
-_STIM_RESETS = {"R": "Z", "RX": "X", "RY": "Y"}
 _STIM_PAULI_2_OUTCOMES = tuple(
     (left, right)
     for left in "IXYZ"
     for right in "IXYZ"
     if (left, right) != ("I", "I")
 )
-_STIM_UNITARY_CACHE: dict[str, np.ndarray] = {}
 _AUTO_MAX_EXPECTED_FAULTS = 0.1
 _AUTO_MAX_BRANCHES = 128
 
@@ -275,9 +241,11 @@ class ImportanceSamplingPolicy:
     optimizer)``.  The target probabilities always come from the physical
     channel and the runner records the likelihood ratio ``target/proposal``.
 
-    Proposal distributions must have support wherever the target distribution
-    is nonzero.  ``max_likelihood_ratio`` is an optional safety guard against a
-    numerically explosive proposal; it raises before applying a sampled branch.
+    Proposal distributions must have exactly the support of the target
+    distribution, including arbitrarily rare positive outcomes. Impossible
+    outcomes must have zero proposal mass. ``max_likelihood_ratio`` is an
+    optional safety guard against a numerically explosive proposal; it raises
+    before applying a sampled branch.
     """
 
     proposal: Any
@@ -340,9 +308,14 @@ class ImportanceSamplingPolicy:
                 f"importance proposal for event {event_index} must sum to one."
             )
         proposal = np.maximum(proposal, 0.0)
-        if np.any((target > 1e-14) & (proposal <= 1e-14)):
+        if np.any((target > 0.0) & (proposal == 0.0)):
             raise ValueError(
                 f"importance proposal for event {event_index} omits a target branch."
+            )
+        if np.any((target == 0.0) & (proposal > 0.0)):
+            raise ValueError(
+                f"importance proposal for event {event_index} assigns probability "
+                "to an impossible target branch."
             )
         return proposal
 
@@ -444,10 +417,15 @@ class TrajectoryDiagnostics:
 
     ``max_kraus_probability_residual`` is measured before the branch
     probabilities are normalized for sampling. A small nonzero value is
-    expected from finite-MPS truncation; a large value indicates that the
-    channel, local contraction, or compression path needs attention.
+    expected from floating-point contraction error; a large value indicates
+    that the channel or probability calculation needs attention.
     ``used_kraus_copy_fallback`` reports whether any local Kraus probability
     could not use the environment contraction fast path.
+    Local MPS replay additionally reports ``planned_strategy``, the selected
+    ``workers`` budget, ``execution_reason`` and any ``fallback_reason``.
+    These optional scheduling fields are unset by other runners.
+    ``max_kraus_parent_batch`` records the largest number of parent states
+    evaluated together; one denotes the ordinary per-parent path.
     """
 
     shots: int
@@ -460,6 +438,18 @@ class TrajectoryDiagnostics:
     max_live_branches: int = 0
     max_kraus_probability_residual: float = 0.0
     used_kraus_copy_fallback: bool = False
+    planned_strategy: str | None = None
+    workers: int | None = None
+    execution_reason: str | None = None
+    fallback_reason: str | None = None
+    max_kraus_parent_batch: int = 1
+    memory_budget_bytes: int | None = None
+    estimated_state_bytes: int | None = None
+    memory_max_branches: int | None = None
+    memory_reason: str | None = None
+    continued_from_cap: bool = False
+    continued_shots: int = 0
+    max_gate_parent_batch: int = 1
 
 
 @dataclass(frozen=True)
@@ -553,7 +543,9 @@ class _StimPlanOperation:
 class StimCircuitPlan:
     """Reusable compilation of a supported Stim circuit into Pepsy events.
 
-    Build this once with :func:`compile_stim_circuit`, then pass it to
+    Build this once with :func:`compile_stim_circuit`, then lower independent
+    Pauli channels with :func:`stim_plan_to_gate_stream` for ``engine.compile``
+    and ``engine.run(shots=...)``, or pass it to
     :func:`sample_stim_circuit`, :func:`sample_stim_circuits`, or
     :func:`run_stim_shots`. Compiling once avoids repeated repeat-block
     expansion and repeated construction of small Clifford matrices.
@@ -1219,6 +1211,32 @@ class NoisyResult:
         """Estimate an observable using the result's shot multiplicities."""
         return self.raw.estimate(values)
 
+    def measurement_routing_diagnostics(self) -> dict:
+        """Aggregate retained collapse histories using shot multiplicities.
+
+        These are logical per-shot counts, not unique shared-prefix operations
+        or importance-weighted estimates. Missing retained histories and engines
+        without this protocol are reported as unavailable shots.
+        """
+        counts = dict.fromkeys(("stim", "stim_region", "mps"), 0)
+        reasons = {}
+        represented = 0
+        for optimizer, count in zip(self.optimizers, self.counts):
+            inspect = getattr(optimizer, "measurement_routing_diagnostics", None)
+            if not callable(inspect):
+                continue
+            report = inspect()
+            represented += count
+            for backend in counts:
+                counts[backend] += count * report["counts"].get(backend, 0)
+            for reason, frequency in report["fallback_reasons"].items():
+                reasons[reason] = reasons.get(reason, 0) + count * frequency
+        return {
+            "counts": counts, "fallback_reasons": reasons,
+            "total": sum(counts.values()), "represented_shots": represented,
+            "unavailable_shots": max(0, self.shots - represented),
+        }
+
     @property
     def effective_sample_size(self) -> float:
         """Return the importance-weight effective sample size."""
@@ -1335,6 +1353,8 @@ def _trajectory_diagnostic_snapshot(optimizer) -> dict[str, Any]:
     """Copy scalar trajectory-quality counters before a state is discarded."""
     info = getattr(optimizer, "_trajectory_diagnostics", None) or {}
     return {
+        "max_gate_parent_batch": int(info.get("max_gate_parent_batch", 1)),
+        "max_kraus_parent_batch": int(info.get("max_kraus_parent_batch", 1)),
         "max_kraus_probability_residual": float(
             info.get("max_kraus_probability_residual", 0.0)
         ),
@@ -1342,6 +1362,18 @@ def _trajectory_diagnostic_snapshot(optimizer) -> dict[str, Any]:
             info.get("used_kraus_copy_fallback", False)
         ),
     }
+
+
+def _accumulate_trajectory_diagnostics(summary, optimizer):
+    """Fold discarded-state diagnostics without retaining one entry per shot."""
+    snapshot = _trajectory_diagnostic_snapshot(optimizer)
+    summary["max_kraus_probability_residual"] = max(
+        summary["max_kraus_probability_residual"],
+        abs(snapshot["max_kraus_probability_residual"]),
+    )
+    summary["used_kraus_copy_fallback"] |= snapshot["used_kraus_copy_fallback"]
+    for key in ("max_gate_parent_batch", "max_kraus_parent_batch"):
+        summary[key] = max(summary.get(key, 1), snapshot.get(key, 1))
 
 
 def _trajectory_diagnostics(
@@ -1369,9 +1401,13 @@ def _trajectory_diagnostics(
 
     max_residual = 0.0
     used_fallback = False
+    max_parent_batch = 1
+    max_gate_batch = 1
     for state in states:
         optimizer = getattr(state, "optimizer", state)
         info = getattr(optimizer, "_trajectory_diagnostics", None) or {}
+        max_gate_batch = max(max_gate_batch, int(info.get("max_gate_parent_batch", 1)))
+        max_parent_batch = max(max_parent_batch, int(info.get("max_kraus_parent_batch", 1)))
         max_residual = max(
             max_residual,
             abs(float(info.get("max_kraus_probability_residual", 0.0))),
@@ -1380,6 +1416,8 @@ def _trajectory_diagnostics(
             used_fallback or info.get("used_kraus_copy_fallback", False)
         )
     for info in diagnostic_infos:
+        max_gate_batch = max(max_gate_batch, int(info.get("max_gate_parent_batch", 1)))
+        max_parent_batch = max(max_parent_batch, int(info.get("max_kraus_parent_batch", 1)))
         max_residual = max(
             max_residual,
             abs(float(info.get("max_kraus_probability_residual", 0.0))),
@@ -1404,6 +1442,8 @@ def _trajectory_diagnostics(
         ),
         max_kraus_probability_residual=float(max_residual),
         used_kraus_copy_fallback=bool(used_fallback),
+        max_kraus_parent_batch=max_parent_batch,
+        max_gate_parent_batch=max_gate_batch,
     )
 
 
@@ -2160,6 +2200,7 @@ def _resolve_auto_parallel_strategy(
     max_branches=None,
     max_branch_factor=None,
     auto_max_expected_faults=0.1,
+    importance_sampling=None,
 ):
     """Resolve ``auto`` before dispatching work to local workers.
 
@@ -2184,44 +2225,75 @@ def _resolve_auto_parallel_strategy(
     return (
         "coalesced"
         if _trajectory_coalescing_fits_cap(
-            plan, shots, max_branches, max_branch_factor
+            plan, shots, max_branches, max_branch_factor,
+            importance_sampling=importance_sampling,
         )
         else "independent"
     )
 
 
-def _trajectory_coalescing_fits_cap(plan, shots, max_branches, max_branch_factor):
-    """Conservatively avoid an auto-coalesced run that must restart.
+def _trajectory_coalescing_fits_cap(
+    plan, shots, max_branches, max_branch_factor, *, importance_sampling=None,
+):
+    """Select prefix sharing from structure and fixed mixture probabilities.
 
-    This is only an upper-bound preflight. It may choose independent replay
-    earlier than necessary, but it never drops probability mass and prevents
-    the expensive deterministic-prefix restart when a stream has obviously
-    more possible leaves than the configured cap.
+    The rare-mixture estimate bounds expected occupied histories by one plus
+    the expected number of shots leaving the dominant history (union bound).
+    Reserve half the branch budget as headroom. This is a scheduling heuristic,
+    never a truncation: runtime caps still trigger a fresh independent replay.
+    Unknown/state-dependent branches and importance proposals use structural
+    bounds only; planning never evaluates a proposal or samples a state.
     """
-    if max_branches is None:
-        return True
     possible = 1
+    fixed_mixtures_only = importance_sampling is None
+    departure_bound = 0.0
     for entry in plan.entries:
         event_factor = 1
         if isinstance(entry, TrajectoryEvent):
             event_factor = len(entry.channel.outcomes)
+            if entry.channel.mode == "mixture" and importance_sampling is None:
+                probabilities = [float(x.probability) for x in entry.channel.outcomes]
+                total = sum(probabilities)
+                event_factor = sum(p > 0.0 for p in probabilities)
+                # Sum the small probabilities directly to preserve rare events.
+                dominant = max(range(len(probabilities)), key=probabilities.__getitem__)
+                departure_bound += sum(
+                    p for i, p in enumerate(probabilities) if i != dominant
+                ) / total
+            else:
+                fixed_mixtures_only = False
         else:
             parts = MpsOptimizer.control_event_parts(entry)
             if parts is None:
+                # Leakage events can branch during hidden resets.
+                if _leakage_event_parts(entry) is not None:
+                    event_factor = max(1, int(shots))
+                    fixed_mixtures_only = False
+                if max_branch_factor is not None and event_factor > max_branch_factor:
+                    return False
+                possible = min(max(1, int(shots)), possible * event_factor)
                 continue
             name, payload, where = parts
             if name == "measure" and payload.get("outcome") is None:
+                event_factor = 2
+            elif name == "reset":
                 event_factor = 2 ** len(where)
             elif name == "measure_reset":
                 event_factor = 2 ** sum(
                     outcome is None for outcome in payload.get("outcomes", ())
                 )
+            elif name == "conditional":
+                event_factor = max(1, int(shots))
+                fixed_mixtures_only = False
+            if event_factor > 1:
+                fixed_mixtures_only = False
         if max_branch_factor is not None and event_factor > max_branch_factor:
             return False
-        possible *= event_factor
-        if min(possible, int(shots)) > max_branches:
-            return False
-    return min(int(shots), possible) <= max_branches
+        possible = min(max(1, int(shots)), possible * event_factor)
+    if max_branches is None or min(int(shots), possible) <= max_branches:
+        return True
+    expected_bound = min(int(shots), 1.0 + int(shots) * departure_bound)
+    return fixed_mixtures_only and expected_bound <= max_branches / 2
 
 
 def _tree_layout_stream(gate_stream):
@@ -3016,11 +3088,14 @@ def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 
 def _trajectory_norm_squared(optimizer) -> float:
-    """Read the represented state norm through the optimizer's public API."""
+    """Read a working norm; common stored exponents cancel from Born ratios."""
     norm = getattr(optimizer, "norm", None)
     if isinstance(optimizer, MpsOptimizer):
         # A common represented exponent cancels from every Born ratio.
         value = optimizer._control_state_norm(include_exponent=False)
+    elif isinstance(optimizer, TreeOptimizer):
+        value, _ = optimizer._ledger_norm()
+        value = _trajectory_real_scalar(value, label="trajectory state norm")
     elif callable(norm):
         value = _trajectory_real_scalar(norm(), label="trajectory state norm")
     else:
@@ -3033,34 +3108,216 @@ def _trajectory_norm_squared(optimizer) -> float:
     return value * value
 
 
+def _mps_kraus_amplitude_block(optimizer, where):
+    """Prepare one normalized dense block for all outcomes of a channel.
+
+    Nonadjacent supports are gathered on a private MPS with untruncated swaps.
+    Only the selected sites are fused, so memory does not grow exponentially
+    with their separation. Physical legs are fused in the operator's order.
+    """
+    state = optimizer.p
+    support = tuple(int(site) for site in where)
+    if optimizer.mode in {"exact", "exact-batch"}:
+        # Exact replay already owns the full state. Keep its amplitudes and
+        # omit represented scale, which cancels from the probability ratio.
+        state = state.copy()
+        state.exponent = 0.
+        block = state.contract(all, preserve_tensor=True, optimize=optimizer.contraction_opt)
+        physical_inds = tuple(optimizer._format_ind(site) for site in support)
+    else:
+        first, last = min(support), max(support)
+        info = optimizer.info_c
+        if last - first + 1 != len(support):
+            state = state.copy()
+            info = dict(info)
+            order = list(range(state.L))
+            for position, site in enumerate(sorted(support), first):
+                current = order.index(site)
+                state.swap_site_to_(current, position, info=info,
+                                    max_bond=None, cutoff=0., cutoff_mode="abs")
+                order.insert(position, order.pop(current))
+            support = tuple(order.index(site) for site in support)
+            last = first + len(support) - 1
+        optimizer.canonize_mps(state, (first, last), info=info)
+        block = state[first] if first == last else qtn.tensor_contract(
+            *(state[site] for site in range(first, last + 1)),
+            preserve_tensor=True, optimize=optimizer.contraction_opt,
+        )
+        physical_inds = tuple(state.site_ind(site) for site in support)
+    if len(physical_inds) > 1:
+        block = block.fuse({physical_inds[0]: physical_inds})
+    return block / block.norm(), physical_inds[0]
+
+
+def _mps_projected_kraus_probability(optimizer, matrix, where):
+    """Read one dense projected amplitude without a cancellation-prone Gram."""
+    block, physical_ind = _mps_kraus_amplitude_block(optimizer, where)
+    projected = block.gate(matrix, physical_ind)
+    amplitude = _trajectory_real_scalar(projected.norm(), label="local Kraus amplitude")
+    return amplitude * amplitude
+
+
+# Bound stacked operators plus projected amplitudes, in array elements. A
+# single outcome can exceed this budget; never truncate its amplitude block.
+_KRAUS_BATCH_MAX_ELEMENTS = 1 << 20
+# Conservative temporary workspace target, independent of retained MPS memory.
+_KRAUS_FRONTIER_MAX_BYTES = 32 << 20
+_KRAUS_FRONTIER_MAX_STATES = 32
+
+
+def _mps_kraus_operators(optimizer, channel, start, stop, xp):
+    """Reuse the shared immutable backend payload cache for either batch axis."""
+    def prepare():
+        return xp.stack(tuple(
+            _to_trajectory_backend(outcome.gate, optimizer)
+            for outcome in channel.outcomes[start:stop]
+        ), axis=0)
+
+    cache = optimizer._backend_cache_plan
+    key = (
+        "trajectory-kraus-batch", id(channel), start, stop,
+        repr(optimizer.backend), repr(optimizer.backend_dtype),
+        repr(optimizer.backend_device),
+    )
+    return prepare() if cache is None else cache.get_or_create_backend_payload(key, channel, prepare)
+
+
+def _projected_kraus_norms(xp, operators, amplitudes):
+    """Reduce projected amplitudes over the last two axes, preserving batches."""
+    projected = xp.matmul(operators, amplitudes)
+    projected = xp.reshape(projected, (*projected.shape[:-2], -1))
+    # Scaling before squaring preserves very rare complex64 outcomes.
+    scale = xp.max(xp.abs(projected), axis=-1, keepdims=True)
+    safe_scale = xp.where(scale == 0, 1, scale)
+    return (xp.linalg.norm(projected / safe_scale, axis=-1)
+            * xp.reshape(scale, projected.shape[:-1]))
+
+
+def _mps_batched_kraus_probabilities(optimizer, channel, where):
+    """Evaluate dense outcomes on-device, downloading only their norm vector."""
+    physical_where = tuple(optimizer._logical_to_physical_where(where))
+    block, physical_ind = _mps_kraus_amplitude_block(optimizer, physical_where)
+    block = block.transpose(
+        physical_ind, *(ind for ind in block.inds if ind != physical_ind)
+    )
+    xp = _array_namespace(block.data)
+    dim = block.ind_size(physical_ind)
+    amplitudes = xp.reshape(block.data, (dim, -1))
+    batch_size = max(1, _KRAUS_BATCH_MAX_ELEMENTS // (dim * dim + ar.size(amplitudes)))
+    norms = []
+    for start in range(0, len(channel.outcomes), batch_size):
+        stop = min(start + batch_size, len(channel.outcomes))
+
+        operators = _mps_kraus_operators(optimizer, channel, start, stop, xp)
+        norms.append(_projected_kraus_norms(xp, operators, amplitudes))
+    amplitudes = norms[0] if len(norms) == 1 else xp.concatenate(norms)
+    # Sampling and importance weights already live on the host. Square there
+    # in float64, preserving probabilities below the array dtype's range.
+    return np.asarray(ar.to_numpy(amplitudes), dtype=float) ** 2
+
+
+def _kraus_frontier_key(optimizer, channel, where):
+    """Admit bounded one-site dense accelerator blocks using metadata only."""
+    if (not isinstance(optimizer, MpsOptimizer) or len(where) != 1
+            or optimizer.mode in {"exact", "exact-batch"}
+            or optimizer._replay_has_symmray_data(optimizer.p)
+            or getattr(optimizer.p, "cyclic", False)):
+        return None
+    backend = optimizer.backend
+    if backend != "cupy" and not (
+        backend == "torch" and "cuda" in str(optimizer.backend_device)
+    ):
+        return None
+    site, = optimizer._logical_to_physical_where(where)
+    data = optimizer.p[site].data
+    itemsize = np.dtype(ar.get_dtype_name(data)).itemsize
+    dim = optimizer.p[site].ind_size(optimizer.p.site_ind(site))
+    # Include prepared/stacked amplitudes and conservative reduction temporaries.
+    cost = itemsize * (ar.size(data) * (4 + 6 * len(channel.outcomes))
+                       + dim * dim * len(channel.outcomes))
+    if 2 * cost > _KRAUS_FRONTIER_MAX_BYTES:
+        return None
+    return backend, str(optimizer.backend_dtype), str(optimizer.backend_device)
+
+
+def _coalesced_kraus_probabilities(nodes, channel, where, *, batch=True):
+    """Yield parent distributions in order, batching compatible GPU blocks.
+
+    Only probabilities are batched. Gate application, adaptive decompositions,
+    canonical metadata, RNG draws and branch caps retain their existing owners.
+    Prepared work is bounded independently of the number of live branches.
+    """
+    index = 0
+    while index < len(nodes):
+        optimizer = nodes[index].optimizer
+        key = (_kraus_frontier_key(optimizer, channel, where)
+               if batch and len(nodes) - index > 1 else None)
+        if key is None:
+            yield _kraus_probabilities(optimizer, channel, where)
+            index += 1
+            continue
+        parents, blocks = [], []
+        cost = 0
+        for node in nodes[index:index + _KRAUS_FRONTIER_MAX_STATES]:
+            opt = node.optimizer
+            if _kraus_frontier_key(opt, channel, where) != key:
+                break
+            site, = opt._logical_to_physical_where(where)
+            tensor = opt.p[site]
+            dim = tensor.ind_size(opt.p.site_ind(site))
+            itemsize = np.dtype(ar.get_dtype_name(tensor.data)).itemsize
+            estimate = itemsize * (ar.size(tensor.data) * (4 + 6 * len(channel.outcomes))
+                                   + dim * dim * len(channel.outcomes))
+            if cost + estimate > _KRAUS_FRONTIER_MAX_BYTES:
+                break
+            # Preserve the existing zero/invalid raw-state norm guard.
+            _trajectory_norm_squared(opt)
+            block, physical_ind = _mps_kraus_amplitude_block(opt, (site,))
+            block = block.transpose(physical_ind, *(i for i in block.inds if i != physical_ind))
+            xp = _array_namespace(block.data)
+            amplitudes = xp.reshape(block.data, (dim, -1))
+            if blocks and amplitudes.shape != blocks[0].shape:
+                # The next parent can be re-prepared safely on the next chunk.
+                break
+            parents.append(opt)
+            blocks.append(amplitudes)
+            cost += estimate
+        xp = _array_namespace(blocks[0])
+        operators = _mps_kraus_operators(parents[0], channel, 0, len(channel.outcomes), xp)
+        amplitudes = xp.reshape(xp.stack(blocks, axis=0), (len(blocks), 1, dim, -1))
+        operators = xp.reshape(operators, (1, len(channel.outcomes), dim, dim))
+        norms = _projected_kraus_norms(xp, operators, amplitudes)
+        probabilities = np.asarray(ar.to_numpy(norms), dtype=float) ** 2
+        for opt, row in zip(parents, probabilities):
+            info = _trajectory_diagnostic_state(opt)
+            info["max_kraus_parent_batch"] = max(
+                int(info.get("max_kraus_parent_batch", 1)), len(parents),
+            )
+            yield _normalize_kraus_probabilities(opt, row)
+        index += len(parents)
+
+
 def _mps_local_kraus_norm_squared(optimizer, matrix, where):
-    """Evaluate ``<psi|K^dagger K|psi>`` without copying the MPS.
+    """Evaluate a normalized local outcome without compressing a trial branch.
 
     Canonical MPS replay reuses and updates the live center metadata. Quimb's
     environment contraction remains available for noncanonical MPS lookalikes;
     returning ``None`` retains the conservative copied-state fallback.
     """
     p = getattr(optimizer, "p", None)
+    if (isinstance(optimizer, MpsOptimizer)
+            and not optimizer._replay_has_symmray_data(p)):
+        return _mps_projected_kraus_probability(optimizer, matrix, where)
     compute = getattr(p, "compute_local_expectation", None)
     if not callable(compute):
         return None
     try:
-        if (isinstance(optimizer, MpsOptimizer)
-                and optimizer.mode not in {"exact", "su"}
-                and len(where) == 1 and not optimizer._replay_has_symmray_data(p)):
-            site = int(where[0])
-            optimizer.canonize_mps(p, site)
-            tensor = p[site]
-            normalized = tensor / tensor.norm()
-            projected = normalized.gate(matrix, p.site_ind(site))
-            amplitude = _trajectory_real_scalar(projected.norm(), label="local Kraus amplitude")
-            return amplitude * amplitude
         gram = matrix.conj().T @ matrix
         support = tuple(int(site) for site in where)
         canonical = getattr(p, "local_expectation_canonical", None)
         if (
             isinstance(optimizer, MpsOptimizer)
-            and optimizer.mode not in {"exact", "su"}
+            and optimizer.mode not in {"exact", "exact-batch", "su"}
             and callable(canonical)
         ):
             value = canonical(
@@ -3078,11 +3335,14 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
         if len(support) == 1 and int(getattr(p, "L", 0)) == 1:
             dense = getattr(p, "to_dense", None)
             if callable(dense):
-                vector = np.asarray(dense(), dtype=complex).reshape(-1)
-                gram_numpy = np.asarray(gram, dtype=complex)
-                denominator = float(np.vdot(vector, vector).real)
+                vector = ar.do("reshape", dense(), (-1,))
+                conjugate = ar.do("conj", vector)
+                denominator = _trajectory_real_scalar(
+                    ar.do("real", ar.do("sum", conjugate * vector)),
+                    label="local Kraus state norm",
+                )
                 if denominator > 0.0:
-                    value = np.vdot(vector, gram_numpy @ vector) / denominator
+                    value = ar.do("sum", conjugate * (gram @ vector)) / denominator
                     value = _trajectory_real_scalar(
                         value, label="local Kraus probability"
                     )
@@ -3091,6 +3351,9 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
                             "local Kraus contraction produced an invalid probability."
                         )
                     return max(0.0, value)
+        # New Quimb names the environment selector ``route``; older builds
+        # use ``method``. Choose from the signature without changing the solve.
+        route_key = "route" if quimb_callable_option_supported(compute, "route") else "method"
         value = compute(
             # ``compute_local_expectation`` accepts scalar keys in some
             # Quimb releases, but the environment implementation used by
@@ -3099,7 +3362,7 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
             {support: gram},
             normalized=True,
             return_all=True,
-            method="envs",
+            **{route_key: "envs"},
         )
         if isinstance(value, Mapping):
             value = next(iter(value.values()))
@@ -3111,7 +3374,9 @@ def _mps_local_kraus_norm_squared(optimizer, matrix, where):
         return None
 
 
-def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
+def _mps_outcome_norm_squared(
+    optimizer, matrix, where, *, base_norm_squared=None
+) -> float:
     """Evaluate one Kraus branch without mutating an MPS or exact leaf."""
     p = getattr(optimizer, "p", None)
     apply_gate = getattr(optimizer, "_apply_gate", None)
@@ -3126,7 +3391,9 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
         optimizer, matrix, physical_where
     )
     if local_probability is not None:
-        return local_probability * _trajectory_norm_squared(optimizer)
+        if base_norm_squared is None:
+            base_norm_squared = _trajectory_norm_squared(optimizer)
+        return local_probability * base_norm_squared
     _record_kraus_probability_diagnostic(optimizer, used_copy_fallback=True)
     candidate = apply_gate(
         p.copy(),
@@ -3143,7 +3410,26 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
 
 
 def _tree_outcome_norm_squared(optimizer, matrix, where) -> float:
-    """Evaluate one Kraus branch on a copied ordinary TTN without mutation."""
+    """Evaluate a Kraus weight independently of tree replay/compression policy."""
+    if isinstance(optimizer, TreeOptimizer):
+        matrix = _to_trajectory_backend(matrix, optimizer)
+        support = optimizer._validate_support(_trajectory_where(where))
+        gram = ar.do("conj", ar.do("transpose", matrix)) @ matrix
+        # Copy only the TTN wrapper, preserving live gauge, histories and RNG.
+        # This exact local contraction neither compresses a trial branch nor
+        # restores its nonunitary norm through inherited stabilization.
+        state = optimizer.tn.copy()
+        state.exponent = 0.
+        value = state.local_expectation(
+            gram, support, normalized=True, _preserve_gauge=False,
+        )
+        # K†K is Hermitian; discard imaginary contraction roundoff before
+        # the scalar readout, including complex64 device arithmetic.
+        value = _trajectory_real_scalar(ar.do("real", value), label="local Kraus probability")
+        if not np.isfinite(value) or value < -1e-10:
+            raise ValueError("local Kraus contraction produced an invalid probability.")
+        return max(0., value) * _trajectory_norm_squared(optimizer)
+    # Retain the copy/apply protocol for external optimizer lookalikes.
     copy = getattr(optimizer, "copy", None)
     if not callable(copy):
         raise TypeError(
@@ -3197,6 +3483,17 @@ def _to_trajectory_backend(matrix, optimizer):
 
 def _to_trajectory_backend_uncached(matrix, optimizer):
     """Convert one generated matrix without consulting the shared cache."""
+    if isinstance(optimizer, MpsOptimizer):
+        like = optimizer._state_backend_like()
+        if not optimizer._is_symmray_array(like):
+            matrix = _real_if_compatible(matrix, like)
+            if (isinstance(matrix, np.ndarray) and np.iscomplexobj(matrix)
+                    and ar.infer_backend(like) != "numpy"
+                    and "complex" not in ar.get_dtype_name(like)):
+                raise TypeError(
+                    "A complex trajectory operator requires a complex MPS dtype; "
+                    "initialize the state with complex64 or complex128."
+                )
     converter = getattr(optimizer, "_to_state_backend", None)
     if callable(converter):
         return converter(matrix)
@@ -3208,8 +3505,27 @@ def _to_trajectory_backend_uncached(matrix, optimizer):
 
 def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.ndarray:
     """Compute normalized state-dependent probabilities for a local channel."""
+    like = (optimizer._state_backend_like()
+            if isinstance(optimizer, MpsOptimizer) else None)
+    with _high_precision_matmul(like):
+        return _kraus_probabilities_impl(optimizer, channel, where)
+
+
+def _kraus_probabilities_impl(optimizer, channel, where):
     base_norm_squared = _trajectory_norm_squared(optimizer)
+    if (isinstance(optimizer, MpsOptimizer)
+            and not optimizer._replay_has_symmray_data(optimizer.p)):
+        # The prepared block is normalized; avoid multiplying by the base
+        # norm only to divide it out again (which can underflow rare weights).
+        return _normalize_kraus_probabilities(
+            optimizer, _mps_batched_kraus_probabilities(optimizer, channel, where)
+        )
     if _is_stabilizer_trajectory_optimizer(optimizer):
+        probabilities = getattr(optimizer, "_trajectory_kraus_probabilities", None)
+        if callable(probabilities):
+            return _normalize_kraus_probabilities(
+                optimizer, probabilities(channel.outcomes, where),
+            )
         # Both STN frontends already expose the exact local Gram-norm path
         # used by their non-unitary dense-gate implementation.  Evaluating
         # ``<psi|K^dagger K|psi>`` through Pauli expectations avoids making a
@@ -3243,12 +3559,19 @@ def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.nda
     else:
         branch_norm_squared = np.asarray(
             [
-                _mps_outcome_norm_squared(optimizer, outcome.gate, where)
+                _mps_outcome_norm_squared(
+                    optimizer, outcome.gate, where,
+                    base_norm_squared=base_norm_squared,
+                )
                 for outcome in channel.outcomes
             ],
             dtype=float,
         )
-    probabilities = branch_norm_squared / base_norm_squared
+    return _normalize_kraus_probabilities(optimizer, branch_norm_squared / base_norm_squared)
+
+
+def _normalize_kraus_probabilities(optimizer, probabilities):
+    """Validate the host sampling distribution and retain its norm residual."""
     if not np.all(np.isfinite(probabilities)) or np.any(probabilities < -1e-10):
         raise ValueError("Kraus channel produced invalid trajectory probabilities.")
     probabilities = np.maximum(probabilities, 0.0)
@@ -3256,8 +3579,8 @@ def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.nda
     if total <= 0.0:
         raise ValueError("Kraus channel has no nonzero trajectory outcome for this state.")
     _record_kraus_probability_diagnostic(optimizer, residual=total - 1.0)
-    # A complete channel sums to one. Normalize the tiny residual caused by
-    # finite-MPS truncation so the shot sampler remains a proper distribution.
+    # A complete channel sums to one. Normalize contraction roundoff so the
+    # shot sampler remains a proper distribution.
     return probabilities / total
 
 
@@ -3351,6 +3674,11 @@ def _run_trajectory_entries(
         kwargs["normalize_final"] = False
         if isinstance(optimizer, MpsOptimizer):
             kwargs["_trajectory_non_unitary"] = True
+            # Kraus branches retain their physical norm until branch
+            # normalization. Override only this segment's copied options;
+            # surrounding unitary segments keep the caller's stabilization.
+            kwargs["stabilize_unitary"] = False
+            kwargs.pop("fit_stabilize_unitary", None)
     optimizer.run(**kwargs)
 
 
@@ -3437,7 +3765,9 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
     if _is_mps_stabilizer_trajectory_optimizer(optimizer):
         site = optimizer._mps_site(_trajectory_where(where)[0])
         optimizer._canonize_p(site)
-        projected_norm = optimizer._renorm_p_at(site)
+        # Support was validated by the sampling distribution. A positive rare
+        # Kraus branch must not inherit the forced-projector tolerance floor.
+        projected_norm = optimizer._renorm_p_at(site, min_norm=0.0)
         # A selected Kraus outcome is a normalized quantum-trajectory branch:
         # close the preceding unitary segment without counting its Born weight
         # as compression loss, then establish the new unit-norm baseline.
@@ -3463,7 +3793,12 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
             physical_boundary=True,
             renormalized=True,
         )
-    normalize()
+    if isinstance(optimizer, TreeOptimizer):
+        # A sampled branch has positive Born weight, even when importance
+        # sampling selected an amplitude below the general normalization eps.
+        normalize(eps=0.)
+    else:
+        normalize()
     # MpsOptimizer stores removed scale in ``p.exponent`` so norm diagnostics
     # see the represented non-unitary norm. A quantum-trajectory branch is
     # physically renormalized, therefore clear that bookkeeping scale.
@@ -3870,6 +4205,11 @@ def _copy_coalesced_node(node: _CoalescedNode) -> _CoalescedNode:
     optimizer = branch_copy() if callable(branch_copy) else node.optimizer.copy()
     if optimizer is node.optimizer:
         raise TypeError("optimizer.copy() must return an independent optimizer state.")
+    # Public optimizer copies may intentionally reset classical history. Branch
+    # replay must preserve it: later rec offsets/feedback depend on the prefix.
+    measurements = getattr(node.optimizer, "measurements", None)
+    if isinstance(measurements, list):
+        optimizer.measurements = list(measurements)
     return _CoalescedNode(
         optimizer=optimizer,
         count=node.count,
@@ -4018,9 +4358,12 @@ def _run_coalesced_entries(
             node.gate_stream.extend(active)
             return node
 
-        nodes[:] = _parallel_map_ordered(
-            run_node, nodes, parallel_workers, parallel_backend
-        )
+        from .mps._trajectory_batch import try_run_gate_batch
+
+        if parallel_workers != 1 or not try_run_gate_batch(nodes, entries, run_kwargs, run_node):
+            nodes[:] = _parallel_map_ordered(
+                run_node, nodes, parallel_workers, parallel_backend
+            )
         pending = []
 
     for event_index, entry in indexed_entries:
@@ -4086,7 +4429,9 @@ def _run_coalesced_entries(
             run_kwargs,
             rng,
             entry=entry,
-            absorb_basis=_coalesced_control_absorb_basis(entry, parts[0]),
+            absorb_basis=_coalesced_control_absorb_basis(
+                entry, parts[0], optimizer=nodes[0].optimizer,
+            ),
             max_branches=max_branches,
             max_branch_factor=max_branch_factor,
             parallel_workers=parallel_workers,
@@ -4096,20 +4441,29 @@ def _run_coalesced_entries(
     return nodes
 
 
-def _coalesced_control_absorb_basis(entry, name) -> bool:
+def _coalesced_control_absorb_basis(entry, name, *, optimizer=None) -> bool | None:
     """Preserve the optional STN basis-absorbing control-event flag."""
     if isinstance(entry, Mapping):
-        return bool(entry.get("absorb_basis", entry.get("absorb", False)))
+        value = entry.get("absorb_basis", entry.get("absorb", entry.get("disentangle")))
+        return None if value is None else bool(value)
     if not isinstance(entry, (tuple, list)):
-        return False
+        return None
     head = str(entry[0]).replace("-", "_").lower()
     if name == "measure":
-        return bool(entry[4]) if len(entry) > 4 else False
-    if name != "measure_reset":
-        return False
-    if head in {"mrx", "mry", "mrz"}:
-        return bool(entry[3]) if len(entry) > 3 else False
-    return bool(entry[4]) if len(entry) > 4 else False
+        flag_index = 4
+        if len(entry) <= flag_index:
+            return None
+    elif name == "measure_reset":
+        flag_index = 3 if head in {"mrx", "mry", "mrz"} else 4
+        if len(entry) <= flag_index:
+            return True if flag_index == 3 else None
+    else:
+        return None
+    if entry[flag_index] is None:
+        # Only the MPS stabilizer treats an explicit None stream flag as its
+        # default. Other optimizers retain their existing bool(None) policy.
+        return None if _is_mps_stabilizer_trajectory_optimizer(optimizer) else False
+    return bool(entry[flag_index])
 
 
 def _coalesced_leakage_measure_leaked(
@@ -4363,9 +4717,12 @@ def _coalesced_leakage_event(
 def _coalesced_measurement_probabilities(optimizer, pauli, where):
     """Use both backend Born weights without subtractive cancellation."""
     if isinstance(optimizer, MpsOptimizer):
-        return optimizer._measurement_probabilities(
-            pauli, optimizer._logical_to_physical_where(where),
-        )
+        with _high_precision_matmul(optimizer._state_backend_like()):
+            optimizer._ensure_mps_state()
+            optimizer._ensure_tracked_center()
+            return optimizer._measurement_probabilities(
+                pauli, optimizer._logical_to_physical_where(where),
+            )
     probabilities = getattr(optimizer, "_measurement_probabilities", None)
     if callable(probabilities):
         return probabilities(pauli, where)
@@ -4474,8 +4831,8 @@ def _apply_coalesced_measurement(
             entry = ("measure_reset", pauli, where[0], int(outcome))
         else:
             entry = ("measure", pauli, where, int(outcome))
-        if absorb_basis and not reset:
-            entry = (*entry, True)
+        if absorb_basis is not None and not reset:
+            entry = (*entry, bool(absorb_basis))
         _run_trajectory_entries(node.optimizer, (entry,), run_kwargs)
         node.gate_stream.append(entry)
         if reset:
@@ -4541,7 +4898,7 @@ def _coalesced_control_event(
     rng,
     *,
     entry=None,
-    absorb_basis=False,
+    absorb_basis=None,
     max_branches=None,
     max_branch_factor=None,
     parallel_workers=1,
@@ -4873,6 +5230,56 @@ def sample_coalesced_bits(
     return CoalescedSampleResult(configs, leaf_indices, probabilities, lengths)
 
 
+def _execute_local_shots(optimizer_factory, gates, shots, *, strategy, common,
+                         error_model, auto_max_expected_faults,
+                         check_independent, progress=None):
+    """Shared MPS/STN local dispatch, continuation and retention-safe retry.
+
+    Frontends own memory estimates and worker planning. This boundary owns
+    replay so neither frontend can silently restart or prune capped prefixes.
+    """
+    options = dict(common)
+
+    def execute():
+        if strategy == "auto" and options["strategy"] == "coalesced":
+            continuation = dict(options)
+            continuation.pop("strategy")
+            continuation.update(
+                _continue_on_cap=True,
+                _continuation_check=lambda: check_independent(1),
+            )
+            if error_model is None:
+                return run_coalesced_trajectory_shots(
+                    optimizer_factory, gates, shots, **continuation,
+                )
+            return run_coalesced_noisy_shots(
+                optimizer_factory, gates, error_model, shots, **continuation,
+            )
+        if error_model is None:
+            return run_trajectory_shots(
+                optimizer_factory, gates, shots, _progress=progress, **options,
+            )
+        return run_noisy_shots(
+            optimizer_factory, gates, error_model, shots,
+            auto_max_expected_faults=auto_max_expected_faults,
+            _progress=progress, **options,
+        )
+
+    retry = False
+    try:
+        raw = execute()
+    except _CoalescedBranchCapExceeded:
+        if strategy != "auto":
+            raise
+        retry = True
+    # Drop the traceback owning the failed frontier before a possible retry.
+    if retry:
+        check_independent(options["parallel_workers"])
+        options["strategy"] = "independent"
+        raw = execute()
+    return raw
+
+
 def run_trajectory_shots(
     optimizer_factory: Callable[[], Any],
     gates,
@@ -4894,6 +5301,8 @@ def run_trajectory_shots(
     retain: str = "all",
     _shot_ids=None,
     _progress=None,
+    _continue_on_cap=False,
+    _continuation_check=None,
 ) -> TrajectoryShotResult | CoalescedTrajectoryResult:
     """Replay user-defined noisy gate-stream trajectories on MPS or tree optimizers.
 
@@ -4949,6 +5358,7 @@ def run_trajectory_shots(
                 shots,
                 max_branches=max_branches,
                 max_branch_factor=max_branch_factor,
+                importance_sampling=policy,
             )
             if str(magic_strategy).strip().lower().replace("-", "_") != "direct":
                 strategy = "independent"
@@ -4956,7 +5366,7 @@ def run_trajectory_shots(
                 try:
                     return run_parallel_trajectory_shots(
                         optimizer_factory,
-                        plan.entries,
+                        plan,
                         shots,
                         seed=seed,
                         run_kwargs=run_kwargs,
@@ -4979,7 +5389,7 @@ def run_trajectory_shots(
                     strategy = "independent"
         return run_parallel_trajectory_shots(
             optimizer_factory,
-            gates,
+            plan,
             shots,
             seed=seed,
             run_kwargs=run_kwargs,
@@ -5028,7 +5438,10 @@ def run_trajectory_shots(
         leakage_records = []
         measurement_records = []
         weights = []
-        diagnostic_infos = []
+        diagnostic_info = {
+            "max_kraus_probability_residual": 0.0,
+            "used_kraus_copy_fallback": False,
+        }
         for child_seed in _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids):
             noise_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
             sample = sample_trajectory_stream(
@@ -5052,7 +5465,8 @@ def run_trajectory_shots(
                 reset_ancillas=magic_reset_ancillas,
                 **dict(run_kwargs),
             )
-            diagnostic_infos.append(_trajectory_diagnostic_snapshot(optimizer))
+            if retain == "none":
+                _accumulate_trajectory_diagnostics(diagnostic_info, optimizer)
             if retain != "none":
                 optimizers.append(optimizer)
                 weights.append(float(sample.weight))
@@ -5075,7 +5489,7 @@ def run_trajectory_shots(
                 shots=int(shots),
                 coalesced=False,
                 diagnostic_infos=(
-                    diagnostic_infos if retain == "none" else ()
+                    (diagnostic_info,) if retain == "none" else ()
                 ),
             ),
         )
@@ -5090,9 +5504,11 @@ def run_trajectory_shots(
             max_branch_factor=max_branch_factor,
             importance_sampling=policy,
             retain=retain,
+            _continue_on_cap=_continue_on_cap,
+            _continuation_check=_continuation_check,
         )
     if strategy == "auto" and _trajectory_coalescing_fits_cap(
-        plan, shots, max_branches, max_branch_factor
+        plan, shots, max_branches, max_branch_factor, importance_sampling=policy,
     ):
         try:
             return run_coalesced_trajectory_shots(
@@ -5105,6 +5521,8 @@ def run_trajectory_shots(
                 max_branch_factor=max_branch_factor,
                 importance_sampling=policy,
                 retain=retain,
+                _continue_on_cap=_continue_on_cap,
+                _continuation_check=_continuation_check,
             )
         except _CoalescedBranchCapExceeded:
             pass
@@ -5115,7 +5533,10 @@ def run_trajectory_shots(
     leakage_records = []
     measurement_records = []
     weights = []
-    diagnostic_infos = []
+    diagnostic_info = {
+        "max_kraus_probability_residual": 0.0,
+        "used_kraus_copy_fallback": False,
+    }
     for child_seed in _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids):
         channel_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
         optimizer = optimizer_factory()
@@ -5253,7 +5674,8 @@ def run_trajectory_shots(
         flush_pending()
         if magic_context is not None:
             _finish_magic_context(optimizer, magic_context)
-        diagnostic_infos.append(_trajectory_diagnostic_snapshot(optimizer))
+        if retain == "none":
+            _accumulate_trajectory_diagnostics(diagnostic_info, optimizer)
         if retain != "none":
             optimizers.append(optimizer)
             weights.append(float(shot_weight))
@@ -5276,7 +5698,7 @@ def run_trajectory_shots(
             shots=int(shots),
             coalesced=False,
             diagnostic_infos=(
-                diagnostic_infos if retain == "none" else ()
+                (diagnostic_info,) if retain == "none" else ()
             ),
         ),
     )
@@ -5349,8 +5771,7 @@ def run_parallel_trajectory_shots(
 
     if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
         raise ValueError("shots must be a nonnegative integer.")
-    entries = _as_entries(gates)
-    plan = compile_trajectory_stream(entries)
+    plan = compile_trajectory_stream(gates)
     child_seeds = _trajectory_seed_pairs(seed, shots, shot_ids=_shot_ids)
 
     def run_one(child_seed):
@@ -5361,7 +5782,7 @@ def run_parallel_trajectory_shots(
         )
         return run_trajectory_shots(
             optimizer_factory,
-            entries,
+            plan,
             1,
             seed=child,
             run_kwargs=run_kwargs,
@@ -5490,6 +5911,11 @@ def run_coalesced_trajectory_shots(
     parallel_workers: int = 1,
     parallel_backend: str = "thread",
     retain: str = "all",
+    _continue_on_cap=False,
+    _continuation_check=None,
+    _nodes=None,
+    _start_index=0,
+    _rng=None,
 ) -> CoalescedTrajectoryResult:
     """Replay an exact count-coalesced ensemble of quantum trajectories.
 
@@ -5514,11 +5940,14 @@ def run_coalesced_trajectory_shots(
     policy = _coerce_importance_policy(importance_sampling)
     plan = compile_trajectory_stream(gates)
     entries = plan.entries
-    nodes = _initial_coalesced_nodes(optimizer_factory, shots)
-    channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
-    if nodes:
-        _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
-    rng = np.random.default_rng(channel_seed)
+    nodes = _initial_coalesced_nodes(optimizer_factory, shots) if _nodes is None else _nodes
+    if _rng is None:
+        channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
+        if nodes and _nodes is None:
+            _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
+        rng = np.random.default_rng(channel_seed)
+    else:
+        rng = _rng
     pending = []
 
     def flush():
@@ -5536,11 +5965,28 @@ def run_coalesced_trajectory_shots(
         pending = []
 
     for event_index, entry in enumerate(entries):
+        if event_index < _start_index:
+            continue
+        if _continue_on_cap and (isinstance(entry, TrajectoryEvent)
+                                or MpsOptimizer.control_event_parts(entry) is not None
+                                or _leakage_event_parts(entry) is not None):
+            flush()
+        if _continue_on_cap and _frontier_needs_continuation(
+            nodes, entry, max_branches, max_branch_factor, policy=policy,
+        ):
+            flush()
+            if _continuation_check is not None:
+                _continuation_check()
+            return _continue_trajectory_frontier(
+                nodes, plan, event_index, rng, run_kwargs, policy, retain,
+            )
         if not isinstance(entry, TrajectoryEvent):
             pending.append((event_index, entry))
             continue
         flush()
-        if entry.channel.mode == "mixture":
+        if entry.channel.mode == "mixture" and (
+            policy is None or not callable(policy.proposal)
+        ):
             outcomes = entry.channel.outcomes
             target, proposal, ratios = _importance_distribution(
                 policy,
@@ -5581,9 +6027,19 @@ def run_coalesced_trajectory_shots(
             )
         else:
             split = []
+            distributions = (
+                _coalesced_kraus_probabilities(
+                    nodes, entry.channel, entry.where,
+                    batch=policy is None or not callable(policy.proposal),
+                ) if entry.channel.mode == "kraus" else None
+            )
             for index, node in enumerate(nodes):
-                probabilities = _kraus_probabilities(
-                    node.optimizer, entry.channel, entry.where
+                # Callable mixture proposals may depend on each parent's
+                # current state, just like state-dependent Kraus proposals.
+                probabilities = (
+                    [outcome.probability for outcome in entry.channel.outcomes]
+                    if entry.channel.mode == "mixture"
+                    else next(distributions)
                 )
                 target, proposal, ratios = _importance_distribution(
                     policy,
@@ -5617,7 +6073,10 @@ def run_coalesced_trajectory_shots(
                         proposal,
                         apply,
                         rng,
-                        context="trajectory Kraus channel",
+                        context=(
+                            "trajectory mixture" if entry.channel.mode == "mixture"
+                            else "trajectory Kraus channel"
+                        ),
                         max_branches=_remaining_coalesced_budget(
                             max_branches, len(split), len(nodes) - index - 1,
                         ),
@@ -5626,9 +6085,81 @@ def run_coalesced_trajectory_shots(
                         parallel_backend=parallel_backend,
                     )
                 )
+            if distributions is not None:
+                # The last next() leaves a generator suspended at its final
+                # yield. Release its parent/workspace references before gates.
+                distributions.close()
             nodes = split
     flush()
     return _coalesced_result(nodes, plan=plan, retain=retain)
+
+
+def _frontier_needs_continuation(nodes, entry, max_branches, max_branch_factor,
+                                 *, policy=None):
+    """Decide before sampling; discarding an overflowing draw would bias shots."""
+    if not nodes or (max_branches is None and max_branch_factor is None):
+        return False
+    if isinstance(entry, TrajectoryEvent):
+        arity = len(entry.channel.outcomes)
+        if entry.channel.mode == "mixture" and policy is None:
+            arity = sum(outcome.probability > 0 for outcome in entry.channel.outcomes)
+        children = [min(node.count, arity) for node in nodes]
+    else:
+        parts = MpsOptimizer.control_event_parts(entry)
+        if not (_leakage_event_parts(entry) is not None or parts is not None
+                and parts[0] in {"measure", "reset", "measure_reset", "conditional"}):
+            return False
+        # Composite controls can contain hidden resets or conditional branches.
+        children = [node.count for node in nodes]
+    return (max_branches is not None and sum(children) > max_branches) or (
+        max_branch_factor is not None and max(children, default=0) > max_branch_factor
+    )
+
+
+def _continue_trajectory_frontier(nodes, plan, start, rng, run_kwargs, policy, retain,
+                                  *, resume=None):
+    """Finish each counted prefix one shot at a time, without replaying it."""
+    shots = sum(node.count for node in nodes)
+    leaves = []
+    summary = {"max_kraus_probability_residual": 0.0, "used_kraus_copy_fallback": False}
+    max_parent_batch = 1
+    max_gate_batch = 1
+    frontier_size = len(nodes)
+    for index in range(len(nodes)):
+        node = nodes[index]
+        count = int(node.count)
+        for shot in range(count):
+            child = node if shot == count - 1 else _copy_coalesced_node(node)
+            child.count = 1
+            result = resume(child) if resume is not None else run_coalesced_trajectory_shots(
+                lambda: None, plan, 1, run_kwargs=run_kwargs,
+                importance_sampling=policy, retain=retain, _nodes=[child],
+                _start_index=start, _rng=rng,
+            )
+            diagnostics = result.diagnostics
+            summary["max_kraus_probability_residual"] = max(
+                summary["max_kraus_probability_residual"],
+                diagnostics.max_kraus_probability_residual,
+            )
+            summary["used_kraus_copy_fallback"] |= diagnostics.used_kraus_copy_fallback
+            max_parent_batch = max(max_parent_batch, diagnostics.max_kraus_parent_batch)
+            max_gate_batch = max(max_gate_batch, diagnostics.max_gate_parent_batch)
+            leaves.extend(result.leaves)
+        nodes[index] = None  # Release completed prefixes when retain='none'.
+    diagnostics = _trajectory_diagnostics(
+        plan, (), shots=shots, coalesced=True,
+        max_live_branches=shots if retain != "none" else min(shots, frontier_size + 1),
+        diagnostic_infos=(summary,),
+    )
+    from dataclasses import replace
+
+    diagnostics = replace(
+        diagnostics, branches=len(leaves), continued_from_cap=True,
+        continued_shots=shots, max_kraus_parent_batch=max_parent_batch,
+        max_gate_parent_batch=max_gate_batch,
+    )
+    return CoalescedTrajectoryResult(tuple(leaves), plan=plan, shot_count=shots,
+                                     diagnostics=diagnostics)
 
 
 def run_coalesced_noisy_shots(
@@ -5645,6 +6176,11 @@ def run_coalesced_noisy_shots(
     parallel_workers: int = 1,
     parallel_backend: str = "thread",
     retain: str = "all",
+    _continue_on_cap=False,
+    _continuation_check=None,
+    _nodes=None,
+    _start_index=0,
+    _rng=None,
 ) -> CoalescedTrajectoryResult:
     """Replay independent Pauli-noise shots using exact count coalescing.
 
@@ -5682,11 +6218,14 @@ def run_coalesced_noisy_shots(
         importance_sampling, PauliErrorModel
     ):
         raise TypeError("importance_sampling must be a PauliErrorModel for Pauli noise.")
-    nodes = _initial_coalesced_nodes(optimizer_factory, shots)
-    channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
-    if nodes:
-        _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
-    rng = np.random.default_rng(channel_seed)
+    nodes = _initial_coalesced_nodes(optimizer_factory, shots) if _nodes is None else _nodes
+    if _rng is None:
+        channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
+        if nodes and _nodes is None:
+            _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
+        rng = np.random.default_rng(channel_seed)
+    else:
+        rng = _rng
     pending = []
 
     def flush():
@@ -5710,6 +6249,36 @@ def run_coalesced_noisy_shots(
         proposal_model.probabilities[label] for label in outcomes
     )
     for gate_index, entry in enumerate(entries):
+        if gate_index < _start_index:
+            continue
+        if _continue_on_cap:
+            support = _event_support(entry)
+            control = MpsOptimizer.control_event_parts(entry)
+            arity = sum(probability > 0 for probability in proposal_probabilities)
+            children = []
+            for node in nodes:
+                bound = 1
+                for _ in support or ():
+                    bound = min(node.count, bound * arity)
+                if control is not None:
+                    bound = node.count
+                children.append(bound)
+            if ((max_branches is not None and sum(children) > max_branches)
+                    or (max_branch_factor is not None
+                        and max(children, default=0) > max_branch_factor)):
+                if _continuation_check is not None:
+                    _continuation_check()
+
+                def resume(child):
+                    return run_coalesced_noisy_shots(
+                        lambda: None, entries, error_model, 1, run_kwargs=run_kwargs,
+                        importance_sampling=importance_sampling, retain=retain,
+                        _nodes=[child], _start_index=gate_index, _rng=rng,
+                    )
+
+                return _continue_trajectory_frontier(
+                    nodes, plan, gate_index, rng, run_kwargs, None, retain, resume=resume,
+                )
         pending.append((gate_index, entry))
         flush()
         conditional = _conditional_pauli_support(entry)
@@ -5797,201 +6366,8 @@ def run_coalesced_noisy_shots(
 
 
 # ---------------------------------------------------------------------------
-# Stim circuit compilation and complete native noise-channel sampling.
+# Stim plan entry point and native noise-channel sampling.
 # ---------------------------------------------------------------------------
-def _require_stim():
-    try:
-        import stim
-    except ImportError as exc:  # pragma: no cover - only without optional stim
-        raise ImportError(
-            "Stim circuit noise support requires the optional 'stim' package. "
-            "Install it with `python -m pip install stim`."
-        ) from exc
-    return stim
-
-
-def _coerce_stim_circuit(circuit):
-    stim = _require_stim()
-    if isinstance(circuit, stim.Circuit):
-        return circuit
-    if isinstance(circuit, str):
-        return stim.Circuit(circuit)
-    raise TypeError("circuit must be a stim.Circuit, Stim source string, or StimCircuitPlan.")
-
-
-def _stim_qubit_targets(instruction, *, allow_inverted_result=False) -> tuple[int, ...]:
-    targets = []
-    for target in instruction.targets_copy():
-        if not target.is_qubit_target:
-            raise NotImplementedError(
-                f"Stim instruction {instruction!s} has a non-qubit target that "
-                "cannot be replayed as an MPS gate stream."
-            )
-        if target.is_inverted_result_target and not allow_inverted_result:
-            raise NotImplementedError(
-                f"Stim instruction {instruction!s} has a classical-record "
-                "controlled/inverted target that cannot be replayed as an MPS gate stream."
-            )
-        targets.append(int(target.value))
-    return tuple(targets)
-
-
-def _stim_pauli_targets(instruction) -> tuple[tuple[str, int], ...]:
-    terms = []
-    for target in instruction.targets_copy():
-        if target.is_combiner:
-            raise NotImplementedError(
-                f"Stim noise instruction {instruction!s} unexpectedly contains a combiner."
-            )
-        if target.is_x_target:
-            axis = "X"
-        elif target.is_y_target:
-            axis = "Y"
-        elif target.is_z_target:
-            axis = "Z"
-        else:
-            raise NotImplementedError(
-                f"Stim noise instruction {instruction!s} has a non-Pauli target."
-            )
-        terms.append((axis, int(target.value)))
-    return tuple(terms)
-
-
-def _stim_record_targets(instruction) -> tuple[tuple[int, bool], ...]:
-    """Normalize Stim ``rec[k]`` targets to ``(offset, inverted)`` pairs."""
-    targets = []
-    for target in instruction.targets_copy():
-        if not target.is_measurement_record_target:
-            raise NotImplementedError(
-                f"Stim annotation {instruction!s} has a non-record target."
-            )
-        targets.append((int(target.value), bool(target.is_inverted_result_target)))
-    if not targets:
-        raise ValueError(f"Stim annotation {instruction!s} needs record targets.")
-    return tuple(targets)
-
-
-def _stim_unitary_matrix(name: str) -> np.ndarray:
-    """Return a cached small Clifford matrix from Stim's public tableau API."""
-    try:
-        return _STIM_UNITARY_CACHE[name]
-    except KeyError:
-        stim = _require_stim()
-        matrix = np.asarray(
-            stim.Tableau.from_named_gate(name).to_unitary_matrix(endian="big"),
-            dtype=np.complex128,
-        )
-        _STIM_UNITARY_CACHE[name] = matrix
-        return matrix
-
-
-def _compile_stim_measurement(instruction, name: str) -> tuple[object, ...]:
-    if name in _STIM_SINGLE_MEASUREMENTS:
-        axis = _STIM_SINGLE_MEASUREMENTS[name]
-        return tuple(
-            ("measure", axis, site)
-            for site in _stim_qubit_targets(instruction, allow_inverted_result=True)
-        )
-    if name in _STIM_SINGLE_MEASURE_RESETS:
-        axis = _STIM_SINGLE_MEASURE_RESETS[name]
-        return tuple(
-            ("measure_reset", axis, site)
-            for site in _stim_qubit_targets(instruction, allow_inverted_result=True)
-        )
-    if name in _STIM_PAIR_MEASUREMENTS:
-        targets = _stim_qubit_targets(instruction, allow_inverted_result=True)
-        if len(targets) % 2:
-            raise ValueError(f"Stim instruction {instruction!s} needs target pairs.")
-        axis = _STIM_PAIR_MEASUREMENTS[name]
-        return tuple(
-            ("measure", axis, targets[offset : offset + 2])
-            for offset in range(0, len(targets), 2)
-        )
-    if name != "MPP":
-        raise NotImplementedError(f"Unsupported Stim measurement instruction {instruction!s}.")
-
-    groups = []
-    targets = instruction.targets_copy()
-    offset = 0
-    while offset < len(targets):
-        axes = []
-        sites = []
-        while True:
-            target = targets[offset]
-            if target.is_x_target:
-                axis = "X"
-            elif target.is_y_target:
-                axis = "Y"
-            elif target.is_z_target:
-                axis = "Z"
-            else:
-                raise ValueError(f"Malformed Stim MPP instruction {instruction!s}.")
-            axes.append(axis)
-            sites.append(int(target.value))
-            offset += 1
-            if offset == len(targets) or not targets[offset].is_combiner:
-                break
-            offset += 1
-            if offset == len(targets):
-                raise ValueError(f"Malformed Stim MPP instruction {instruction!s}.")
-        groups.append(("measure", "".join(axes), tuple(sites)))
-    return tuple(groups)
-
-
-def _compile_stim_unitary(instruction, name: str) -> tuple[object, ...]:
-    stim = _require_stim()
-    if name in {"I", "II"}:
-        return ()
-    gate_data = stim.gate_data(name)
-    if gate_data.is_single_qubit_gate:
-        targets = _stim_qubit_targets(instruction)
-        matrix = _stim_unitary_matrix(name)
-        return tuple((matrix, site) for site in targets)
-    if gate_data.is_two_qubit_gate:
-        targets = _stim_qubit_targets(instruction)
-        if len(targets) % 2:
-            raise ValueError(f"Stim instruction {instruction!s} needs target pairs.")
-        matrix = _stim_unitary_matrix(name)
-        return tuple(
-            (matrix, targets[offset : offset + 2])
-            for offset in range(0, len(targets), 2)
-        )
-    raise NotImplementedError(
-        f"Stim instruction {instruction!s} is not a one- or two-qubit unitary "
-        "supported by both MPS optimizers."
-    )
-
-
-def _compile_stim_classical_control(instruction, name: str):
-    """Lower one Stim measurement-record-controlled Pauli gate.
-
-    The supported form is CX/CY/CZ rec[k] q, including an inverted record
-    target. It becomes the backend-independent ("if", k, bit, action) event.
-    More elaborate classical arithmetic remains intentionally outside this
-    compiler so a record cannot be mistaken for a quantum wire.
-    """
-    targets = instruction.targets_copy()
-    records = [target for target in targets if target.is_measurement_record_target]
-    qubits = [target for target in targets if target.is_qubit_target]
-    if len(targets) != 2 or len(records) != 1 or len(qubits) != 1:
-        raise NotImplementedError(
-            f"Stim instruction {instruction!s} must contain exactly one "
-            "measurement-record control and one qubit target."
-        )
-    if name not in {"CX", "CY", "CZ"}:
-        raise NotImplementedError(
-            f"Stim classical-record-controlled gate {name} is not supported."
-        )
-    record = records[0]
-    # Stim's inverted record target means 'apply when the recorded bit is 0'.
-    expected_bit = 0 if record.is_inverted_result_target else 1
-    axis = {"CX": "X", "CY": "Y", "CZ": "Z"}[name]
-    return (
-        "if",
-        int(record.value),
-        expected_bit,
-        (_stim_unitary_matrix(axis), int(qubits[0].value)),
-    )
 
 
 def compile_stim_circuit(circuit) -> StimCircuitPlan:
@@ -6006,93 +6382,39 @@ def compile_stim_circuit(circuit) -> StimCircuitPlan:
     feed-forward events. General classical arithmetic and record-to-record
     operations remain rejected.
     """
-    if isinstance(circuit, StimCircuitPlan):
-        return circuit
-    stim_circuit = _coerce_stim_circuit(circuit)
-    stim = _require_stim()
-    operations = []
-    detectors = []
-    observables = []
-    measurement_count = 0
-    for instruction_index, instruction in enumerate(stim_circuit.flattened()):
-        name = instruction.name.upper()
-        args = tuple(float(value) for value in instruction.gate_args_copy())
-        if name == "DETECTOR":
-            detectors.append(
-                StimDetector(
-                    instruction_index=instruction_index,
-                    detector_index=len(detectors),
-                    rec_targets=_stim_record_targets(instruction),
-                    coordinates=args,
-                    measurement_count=measurement_count,
-                )
-            )
-            continue
-        if name == "OBSERVABLE_INCLUDE":
-            if len(args) != 1 or int(args[0]) != args[0] or args[0] < 0:
-                raise ValueError(
-                    f"Stim OBSERVABLE_INCLUDE needs one nonnegative integer id: {instruction!s}."
-                )
-            observables.append(
-                StimObservable(
-                    instruction_index=instruction_index,
-                    observable_index=int(args[0]),
-                    rec_targets=_stim_record_targets(instruction),
-                    measurement_count=measurement_count,
-                )
-            )
-            continue
-        if name in _STIM_NOISE_NAMES:
-            targets = (
-                _stim_pauli_targets(instruction)
-                if name in {"E", "ELSE_CORRELATED_ERROR"}
-                else tuple(("I", site) for site in _stim_qubit_targets(instruction))
-            )
-            operations.append(
-                _StimPlanOperation(
-                    instruction_index, name, args, targets, is_noise=True
-                )
-            )
-            continue
-        if name in _STIM_IGNORED_NAMES:
-            continue
-        if any(
-            target.is_measurement_record_target
-            for target in instruction.targets_copy()
-        ):
-            entries = (_compile_stim_classical_control(instruction, name),)
-            operations.append(
-                _StimPlanOperation(instruction_index, name, args, (), entries)
-            )
-            continue
-        if name in _STIM_SINGLE_MEASUREMENTS or name in _STIM_SINGLE_MEASURE_RESETS:
-            entries = _compile_stim_measurement(instruction, name)
-        elif name in _STIM_PAIR_MEASUREMENTS or name == "MPP":
-            entries = _compile_stim_measurement(instruction, name)
-        elif name in _STIM_RESETS:
-            entries = tuple(
-                ("reset", site, _STIM_RESETS[name])
-                for site in _stim_qubit_targets(instruction)
-            )
-        else:
-            gate_data = stim.gate_data(name)
-            if not gate_data.is_unitary:
-                raise NotImplementedError(
-                    f"Stim instruction {instruction!s} is not a supported quantum "
-                    "operation for MPS replay."
-                )
-            entries = _compile_stim_unitary(instruction, name)
-        if name in _STIM_SINGLE_MEASUREMENTS or name in _STIM_SINGLE_MEASURE_RESETS:
-            measurement_count += len(entries)
-        elif name in _STIM_PAIR_MEASUREMENTS or name == "MPP":
-            measurement_count += len(entries)
-        operations.append(_StimPlanOperation(instruction_index, name, args, (), entries))
-    return StimCircuitPlan(
-        int(stim_circuit.num_qubits),
-        tuple(operations),
-        tuple(detectors),
-        tuple(observables),
-    )
+    return _stim_compile.compile_stim_circuit(circuit)
+
+
+def stim_plan_to_gate_stream(plan: StimCircuitPlan) -> tuple[object, ...]:
+    """Translate a compiled Stim plan into one unsampled Pepsy gate stream.
+
+    Ideal gates, measurements, resets and record-controlled Paulis retain their
+    order. Independent Pauli/depolarizing noise becomes stream-local stochastic
+    entries, so ``engine.run(shots=...)`` draws fresh faults internally. No RNG
+    or evolving state is used here. The returned tuple can be inspected or
+    passed to :func:`compile_trajectory_stream` or ``engine.compile``.
+
+    Correlated-error chains and heralded channels require the native Stim shot
+    runners and raise NotImplementedError here. Readout annotations remain in
+    ``plan``; resolve them with :func:`stim_readout_parities`. Generated ideal
+    matrices are NumPy complex128; explicit backend conversion is required
+    before installing them on a simulator using another backend or dtype.
+    """
+    return _stim_compile.stim_plan_to_gate_stream(plan)
+
+
+def stim_readout_parities(plan: StimCircuitPlan, measurement_records):
+    """Return raw detector and logical-observable parity arrays (uint8).
+
+    ``measurement_records`` is an iterable of per-shot or per-leaf structured
+    records whose outcomes are +1/-1. Internal bare-reset records are excluded.
+    Detector columns follow plan order; observable columns follow logical IDs,
+    combining repeated OBSERVABLE_INCLUDE annotations by XOR and retaining
+    missing IDs as zero columns. Empty batches retain their column dimensions.
+    Weight coalesced rows with the result's counts. These are raw parities,
+    without Stim reference-sample subtraction or decoder correction.
+    """
+    return _stim_compile.stim_readout_parities(plan, measurement_records)
 
 
 def _sample_label(

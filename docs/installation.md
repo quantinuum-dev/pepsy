@@ -28,6 +28,9 @@ may install further dependencies. See the
 [dependency audit](development/notes/dependency_minimums_2026_09.md) for
 minimum versions and tested combinations.
 
+Documentation is kept as Markdown under `docs/`; reading it needs no extra
+documentation packages.
+
 ## Optional features
 
 Install only the features you use. These commands are alternatives, not a
@@ -62,17 +65,3 @@ Combine extras when needed, and add `-e` for an editable development install:
 ```bash
 python -m pip install -e ".[torch,symmetry]"
 ```
-
-## Build the documentation
-
-Read the Markdown in `docs/` directly, or build a searchable HTML site with
-generated API pages:
-
-```bash
-python -m pip install -e ".[docs]"
-python -m sphinx -W --keep-going -b html docs docs/_build/html
-```
-
-The build reads the source tree statically through AutoAPI, so optional
-Torch, JAX, NetKet, Stim, and Symmray integrations do not need to be enabled
-just to generate the API navigation.

@@ -1,9 +1,7 @@
 # API migration guide
 
-The named import aliases listed below remain available during the 0.x
-compatibility window. This does not imply that every optimizer mode, default,
-or supported Python version is unchanged. New code should use owning
-namespaces and the canonical imports below.
+Use the owning namespaces and canonical imports below. This does not imply
+that every optimizer mode, default, or supported Python version is unchanged.
 
 ## Upgrading from 0.4.1 to 0.5.0
 
@@ -90,38 +88,34 @@ For `TreeSampler`, `backend="auto"` retains the dense compatibility path for
 Symmray input; request `backend="symmray"` or `"native"` for block-sparse
 sampling. See [tree sampling](../api/sampling/tree.md).
 
+## Removed duplicate imports
+
+The backend configuration and linalg helpers now live only in
+`pepsy.backends`. The duplicate `pepsy.tensors.*` and
+`pepsy.tensors.core.*` imports were removed. Import them from `pepsy.backends`.
+
+The unused aliases `pepsy.experimental.mera`,
+`pepsy.optimizers.QMeraParametricEnergyOptimizer`,
+`pepsy.sampling.MpsStabSampler`,
+`pepsy.optimizers.stabilizer_tn.StabilizerMps`,
+`pepsy.tensors.SpinfulFermionHubbard`, and `pepsy.tensors.hrps_to_ttn` were
+removed. Use `pepsy.experimental.qmera`,
+`pepsy.optimizers.QMeraEnergyOptimizer`,
+`pepsy.sampling.StabilizerMpsSampler`,
+`pepsy.optimizers.stabilizer_tn.StabilizerMpsSimulator`,
+`pepsy.tensors.SpinfulFermion`, and `pepsy.tensors.hrs_to_ttn`, respectively.
+
 ## Deprecated aliases
 
 | Deprecated import | Canonical import |
 | --- | --- |
-| `pepsy.tensors.backend_cupy` | `pepsy.backends.backend_cupy` |
-| `pepsy.tensors.backend_jax` | `pepsy.backends.backend_jax` |
-| `pepsy.tensors.backend_numpy` | `pepsy.backends.backend_numpy` |
-| `pepsy.tensors.backend_torch` | `pepsy.backends.backend_torch` |
-| `pepsy.tensors.build_backend` | `pepsy.backends.build_backend` |
-| `pepsy.tensors.get_default_array_backend` | `pepsy.backends.get_default_array_backend` |
-| `pepsy.tensors.get_default_grad_backend` | `pepsy.backends.get_default_grad_backend` |
-| `pepsy.tensors.get_torch_linalg_config` | `pepsy.backends.get_torch_linalg_config` |
-| `pepsy.tensors.register_jax_linalg` | `pepsy.backends.register_jax_linalg` |
-| `pepsy.tensors.register_torch_linalg` | `pepsy.backends.register_torch_linalg` |
-| `pepsy.tensors.reset_default_backends` | `pepsy.backends.reset_default_backends` |
-| `pepsy.tensors.reset_linalg_registrations` | `pepsy.backends.reset_linalg_registrations` |
-| `pepsy.tensors.set_default_array_backend` | `pepsy.backends.set_default_array_backend` |
-| `pepsy.tensors.set_default_grad_backend` | `pepsy.backends.set_default_grad_backend` |
-| `pepsy.tensors.TorchLinalgConfig` | `pepsy.backends.TorchLinalgConfig` |
 | `pepsy.tensors.build_contraction` | `pepsy.tensors.build_optimizer` |
-| `pepsy.tensors.SpinfulFermionHubbard` | `pepsy.tensors.SpinfulFermion` |
 | `pepsy.tensors.hrps_to_mps` | `pepsy.tensors.hrs_to_mps` |
 | `pepsy.tensors.hrps_to_peps` | `pepsy.tensors.hrs_to_peps` |
-| `pepsy.tensors.hrps_to_ttn` | `pepsy.tensors.hrs_to_ttn` |
 | `pepsy.boundary.normalize` | `pepsy.boundary.peps_normalize` |
 | `pepsy.boundary.infidelity` | `pepsy.boundary.peps_infidelity` |
-| `pepsy.optimizers.QMeraParametricEnergyOptimizer` | `pepsy.optimizers.QMeraEnergyOptimizer` |
 | `pepsy.optimizers.MpsStabOptimizer` | `pepsy.optimizers.StabilizerMpsSimulator` |
 | `pepsy.optimizers.TreeStabOptimizer` | `pepsy.optimizers.StabilizerTreeSimulator` |
-| `pepsy.sampling.MpsStabSampler` | `pepsy.sampling.StabilizerMpsSampler` |
-| `pepsy.optimizers.stabilizer_tn.StabilizerMps` | `pepsy.optimizers.stabilizer_tn.StabilizerMpsSimulator` |
-| `pepsy.experimental.mera` | `pepsy.experimental.qmera` |
 | `pepsy.optimizers.mera` | `pepsy.optimizers.qmera` |
 | `ham_tn.build_mpo(...)` | `ham_tn.to_mpo(...)` |
 | `ham_tn.build_pepo(...)` | `ham_tn.to_pepo(...)` |
@@ -135,12 +129,11 @@ python -W error::DeprecationWarning -m pytest
 
 ## Removal policy
 
-No alias is scheduled for removal from the current 0.x line. Before a planned
-breaking release, maintainers should review warning usage, publish release
-notes with the table above, and remove only aliases that have completed the
-deprecation window. The root-level compatibility facade is governed by
-[`api-manifest.txt`](api-manifest.txt) and remains unchanged until that
-review.
+The removed imports above are breaking changes and are recorded here for
+migration. The remaining aliases in the table still warn and are retained for
+the 0.x compatibility window. The root-level facade manifest is maintained in
+[`api-manifest.txt`](api-manifest.txt); add root exports only when a concrete
+consumer needs them.
 
 ## Tree operator conversion
 

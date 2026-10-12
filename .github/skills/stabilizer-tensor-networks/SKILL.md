@@ -82,11 +82,19 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   underscore `guess_<method>` spelling remains a compatibility alias. Native
   Symmray and fermionic paths retain their sector-aware materialized target
   and direct FIT initialization.
-- STN `dmrg1`, `dmrg2`, and `dmrg3` mirror the ordinary MPS local schedule:
+- STN `dmrg`/`fit` fixes one-site FIT, matching ordinary MPS. Reject multi-site
+  overrides and select `dmrg2`/`dmrg3` explicitly for growth.
+  STN `dmrg2` and `dmrg3` mirror the ordinary MPS local schedule:
   isolated SRC warm-up, two-site or three-site growth, then one-site refinement
   on longer windows. `dmrg3` falls back to two-site FIT on an adjacent two-site
-  window, and `dmrg1` latches one-site updates after full-chain rank ceilings
-  are reached. `get_fit_diagnostics()` exposes this schedule.
+  window. Legacy STN `dmrg1` retains two-site growth and latches one-site
+  updates after full-chain rank ceilings are reached. Adjacent windows inherit
+  `n_iter`, or `min(n_iter, fit_single_pair_n_iter)` with a positive explicit
+  cap; a one-update shortcut requires `fit_single_pair_fast_path=True`.
+  Dense native replay accepts the shared capability-checked `compression_opts`
+  mapping, including interior sub-MPO dispatch. FIT/native graded/branch-sum
+  routes reject unsupported explicit options. Keep run controls isolated and
+  forward them to shot replay. `get_fit_diagnostics()` exposes the schedule.
 - **Canonical-centre discipline** → preserve the simulator's `cur_orthog` info through
   quimb operations. Canonicalize explicitly before local projection, evaluate local
   expectations and unitary norm loss at the tracked centre, and renormalize the centre
@@ -170,6 +178,13 @@ The concrete pepsy + stim call surface is in
 [references/pepsy_stim_api.md](./references/pepsy_stim_api.md).
 
 ## Implementation status (already built in `src/pepsy/optimizers/stabilizer_tn/`)
+
+`mps_stab_optimizer.py` owns simulator state and replay. `_advice.py` owns
+stream analysis and recommendations, `_layout.py` owns coefficient-frame
+layout tracing/installation, and `_stream_helpers.py` owns shared stream
+parsing and Clifford localizers. Preserve descriptor binding and subclass
+dispatch through the simulator; these helpers do not own a second state.
+
 The simulator is mature and validated against dense/stim (`tests/test_stabilizer_tn.py`):
 `STNState` (tableau + `|p>`), Clifford and
 non-Clifford evolution, constructive exact cooling, explicit greedy Clifford cooling,
@@ -192,9 +207,10 @@ This collapses all of Lemma 2/3's $I_x,I_y,I_z$ mask algebra into one call:
 - **Non-Clifford rotation** $\exp(-i\theta/2\,O) \to \exp(-i\theta/2\,M)$ on $|\nu\rangle$.
 - **Measurement** $\langle O\rangle = \langle\nu|M|\nu\rangle$; collapse projector
   $\tfrac{I\pm O}{2}\to\tfrac{I\pm M}{2}$ on $|\nu\rangle$ (basis fixed), then renormalize.
-  This fixed-basis collapse is `measure(pauli, where)` (the default), is self-consistent
+  This fixed-basis collapse is `measure(pauli, where, disentangle=False)`, is self-consistent
   (repeated measurement is deterministic), and does **not** absorb $O$ into the stabilizer
-  group. The **basis-updating** form is `measure(pauli, where, absorb_basis=True)`: a
+  group. The default is `disentangle=True` (`None` selects the default): first try
+  certified native tableau collapse; otherwise use the **basis-updating** form. A
   Clifford $V$ localizes $M=C^\dagger O C$ to $\pm Z_k$, is applied to $|\nu\rangle$ with
   $V^\dagger$ absorbed into the basis ($|\psi\rangle$ preserved), and qubit $k$ is projected
   out — so the measured qubit **disentangles from** $|\nu\rangle$.

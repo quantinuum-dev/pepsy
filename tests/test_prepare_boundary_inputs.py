@@ -7,6 +7,7 @@ import quimb.tensor as qtn
 
 import pepsy
 from pepsy._internal.quimb import (
+    call_quimb_2d,
     quimb_1d_callable_compression_available,
     quimb_ctmrg_mode_available,
     quimb_ctmrg_projector_canonize_available,
@@ -148,6 +149,21 @@ def test_bdymps_chi_reports_largest_boundary_bond():
 
     bdy.expand_bnd(12)
     assert bdy.chi == max(int(mps.max_bond()) for mps in bdy.mps_b.values())
+
+
+def test_same_cap_retuning_regrows_compressed_boundaries():
+    """Reuse must not freeze a low-rank guess that has room to grow."""
+    from pepsy.boundary.metrics import _retune_bdy_to_chi
+
+    ket = qtn.PEPS.rand(3, 3, bond_dim=2, seed=37, dtype='complex128')
+    _, norm = pepsy.build_bra_ket(ket=ket)
+    bdy = pepsy.BdyMPS(tn_double=norm, chi=8)
+    for mps in bdy.mps_b.values():
+        mps.compress(max_bond=1)
+    assert bdy.chi == 1
+    assert bdy._chi_target == 8
+    _retune_bdy_to_chi(bdy, 8, 'regrow')
+    assert bdy.chi > 1
 
 
 def test_bdymps_expand_bnd_updates_all_boundaries():
@@ -2549,7 +2565,8 @@ def test_contract_flat_middle_out_matches_manual_quimb_at_finite_chi():
     """The facade should exactly compose Quimb's protected-region path."""
     tn = qtn.TN2D_rand(4, 7, D=3, seed=307, dtype="complex128")
     around = tuple((x, 3) for x in range(tn.Lx))
-    reduced = tn.contract_boundary(
+    reduced = call_quimb_2d(
+        tn.contract_boundary,
         max_bond=3,
         mode="direct",
         canonize=True,
@@ -3619,7 +3636,46 @@ def test_infidelity_reuses_existing_bdy_holder_entries(monkeypatch):
     assert len(captured["contract_calls"]) == 3
 
 
-def test_infidelity_retunes_all_existing_boundaries_to_requested_chi(monkeypatch):
+@pytest.mark.parametrize("method", ["dmrg", "mps"])
+@pytest.mark.parametrize("strip_exponent", [False, True])
+def test_metric_cap_pairs_match_dense_norm_and_infidelity(monkeypatch, method, strip_exponent):
+    """Real contractions use each requested cap and reproduce dense references."""
+    metrics = pepsy.boundary.metrics
+    original_contract = metrics._contract_peps_double_layer
+    calls = []
+
+    def record_contract(*args, **kwargs):
+        calls.append(kwargs["chi"])
+        return original_contract(*args, **kwargs)
+
+    monkeypatch.setattr(metrics, "_contract_peps_double_layer", record_contract)
+    p = qtn.PEPS.rand(2, 3, bond_dim=2, seed=981, dtype="complex128")
+    target = qtn.PEPS.rand(2, 3, bond_dim=2, seed=982, dtype="complex128")
+    dense = p.to_dense().reshape(-1)
+    dense_target = target.to_dense().reshape(-1)
+    reference = 1 - abs(np.vdot(dense_target, dense)) ** 2 / (
+        np.vdot(dense, dense).real * np.vdot(dense_target, dense_target).real
+    )
+    opts = dict(chi=(8, 10), method=method, strip_exponent=strip_exponent)
+    result = pepsy.peps_infidelity(p, target, **opts)
+    assert calls == [8, 8, 10]
+    assert result["infidelity"] == pytest.approx(reference, abs=1e-10)
+    np.testing.assert_allclose(p.to_dense().reshape(-1), dense, atol=1e-12)
+    calls.clear()
+    pepsy.peps_infidelity(p, target, norm=result["norm"], norm_target=result["norm_target"],
+                         **opts)
+    assert calls == [10]
+    calls.clear()
+    pepsy.peps_normalize(p, **opts)
+    assert calls == [8]
+    normalized = p.to_dense().reshape(-1)
+    np.testing.assert_allclose(normalized, dense / np.linalg.norm(dense), atol=1e-10)
+
+
+@pytest.mark.parametrize("chi,norm_cap,overlap_cap", [(10, 10, 10), ((6, 9), 6, 9)])
+def test_infidelity_retunes_all_existing_boundaries_to_requested_chi(
+    monkeypatch, chi, norm_cap, overlap_cap,
+):
     """Existing bdy handles should all retune to the requested chi."""
     captured = {"contract_calls": []}
 
@@ -3657,16 +3713,16 @@ def test_infidelity_retunes_all_existing_boundaries_to_requested_chi(monkeypatch
     _ = pepsy.peps_infidelity(
         p,
         p_target,
-        chi=10,
+        chi=chi,
         bdy=bdy,
         bdy_target=bdy_target,
         bdy_overlap=bdy_overlap,
         progress=False,
     )
 
-    assert bdy["bdy"].chi == 10
-    assert bdy_target["bdy"].chi == 10
-    assert bdy_overlap["bdy"].chi == 10
-    assert bdy["bdy"].expands == [(10, True)]
-    assert bdy_target["bdy"].expands == [(10, True)]
-    assert bdy_overlap["bdy"].expands == []
+    assert bdy["bdy"].chi == norm_cap
+    assert bdy_target["bdy"].chi == norm_cap
+    assert bdy_overlap["bdy"].chi == overlap_cap
+    assert bdy["bdy"].expands == [(norm_cap, True)]
+    assert bdy_target["bdy"].expands == [(norm_cap, True)]
+    assert bdy_overlap["bdy"].expands == ([] if overlap_cap == 10 else [(overlap_cap, True)])

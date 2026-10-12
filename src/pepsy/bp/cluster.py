@@ -87,7 +87,6 @@ from .._internal.quimb import (
     quimb_bp_constructor_option_supported as _quimb_bp_constructor_option_supported,
     quimb_bp_constructor_options as _quimb_bp_constructor_options,
     quimb_gloop_options as _quimb_gloop_options,
-    quimb_bp_run_options as _quimb_bp_run_options,
 )
 
 __all__ = [
@@ -170,7 +169,9 @@ def _run_plain_bp(
         "info": info,
         "progbar": progbar,
     }
-    bp.run(**_quimb_bp_run_options(bp, run_opts))
+    from .relay import _run_bp_strict
+
+    _run_bp_strict(bp, run_opts)
     info["quimb_converged"] = bool(info.get("converged", False))
     info["converged"] = _strict_converged(info, tol, tol_abs)
     return info

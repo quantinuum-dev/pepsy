@@ -1,6 +1,8 @@
 """Tests for :class:`pepsy.TreeSampler`, the tree-tensor-network perfect sampler."""
 
 from itertools import product
+import gc
+import weakref
 
 import numpy as np
 import pytest
@@ -161,6 +163,393 @@ def test_physical_root_probabilities_and_amplitudes_match_statevector():
 # -- empirical sampling -------------------------------------------------------
 
 
+@pytest.mark.parametrize("chunk_size", [1, 7, 1000])
+@pytest.mark.parametrize("root_qubit", [None, 2])
+def test_optional_chunks_preserve_seeded_born_samples(chunk_size, root_qubit):
+    n = 5
+    plan = TreePlan.from_order(
+        [q for q in range(n) if q != root_qubit],
+        structure="balanced", root_qubit=root_qubit,
+    )
+    opt = TreeOptimizer(_random_stream(n, 30, np.random.default_rng(91)), tree=plan, chi=32)
+    reference = TreeSampler(opt, seed=17)
+    sampler = TreeSampler(opt, seed=17, chunk_size=chunk_size)
+    before = opt.to_dense().copy()
+    for seed in (9, None, None):
+        expected = reference.sample_batch(31, seed=seed)
+        actual = sampler.sample_batch(31, seed=seed)
+        np.testing.assert_array_equal(actual.configs, expected.configs)
+        np.testing.assert_allclose(actual.probs, expected.probs, atol=1e-12)
+        _, exact = _exact_probs(opt, n)
+        indices = actual.configs @ (2 ** np.arange(n - 1, -1, -1))
+        np.testing.assert_allclose(actual.probs, exact[indices], atol=1e-12)
+    np.testing.assert_allclose(opt.to_dense(), before, atol=1e-12)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1, 1.5, True])
+def test_invalid_tree_sample_chunk_size(chunk_size):
+    with pytest.raises(ValueError, match="chunk_size"):
+        TreeSampler(None, chunk_size=chunk_size)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch", "torch_cuda", "cupy"])
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+def test_chunks_release_outputs_and_preserve_backend(monkeypatch, backend, dtype):
+    """Finished shot buffers must die before the next contraction starts."""
+    state = pepsy.TreeTensorNetwork.rand(
+        TreePlan.from_order(range(5), structure="balanced"),
+        D=4, seed=19, dtype=dtype,
+    )
+    if backend.startswith("torch"):
+        torch = pytest.importorskip("torch")
+        if backend == "torch_cuda" and not torch.cuda.is_available():
+            pytest.skip("Torch CUDA unavailable")
+        device = "cuda:0" if backend == "torch_cuda" else "cpu"
+        state.apply_to_arrays(
+            lambda a: torch.as_tensor(a, dtype=getattr(torch, dtype), device=device)
+        )
+    elif backend == "cupy":
+        cp = pytest.importorskip("cupy")
+        try:
+            if cp.cuda.runtime.getDeviceCount() < 1:
+                pytest.skip("CUDA unavailable")
+        except cp.cuda.runtime.CUDARuntimeError:
+            pytest.skip("CUDA unavailable")
+        state.apply_to_arrays(lambda a: cp.asarray(a))
+
+    reference = TreeSampler(state, backend="native").sample_batch(11, seed=23)
+    sampler = TreeSampler(state, backend="native", chunk_size=4)
+    original = sampler._sample_arrays
+    previous = []
+    sizes = []
+
+    def checked_sample(n_samples, rng, **kwargs):
+        assert all(ref() is None for ref in previous)
+        result = original(n_samples, rng, **kwargs)
+        previous[:] = [weakref.ref(array) for array in result]
+        sizes.append(n_samples)
+        return result
+
+    monkeypatch.setattr(sampler, "_sample_arrays", checked_sample)
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        result = sampler.sample_batch(11, seed=23)
+        assert all(ref() is None for ref in previous)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+    assert sizes == [4, 4, 3]
+    assert result.backend == reference.backend
+    assert result.configs.dtype == reference.configs.dtype
+    assert result.probs.dtype == reference.probs.dtype
+    if backend != "numpy":
+        assert result.configs.device == reference.configs.device
+        assert result.probs.device == reference.probs.device
+    actual, expected = result.to_numpy(), reference.to_numpy()
+    np.testing.assert_array_equal(actual.configs, expected.configs)
+    tolerance = 1e-6 if dtype == "complex64" else 1e-12
+    np.testing.assert_allclose(actual.probs, expected.probs, atol=tolerance)
+    np.testing.assert_allclose(
+        actual.probs, sampler.probabilities(actual.configs), atol=tolerance,
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [11, 20])
+def test_single_chunk_reuses_kernel_outputs(monkeypatch, chunk_size):
+    sampler = TreeSampler(TreeOptimizer([], n=2), chunk_size=chunk_size)
+    original = sampler._sample_arrays
+    outputs = []
+
+    def record_sample(*args, **kwargs):
+        result = original(*args, **kwargs)
+        outputs.append(result)
+        return result
+
+    monkeypatch.setattr(sampler, "_sample_arrays", record_sample)
+    configs, probs = sampler.sample_arrays(11, seed=3)
+    assert len(outputs) == 1
+    assert configs is outputs[0][0]
+    assert probs is outputs[0][1]
+
+
+def test_cupy_chunk_sampling_uses_state_device():
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 2:
+            pytest.skip("Requires two CUDA devices")
+    except cp.cuda.runtime.CUDARuntimeError:
+        pytest.skip("CUDA unavailable")
+    with cp.cuda.Device(1):
+        state = TreeOptimizer([(pepsy.h(), 0)], n=3).tn
+        state.apply_to_arrays(cp.asarray)
+        sampler = TreeSampler(state, backend="native", chunk_size=3)
+        reference = sampler.sample_batch(8, seed=4).to_numpy()
+    with cp.cuda.Device(0):
+        result = sampler.sample_batch(8, seed=4)
+        scores = sampler.probabilities(reference.configs, to_numpy=False)
+        assert cp.cuda.runtime.getDevice() == 0
+    assert result.configs.device.id == result.probs.device.id == scores.device.id == 1
+    np.testing.assert_array_equal(result.to_numpy().configs, reference.configs)
+    np.testing.assert_allclose(result.to_numpy().probs, reference.probs)
+    np.testing.assert_allclose(scores.get(), reference.probs)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch", "cupy"])
+@pytest.mark.parametrize("batch", [1, 3])
+def test_chunked_density_transfer_matches_dense_without_full_environment(monkeypatch, backend, batch):
+    import pepsy.sampling.tree as module
+
+    state = TreeOptimizer([], n=2).tn
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        state.apply_to_arrays(lambda x: torch.as_tensor(x, dtype=torch.complex128))
+    elif backend == "cupy":
+        cp = pytest.importorskip("cupy")
+        try:
+            if cp.cuda.runtime.getDeviceCount() < 1:
+                pytest.skip("CUDA unavailable")
+        except cp.cuda.runtime.CUDARuntimeError:
+            pytest.skip("CUDA unavailable")
+        state.apply_to_arrays(lambda x: cp.asarray(x, dtype=cp.complex128))
+    sampler = TreeSampler(state, chunk_size=3)
+    rng = np.random.default_rng(27)
+    ur = rng.normal(size=(5, 7, 3)) + 1j * rng.normal(size=(5, 7, 3))
+    x = rng.normal(size=(batch, 5, 5)) + 1j * rng.normal(size=(batch, 5, 5))
+    rho = x @ x.conj().transpose(0, 2, 1)
+    expected = np.einsum("BaA,acF,AdF->Bcd", rho, ur, ur.conj())
+    monkeypatch.setattr(module, "_SAMPLE_ENV_BYTES", 5 * 5 * 7 * 16 * 2)
+    original = sampler._einsum
+    widths = []
+
+    def checked_einsum(equation, *operands):
+        assert equation != "acF,AdF->acAd"
+        result = original(equation, *operands)
+        if equation == "acF,AdF->aAcd":
+            widths.append(result.shape[2])
+            assert np.prod(result.shape) * 16 <= module._SAMPLE_ENV_BYTES
+        return result
+
+    monkeypatch.setattr(sampler, "_einsum", checked_einsum)
+    actual = sampler._sample_first_child_density(sampler._as_backend(rho), sampler._as_backend(ur))
+    if backend == "torch":
+        assert torch.is_tensor(actual)
+        actual = actual.numpy()
+    elif backend == "cupy":
+        assert isinstance(actual, cp.ndarray)
+        actual = actual.get()
+    np.testing.assert_allclose(actual, expected, atol=1e-11)
+    assert widths == ([] if batch == 1 else [2, 2, 2, 1])
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch", "torch_cuda", "cupy"])
+@pytest.mark.parametrize("root_qubit,chunk_size", [(None, None), (None, 7), (2, 7)])
+def test_shared_density_samples_match_dense_conditionals(
+    monkeypatch, backend, root_qubit, chunk_size,
+):
+    """Shared prefixes must branch with the same draws and exact Born weights."""
+    n, count, seed = 7, 31, 17
+    plan = TreePlan.from_order(
+        [q for q in range(n) if q != root_qubit],
+        structure="balanced", max_arity=3,
+        top_arity=3 if root_qubit is None else 2, root_qubit=root_qubit,
+    )
+    state = pepsy.TreeTensorNetwork.rand(plan, D=5, seed=19, dtype="complex128")
+    vector = np.asarray(state.to_dense()).reshape(-1)
+    exact = np.abs(vector) ** 2
+    exact /= exact.sum()
+    if backend.startswith("torch"):
+        torch = pytest.importorskip("torch")
+        if backend == "torch_cuda" and not torch.cuda.is_available():
+            pytest.skip("Torch CUDA unavailable")
+        device = "cuda:0" if backend == "torch_cuda" else "cpu"
+        state.apply_to_arrays(lambda a: torch.as_tensor(a, device=device))
+    elif backend == "cupy":
+        cp = pytest.importorskip("cupy")
+        try:
+            if cp.cuda.runtime.getDeviceCount() < 1:
+                pytest.skip("CUDA unavailable")
+        except cp.cuda.runtime.CUDARuntimeError:
+            pytest.skip("CUDA unavailable")
+        state.apply_to_arrays(cp.asarray)
+
+    center = state.orthogonality_center
+    source_arrays = tuple(t.data for t in state.tensors)
+    sampler = TreeSampler(state, backend="native", strategy="standard", chunk_size=chunk_size)
+    # Enumerate the dense conditional distribution in physical traversal order.
+    order, stack = [], [plan.root]
+    while stack:
+        node = stack.pop()
+        if node in plan.qubit_of_node:
+            order.append(plan.qubit_of_node[node])
+        stack.extend(reversed(plan.children[node]))
+    basis = _all_configs(n)
+    weights = np.broadcast_to(exact, (count, len(exact))).copy()
+    expected = np.empty((count, n), dtype=np.int64)
+    for q, draws in zip(order, np.random.default_rng(seed).random((n, count))):
+        p0 = weights[:, basis[:, q] == 0].sum(axis=1) / weights.sum(axis=1)
+        expected[:, q] = draws > p0
+        weights *= basis[None, :, q] == expected[:, None, q]
+
+    physical_batches = []
+    einsum = sampler._einsum
+
+    def record_physical_batch(equation, *operands):
+        if equation in {"BaA,axF,AxF->Bx", "Ba,axF->BxF"}:
+            physical_batches.append(operands[0].shape[0])
+        return einsum(equation, *operands)
+
+    monkeypatch.setattr(sampler, "_einsum", record_physical_batch)
+    result = sampler.sample_batch(count, seed=seed)
+    nchunks = 1 if chunk_size is None else (count + chunk_size - 1) // chunk_size
+    assert physical_batches[::n] == [1] * nchunks
+    assert max(physical_batches) == min(chunk_size or count, count)
+    assert result.backend == ("torch" if backend.startswith("torch") else backend)
+    if backend != "numpy":
+        assert result.configs.device == result.probs.device == source_arrays[0].device
+    actual = result.to_numpy()
+    np.testing.assert_array_equal(actual.configs, expected)
+    indices = expected @ (2 ** np.arange(n - 1, -1, -1))
+    np.testing.assert_allclose(actual.probs, exact[indices], atol=1e-12, rtol=1e-12)
+    assert state.orthogonality_center == center
+    assert all(t.data is original for t, original in zip(state.tensors, source_arrays))
+
+
+def test_shared_density_transfer_preserves_torch_gradients():
+    torch = pytest.importorskip("torch")
+    state = TreeOptimizer([], n=2).tn
+    state.apply_to_arrays(lambda a: torch.as_tensor(a, dtype=torch.complex128))
+    sampler = TreeSampler(state, backend="native")
+    rng = torch.Generator().manual_seed(21)
+    x = torch.randn(1, 3, 3, dtype=torch.complex128, generator=rng, requires_grad=True)
+    ur = torch.randn(3, 4, 2, dtype=torch.complex128, generator=rng, requires_grad=True)
+    rho = x @ x.mH
+    actual = sampler._sample_first_child_density(rho, ur)
+    expected = torch.einsum("BaA,acF,AdF->Bcd", rho, ur, ur.conj())
+    torch.testing.assert_close(actual, expected, atol=1e-11, rtol=1e-11)
+    actual_grads = torch.autograd.grad(actual.real.sum(), (x, ur), retain_graph=True)
+    expected_grads = torch.autograd.grad(expected.real.sum(), (x, ur))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, atol=1e-11, rtol=1e-11)
+
+
+@pytest.mark.parametrize("root_qubit", [None, 2])
+def test_pure_sampling_environment_avoids_last_density(monkeypatch, root_qubit):
+    """The final physical site uses a vector while earlier siblings stay mixed."""
+    plan = TreePlan.from_order(
+        [q for q in range(7) if q != root_qubit], structure="balanced",
+        max_arity=3, top_arity=3 if root_qubit is None else 2,
+        root_qubit=root_qubit,
+    )
+    state = pepsy.TreeTensorNetwork.rand(plan, D=5, seed=19, dtype="complex128")
+    sampler = TreeSampler(state, strategy="standard", chunk_size=11)
+    physical_routes = []
+    einsum = sampler._einsum
+
+    def record_route(equation, *operands):
+        if equation in {"BaA,axF,AxF->Bx", "Ba,axF->BxF"}:
+            physical_routes.append(equation)
+        return einsum(equation, *operands)
+
+    monkeypatch.setattr(sampler, "_einsum", record_route)
+    actual = sampler.sample_batch(11, seed=17)
+    assert physical_routes[-1] == "Ba,axF->BxF"
+    assert "BaA,axF,AxF->Bx" in physical_routes
+    exact = np.abs(np.asarray(state.to_dense()).reshape(-1)) ** 2
+    exact /= exact.sum()
+    indices = actual.configs @ (2 ** np.arange(6, -1, -1))
+    np.testing.assert_allclose(actual.probs, exact[indices], atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 3])
+@pytest.mark.parametrize("root_qubit", [None, 2])
+def test_vector_sampling_preserves_torch_probability_gradients(chunk_size, root_qubit):
+    """For the drawn configurations, sampling and independent scoring differentiate alike."""
+    torch = pytest.importorskip("torch")
+    plan = TreePlan.from_order(
+        [q for q in range(5) if q != root_qubit],
+        structure="balanced", root_qubit=root_qubit,
+    )
+    state = pepsy.TreeTensorNetwork.rand(plan, D=4, seed=19, dtype="complex128")
+    state.apply_to_arrays(lambda a: torch.as_tensor(a).requires_grad_())
+    # Free source parameters need differentiable QR factors; an isometry
+    # proof establishes a value, not unconstrained parameter derivatives.
+    state.invalidate_canonical_form()
+    inputs = tuple(t.data for t in state.tensors)
+    sampler = TreeSampler(state, backend="native", chunk_size=chunk_size)
+    configs, actual = sampler.sample_arrays(7, seed=17)
+    # Sampling differentiates normalized conditionals. Explicit normalization
+    # also differentiates the captured scoring arrays' overall scale.
+    expected = sampler.probabilities(configs, to_numpy=False)
+    expected = expected / sampler.probabilities(_all_configs(5), to_numpy=False).sum()
+    torch.testing.assert_close(actual, expected, atol=1e-11, rtol=1e-11)
+    actual_gradients = torch.autograd.grad(actual.sum(), inputs, retain_graph=True)
+    expected_gradients = torch.autograd.grad(expected.sum(), inputs)
+    for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual_gradient, expected_gradient, atol=1e-10, rtol=1e-10)
+
+
+@pytest.mark.parametrize("method", ["amplitudes", "probabilities"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_scoring_releases_snapshot_without_cyclic_gc(monkeypatch, method, fail):
+    """Discarded sampler snapshots die immediately, including after a scoring error."""
+    state = pepsy.TreeTensorNetwork.rand(
+        TreePlan.from_order(range(5), structure="balanced"), D=4, seed=19,
+    )
+    sampler = TreeSampler(state)
+    sampler_ref = weakref.ref(sampler)
+    snapshot_refs = [weakref.ref(a) for a in sampler._arrays.values()]
+    configs = np.zeros((3, 5), dtype=np.int64)
+    configs_ref = weakref.ref(configs)
+    if fail:
+        def failed_contract(*args, **kwargs):
+            raise RuntimeError("injected scoring failure")
+
+        monkeypatch.setattr(TreeSampler, "_tensordot", failed_contract)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        if fail:
+            with pytest.raises(RuntimeError, match="injected scoring failure"):
+                getattr(sampler, method)(configs)
+        else:
+            getattr(sampler, method)(configs)
+        del sampler, configs
+        assert sampler_ref() is None
+        assert configs_ref() is None
+        assert all(ref() is None for ref in snapshot_refs)
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("off_root", [False, True])
+def test_sampling_reuses_canonical_path_and_does_not_move_center(monkeypatch, off_root):
+    plan = TreePlan.from_order(range(7), structure="balanced")
+    state = pepsy.TreeTensorNetwork.rand(plan, D=4, seed=19, dtype="complex128")
+    if off_root:
+        state.shift_orthogonality_center(plan.leaf_of_qubit[0])
+    center = state.orthogonality_center
+    source = [(t.data, t.left_inds) for t in state.tensors]
+    edges = []
+    original = pepsy.TreeTensorNetwork.canonize_edge_
+
+    def record_edge(network, a, b, **kwargs):
+        edges.append((a, b))
+        return original(network, a, b, **kwargs)
+
+    monkeypatch.setattr(pepsy.TreeTensorNetwork, "canonize_edge_", record_edge)
+    sampler = TreeSampler(state)
+    assert len(edges) == len(plan.node_path(center, plan.root)) - 1
+    before = len(edges)
+    sampler.sample_arrays(13, seed=17)
+    assert len(edges) == before
+    assert state.orthogonality_center == center
+    assert all(t.data is data and t.left_inds == left_inds
+               for t, (data, left_inds) in zip(state.tensors, source))
+
+
 def test_sample_frequencies_converge_to_born():
     n = 4
     rng = np.random.default_rng(3)
@@ -269,7 +658,8 @@ def test_batch_result_helpers():
     assert np.array_equal(np_copy.probs, res.probs)
 
 
-def test_tree_sampler_preserves_torch_backend_and_supports_host_copy():
+@pytest.mark.parametrize("chunk_size", [None, 7])
+def test_tree_sampler_preserves_torch_backend_and_supports_host_copy(chunk_size):
     torch = pytest.importorskip("torch")
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     state = TreeOptimizer(None, n=3).tn
@@ -279,7 +669,7 @@ def test_tree_sampler_preserves_torch_backend_and_supports_host_copy():
     )
     opt = TreeOptimizer([(h, 0)], state=state, run=True, mode="direct")
 
-    sampler = TreeSampler(opt, backend="native", seed=0)
+    sampler = TreeSampler(opt, backend="native", seed=0, chunk_size=chunk_size)
     assert sampler.resolved_backend == "torch"
     configs = _all_configs(3)
     probs = sampler.probabilities(configs, to_numpy=False)
@@ -295,7 +685,7 @@ def test_tree_sampler_preserves_torch_backend_and_supports_host_copy():
     assert isinstance(host.configs, np.ndarray)
     assert np.allclose(host.probs, sampler.probabilities(host.configs))
 
-    host_sampler = TreeSampler(opt, backend="numpy")
+    host_sampler = TreeSampler(opt, backend="numpy", chunk_size=chunk_size)
     host_configs, host_probs = host_sampler.sample_arrays(8, seed=4)
     assert isinstance(host_configs, np.ndarray)
     assert isinstance(host_probs, np.ndarray)
@@ -309,7 +699,8 @@ def test_tree_sampler_rejects_explicit_backend_mismatch():
         TreeSampler(opt, backend="torch")
 
 
-def test_tree_sampler_preserves_cupy_backend_when_available():
+@pytest.mark.parametrize("chunk_size", [None, 7])
+def test_tree_sampler_preserves_cupy_backend_when_available(chunk_size):
     cupy = pytest.importorskip("cupy")
     try:
         if cupy.cuda.runtime.getDeviceCount() < 1:
@@ -321,7 +712,7 @@ def test_tree_sampler_preserves_cupy_backend_when_available():
     state = TreeOptimizer(None, n=2).tn
     state.apply_to_arrays(to_backend)
     opt = TreeOptimizer([(to_backend(pepsy.h()), 0)], state=state, mode="direct")
-    sampler = TreeSampler(opt, backend="native")
+    sampler = TreeSampler(opt, backend="native", chunk_size=chunk_size)
 
     result = sampler.sample_batch(16, seed=2)
     assert sampler.resolved_backend == "cupy"
@@ -329,6 +720,7 @@ def test_tree_sampler_preserves_cupy_backend_when_available():
     assert isinstance(result.probs, cupy.ndarray)
     assert isinstance(sampler.probabilities(result.configs, to_numpy=False), cupy.ndarray)
     assert isinstance(result.to_numpy().configs, np.ndarray)
+    np.testing.assert_allclose(result.to_numpy().probs, sampler.probabilities(result.configs))
 
 
 def test_sample_returns_list_result():
@@ -465,10 +857,11 @@ def test_fermionic_tree_probabilities_match_statevector(root_qubit):
     assert np.max(np.abs(probs - exact)) < 1e-10
 
 
-def test_fermionic_tree_samples_conserve_charge_and_decode():
+@pytest.mark.parametrize("strategy", ["standard", "factor"])
+def test_fermionic_tree_samples_conserve_charge_and_decode(strategy):
     pytest.importorskip("symmray")
     engine, fermion, target, L = _fermionic_tree(chi=64)
-    sampler = TreeSampler(engine, fermion=fermion, seed=0)
+    sampler = TreeSampler(engine, fermion=fermion, seed=0, strategy=strategy)
 
     res = sampler.sample_batch(2000, seed=42)
     assert res.configs.shape == (2000, L)
@@ -510,7 +903,8 @@ def test_non_fermionic_occupations_raises():
         res.occupations()
 
 
-def test_tree_sampler_symmray_generic_abelian_stays_block_sparse(monkeypatch):
+@pytest.mark.parametrize("strategy", ["standard", "factor"])
+def test_tree_sampler_symmray_generic_abelian_stays_block_sparse(monkeypatch, strategy):
     """Generic Abelian TTNs use the native path without densifying tensors."""
     pytest.importorskip("symmray")
     plan = TreePlan.from_order(range(4), max_arity=2, top_arity=2)
@@ -528,7 +922,7 @@ def test_tree_sampler_symmray_generic_abelian_stays_block_sparse(monkeypatch):
         raise AssertionError("native TreeSampler must not densify Symmray data")
 
     monkeypatch.setattr(type(state.node_tensor(0).data), "to_dense", fail_dense)
-    sampler = TreeSampler(state, backend="symmray", seed=7)
+    sampler = TreeSampler(state, backend="symmray", seed=7, strategy=strategy)
     configs = np.asarray(list(product(range(2), repeat=4)), dtype=np.int64)
     amplitudes = sampler.amplitudes(configs)
     probabilities = sampler.probabilities(configs)
@@ -550,7 +944,8 @@ def test_tree_sampler_symmray_generic_abelian_stays_block_sparse(monkeypatch):
 
 
 @pytest.mark.parametrize("symmetry", ("U1",))
-def test_tree_sampler_symmray_fermionic_native_matches_statevector(symmetry):
+@pytest.mark.parametrize("strategy", ["standard", "factor"])
+def test_tree_sampler_symmray_fermionic_native_matches_statevector(symmetry, strategy):
     """Native fermionic tree probabilities agree with a dense oracle."""
     pytest.importorskip("symmray")
     fermion = pepsy.Fermion(spinful=True, symmetry=symmetry)
@@ -561,7 +956,7 @@ def test_tree_sampler_symmray_fermionic_native_matches_statevector(symmetry):
         chi=4,
         seed=17,
     )
-    sampler = TreeSampler(state, backend="symmray", fermion=fermion)
+    sampler = TreeSampler(state, backend="symmray", fermion=fermion, strategy=strategy)
     configs = np.asarray(
         list(product(*(range(len(code_map)) for code_map in sampler.physical_code_maps))),
         dtype=np.int64,
@@ -581,6 +976,8 @@ def test_tree_sampler_symmray_fermionic_native_matches_statevector(symmetry):
         probabilities,
         atol=1e-11,
     )
+    sampled = sampler.sample_batch(8, seed=11)
+    np.testing.assert_allclose(sampler.probabilities(sampled.configs), sampled.probs, atol=1e-11)
 
 
 @pytest.mark.parametrize(
@@ -608,7 +1005,10 @@ def test_tree_sampler_symmray_fermionic_native_matches_statevector(symmetry):
         ),
     ),
 )
-def test_tree_sampler_symmray_fermion_code_maps(monkeypatch, symmetry, occupations, expected):
+@pytest.mark.parametrize("chunk_size", [None, 3])
+def test_tree_sampler_symmray_fermion_code_maps(
+    monkeypatch, symmetry, occupations, expected, chunk_size,
+):
     """Fermionic code decoding follows each Symmray symmetry convention."""
     pytest.importorskip("symmray")
     fermion = pepsy.Fermion(spinful=True, symmetry=symmetry)
@@ -618,7 +1018,9 @@ def test_tree_sampler_symmray_fermion_code_maps(monkeypatch, symmetry, occupatio
         raise AssertionError("native TreeSampler must not densify Symmray data")
 
     monkeypatch.setattr(type(state.node_tensor(0).data), "to_dense", fail_dense)
-    sampler = TreeSampler(state, backend="symmray", fermion=fermion, seed=0)
+    sampler = TreeSampler(
+        state, backend="symmray", fermion=fermion, seed=0, chunk_size=chunk_size,
+    )
     batch = sampler.sample_batch(4, seed=5)
 
     assert sampler.resolved_backend == "symmray"

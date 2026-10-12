@@ -855,6 +855,20 @@ def _fixed_rank_svd(matrix):
             singular_values[..., :rank],
             right[..., :rank, :],
         )
+    if _backend_name(matrix) == "numpy":
+        try:
+            return ar.do("linalg.svd", matrix, full_matrices=False)
+        except np.linalg.LinAlgError as original_error:
+            if matrix.ndim != 2 or not np.isfinite(matrix).all():
+                raise
+            # LAPACK's divide-and-conquer SVD can fail on a finite,
+            # ill-conditioned graph-assembly core. The optional general
+            # rectangular driver is a numerical fallback, not a rank policy.
+            try:
+                from scipy.linalg import svd  # pylint: disable=import-outside-toplevel
+            except ImportError:
+                raise original_error from None
+            return svd(matrix, full_matrices=False, lapack_driver="gesvd")
     if _backend_name(matrix) != "torch":
         return ar.do("linalg.svd", matrix, full_matrices=False)
 
@@ -1211,17 +1225,13 @@ def _sparse_virtual_to_dense(tensor):
 
 
 def _dense_virtual_to_sparse(array):
-    """Convert a NumPy virtual tensor to retained operator-valued blocks."""
-    if _backend_name(array) not in {"builtins", "numpy"}:
-        raise TypeError(
-            "native block-sparse Symmray MPO compilation currently requires "
-            "NumPy local tensors."
-        )
+    """Retain backend blocks, including numerical zeros with live derivatives."""
+    numpy = _backend_name(array) in {"builtins", "numpy"}
     blocks = {
         (left, right): array[left, right]
         for left in range(array.shape[0])
         for right in range(array.shape[1])
-        if np.any(array[left, right])
+        if not numpy or np.any(array[left, right])
     }
     if not blocks:
         blocks[(0, 0)] = array[0, 0]
@@ -1229,13 +1239,14 @@ def _dense_virtual_to_sparse(array):
 
 
 def _native_mpo_dense_index_maps(mpo, semantic, groups, value):
-    """Build physical-basis charge maps for a fused native MPO result.
+    """Build physical-basis charge maps for a native MPO result.
 
     Symmray stores a fused index in contiguous sector order.  That order is
     useful for block operations, but it is not necessarily the caller's
     computational-basis order.  ``AbelianArray.to_dense(index_maps=...)``
-    accepts the original basis-to-charge map and restores that order without
-    expanding the MPO's virtual or sector blocks first.
+    accepts the original basis-to-charge map. Unfuse physical legs first:
+    total charges alone cannot identify the within-sector order when local
+    physical sectors have degeneracy.
     """
     if not hasattr(value, "to_dense") or not hasattr(value, "indices"):
         return None
@@ -1323,7 +1334,7 @@ class _PhysicalBasisDenseMPO:
             semantic is not None
             or getattr(self, "pepsy_mpo_symmetry", None) is not None
         )
-        if not hasattr(value, "indices") or not has_physical_metadata:
+        if not hasattr(value, "unfuse_all") or not has_physical_metadata:
             return self._maybe_qarray(value, to_qarray)
 
         groups = (
@@ -1334,18 +1345,22 @@ class _PhysicalBasisDenseMPO:
                 tuple(self.lower_inds_present),
             )
         )
+        shape = value.shape
+        # Fused charge maps lose the ordering of degeneracy offsets from
+        # different local sectors. Restore individual physical axes before
+        # converting the contracted result, never the MPO's virtual bonds.
+        value = value.unfuse_all()
         index_maps = _native_mpo_dense_index_maps(
             self,
             semantic,
-            groups,
+            tuple((ind,) for group in groups for ind in group),
             value,
         )
         if index_maps is not None:
             value = value.to_dense(index_maps=index_maps)
-        elif hasattr(value, "unfuse_all"):
-            value = value.unfuse_all()
-            if hasattr(value, "to_dense"):
-                value = value.to_dense()
+        else:
+            value = value.to_dense()
+        value = ar.do("reshape", value, shape)
 
         return self._maybe_qarray(value, to_qarray)
 
@@ -1433,11 +1448,14 @@ def _as_square_operator(value):
     return array
 
 
-def _local_operator_mpo_cores(term):
+def _local_operator_mpo_cores(term, *, factorization="auto"):
     """Decompose one general local operator into exact fixed-rank MPO cores."""
 
     if not isinstance(term, MPOLocalOperatorTerm):
         raise TypeError("term must be an MPOLocalOperatorTerm.")
+    from ._cluster_factorization import fixed_split, normalize_factorization
+
+    factorization = normalize_factorization(factorization)
     nsites = len(term.sites)
     phys_dim = term.phys_dim
     if nsites == 1:
@@ -1463,22 +1481,19 @@ def _local_operator_mpo_cores(term):
             remainder,
             (left_rank * local_size, -1),
         )
-        u, singular_values, vh = _fixed_rank_svd(matrix)
         rank = min(int(matrix.shape[0]), int(matrix.shape[1]))
-        u = u[:, :rank]
-        singular_values = singular_values[:rank]
-        vh = vh[:rank]
+        if factorization == "fixed":
+            u, remainder = fixed_split(matrix)
+        else:
+            u, singular_values, vh = _fixed_rank_svd(matrix)
+            u = u[:, :rank]
+            remainder = ar.do("multiply", singular_values[:rank, None], vh[:rank])
         core = ar.do(
             "reshape",
             u,
             (left_rank, phys_dim, phys_dim, rank),
         )
         cores.append(ar.do("transpose", core, (0, 3, 1, 2)))
-        remainder = ar.do(
-            "multiply",
-            singular_values[:, None],
-            vh,
-        )
         left_rank = rank
         remaining_sites = nsites - site - 1
         remainder = ar.do(
@@ -1828,7 +1843,6 @@ def _term_from_input(term):
                 )
             else:
                 coefficient = 1.0
-        coefficient = coefficient
         matrix = _as_square_operator(operators)
         normalized_sites = normalize_integer_tuple(
             sites,
@@ -2506,7 +2520,7 @@ def _compile_generic_terms(terms, *, shape=None, mapper=None, map_mode="snake"):
     return chain_length, tuple(compiled), metadata
 
 
-def _mixed_term_automaton(L, terms, *, phys_dim, unit_coefficients):
+def _mixed_term_automaton(L, terms, *, phys_dim, unit_coefficients, factorization="auto"):
     """Compile product and general local terms into one exact automaton."""
 
     automaton = MPOAutomaton(L, phys_dim=int(phys_dim))
@@ -2527,7 +2541,7 @@ def _mixed_term_automaton(L, terms, *, phys_dim, unit_coefficients):
             term_slots.append(((first_site, transition_index, term.operators[0]),))
             continue
 
-        cores = _local_operator_mpo_cores(term)
+        cores = _local_operator_mpo_cores(term, factorization=factorization)
         slots = automaton.add_local_mpo_term(
             term.sites,
             cores,
@@ -3145,6 +3159,7 @@ class FirstDegreeMPO:
                 symmetry=self.symmetry,
                 physical_charges=self.physical_charges,
                 fermionic=self.fermionic,
+                validated=self.metadata.get('_native_charge_validated', False),
             )
         else:
             dense_arrays = tuple(
@@ -3217,7 +3232,9 @@ class FirstDegreeMPO:
         contract the Frobenius norm of ``MPO_before - MPO_after`` without
         densifying either operator. ``sector_aware='auto'`` uses the native
         Symmray sector-wise SVD when the compiled MPO has Abelian blocks;
-        ``sector_aware=True`` rejects a dense fallback.
+        ``sector_aware=True`` rejects a dense fallback. For dense MPOs,
+        the difference is QR-canonicalized before its norm is contracted
+        to avoid cancellation at small errors.
         """
         if max_bond is not None:
             if not isinstance(max_bond, Integral) or int(max_bond) < 1:
@@ -3260,6 +3277,11 @@ class FirstDegreeMPO:
             # computes the operator Frobenius norm here. Keeping this behind
             # an explicit flag leaves the normal compression path unchanged.
             difference = reference - mpo
+            if initial_sector_summary is None:
+                # QR-canonicalize the direct-sum difference before contracting
+                # its norm. Its raw doubled network can cancel large terms and
+                # lose small compression errors to floating-point roundoff.
+                difference.left_canonize()
             operator_frobenius_error = difference.norm()
             reference_norm = reference.norm()
             try:
@@ -3340,12 +3362,23 @@ class FirstDegreeMPO:
         paper-history representation. Use :meth:`to_mpo` for contraction or
         use :meth:`compress_exact` before this method if analytical history
         compression is also desired.
+
+        Native charge sectors require an explicit allocation that a total
+        cap cannot specify. Use :meth:`compress_adaptive` for sector-preserving
+        NumPy/Torch compression, or retain exact fixed native construction.
         """
         if not isinstance(max_bond, Integral) or int(max_bond) < 1:
             raise ValueError("max_bond must be a positive integer.")
         max_bond = int(max_bond)
         form = _normalize_tt_svd_form(form)
         initial_bond_dimensions = tuple(self.bond_dimensions)
+
+        if self.symmetry is not None:
+            raise ValueError(
+                'fixed-rank compression cannot choose a fixed native sector allocation; '
+                'use compress_adaptive(max_bond, cutoff=0) for sector-preserving compression '
+                'or retain the uncompressed fixed native construction.'
+            )
 
         if self.L == 1:
             output = self.copy()
@@ -3412,17 +3445,15 @@ class FirstDegreeMPO:
         be inserted without first materializing a temporary Quimb MPO. Rank
         selection is a discrete control-flow decision. Singular values are
         read only for that decision and tensor arithmetic remains on the
-        source backend, but compiled/JIT traces should use
-        :meth:`compress_fixed_rank` instead.
+        source backend. Dense compiled/JIT traces can use
+        :meth:`compress_fixed_rank` instead. Native NumPy/Torch compression
+        preserves charge sectors and uses paired-factor Torch derivatives
+        within locally fixed, gapped rank charts. Native JAX compression is
+        unsupported; use uncompressed fixed construction for JIT.
         """
         if not isinstance(max_bond, Integral) or int(max_bond) < 1:
             raise ValueError("max_bond must be a positive integer.")
         max_bond = int(max_bond)
-        if self.symmetry is not None:
-            raise ValueError(
-                "adaptive semantic TT-SVD cannot preserve native symmetry; "
-                "use sector-aware Quimb compression instead."
-            )
         form = _normalize_tt_svd_form(form)
         cutoff_mode = _normalize_tt_svd_cutoff_mode(cutoff_mode)
         if cutoff is None:
@@ -3432,6 +3463,14 @@ class FirstDegreeMPO:
                 cutoff,
                 self.arrays[0],
             )
+        if self.symmetry is not None:
+            from ._cluster_native import compress_native_accumulator
+
+            output, report = compress_native_accumulator(self, max_bond, resolved_cutoff,
+                                                         cutoff_mode, form)
+            output.metadata['compression_report'] = report
+            output.compression_report = report
+            return (output, report) if return_report else output
         source_arrays = self.arrays
         initial_bond_dimensions = tuple(self.bond_dimensions)
         if self.L == 1:
@@ -4028,7 +4067,12 @@ class FirstDegreeMPO:
         constructed.
         """
         normalized_paths = []
+        path_charges = []
         for path in paths:
+            if self.symmetry is not None:
+                if not hasattr(path, 'charges'):
+                    raise ValueError('native path insertion requires structural virtual charges.')
+                path_charges.append(path.charges)
             path = tuple(path)
             if len(path) != self.L:
                 raise ValueError(f"path_cores must have length {self.L}.")
@@ -4135,14 +4179,22 @@ class FirstDegreeMPO:
                 )
             )
 
+        levels = None
+        if self.symmetry is not None:
+            from ._cluster_native import charge_levels
+
+            charges = [tuple(level.charge for level in cut) for cut in self.levels]
+            for cut in range(1, self.L):
+                charges[cut] += tuple(q for path in path_charges for q in path[cut])
+            levels = charge_levels(charges)
         return type(self)(
-            arrays,
-            degree=self.degree,
+            arrays, levels=levels, degree=self.degree,
             **self._symmetry_options(),
             upper_ind_id=self.upper_ind_id,
             lower_ind_id=self.lower_ind_id,
             site_tag_id=self.site_tag_id,
-            metadata={"operation": "add_path", "history_valid": False},
+            metadata={"operation": "add_path", "history_valid": False,
+                      "_native_charge_validated": self.metadata.get('_native_charge_validated', False)},
         )
 
     def product(self, other, *, kind="ordinary"):

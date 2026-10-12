@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 from .._internal.cutoff import dtype_auto_cutoff
 from .._internal.quimb import require_quimb_1d_compression_method, run_seeded_quimb
 from ..tensors.observables import tn_fidelity
+from ..tensors.contractions import build_optimizer
 from ..fitting.local import FIT
 from ._fit_policy import (
     _FIT_QUIMB_MODES,
@@ -88,12 +89,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         lattice shape can be inferred.
     mps_boundaries : dict[str, qtn.MatrixProductState]
         Boundary dictionary, typically from ``BdyMPS(...).mps_b``.
-    contraction_opt : str | object, default="auto-hq"
+    contraction_opt : str | object | None, default=None
         Contraction optimizer used for final contraction and fidelity calls.
-    fit_contraction_opt : str | object, default="auto-hq"
+        None builds Pepsy's reusable Cotengra optimizer.
+    fit_contraction_opt : str | object | None, default=None
         Contraction optimizer used by the local :class:`~pepsy.fitting.local.FIT`
         boundary fits. Kept separate from ``contraction_opt`` so the local
         fitting path can be tuned independently of the final contraction.
+        None inherits ``contraction_opt`` and its reusable search cache.
     fit_mode : {"direct", "src", "src-mps", "zipup", "sdc", "sdcr", "dm",
         "eff", "one-site", "dmrg", "dmrg1", "two-site", "dmrg2", "global"},
         default="eff"
@@ -182,8 +185,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         norm,
         mps_boundaries,
         *,
-        contraction_opt="auto-hq",
-        fit_contraction_opt="auto-hq",
+        contraction_opt=None,
+        fit_contraction_opt=None,
         fit_mode="eff",
         fit_layer_mode="joint",
         fit_layer_order="input",
@@ -208,8 +211,12 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
         self.norm = norm
         self.mps_boundaries = mps_boundaries
-        self.contraction_opt = contraction_opt
-        self.fit_contraction_opt = fit_contraction_opt
+        self.contraction_opt = (
+            build_optimizer(progbar=False) if contraction_opt is None else contraction_opt
+        )
+        self.fit_contraction_opt = (
+            self.contraction_opt if fit_contraction_opt is None else fit_contraction_opt
+        )
         # Validate at construction time rather than after an expensive PEPS
         # boundary has already reached its first local fit.
         self.fit_mode = _canonical_fit_mode_selector(fit_mode)
@@ -1023,6 +1030,30 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         return guess
 
     def _fit_boundary(
+        self, tn, boundary_key, previous, site_tag_id, boundary_len,
+    ):
+        cache = getattr(self.mps_boundaries, 'environment_cache', None)
+        signature = None
+        if cache is not None:
+            cached, signature = cache.lookup(self, boundary_key, previous)
+            if cached is not None:
+                return cached
+            # A local gate can change the outgoing bond of this cut. Retain
+            # other cuts, but recreate this lazy guess if its interface changed.
+            guess = dict.get(self.mps_boundaries, boundary_key)
+            if guess is not None:
+                expected = {i: tn.ind_size(i) for i in tn.outer_inds()}
+                actual = {i: guess.ind_size(i) for i in guess.outer_inds()}
+                if actual != expected:
+                    self.mps_boundaries.pop(boundary_key, None)
+        result = self._fit_boundary_uncached(
+            tn, boundary_key, previous, site_tag_id, boundary_len,
+        )
+        if cache is not None:
+            cache.store(boundary_key, signature, result)
+        return result
+
+    def _fit_boundary_uncached(
         self,
         tn,
         boundary_key,

@@ -4,6 +4,12 @@ The BP namespace contains message-passing, loop-expansion, and partitioned
 norm-estimation helpers. It is an advanced extension and is loaded lazily by
 the top-level package.
 
+Plain and relay BP report strict residual convergence. If Quimb stops because
+its pending-message queue empties while the last residual is still too large,
+Pepsy confirms convergence with the remaining iteration budget. The reported
+iteration count includes those confirmation sweeps. Explicit rolling-stop
+settings remain respected; a rolling stop alone does not imply a fixed point.
+
 Jump to [boundary measurements](#peps-boundary-measurements),
 [fermionic PEPO norms](#native-fermionic-pepo-norm-workflow),
 [loop-cluster compression](#reduced-loop-cluster-compression), or
@@ -190,14 +196,31 @@ block-sparse through the graded SVD adapter; use `solver="auto"` or
 `solver="quimb"` there. Dense QR/autodiff refinement is intentionally not
 available for native arrays because it would flatten charge sectors.
 
+For dense Quimb, QR, and normal ALS, `monitor_convergence=True` opts into
+complete-sweep stopping and fills `ReducedALSSolution.iterations`, `converged`,
+and `termination_reason`. The stopping criterion is squared residual divided
+by target norm at most `tol`, or absolute complete-sweep cost change divided
+by target norm at most `tol`. Zero tolerance requests the full iteration
+budget. The monitored Quimb route reuses the same open overlap networks and
+regauges with QR/LQ between public Quimb ALS sweeps. It records a cost per
+sweep; QR/normal also retain their half-sweep measurements. The default
+unmonitored behavior is unchanged, with these status fields set to `None`.
+Monitoring is unavailable for autodiff and native Symmray's graded-SVD route.
+
 For explicit dense diagnostics, use `problem.dense_metric()` and
 `problem.dense_linear_term()`. Direct problem builders also accept
 `materialize_metric=True`, but this is unnecessary for the native Quimb path.
 All reduced problem builders Hermitianize and PSD-project the smaller open
 environment by default. `problem.raw_min_eigenvalue` and
 `problem.clipped_eigenvalues` expose the projection diagnostics.
-The three builder return types share the `ReducedUpdateProblem` type alias for
-annotations. The full-system `max_cluster_size` cutoff is an exact small-system
+The builder return types share the `ReducedUpdateProblem` type alias for
+annotations. `ReducedEnvironmentUpdateProblem(pair, environment, target)`
+also accepts an externally contracted reduced environment, such as the checked
+boundary-MPS environment used by `PepsOptimizer` two-site updates. It does not
+claim an exact environment or run BP. The shared `solve_reduced_als` result
+reports `solver="quimb"`, `"qr"`, or `"normal"` on those dense routes;
+other routes retain `None` when no route diagnostic is available.
+The full-system `max_cluster_size` cutoff is an exact small-system
 oracle (up to the requested Hermitian/PSD projection), so a practical
 convergence study compares a ladder of total cutoffs against
 `exact_reduced_update_problem(..., psd_project=False)` and reports the open
@@ -689,6 +712,41 @@ the private cluster copy, and lets Quimb perform its usual QR/SVD compressed
 contraction. Pass `optimize="auto-hq"`, another Quimb optimizer string, or a
 standard Cotengra path optimizer through either path-cluster helper.
 
+## Expectation inputs and outputs
+
+The expectation helpers above accept a term mapping. Use a tuple of sites
+as each key, in the same order as the operator's physical axes. For dense
+operators, one-site shape is `(d, d)`; two-site shape is `(d0*d1, d0*d1)`
+or `(d0, d1, d0, d1)`, with all output axes before all input axes. Native
+fermionic operators must preserve their graded basis and site order.
+
+The helpers work on private contraction networks and leave the input PEPS
+and operators unchanged. Path-cluster `gauges` supplies external SU bond
+vectors, which are also left unchanged. Returned scalars stay in the active
+array backend; they are not guaranteed to be Python floats.
+
+| Option | Result |
+| --- | --- |
+| `normalized=True`, `return_all=False` | Sum of locally normalized expectations |
+| `normalized=False`, `return_all=False` | Sum of unnormalized numerators |
+| `return_all=True` with either Boolean normalization | Mapping from the original term keys to scalar values |
+| Boundary helper with `normalized="return", return_all=True` | Mapping to `(numerator, local_norm)` pairs |
+
+For a small dense example with known expectations:
+
+```python
+import numpy as np
+import quimb.tensor as qtn
+from pepsy.bp import compute_boundary_expectation
+
+zero = np.array([1.0, 0.0])
+peps = qtn.PEPS.product_state([[zero, zero], [zero, zero]])
+z = np.diag([1.0, -1.0])
+terms = {((0, 0),): z, ((0, 0), (1, 1)): np.kron(z, z)}
+values = compute_boundary_expectation(peps, terms, max_bond=4, return_all=True)
+assert all(np.isclose(value, 1.0) for value in values.values())
+```
+
 ## Local reduced density matrices
 
 For a single route-independent entry point, use `rho_expand`. Its
@@ -773,6 +831,14 @@ energy = compute_local_expectation_edge_loop_series(
 
 `partial_trace_edge_loop_series_expand` supplies the matching diagnostic RDM.
 The scalar function is the fermion-safe choice for its supported cases.
+With `multi_excitation_correct=True`, D2 norm weights supplied to Quimb's
+real suppression solver are checked for finiteness and reality. An imaginary
+residue up to `64 * eps * max(1, abs(real_weight))` is treated as contraction
+roundoff, using the weight's precision. Larger residues raise `ValueError`;
+check message Hermiticity, or explicitly choose the unsuppressed expansion
+with `multi_excitation_correct=False`. Observable numerators, returned
+complex values, and cached input weights are preserved.
+
 Explicit terms can be passed as `LoopSeriesTerm` objects (or virtual-edge sets); at present they cannot put
 Q on a bond wholly internal to the selected observable support. A nonzero-Q
 fermionic scalar correction is currently restricted to one-site gates; the
