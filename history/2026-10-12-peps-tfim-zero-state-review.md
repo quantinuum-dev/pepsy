@@ -167,3 +167,77 @@ New temporary evidence: `diagnose_sweep.py`, `check_failed_metric.py`, and
 the same run directory. This follow-up changes only this record;
 `git diff --check` passes. No implementation test suite was rerun for the
 documentation-only change.
+
+## Corrected full D=2 rerun
+
+Starting afresh from |0⟩¹⁶ with the corrected settings above completes
+**all 50 steps to t=5**, taking 1096.07 s inside the driver (18.27 min).
+The ALS schedule, D=2, gates and dt are unchanged. This run does not resume
+the old t=1.4 checkpoint, so its t=1.5 result differs from the one-step probe.
+
+| Time | Exact circuit fidelity |
+| --- | ---: |
+| 0 | 1 |
+| 1 | 0.987006297992 |
+| 1.5 | 0.915209878846 |
+| 2 | 0.823425425727 |
+| 3 | 0.762532403641 |
+| 4 | 0.723221498507 |
+| 5 | 0.725660291295 |
+
+Of 400 strip batches, 378 accept an optimized candidate, 21 skip optimization
+because the precheck is below tolerance, and one at t=0.3 retains its warm
+start after `no_valid_local_updates`. There are no later failed fits or
+trajectory stops. Every saved state is finite with D≤2; the maximum exact
+squared-norm error is 2.51e-9. Final mean Z is 0.933212049765 versus exact
+0.737920428067, so numerical completion does not establish an accurate
+long-time D=2 approximation for all observables.
+
+Per-step exact vectors, full optimizer records, checkpoints, aggregate JSON,
+and PNG/SVG figures are in `sweep-torch-accurate/` under the existing temporary
+run directory. `run_validation.py --mode sweep --backend torch
+--accurate-boundary --label sweep-torch-accurate` specifies this run; its
+output directory must be new. No package implementation changed.
+
+## D=3,4 background comparison launched
+
+The user explicitly requested every configuration target **t=5**, with exact
+fidelity recorded alongside approximate results. Eight sequential CPU runs
+are queued under `/tmp/pepsy-tfim-d34-pCJAS1/`:
+
+| D | Low norm/overlap caps | High norm/overlap caps | Solvers |
+| --- | --- | --- | --- |
+| 3 | `(18,36)` | `(36,144)` | ALS and Torch global L-BFGS-B |
+| 4 | `(32,64)` | `(64,256)` | ALS and Torch global L-BFGS-B |
+
+All start from |0⟩¹⁶ with the same circuit and use single-strip batches,
+column gate order, SU warm starts and exact layered targets. Global L-BFGS-B
+varies every candidate tensor; its target batch matches the ALS batching
+policy. Subsequent targets differ when the trajectories diverge. ALS retains
+its default budget; L-BFGS-B uses at most 100 iterations per batch and
+`tol=1e-10`, with direct BRA/KET boundary compression. Compare measured
+fidelity versus cost, not iteration counts or nominal convergence alone.
+
+Each configuration uses its specified caps for fitting and metrics, measures
+target norms, and disables cap retries/adaptive growth. Every acceptance
+metric and optimized candidate is also audited with a normalized exact dense
+overlap; every time step records exact circuit fidelity, mean Z, normalization,
+driver/audit/measurement times, peak RSS, warnings and optimizer records.
+The first global fit also records a directional finite-difference check.
+A four-step D=2 runner check completed, but its global directional derivative
+error was 3.06e-7, exceeding the chosen 2e-7 absolute allowance. That failed
+gradient check is retained; global gradients are not certified by this launch.
+
+The worker runs one configuration at a time with one CPU thread, a 16 GiB
+RSS guard and no whole-run time limit. Failed configurations retain their
+checkpoints/tracebacks and the worker proceeds to the next case. A `STOP`
+file in the run root stops the worker and active process. The source is
+isolated in a detached worktree at `31e9dab`; FullUpdate helpers and exact
+reference vectors were copied. A runner filename collision with Python's
+`queue` module was caught during setup, stopped and corrected before the
+production launch; its artifacts remain in `bootstrap-failure/`.
+
+`manifest.json` defines the grid; `queue-status.json` reports live progress;
+`runs/<name>/observations.json` and `metrics.jsonl` hold the comparisons.
+The foreground tool session owning the background worker is `8719`.
+**D=3,4 results are pending**, not established by the completed D=2 run.
