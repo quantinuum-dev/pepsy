@@ -34,6 +34,12 @@ For documentation and planning, use the
 [plan index](../../../docs/development/plans/README.md). Keep explanations short,
 use precise equations with colored important terms, and route to owning designs.
 
+Use the [documentation ownership map](../../../docs/development/README.md#document-ownership)
+when reorganizing Markdown. Test profiles and CI belong in
+[testing.md](../../../docs/development/testing.md); rationale/comment rules
+belong in the [code-change policy](../../../docs/development/code_policy.md).
+Keep a single planning index and descriptive domain plans in `docs/development/plans/`.
+
 ## Shared numerical contracts
 
 Read [references/numerical-contracts.md](references/numerical-contracts.md)

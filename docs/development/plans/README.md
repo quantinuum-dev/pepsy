@@ -1,37 +1,42 @@
 # Implementation plans
 
-These documents record proposed work and implementation progress. Some are
-historical or deferred; check each plan's status against the current code and
-tests. For supported behavior, use the [API guides](../../api/index.md).
+This is Pepsy's single planning index. Domain plans live in this directory
+under descriptive lowercase filenames; root `plan.md` and `PLAN.md` are retired.
+For supported behavior, use the [API guides](../../api/index.md) and current code.
 
 ## Choose a route
 
 | Need | Owner |
 | --- | --- |
-| Current public behavior | [API guides](../../api/index.md), implementation and focused tests |
-| Cluster/downstream capability and validation | [Current status ledger](../cluster_optimization_status.md) |
-| Reusable task instructions | [Maintainer router](../../../.github/skills/pepsy-maintainer/SKILL.md) and the selected domain skill |
-| Package workstream history | [Project roadmap](project.md), with its stated historical baseline |
-| Deferred native fermionic PEPO design | Root [plan.md](../../../plan.md); this remains a scoped proposal |
-| Plan writing | [Markdown policy](../markdown_policy.md) |
-
-Keep each new or revised plan compact: status/baseline, scope, intended result,
-next steps, validation and owning references. Move long derivations to an owning
-note and record completed measurements in the session journal. Plan status is
-separate from implementation and validation evidence.
+| Public behavior and compatibility | [API guides](../../api/index.md) and [stability policy](../../stability.md) |
+| Cluster/downstream capability and validation | [Current status](../cluster_optimization_status.md) |
+| Reusable task instructions | [Maintainer router](../../../.github/skills/pepsy-maintainer/SKILL.md) and its domain skills |
+| Package workstream history | [Historical project roadmap](project.md), snapshot 2026-09-14 |
+| Deferred native fermionic PEPO design | [Native fermionic PEPO proposal](native_fermionic_pepo.md) |
+| Plan format | [Markdown policy](../markdown_policy.md) |
 
 ## Domain plans
 
-- [Project roadmap](project.md)
-- [Operator and exponential API plan](operator_api.md)
-- [Lightweight package plan](lightweight-package.md)
-- [Optimizer plan](optimizers.md)
-- [SymDMRG2 matvec fanout-GEMM plan](symdmrg_matvec_fanout.md)
-- [PEPS optimizer plan](peps_optimizer.md)
-- [TreePeps and tree-embedded PEPS plan](tree_peps.md)
-- [Tree FIT path traversal plan](tree_fit_path_traversal.md)
-- [Tree optimizer consolidation plan](tree_optimizer_consolidation.md)
-- [PEPS direct sampler plan](peps_sampler.md)
-- [BP-guided regional CTMRG/RG plan](regional_ctmrg_rg.md)
-- [Sweep optimizer plan](sweep_optimizer.md)
-- [Stabilizer tensor-network plan](stabilizer_tn.md)
+Each document records its own scope and baseline. Implementation statements
+inside an older plan describe that record, not a fresh package-wide validation.
+
+| Area | Design or progress record |
+| --- | --- |
+| Operators and exponentials | [Operator API](operator_api.md) |
+| Native fermionic PEPO construction | [Deferred proposal](native_fermionic_pepo.md) |
+| Package and import costs | [Lightweight package](lightweight-package.md) |
+| Boundary providers and sweeps | [Optimizer boundaries](optimizers.md), [PEPS split](peps_optimizer.md), [sweep providers](sweep_optimizer.md) |
+| PEPS direct sampling | [Direct sampler](peps_sampler.md) |
+| Tree networks | [Tree PEPS](tree_peps.md), [FIT traversal](tree_fit_path_traversal.md), [optimizer consolidation](tree_optimizer_consolidation.md) |
+| Symmetric DMRG | [Matvec fanout](symdmrg_matvec_fanout.md) |
+| Stabilizer simulation | [Stabilizer tensor networks](stabilizer_tn.md) |
+| Regional CTMRG/RG | [Deferred regional design](regional_ctmrg_rg.md) |
+| Historical package workstreams | [Project roadmap](project.md) |
+
+## Maintain a plan
+
+State status, baseline, scope, intended result, next steps and validation.
+Link API contracts, measurements and long derivations in their owning guides
+or notes. Update an existing domain plan instead of adding a competing overview.
+Preserve superseded designs and completed journal evidence with their dates.
+Plans describe work; the user's scope authorizes its implementation.

@@ -16,6 +16,8 @@ references:
   - AGENTS.md
   - README.md
   - CONTRIBUTING.md
+  - docs/development/testing.md
+  - docs/development/code_policy.md
   - pyproject.toml
   - docs/development/package_layout.md
   - docs/development/markdown_policy.md

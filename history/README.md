@@ -52,8 +52,9 @@ git diff --cached -- AGENTS.md .github/skills history
    older entries when a specific decision needs investigation.
 3. Consult a plan only when relevant. The broader
    [project roadmap](../docs/development/plans/project.md) contains historical
-   and proposed work; root [PLAN.md](../PLAN.md) currently describes a deferred
-   native fermionic PEPO design, not the status of the whole package.
+   and proposed work. The [plan index](../docs/development/plans/README.md)
+   owns navigation; the [native fermionic PEPO design](../docs/development/plans/native_fermionic_pepo.md)
+   remains a deferred proposal.
 
 ## End-of-session checklist
 

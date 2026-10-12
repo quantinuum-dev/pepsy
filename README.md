@@ -11,26 +11,6 @@ tensor-network construction, contraction, compression and general solvers
 live here; downstream packages call these public APIs for their own domain
 algorithms. See [package ownership](docs/development/package_layout.md#pepsy-and-downstream-packages).
 
-Cluster PEPO `trace_exp` constructs and traces the selected PEPO, including
-rank caps and compression. Use `pepsy.operators.trace_pepo(pepo)` to measure
-an existing result; `partition_trace_exp` is the explicit uncompressed scalar
-shortcut. See the [trace contract](docs/api/operators/cluster_expansion.md#trace-of-the-constructed-pepo).
-
-Native bosonic cluster MPOs support exact Torch/JAX autodiff and sector-preserving
-NumPy/Torch compressed assembly. See the [construction and gradient limits](docs/api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos).
-
-For repeated spin-cluster evaluations, experimental
-[`prepare_cluster_channels`](docs/api/operators/cluster_channels.md) assembles
-compact MPO/PEPO tensors directly from local factors with frozen QR-prepared
-bases, avoiding expanded histories and numerical decomposition during
-autodiff. MPO preparation first shares formally equivalent transitions;
-further numerical reductions define an explicit approximate operator.
-For exact graph MPOs, `preparation="frontier"` also avoids enumerating
-complete collections by retaining only clusters crossing the current cut.
-For graph/square PEPOs, `preparation="symbolic"` shares exact graph channels
-before routing and reuses a linear reference template. Full channels preserve
-the chosen expansion; capped accuracy and speed must be measured.
-
 Version **0.5.0** · Python **3.12+** · [Changelog](CHANGELOG.md)
 
 ## Install from GitHub
@@ -75,6 +55,8 @@ shows how to collect fidelity diagnostics.
 | Learn through examples | [Tutorials](docs/tutorials/index.md) and [runnable examples](docs/examples.md) |
 | Find classes, functions, and imports | [API reference](docs/api/index.md) and [package map](docs/api/package.md) |
 | Use symmetric or fermionic states | [Symmetric tensors](docs/api/tensors/symmetric.md) |
+| Build or trace cluster operators | [MPO construction](docs/api/operators/mpo_cluster.md) and [PEPO trace contract](docs/api/operators/cluster_expansion.md#trace-of-the-constructed-pepo) |
+| Reuse repeated cluster evaluations | [Experimental compact channels and their limits](docs/api/operators/cluster_channels.md) |
 | Upgrade from 0.4.1 | [Migration guide](docs/development/api-migration.md) |
 | Check compatibility guarantees | [API stability](docs/stability.md) |
 | Contribute or run tests | [Contributing](CONTRIBUTING.md) |

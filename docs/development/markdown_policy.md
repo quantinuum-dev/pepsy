@@ -28,6 +28,10 @@ references easy to scan. Distinguish implemented, proposed, deferred and measure
 work. Preserve superseded designs in labeled archives; record results in dated
 handoffs. A plan describes work without authorizing it.
 
+Keep one planning index at `docs/development/plans/README.md` and use descriptive
+lowercase filenames for domain designs. Do not create root `plan.md`/`PLAN.md`
+aliases or repeat test commands and API contracts across plans; link their owners.
+
 Keep skill entry points short and route to existing domain guidance. Load only
 relevant references. Put public usage in its API guide and avoid copying plans
 or numerical manuals into skills.
