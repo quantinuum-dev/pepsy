@@ -87,3 +87,38 @@ The compatible isolated environment and installed versions from the
 the same upstream audit applies. Expanded diagnostic scripts/results live
 under `/tmp/pepsy_4x4_review.py` and `/tmp/pepsy-4x4-*` and may be temporary.
 No production trajectory or shared dependency was changed.
+
+## Matched Torch/JAX follow-up
+
+The earlier table compares each path with its own unoptimized run. Its
+40-gate full-circuit and six-gate two-strip rows must not be used to compare
+backend accuracy. The values are **infidelity**, so smaller is better.
+
+A controlled rerun built one NumPy target and one SU guess, then copied their
+arrays exactly into Torch and JAX. Both used the same six diagonal gates on
+columns 1 and 2, exact initial normalization, complex128 CPU data, layered
+targets, direct BRA/KET compression, cutoff zero, canonicalization enabled,
+no exponent stripping, and five L-BFGS-B steps. Initial parameter vectors
+were bitwise identical. Both backends made seven optimization evaluations;
+Torch used eager execution and JAX used JIT.
+
+| Norm/overlap caps | Backend | Initial exact infidelity | Final exact infidelity |
+| --- | --- | ---: | ---: |
+| `(8, 16)` | Torch | 0.102158635429621 | 0.080258389691159 |
+| `(8, 16)` | JAX | 0.102158635429621 | 0.080258389691160 |
+| `(16, 64)` | Torch | 0.102158635429621 | 0.080175937759808 |
+| `(16, 64)` | JAX | 0.102158635429621 | 0.080175937759808 |
+
+At default caps, final fidelities differ by `8.9e-16`; at tighter caps they
+agree at the displayed precision and in the returned Python floats.
+Initial full-gradient component differences are at most `6.8e-15`; each
+backend also passes its directional finite-difference check, with absolute
+error below `3.2e-10`. The tighter-cap objectives agree with exact dense
+infidelity to roundoff. All outputs retain D≤2 and improve exact fidelity.
+
+The shared warm start is normalized and constructed once before backend
+conversion; this removes the backend-specific driver preparation from the
+comparison. Its initial infidelity therefore differs slightly from the
+previous independently constructed two-strip warm starts. No optimizer code
+was changed. Temporary reproduction and machine-readable results are
+`/tmp/pepsy_4x4_matched.py` and `/tmp/pepsy-4x4-matched.json`.
