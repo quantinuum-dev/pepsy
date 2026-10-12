@@ -29,8 +29,8 @@ at `cluster_size=1`. The notebook retains its existing explicit onsite-only
 special case, giving `C1`; for every p>=2 it supplies the full ITF + NNN
 Hamiltonian. This limitation is documented rather than changing package policy.
 
-Files: [notebook](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb) and
-[guide](../../gaugy_examples/pauli_gaugy/README.md). No package implementation
+Files: [notebook](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb) and
+[guide](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/README.md). No package implementation
 was changed. The source probe resolved the function to this local Pepsy
 checkout's `src/pepsy/operators/mpo_product.py`. Compression and environment
 are unchanged from the [dimension audit](2026-09-29-cluster-mpo-dimension-audit.md).

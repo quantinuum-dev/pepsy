@@ -1,7 +1,7 @@
 # 2026-09-29 — Six-site cluster MPO dimension audit
 
 The user requested verification of the dimensions in
-[cluster_1d.ipynb](../../../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb)
+[cluster_1d.ipynb](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb)
 and an explanation of fixed versus compact channels. This audit changes
 notebook diagnostics and explanations, not package implementations or
 compression settings. Measurements use the current working trees, including

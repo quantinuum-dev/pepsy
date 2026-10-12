@@ -35,6 +35,8 @@ and [tutorials](../../tutorials/index.md).
   published backend/downstream capabilities, validation scopes and limitations.
 - [Archived cluster status through 2026-10-12](2026-10-12-cluster-status-archive.md)
   — Complete earlier ledger with its original publication and test baselines.
+- [Recovered historical example links](../../../history/2026-10-12-historical-link-recovery.md)
+  — Verified Git snapshots for moved or retired examples; original findings preserved.
 - [Composed boundary-factor derivatives](2026-09-26-projector-boundary-gradients.md)
   — Rank-deficient MPS correction, mathematical contract, and regressions.
 - [PEPO product traces](2026-09-26-pepo-product-trace.md) — Product-expansion

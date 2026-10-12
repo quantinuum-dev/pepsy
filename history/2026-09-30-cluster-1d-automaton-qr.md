@@ -1,7 +1,7 @@
 # 2026-09-30 — Add automaton plus delinearisation comparison
 
 - Scope: user-requested automaton + QR delinearisation in the active
-  [cluster_1d notebook](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb).
+  [cluster_1d notebook](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb).
 - Baselines: Gaugy Examples `main` at `dbabafa`; Pepsy `develop` at `c1ff0f8`.
 - Status: uncommitted working-tree edits; nothing staged or published.
 

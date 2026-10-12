@@ -15,7 +15,7 @@ colors. The current equations already parsed in KaTeX; an editor-specific
 failure to render all math was not reproduced.
 
 - Restored colored inline and display equations in
-  [cluster_1d.ipynb](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb), with
+  [cluster_1d.ipynb](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb), with
   standalone display delimiters and blank lines. Kept the nearest-neighbor
   model and current dense/MPO numerical workflow.
 - Matched gallery equations and labels to the highlighted support color;
@@ -23,7 +23,7 @@ failure to render all math was not reproduced.
 - Corrected the disjoint example to physical tensor-factor order
   `B_01 tensor B_2 tensor B_34 tensor B_5`. Added matching colored block labels
   and reduced whitespace in
-  [cluster_1d_diagrams.py](../../gaugy_examples/pauli_gaugy/cluster_1d_diagrams.py).
+  [cluster_1d_diagrams.py](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d_diagrams.py).
 - Refreshed only the seven schematic outputs. All 22 code-cell sources,
   notebook metadata, and other saved outputs were preserved.
 

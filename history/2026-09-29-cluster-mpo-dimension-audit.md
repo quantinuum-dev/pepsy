@@ -8,8 +8,8 @@
 
 ## Changes and findings
 
-- Expanded the [notebook](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb)
-  and [guide](../../gaugy_examples/pauli_gaugy/README.md) explanations. Plot
+- Expanded the [notebook](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb)
+  and [guide](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/README.md) explanations. Plot
   labels now say **uncompressed (fixed)** and **SVD-compressed**, and explicitly
   describe stored dimensions rather than minimum ranks.
 - Added per-bond storage checks, independent Schmidt-unfolding diagnostics,

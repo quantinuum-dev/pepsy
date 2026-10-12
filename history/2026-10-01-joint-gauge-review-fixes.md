@@ -12,13 +12,13 @@
   Pepsy's explicit `patience` and `bad_max` callback reasons retain precedence.
   Parameter selection, objective values, and optimization behavior are unchanged.
 - Updated the [solver API guide](../docs/api/solvers/gradient.md) and changelog.
-- The [joint gauge notebook](../../gaugy_examples/pauli_gaugy/gauge_optimization/joint_gauge_optimization.ipynb)
+- The [joint gauge notebook](https://github.com/rezaquant/gaugy_examples/blob/96e274d4cbe7c2f5407b3629ed81f515641a3ef0/pauli_gaugy/gauge_optimization/joint_gauge_optimization.ipynb)
   compares compiled autodiff gradients against central differences of
   `compiled.loss_vector` on the selected backend/device at the optimized
   parameters. It checks V-only and G-only directions at two step sizes, saves
   the diagnostic, and raises on disagreement. Updated its adjacent README.
 - Added [solver regressions](../tests/test_gradient_solver.py) and
-  [notebook regressions](../../gaugy_examples/pauli_gaugy/gauge_optimization/test_joint_notebook.py).
+  [notebook regressions](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/gauge_optimization/test_joint_notebook.py).
   The latter execute the actual diagnostic cell, forbid the native checker,
   and verify detection of incorrect V and G compiled gradients separately.
 

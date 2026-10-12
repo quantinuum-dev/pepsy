@@ -28,7 +28,7 @@
   Scalar partition traces stay separate from rank-capped materialization;
   local residual inspection lazily uses the shared MPO engine.
 - Updated public guides, status ledger, changelog, and runnable
-  [example](../examples/square_interaction_cluster_plan.py). Matching Gaugy
+  [example](https://github.com/quantinuum-dev/pepsy/blob/5316cb03c5778cb116432539724231b864567e90/examples/square_interaction_cluster_plan.py). Matching Gaugy
   integration selects this public factory while preserving Pauli endpoints.
 
 ## Validation

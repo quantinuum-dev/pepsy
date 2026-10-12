@@ -5,7 +5,7 @@
 - Status: uncommitted working-tree edits; nothing staged or published.
 
 Updated only Markdown in
-[cluster_1d.ipynb](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb).
+[cluster_1d.ipynb](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb).
 Removed repeated formulas and narrative, shortened gallery captions, and made
 NN, NNN, field, residual, and MPO quantities visually distinct. Markdown is
 approximately 60% shorter by whitespace-delimited token count. Kept the model,

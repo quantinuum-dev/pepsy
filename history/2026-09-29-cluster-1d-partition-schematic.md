@@ -19,7 +19,7 @@ not been confirmed.
   explicit tensor-product labels, and the disjoint `B_01 tensor B_23` term.
 - Restored the illustration and matching cutoff equations under **Four-site
   example** in
-  [cluster_1d.ipynb](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb).
+  [cluster_1d.ipynb](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb).
   Only that section's two cells changed. All other cells, outputs, and notebook
   metadata were preserved exactly, including the six-site galleries.
 
