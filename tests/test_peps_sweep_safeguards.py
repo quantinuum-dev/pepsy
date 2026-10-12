@@ -149,6 +149,7 @@ def test_driver_does_not_label_all_skipped_objective_only_sweep_optimized(monkey
     gate = np.diag(np.exp(-.2j * np.array([1., -1., -1., 1.])))
     kwargs = dict(
         chi=1, boundary_chi=4, fit_mode="direct", contraction_opt="greedy",
+        optimizer="nlopt", fit_init_strategy="guess-src",
         normalize_kwargs={"method": "exact"},
         sweep_optimize_kwargs={"n_round_trips": 0},
     )
@@ -179,6 +180,7 @@ def test_clipped_outer_precheck_still_invokes_sweep(monkeypatch):
     optimizer = PepsOptimizer(
         state, [(gate, ((0, 0), (0, 1)))], chi=1, fit_mode="direct",
         boundary_chi=4, evaluation_chi=4, contraction_opt="greedy", boundary_convergence=False,
+        optimizer="nlopt", fit_init_strategy="guess-src",
     )
     calls = []
 
@@ -271,6 +273,7 @@ def test_real_coarse_boundary_failure_returns_warm_start(measure, accept_if_impr
     gate = np.diag(np.exp(-0.01j * np.array([1., -1., -1., 1.])))
     kwargs = dict(
         chi=2, boundary_chi=1, contraction_opt="greedy",
+        optimizer="nlopt", fit_init_strategy="guess-src",
         normalize_kwargs={"method": "exact"},
         infidelity_kwargs={"method": "exact"},
     )

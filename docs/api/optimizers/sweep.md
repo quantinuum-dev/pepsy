@@ -1,5 +1,10 @@
 # `pepsy.optimizers.sweep.optimizer`
 
+`metrics()` and `infidelity()` reuse the constructor's known `target_norm`
+(one by default), matching local optimization. Pass `norm_target=None`
+explicitly for an independent target-norm measurement. Unitary gates on a
+normalized input need no repeated target contraction.
+
 `SweepOptimizer` supports two boundary-environment engines:
 
 - `boundary_engine="dmrg"` uses Pepsy `BdyMPS` plus `CompBdy`.
@@ -13,7 +18,30 @@
 Torch-backed Symmray blocks use the Torch autograd local solver. NumPy-backed
 Symmray blocks retain the finite-difference fallback.
 
+`optimize_axis(axis, start_index=k, n_round_trips=2, ...)` starts its initial
+forward optimization at strip `k`, then performs two complete backward/forward
+round trips across the axis. Earlier strips initially build boundaries without
+being optimized. Each return uses updated directional environments. The PEPS
+driver uses this entry point for its default gated-strip-first sweep; the
+standalone method still defaults to `start_index=0, n_round_trips=1`.
+
+`n_cycles` and `n_round_trips` require nonnegative integers; `env_n_iter`
+requires a positive integer. Constructor-only `boundary_engine` and
+`boundary_options` are rejected in optimization-option mappings. Set them
+when constructing `SweepOptimizer`.
+
 ## ALS within a slice
+
+`optimizer_options={"linear_solver": "auto", "max_matrix_size": 1024}`
+selects the native Hermitian positive-support spectral solve for local virtual
+matrix dimensions up to the limit, and matrix-free, diagonally preconditioned
+CG above it. The physical dimension supplies multiple right-hand sides; it
+does not multiply the virtual matrix dimension. Explicit solver choices and
+their guards remain unchanged. CG still reports nonpositive curvature or
+failure to reach its residual tolerance; no hidden solver fallback is added.
+`cg_shift` is an explicit relative ridge for the iterative branch, not a
+guarantee that an inaccurate boundary metric becomes positive definite.
+Supported arrays remain NumPy, Torch and CuPy; this adds no JAX/Symmray support.
 
 Dense inputs also support `optimizer="als"` in `set_optimize_kwargs`, or
 `solver="als"` in `optimize_axis`. The outer boundary sweep is unchanged;

@@ -19,6 +19,7 @@ from .._internal.quimb import (
 )
 from ..tensors.validation import _PHYS_OUTER, validate_tensor_network_tags
 from .states import BdyMPS
+from ._layers import prepare_quimb_site_layers
 from ._fit_policy import (
     _FIT_QUIMB_MODES,
     _canonical_fit_layer_mode,
@@ -1248,6 +1249,7 @@ def _contract_quimb_double_layer(  # pylint: disable=R0912,R0913,R0914,R0915
     }
 
     if method == "mps":
+        norm = prepare_quimb_site_layers(norm, layer_tags)
         contract_fn = getattr(norm, "contract_boundary", None)
         if not callable(contract_fn):
             raise TypeError("method='mps' requires a network with contract_boundary().")

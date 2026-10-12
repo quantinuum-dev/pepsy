@@ -172,7 +172,7 @@ def _install_fake_normalize(monkeypatch):
 
 
 @pytest.mark.parametrize("options,strategy,iterations", [
-    ({}, "guess-src", 10),
+    ({}, "reuse-direct", 10),
     ({"boundary_kwargs": {"fit_init_strategy": "direct", "n_iter": 3}}, "direct", 3),
     ({"boundary_kwargs": {"fit_init_strategy": "direct"},
       "fit_init_strategy": "guess-sdc"}, "guess-sdc", 10),
@@ -565,8 +565,8 @@ def test_sweep_optimizer_retains_fit_diagnostics_in_run_result():
 
 
 @pytest.mark.parametrize("engine,normalize_chi,renormalize_kwargs,backend_cap,expected", [
-    ("dmrg", None, None, None, [4, 4]),
-    ("quimb-mps", None, None, None, [4, 4]),
+    ("dmrg", None, None, None, [2, 2]),
+    ("quimb-mps", None, None, None, [2, 2]),
     ("quimb-mps", (8, 10), None, None, [8, 8]),
     ("quimb-mps", 8, {"chi": 6}, None, [6, 8]),
     ("quimb-mps", 8, None, 6, [6, 6]),
@@ -617,10 +617,10 @@ def test_peps_optimizer_boundary_pairs_complete_real_sweep(engine, fit_mode):
     opt = PepsOptimizer(
         state, [(gate, ((0, 0), (0, 1)))], chi=1,
         fit_mode=fit_mode, boundary_engine=engine, fit_timing=True,
-        optimizer_options={"maxeval": 10},
+        optimizer="nlopt", optimizer_options={"maxeval": 10},
         sweep_optimize_kwargs={"n_round_trips": 1}, boundary_convergence=False,
     )
-    output = opt.run(infidelity_tol=0., progress=False)
+    output = opt.run(k_2q_batch="auto", gate_order="input", infidelity_tol=0., progress=False)
     record = opt.get_step_records()[0]
     assert record["optimizer_attempted"]
     assert record["final_infidelity"] <= record["pre_infidelity"]
@@ -629,8 +629,8 @@ def test_peps_optimizer_boundary_pairs_complete_real_sweep(engine, fit_mode):
     assert np.vdot(vector, vector).real == pytest.approx(1., abs=1e-10)
     if engine == "dmrg":
         assert opt.get_fit_diagnostics()
-    assert opt.boundary_chi == (4, 5)
-    assert record["normalize_chi"] == record["evaluation_chi"] == (4, 5)
+    assert opt.boundary_chi == (2, 4)
+    assert record["normalize_chi"] == record["evaluation_chi"] == (2, 4)
     np.testing.assert_array_equal(state.to_dense(), original)
 
 
@@ -802,7 +802,7 @@ def test_peps_optimizer_target_is_exact_before_chi_decision():
         boundary_engine="quimb-mps", contraction_opt="greedy", boundary_convergence=False,
     )
 
-    output = optimizer.run(cutoff=0.1, cutoff_mode="rsum2", optimize=False)
+    output = optimizer.run(k_2q_batch="auto", gate_order="input", cutoff=0.1, cutoff_mode="rsum2", optimize=False)
 
     amplitudes = np.sort(np.abs(output.to_dense().reshape(-1)))[-2:]
     np.testing.assert_allclose(amplitudes, [np.sin(angle), np.cos(angle)], atol=1e-12)
@@ -833,8 +833,8 @@ def test_peps_optimizer_auto_matches_explicit_policy(backend, dtype, cutoff, tol
         state, [(gate, ((0, 0), (0, 1)))], chi=1, boundary_chi=8,
         boundary_engine="quimb-mps", contraction_opt="greedy", boundary_convergence=False,
     )
-    actual = automatic.run(optimize=False)
-    expected = explicit.run(cutoff=cutoff, cutoff_mode="rsum2",
+    actual = automatic.run(k_2q_batch="auto", gate_order="input", optimize=False)
+    expected = explicit.run(k_2q_batch="auto", gate_order="input", cutoff=cutoff, cutoff_mode="rsum2",
                             infidelity_tol=tolerance, optimize=False)
     np.testing.assert_allclose(actual.to_dense(), expected.to_dense(), atol=cutoff)
     record = automatic.get_step_records()[0]
@@ -859,14 +859,14 @@ def test_peps_optimizer_auto_rechecks_replacement_state_dtype(monkeypatch):
 
     opt = PepsOptimizer(typed_state("complex128"),
                         [({"bond": 2}, ((0, 0), (0, 1)))], chi=3, inplace=True, boundary_convergence=False)
-    opt.run()
+    opt.run(k_2q_batch="auto", gate_order="input")
     assert opt.step_records[0]["cutoff"] == 1e-12
     assert opt.step_records[0]["infidelity_tol"] == 1e-9
     opt.set_state(typed_state("complex64"))
-    opt.run()
+    opt.run(k_2q_batch="auto", gate_order="input")
     assert opt.step_records[0]["cutoff"] == 1e-6
     assert opt.step_records[0]["infidelity_tol"] == 1e-5
-    opt.run(cutoff=0., cutoff_mode="abs", infidelity_tol=2e-8)
+    opt.run(k_2q_batch="auto", gate_order="input", cutoff=0., cutoff_mode="abs", infidelity_tol=2e-8)
     assert opt.step_records[0]["cutoff"] == 0.
     assert opt.step_records[0]["cutoff_mode"] == "abs"
     assert opt.step_records[0]["infidelity_tol"] == 2e-8
@@ -893,7 +893,7 @@ def test_peps_optimizer_rejects_truncated_target_options(target_kwargs):
         chi=2, normalize_initial=False, target_gate_kwargs=target_kwargs, boundary_convergence=False,
     )
     with pytest.raises(ValueError, match="exact post-gate target"):
-        optimizer.run(normalize_target=False)
+        optimizer.run(k_2q_batch="auto", gate_order="input", normalize_target=False)
 
 
 @pytest.mark.parametrize("per_call", [False, True])
@@ -916,7 +916,7 @@ def test_peps_optimizer_exact_target_ignores_general_final_gate_cap(per_call):
     expected = np.zeros(16, dtype="complex128")
     expected[0], expected[12] = np.cos(angle), -1j * np.sin(angle)
     np.testing.assert_allclose(target.to_dense().reshape(-1), expected, atol=1e-12)
-    opt.run(optimize=False, gate_kwargs=options if per_call else None)
+    opt.run(k_2q_batch="auto", gate_order="input", optimize=False, gate_kwargs=options if per_call else None)
     record = opt.get_step_records()[0]
     assert record["target_max_bond"] == 2
     assert record["reason"] == "warmstart"
@@ -952,7 +952,7 @@ def test_peps_optimizer_metric_cap_precedence_matches_run_records(
         DummyState(), [({"bond": 2}, ((0, 0), (0, 1)))], chi=1,
         normalize_kwargs={"chi": 2}, infidelity_kwargs={"chi": 3}, **configured, boundary_convergence=False,
     )
-    opt.run(optimize=False, **run_options)
+    opt.run(k_2q_batch="auto", gate_order="input", optimize=False, **run_options)
     assert all(call[1]["chi"] == expected[0] for call in norms)
     assert evaluations == [expected[1]]
     record = opt.get_step_records()[0]
@@ -1041,7 +1041,7 @@ def test_peps_optimizer_within_chi_skips_infidelity_and_optimizer(monkeypatch):
         normalize_initial=False, boundary_convergence=False,
     )
 
-    out = opt.run(progress=False, normalize_target=False)
+    out = opt.run(k_2q_batch="auto", gate_order="input", progress=False, normalize_target=False)
 
     assert out.bond == 2
     assert len(gate_calls) == 1
@@ -1075,12 +1075,12 @@ def test_peps_optimizer_truncated_warmstart_below_tol_skips_sweep(monkeypatch):
         normalize_initial=False, boundary_convergence=False,
     )
 
-    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+    out = opt.run(k_2q_batch="auto", gate_order="input", progress=False, infidelity_tol=1.0e-9)
 
     assert out.bond == 3
     assert out.normalized == 1
     assert len(norm_calls) == 1
-    assert norm_calls[0][1]["chi"] == (12, 15)
+    assert norm_calls[0][1]["chi"] == (18, 36)
     assert norm_calls[0][1]["n_iter"] == 10
     assert norm_calls[0][1]["direction"] == "y"
     assert norm_calls[0][1]["max_separation"] == 1
@@ -1116,7 +1116,7 @@ def test_peps_optimizer_symmray_defaults_to_quimb_mps_boundaries(monkeypatch):
         normalize_initial=False, boundary_convergence=False,
     )
 
-    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+    out = opt.run(k_2q_batch="auto", gate_order="input", progress=False, infidelity_tol=1.0e-9)
 
     assert out.bond == 3
     assert norm_calls[0][1]["method"] == "mps"
@@ -1211,7 +1211,7 @@ def test_peps_optimizer_runs_sweep_and_records_geometric_fidelity(monkeypatch):
     assert captured["init"]["kwargs"]["track_boundary_fidelity"] is False
     assert captured["init"]["kwargs"]["normalize_kwargs"]["strip_exponent"] is True
     assert captured["optimize_kwargs"]["n_cycles"] == 2
-    assert captured["optimize_kwargs"]["n_round_trips"] == 4
+    assert captured["optimize_kwargs"]["n_round_trips"] == 2
     assert captured["optimize_kwargs"]["renormalize"] is False
     assert captured["optimize_kwargs"]["env_n_iter"] == 10
     assert captured["optimize_kwargs"]["progress"] is True
@@ -1244,12 +1244,12 @@ def test_peps_optimizer_runs_sweep_and_records_geometric_fidelity(monkeypatch):
 
 
 @pytest.mark.parametrize("caps,environment,normalization,evaluation", [
-    ({}, (12, 15), (12, 15), (12, 15)),
-    ({"boundary_chi": 4}, 4, (12, 15), (12, 15)),
-    ({"boundary_chi": (5, 7)}, (5, 7), (12, 15), (12, 15)),
+    ({}, (18, 36), (18, 36), (18, 36)),
+    ({"boundary_chi": 4}, 4, (18, 36), (18, 36)),
+    ({"boundary_chi": (5, 7)}, (5, 7), (18, 36), (18, 36)),
     ({"boundary_chi": 4, "normalize_chi": 6, "evaluation_chi": 9}, 4, 6, 9),
-    ({"normalize_chi": 6, "evaluation_chi": 9}, (12, 15), 6, 9),
-    ({"normalize_chi": (6, 7), "evaluation_chi": (8, 9)}, (12, 15), (6, 7), (8, 9)),
+    ({"normalize_chi": 6, "evaluation_chi": 9}, (18, 36), 6, 9),
+    ({"normalize_chi": (6, 7), "evaluation_chi": (8, 9)}, (18, 36), (6, 7), (8, 9)),
 ])
 def test_peps_optimizer_separates_optimization_normalize_and_evaluation_chi(
     monkeypatch, caps, environment, normalization, evaluation,
@@ -1297,7 +1297,7 @@ def test_peps_optimizer_separates_optimization_normalize_and_evaluation_chi(
         **caps, boundary_convergence=False,
     )
 
-    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+    out = opt.run(k_2q_batch="auto", gate_order="input", progress=False, infidelity_tol=1.0e-9)
 
     assert out.name == "best"
     assert [call[1]["chi"] for call in norm_calls] == [normalization] * 3
@@ -1340,7 +1340,7 @@ def test_peps_optimizer_run_overrides_normalize_and_evaluation_chi(
         normalize_initial=False, boundary_convergence=False,
     )
 
-    out = opt.run(
+    out = opt.run(k_2q_batch="auto", gate_order="input",
         progress=False,
         optimize=False,
         normalize_chi=norm_cap,
@@ -1410,7 +1410,7 @@ def test_peps_optimizer_rejects_optimizer_when_final_infidelity_is_worse(monkeyp
         normalize_initial=False, boundary_convergence=False,
     )
 
-    out = opt.run(progress=False)
+    out = opt.run(k_2q_batch="auto", gate_order="input", progress=False)
 
     record = opt.step_records[0]
     assert out.bond == 3
@@ -1494,7 +1494,7 @@ def test_peps_optimizer_global_defaults_options_and_torch_svd(monkeypatch):
     init_kwargs = captured["init"]["kwargs"]
     assert init_kwargs["chi"] == (16, 16)
     assert init_kwargs["norm_kwargs"]["chi"] == (16, 16)
-    assert init_kwargs["normalize_kwargs"]["chi"] == (12, 15)
+    assert init_kwargs["normalize_kwargs"]["chi"] == (18, 36)
     assert init_kwargs["norm_kwargs"]["mode"] == "mps"
     assert init_kwargs["norm_kwargs"]["mode_"] == "mps"
     assert init_kwargs["norm_kwargs"]["max_separation"] == 1
@@ -1711,14 +1711,14 @@ def test_peps_optimizer_run_resets_traces_by_default(monkeypatch):
         normalize_initial=False, boundary_convergence=False,
     )
 
-    opt.run(progress=False, optimize=False)
+    opt.run(k_2q_batch="auto", gate_order="input", progress=False, optimize=False)
     assert opt.local_infidelities == [pytest.approx(0.1)]
 
-    opt.run(progress=False, optimize=False, reset_traces=False)
+    opt.run(k_2q_batch="auto", gate_order="input", progress=False, optimize=False, reset_traces=False)
     assert opt.local_infidelities == [pytest.approx(0.1), pytest.approx(0.2)]
     assert len(opt.step_records) == 2
 
-    opt.run(progress=False, optimize=False)
+    opt.run(k_2q_batch="auto", gate_order="input", progress=False, optimize=False)
     assert opt.local_infidelities == [pytest.approx(0.3)]
     assert len(opt.step_records) == 1
 
@@ -1763,7 +1763,7 @@ def test_peps_optimizer_progress_reports_geometric_infidelity(monkeypatch):
         normalize_initial=False, boundary_convergence=False,
     )
 
-    _ = opt.run(progress=True, infidelity_tol=1.0e-3)
+    _ = opt.run(k_2q_batch="auto", gate_order="input", progress=True, infidelity_tol=1.0e-3)
 
     progress = progress_instances[-1]
     last = progress.postfix_calls[-1]
@@ -1892,7 +1892,7 @@ def test_peps_optimizer_nonunitary_normalizes_target_before_infidelity(monkeypat
         normalize_initial=False, boundary_convergence=False,
     )
 
-    out = opt.run(non_unitary=True, infidelity_tol=1.0e-9, progress=False)
+    out = opt.run(k_2q_batch="auto", gate_order="input", non_unitary=True, infidelity_tol=1.0e-9, progress=False)
 
     assert out.bond == 3
     assert opt.step_records[0]["reason"] == "below_tol"
@@ -1916,7 +1916,7 @@ def test_peps_optimizer_compares_candidates_at_common_retry_cap(monkeypatch):
         return DummyState(bond=1, name="candidate"), .1, {}
     monkeypatch.setattr(opt, "_optimize_state", optimize)
     with pytest.warns(RuntimeWarning, match="retrying"):
-        out = opt.run()
+        out = opt.run(k_2q_batch="auto", gate_order="input")
     assert out.name == "candidate"
     assert caps == [2, 2, 4, 4]
     record = opt.step_records[0]
@@ -2065,9 +2065,9 @@ def test_peps_optimizer_symmray_sweep_uses_quimb_mps_boundaries(monkeypatch):
         [({"bond": 8}, ((0, 0), (0, 1)))],
         chi=3,
         normalize_initial=False, boundary_convergence=False,
-    )
+     optimizer="nlopt")
 
-    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+    out = opt.run(k_2q_batch="auto", gate_order="input", progress=False, infidelity_tol=1.0e-9)
 
     assert out.name == "best"
     assert captured["kwargs"]["boundary_engine"] == "quimb-mps"
@@ -2272,7 +2272,7 @@ def test_peps_optimizer_explicit_quimb_boundary_engine_forwards_options(monkeypa
         normalize_initial=False, boundary_convergence=False,
     )
 
-    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+    out = opt.run(k_2q_batch="auto", gate_order="input", progress=False, infidelity_tol=1.0e-9)
 
     assert out.name == "best"
     assert captured["kwargs"]["boundary_engine"] == "quimb-mps"
@@ -2411,7 +2411,7 @@ def test_peps_optimizer_explicit_dmrg_boundary_engine_overrides_symmray_auto(mon
         normalize_initial=False, boundary_convergence=False,
     )
 
-    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+    out = opt.run(k_2q_batch="auto", gate_order="input", progress=False, infidelity_tol=1.0e-9)
 
     assert out.name == "best"
     assert captured["kwargs"]["boundary_engine"] == "dmrg"
@@ -2441,6 +2441,6 @@ def test_peps_optimizer_forwards_entry_which_over_default(monkeypatch):
         normalize_initial=False, boundary_convergence=False,
     )
 
-    _ = opt.run(progress=False, normalize_target=False)
+    _ = opt.run(k_2q_batch="auto", gate_order="input", progress=False, normalize_target=False)
 
     assert gate_calls[0]["which"] == "lower"

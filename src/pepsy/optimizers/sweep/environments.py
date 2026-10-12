@@ -9,6 +9,7 @@ from functools import lru_cache
 from ..._internal.quimb import call_quimb_2d, quimb_2d_options
 from ...backends.convert import resolve_backend_sample_data_from_tn
 from ..._internal.cutoff import dtype_auto_cutoff
+from ...boundary._layers import prepare_quimb_site_layers
 
 __all__ = [
     "QuimbMpsBoundaryStore",
@@ -434,6 +435,11 @@ class QuimbMpsBoundaryStore:  # pylint: disable=protected-access,too-many-instan
         static environment and update the other side incrementally.
         """
         axis = _canonical_axis(axis)
+        if int(getattr(tn, 'Ly' if axis == 'y' else 'Lx', 0)) == 1:
+            self.clear(axis)
+            self.update_count += 1
+            return self
+        tn = prepare_quimb_site_layers(tn, self.layer_tags)
         if axis == "y":
             compute_fn = getattr(tn, "compute_y_environments", None)
         elif axis == "x":
@@ -491,6 +497,15 @@ class QuimbMpsBoundaryStore:  # pylint: disable=protected-access,too-many-instan
 
         static_side = f"{axis}{'max' if update_side == 'left' else 'min'}"
         moving_side = f"{axis}{'min' if update_side == 'left' else 'max'}"
+        # A singleton axis has no cuts. Quimb's environment constructor
+        # assumes at least two planes and indexes sweep[1].
+        if int(getattr(tn, 'Ly' if axis == 'y' else 'Lx', 0)) == 1:
+            self.clear(axis)
+            self._sweep_axis = axis
+            self._sweep_update_side = update_side
+            self._sweep_moving_env = None
+            self.update_count += 1
+            return self
         if reuse_static and self._has_complete_side(tn, axis, static_side):
             self._resolve_cutoff(tn)
             self._clear_side(axis, moving_side)
@@ -506,6 +521,7 @@ class QuimbMpsBoundaryStore:  # pylint: disable=protected-access,too-many-instan
             self.update_count += 1
             return self
 
+        tn = prepare_quimb_site_layers(tn, self.layer_tags)
         # The public Quimb names are ``compute_ymin_environments`` etc.
         compute_fn = getattr(
             tn,
@@ -636,6 +652,7 @@ class QuimbMpsBoundaryStore:  # pylint: disable=protected-access,too-many-instan
         opts = self._compute_kwargs()
         opts.pop("dense", None)
         opts.pop("envs", None)
+        pair = prepare_quimb_site_layers(pair, self.layer_tags)
         call_quimb_2d(
             getattr(pair, f"contract_boundary_from_{direction}_"),
             xrange=xrange,

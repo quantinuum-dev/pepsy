@@ -39,6 +39,9 @@ _FIT_INIT_STRATEGY_ALIASES = {
     "guess-direct": "guess-direct",
     "guess-src": "guess-src",
     "guess-sdc": "guess-sdc",
+    "reuse-direct": "reuse-direct",
+    "reuse-src": "reuse-src",
+    "reuse-sdc": "reuse-sdc",
 }
 
 _FIT_QUIMB_MODES = frozenset(
@@ -131,7 +134,8 @@ def _canonical_fit_init_strategy(strategy):
     except KeyError as exc:
         raise ValueError(
             f"Unknown fit_init_strategy={strategy!r}. Expected 'direct', "
-            "'auto', 'guess-direct', 'guess-src', or 'guess-sdc'."
+            "'auto', 'guess-direct', 'guess-src', 'guess-sdc', "
+            "'reuse-direct', 'reuse-src', or 'reuse-sdc'."
         ) from exc
 
 

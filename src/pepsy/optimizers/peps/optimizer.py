@@ -52,6 +52,10 @@ from ..sweep.environments import (
 from ._timing import profile_run, timed_phase
 from ._boundary_convergence import chi_pair, convergence_options, select_boundary_chi
 from ._gate_order import fixed_gate_sites, gate_order_option, ordered_gate_run
+from ._strip_batch import (
+    collect_strip_batch, layered_target, reuse_boundary_guesses,
+    simple_update_guess, strip_key,
+)
 
 __all__ = ["PepsOptimizer"]
 
@@ -65,10 +69,10 @@ _DEFAULT_BOUNDARY_KWARGS = {
 }
 _DEFAULT_GLOBAL_SEQUENCE = ("xmax", "xmin", "ymin", "ymax")
 _DEFAULT_SWEEP_OPTIMIZE_KWARGS = {
-    "n_round_trips": 4,
+    "n_round_trips": 2,
     "renormalize": False,
 }
-_DEFAULT_SWEEP_SOLVER = "nlopt"
+_DEFAULT_SWEEP_SOLVER = "als"
 _DEFAULT_SWEEP_NLOPT_ALGORITHM = "LD_LBFGS"
 _DEFAULT_SWEEP_NLOPT_OPTIONS = {
     "algorithm": _DEFAULT_SWEEP_NLOPT_ALGORITHM,
@@ -159,7 +163,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     after output normalization. Otherwise a warm start is formed by compressing ``target.copy()`` to
     ``chi``; this warm start is either accepted by a boundary-fidelity check or
     refined against the exact target with ``mode="sweep"`` or ``mode="global"``.
-    By default ``run(k_2q_batch="auto")`` batches gates in circuit order while
+    Sweep mode defaults to fixed strip targets, simple-update guesses and ALS,
+    starting at the gated strip before traversing the complete parallel axis.
+    Global mode defaults to ``run(k_2q_batch="auto")``, batching gates while
     the target bonds stay within ``2 * chi`` for diagonal qubit gates or
     ``4 * chi`` for other gates. A larger exact single-gate target is processed
     alone. Positive integers select a fixed two-site gate count.
@@ -187,15 +193,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
       :meth:`set_state` when you want to replay from a fresh input state.
     - If ``normalize_chi`` or ``evaluation_chi`` is left as ``None``, standalone
       normalization and infidelity diagnostics inherit ``boundary_chi`` for
-      two-site full update, otherwise ``(4 * chi, 5 * chi)`` as norm/overlap
+      two-site full update, otherwise ``(2 * chi**2, 4 * chi**2)`` as norm/overlap
       caps. Normalization uses only the first entry.
     - ``accept_if_improved=True`` is most meaningful with
       ``measure_final_infidelity=True``. If final measurement is disabled, the
       optimizer loss used as a fallback can come from the coarser
       ``boundary_chi`` environment while the pre-check used ``evaluation_chi``.
-    - Symmray PEPS inputs must be Torch-backed. Their sweep cleanup defaults
-      to NLopt ``LD_LBFGS`` while obtaining gradients from Torch autograd;
-      provide both the PEPS and gates with the same Torch Symmray backend.
+    - Native Symmray and JAX states do not support the default strip ALS.
+      Symmray sweep cleanup requires explicit ``optimizer="nlopt"`` with
+      PEPS targets and Torch-backed states/gates; global mode supports JAX.
     - Unitary evolution is assumed by default: generated targets are not
       rescaled. ``non_unitary=True`` enables target normalization, and
       ``normalize_target`` explicitly overrides that policy. Retained outputs
@@ -222,18 +228,18 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Boundary contraction bond dimension used by the sweep/global
         optimization backends. Two-site full update defaults to one scalar
         ``2 * chi**2``, also inherited by normalization and evaluation. Other
-        modes default to ``(4 * chi, 5 * chi)`` for norm and overlap, with
+        modes default to ``(2 * chi**2, 4 * chi**2)`` for norm and overlap, with
         independent normalization/evaluation defaults. A scalar sets both caps.
     normalize_chi : int | tuple[int, int] | None, optional
         Boundary cap or norm/overlap pair used for PEPS normalization calls.
         Defaults to ``boundary_chi`` for two-site full update, otherwise
-        ``(4 * chi, 5 * chi)``; only the norm (first) entry is used.
+        ``(2 * chi**2, 4 * chi**2)``; only the norm (first) entry is used.
     evaluation_chi : int | tuple[int, int] | None, optional
         Boundary bond dimension used for pre/post local infidelity estimates
         that decide whether the warm start or optimized candidate is accepted.
         This is the knob for stricter initial/final diagnostics. If ``None``,
         the evaluation chi defaults to ``boundary_chi`` for two-site full
-        update, otherwise ``(4 * chi, 5 * chi)``. Measured state
+        update, otherwise ``(2 * chi**2, 4 * chi**2)``. Measured state
         norms use the first entry; the overlap uses the second. A scalar sets
         both. Unitary runs assume target norm one unless explicitly overridden.
     evaluation_max_retries : int | None, default=None
@@ -255,7 +261,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     update_style : {"row-column", "row", "column", "two-site"}, default="row-column"
         Sweep local update scope. Row/column fits use the existing variational
         solver; two-site defaults to reduced ALS and processes each two-site gate.
-    gate_order : {"input", "column", "row", "smart"}, default="input"
+    gate_order : {"input", "column", "row", "smart"} | None, default=None
+        None selects column order in sweep mode (row for ``update_style="row"``),
+        and input order in global/two-site modes, including run-time overrides.
         Row/column policies reorder commuting two-qubit blocks into strips.
         Disjoint gates commute; overlapping gates must both be diagonal for
         these two policies. ``last_gate_order`` maps the executed
@@ -286,7 +294,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         estimates, and sweep environment updates. Defaults are
         ``n_iter=10``, ``direction="y"``, ``max_separation=1``,
         ``track_boundary_fidelity=False``, and ``strip_exponent=True``.
-        Boundary FIT uses ``fit_init_strategy="guess-src"`` by default;
+        Sweep boundary FIT defaults to ``fit_init_strategy="reuse-direct"``;
+        other modes retain ``"guess-src"``. Cuts are refitted after changes;
         explicit direct arguments or mapping entries override this policy.
         FIT controls such as ``fit_mode``, ``fit_layer_mode``, ``layer_tags``,
         the ``fit_*`` initialization/convergence options, and ``cutoff`` are
@@ -301,8 +310,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         inputs to Quimb MPS boundaries. The same selector supplies default
         ``method="mps"`` metric contractions when Quimb MPS is selected.
     boundary_convergence : bool | mapping | "auto", default="auto"
-        Auto disables probes for two-site full update and enables them for
-        row/column sweeps. Explicit True or a mapping opts into probes.
+        Auto disables probes for strip batches and two-site full update.
+        Explicit True or a mapping opts into probes with non-strip batching.
         Before sweep refinement, recompute both state norms and their complex
         overlap in x and y at increasing boundary caps. Mapping controls are
         ``rtol=1e-5``, ``atol=1e-8`` (normalized overlap), ``schedule='d2'``,
@@ -338,10 +347,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     optimizer : str | None, optional
         Compact optimizer selection for the chosen variational backend. In
         sweep mode this maps to :class:`SweepOptimizer`'s local solver name;
-        when left as ``None`` the sweep local solver defaults to NLopt
-        ``LD_LBFGS``. Torch-backed Symmray states still supply gradients via
-        Torch autograd. ``"als"`` selects dense one-site ALS passes inside
-        each row/column, retaining the outer sweep schedule. In global mode, ``"nlopt"`` together with
+        when left as ``None`` the sweep local solver defaults to ``"als"``.
+        ALS visits one tensor at a time inside each row/column. Explicit
+        ``"nlopt"`` retains the older gradient solver and automatic gate batching.
+        In global mode, ``"nlopt"`` together with
         ``optimizer_options={"algorithm": "LD_VAR2"}`` routes to
         :meth:`GlobalOptimizer.optimize_nlopt`.
     optimizer_options : mapping, optional
@@ -351,13 +360,16 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         each local slice solve, not the complete circuit. Global mode accepts aliases such as
         ``algorithm``, ``maxeval``/``n_steps``, tolerance keys, ``device``, and
         ``progress``.
-        Sweep ALS accepts ``n_round_trips=2`` for the inner forward/backward
+        Sweep ALS defaults to ``linear_solver="auto"`` (small spectral solve,
+        large matrix-free CG) and ``n_round_trips=2`` for inner forward/backward
         passes, ``rtol=1e-9``, ``rcond=None`` and ``max_matrix_size=1024``.
     sweep_kwargs : mapping, optional
         Constructor options forwarded to :class:`SweepOptimizer`.
     sweep_optimize_kwargs : mapping, optional
-        Per-run sweep controls. PEPS defaults use ``n_round_trips=4`` and
-        ``renormalize=False``; pass explicit values here to override them.
+        Per-run sweep controls. PEPS defaults use ``n_round_trips=2`` and
+        ``renormalize=False``. For strip batches, the first forward pass starts
+        at the gated strip; two backward/forward round trips then cover all
+        parallel strips. This budget is separate from inner ALS round trips.
     sweep_progress : bool | None, default=None
         Show the internal directional sweep progress bar independently of
         the outer PEPS bar. ``None`` follows the outer ``progress`` setting;
@@ -439,7 +451,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         boundary_convergence="auto",
         mode="sweep",
         update_style="row-column",
-        gate_order="input",
+        gate_order=None,
         contraction_opt=None,
         which=None,
         inplace=False,
@@ -501,8 +513,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._boundary_convergence_auto = boundary_convergence == 'auto'
         self._evaluation_retries_auto = evaluation_max_retries is None
         self._boundary_fit_auto = fit_mode is None and 'fit_mode' not in (boundary_kwargs or {})
+        self._boundary_init_auto = fit_init_strategy is None and 'fit_init_strategy' not in (boundary_kwargs or {})
         self.boundary_chi = self._validate_boundary_chi(
-            (2 * self.chi**2 if self._active_full_update else (4 * self.chi, 5 * self.chi))
+            (2 * self.chi**2 if self._active_full_update else (2 * self.chi**2, 4 * self.chi**2))
             if boundary_chi is None else boundary_chi
         )
         self.normalize_chi = (
@@ -519,13 +532,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             (0 if self._active_full_update else 2) if evaluation_max_retries is None
             else evaluation_max_retries)
         self.boundary_convergence = convergence_options(
-            not self._active_full_update if self._boundary_convergence_auto else boundary_convergence,
+            self.mode == 'global' if self._boundary_convergence_auto else boundary_convergence,
             bond_dim=self.chi)
         self._boundary_chi_floor = None
         self.evaluation_negative_tol = float(evaluation_negative_tol)
         if not math.isfinite(self.evaluation_negative_tol) or self.evaluation_negative_tol < 0:
             raise ValueError("evaluation_negative_tol must be finite and non-negative.")
-        self.gate_order = gate_order_option(gate_order)
+        self._gate_order_auto = gate_order is None
+        self.gate_order = (self._default_gate_order(self.mode, self.update_style)
+                           if self._gate_order_auto else gate_order_option(gate_order))
         self.last_gate_order = None
         from ._full_update import options as full_update_options
         self.full_update_kwargs = full_update_options(full_update_kwargs)
@@ -569,6 +584,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         if self._boundary_fit_auto:
             self.boundary_kwargs['fit_mode'] = 'dmrg' if self._active_full_update else 'eff'
+        if self._boundary_init_auto and self.mode == 'sweep' and not self._active_full_update:
+            self.boundary_kwargs['fit_init_strategy'] = 'reuse-direct'
         self.boundary_engine = canonical_boundary_engine_selector(boundary_engine)
         self._boundary_layers_auto = self.boundary_kwargs.get('fit_layer_mode') is None
         self._validate_boundary_fit_policy()
@@ -579,6 +596,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.target_gate_kwargs = dict(target_gate_kwargs or {})
         self.warmstart_gate_kwargs = dict(warmstart_gate_kwargs or {})
         self.optimizer = optimizer
+        self._strip_guess_boundaries = None
         self.optimizer_options = dict(optimizer_options or {})
         self.sweep_kwargs = dict(sweep_kwargs or {})
         self.sweep_optimize_kwargs = dict(sweep_optimize_kwargs or {})
@@ -613,6 +631,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             allowed = ", ".join(sorted(cls._ALLOWED_MODES))
             raise ValueError(f"Unknown mode: {mode!r}. Expected one of: {allowed}.")
         return mode_norm
+
+    @staticmethod
+    def _default_gate_order(mode, style):
+        if mode == 'sweep' and style != 'two-site':
+            return 'row' if style == 'row' else 'column'
+        return 'input'
 
     @staticmethod
     def _validate_scalar_chi(chi, *, name):
@@ -673,7 +697,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         elif "chi" in stored:
             value = stored["chi"]
         else:
-            default = self.boundary_chi if self._active_full_update else (4 * self.chi, 5 * self.chi)
+            default = self.boundary_chi if self._active_full_update else (2 * self.chi**2, 4 * self.chi**2)
             value = self.boundary_kwargs.get("chi", default)
         if value is None:
             return None
@@ -1040,8 +1064,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Do not inspect native block arrays or traced/trainable gate values.
         Zero entries of a trainable gate can have nonzero tangents.
         """
-        if ar.infer_backend(gate_payload) not in {"numpy", "torch", "cupy"}:
+        backend = ar.infer_backend(gate_payload)
+        if backend not in {"numpy", "torch", "cupy", "jax"}:
             return 4
+        if backend == "jax":
+            from jax.core import Tracer
+
+            if isinstance(gate_payload, Tracer):
+                return 4
         if getattr(gate_payload, "requires_grad", False):
             return 4
         if tuple(getattr(gate_payload, "shape", ())) not in {(4, 4), (2, 2, 2, 2)}:
@@ -1787,6 +1817,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 self.optimizer_options, opt_kwargs.get("optimizer_options"),
             )
         opt_kwargs.setdefault("optimizer", _DEFAULT_SWEEP_SOLVER)
+        if _optimizer_key(opt_kwargs.get("optimizer")) == "als":
+            opt_kwargs["optimizer_options"] = _merge_opts(
+                {"linear_solver": "auto", "n_round_trips": 2},
+                opt_kwargs.get("optimizer_options"),
+            )
         if _optimizer_key(opt_kwargs.get("optimizer")) == "nlopt":
             opt_kwargs["optimizer_options"] = _merge_opts(
                 _DEFAULT_SWEEP_NLOPT_OPTIONS,
@@ -1975,10 +2010,16 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         sweep_kwargs = dict(sweep_kwargs or {})
         checked_boundaries = sweep_kwargs.pop('_checked_boundaries', None)
         checked_target = sweep_kwargs.pop('_checked_target', None)
+        is_strip = '_active_strip' in (sweep_optimize_kwargs or {})
         # build_bra_ket already separates colliding ket/bra bonds. Keep the
         # calibrated labels when transferring environments into this fitter.
         target_opt = (checked_target if checked_boundaries is not None
                       else self._copy_and_mangle_target(target))
+        if is_strip:
+            # Stable disjoint labels permit compatible overlap guesses to
+            # survive subsequent strip batches. No numerical cuts are reused.
+            target_opt = target.copy()
+            target_opt.mangle_inner_('__pepsy_strip_target')
         boundary_init_kwargs, boundary_opt_kwargs, strip_exponent = self._sweep_boundary_kwargs(
             progress=progress,
             sweep_progress=sweep_progress,
@@ -2041,6 +2082,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             state_target=target_opt,
             **init_kwargs,
         )
+        guess_reuse = (reuse_boundary_guesses(sweeper, self._strip_guess_boundaries)
+                       if is_strip and sweeper.fit_init_strategy.startswith('reuse-') else None)
 
         opt_kwargs = _merge_opts(
             _DEFAULT_SWEEP_OPTIMIZE_KWARGS,
@@ -2063,19 +2106,41 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             opt_kwargs["progress_position"] = 1 if progress and sweep_progress else 0
             opt_kwargs["progress_leave"] = False
         opt_kwargs.setdefault("progress", bool(progress))
+        active_strip = opt_kwargs.pop('_active_strip', None)
         if opt_kwargs:
             sweeper.set_optimize_kwargs(**opt_kwargs)
 
-        result = sweeper.run()
+        if active_strip is None:
+            result = sweeper.run()
+        else:
+            axis, index = active_strip
+            strip_options = dict(sweeper.optimize_kwargs)
+            axes = tuple(strip_options.pop('axes', (axis,)))
+            if axes != (axis,):
+                raise ValueError('strip sweep axes must match the gated strip axis')
+            strip_options['solver'] = strip_options.pop('optimizer', 'als')
+            strip_options['solver_options'] = strip_options.pop('optimizer_options', None)
+            # The driver owns default pre/post metrics. Explicit diagnostic
+            # requests still run through the common sweep lifecycle.
+            strip_options.setdefault('compute_initial_loss', False)
+            strip_options.setdefault('compute_final_loss', False)
+            result = sweeper._run_global_sweeps(
+                axes=(axis,), start_index=index, retain_boundary_guesses=True,
+                **strip_options,
+            )
+            if sweeper.boundary_engine == 'dmrg':
+                self._strip_guess_boundaries = result.pop('boundary_guesses', None)
         self._append_fit_diagnostics(getattr(sweeper, "fit_diagnostics", None))
         best_state = result.get("best_state") if isinstance(result, Mapping) else None
         state_out = best_state if best_state is not None else sweeper.state
         final_infidelity = None
-        if isinstance(result, Mapping):
+        if isinstance(result, Mapping) and result.get('success') is not False:
             final_infidelity = result.get("best_loss")
             if final_infidelity is None:
                 final_infidelity = result.get("loss_after")
         summary = self._summarize_sweep_result(result)
+        if guess_reuse is not None:
+            summary['boundary_guesses_reused'] = guess_reuse
         if checked_boundaries is not None:
             summary['environment_reuse'] = {
                 name: boundary.mps_b.environment_cache.report()
@@ -2146,6 +2211,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 init_kwargs.get("loss_opt"),
             )
 
+        # This driver applies its explicit registration policy immediately
+        # before optimization, including any fallback backend.
+        init_kwargs.setdefault('register_linalg', False)
         optimizer = GlobalOptimizer(
             state=state,
             state_target=target_opt,
@@ -2228,6 +2296,16 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         runs = result.get("runs")
         if runs is not None:
             summary["n_runs"] = len(runs)
+            summary["sweep_history"] = [
+                {key: run[key] for key in (
+                    "axis", "index", "sweep", "loss_initial", "loss_final",
+                    "raw_loss_initial", "raw_loss_final", "n_round_trips",
+                    "update_applied", "invalid_loss", "environment_reuse",
+                    "contraction_cache",
+                    "bdy_norm", "bdy_overlap_norm",
+                ) if key in run}
+                for run in runs
+            ]
             als_runs = [run for run in runs if run.get("solver") == "als"]
             if als_runs:
                 local_solves = [solve for run in als_runs for solve in run.get("local_solves", ())]
@@ -2823,7 +2901,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         progress=None,
         cutoff="auto",
         cutoff_mode="auto",
-        k_2q_batch="auto",
+        k_2q_batch=None,
+        strip_batch_size=1,
+        warmstart_method=None,
+        target_representation="auto",
         non_unitary=False,
         normalize_target=None,
         normalize_initial=None,
@@ -2872,7 +2953,17 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             warm-start compression. Automatic cutoff follows the current PEPS
             dtype: 1e-12 for float64/complex128, 1e-6 for float32/complex64,
             and 1e-3 for 16-bit data. Automatic cutoff mode is "rsum2".
-        k_2q_batch : {"auto"} | int, default="auto"
+        k_2q_batch : {"auto", "strip", "all"} | int | None, default=None
+            None selects ``"strip"`` for sweep ALS and ``"auto"`` otherwise.
+            ``"strip"`` collects consecutive gates within one row/column,
+            then starts ALS at that strip and sweeps all parallel strips,
+            or fits the whole state in global mode.
+            One-site gates are barriers. ``"all"`` absorbs the remaining gate
+            queue into one exact target for global optimization.
+            Strip batches require fixed caps (``boundary_convergence=False``)
+            and final normalization. In sweep mode they require
+            ``optimizer="als"``; its inner round-trip budget controls
+            forward/backward tensor visits.
             Automatic batches stop before a gate makes any target bond exceed
             ``2 * chi`` for diagonal qubit gates (including RZZ), or
             ``4 * chi`` when other two-site gates enter the batch.
@@ -2887,6 +2978,21 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             in circuit order and do not count toward the two-site limit.
             Leading one-site gates are applied directly; trailing one-site
             gates join an automatic batch until its next stopping condition.
+        strip_batch_size : int, default=1
+            Number of adjacent parallel strips allowed in a strip batch.
+            Values above one require global mode. Input gate order is retained.
+        warmstart_method : {"compress", "simple-update"} | None, default=None
+            None selects simple update for sweep strip batches and compression
+            otherwise.
+            Compress the exact target, or apply the batch gates individually
+            to a private simple-update gauge state and absorb its gauges once.
+            Simple update changes only the guess; the target stays exact.
+        target_representation : {"auto", "layered", "peps"}, default="auto"
+            Strip ALS uses exact, separately tagged split-gate factors by
+            default. Global fitting defaults to an enlarged PEPS and accepts
+            explicit layered targets with strip/all/integer gate batches.
+            With a layered target, the compress guess applies/truncates gates
+            sequentially. Automatic bond-growth batching requires PEPS targets.
         non_unitary : bool, default=False
             If ``True``, target states produced by gates are explicitly
             normalized before fidelity estimates and optimization.
@@ -2983,6 +3089,17 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             run_mode = 'full-update'
         if run_mode == 'full-update' and style in {'row', 'column'}:
             raise ValueError('full-update uses two-site updates, not row/column updates')
+        sweep_options = self._apply_sweep_optimizer_options(_merge_opts(
+            self.sweep_optimize_kwargs, sweep_optimize_kwargs,
+        ))
+        sweep_solver = _optimizer_key(sweep_options['optimizer'])
+        if k_2q_batch is None:
+            k_2q_batch = 'strip' if run_mode == 'sweep' and sweep_solver == 'als' else 'auto'
+        if isinstance(k_2q_batch, str):
+            k_2q_batch = k_2q_batch.strip().lower()
+        if warmstart_method is None:
+            warmstart_method = ('simple-update' if run_mode == 'sweep' and k_2q_batch == 'strip'
+                                else 'compress')
         # Resolve automatic defaults for the effective run style as well as
         # constructor selection. Explicit policies and diagnostic caps survive.
         self._active_full_update = run_mode == 'full-update'
@@ -2993,16 +3110,22 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         if self._accept_if_improved_auto:
             self.accept_if_improved = not self._active_full_update
         if self._boundary_chi_auto:
-            self.boundary_chi = 2 * self.chi**2 if self._active_full_update else (4 * self.chi, 5 * self.chi)
+            self.boundary_chi = 2 * self.chi**2 if self._active_full_update else (2 * self.chi**2, 4 * self.chi**2)
         if self._boundary_convergence_auto:
-            self.boundary_convergence = convergence_options(not self._active_full_update, bond_dim=self.chi)
+            self.boundary_convergence = convergence_options(
+                not self._active_full_update and k_2q_batch != 'strip', bond_dim=self.chi,
+            )
         if self._evaluation_retries_auto:
             self.evaluation_max_retries = 0 if self._active_full_update else 2
         if self._boundary_fit_auto:
             self.boundary_kwargs['fit_mode'] = 'dmrg' if self._active_full_update else 'eff'
+        if self._boundary_init_auto:
+            self.boundary_kwargs['fit_init_strategy'] = (
+                'reuse-direct' if run_mode == 'sweep' else _DEFAULT_BOUNDARY_KWARGS['fit_init_strategy']
+            )
         normalize_chi = self._boundary_chi_for_norm(normalize_chi, options=normalize_kwargs)
         evaluation_chi = self._boundary_chi_for_infidelity(evaluation_chi, options=infidelity_kwargs)
-        if run_mode == 'sweep' and style in {'row', 'column'}:
+        if run_mode == 'sweep' and k_2q_batch != 'strip' and style in {'row', 'column'}:
             sweep_optimize_kwargs = {**(sweep_optimize_kwargs or {}),
                                      'axes': ('x',) if style == 'row' else ('y',)}
         adaptive_boundary = run_mode in {"sweep", "full-update"} and optimize and self.boundary_convergence is not None
@@ -3036,10 +3159,50 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             if accept_if_improved is None
             else bool(accept_if_improved)
         )
-        if isinstance(k_2q_batch, str) and k_2q_batch.strip().lower() == "auto":
-            k_2q_batch = "auto"
+        if isinstance(k_2q_batch, str) and k_2q_batch.strip().lower() in {"auto", "strip", "all"}:
+            k_2q_batch = k_2q_batch.strip().lower()
         else:
             k_2q_batch = self._validate_scalar_chi(k_2q_batch, name="k_2q_batch")
+        if warmstart_method not in {'compress', 'simple-update'}:
+            raise ValueError("warmstart_method must be 'compress' or 'simple-update'")
+        if target_representation not in {'auto', 'layered', 'peps'}:
+            raise ValueError("target_representation must be 'auto', 'layered', or 'peps'")
+        has_two_site = any(self._site_count(entry[1], self.state) == 2 for entry in self.gates)
+        layered = has_two_site and (target_representation == 'layered' or (
+            target_representation == 'auto' and run_mode == 'sweep' and k_2q_batch == 'strip'
+        ))
+        if layered and not (
+            (run_mode == 'sweep' and k_2q_batch == 'strip')
+            or (run_mode == 'global' and k_2q_batch != 'auto')
+        ):
+            raise ValueError('layered targets require strip ALS or global strip/all/integer batches')
+        if layered and (self.gate_kwargs or self.target_gate_kwargs or gate_kwargs
+                        or self.which is not None or any(g[2] is not None for g in self.gates)):
+            raise ValueError('layered targets require physical gates without custom gate application options')
+        if layered and uses_symmray_arrays(self.state):
+            raise NotImplementedError('layered PEPS gate targets currently require dense arrays')
+        strip_batch_size = self._validate_scalar_chi(strip_batch_size, name='strip_batch_size')
+        if strip_batch_size != 1 and (k_2q_batch != 'strip' or run_mode != 'global'):
+            raise ValueError('multiple strips require global mode and k_2q_batch="strip"')
+        if k_2q_batch == 'all' and run_mode != 'global':
+            raise ValueError('k_2q_batch="all" requires global mode')
+        if k_2q_batch == 'strip' and has_two_site:
+            if run_mode == 'full-update' or (run_mode == 'sweep' and sweep_solver != 'als'):
+                raise ValueError("strip batching requires sweep ALS or global optimization")
+            if adaptive_boundary:
+                raise ValueError('strip batching uses fixed caps; set boundary_convergence=False')
+            if not normalize_final:
+                raise ValueError('strip batching requires normalize_final=True')
+            for _, where, which in self.gates:
+                if self._site_count(where, self.state) == 2:
+                    strip_key(where)
+                if which is not None or self.which is not None:
+                    raise ValueError('strip batching requires physical PEPS gates')
+        if warmstart_method == 'simple-update' and has_two_site and (
+                self.which is not None or any(entry[2] is not None for entry in self.gates)
+                or self.gate_kwargs or self.target_gate_kwargs or self.warmstart_gate_kwargs
+                or gate_kwargs or run_mode == 'full-update'):
+            raise ValueError('simple-update guesses require physical PEPS gates without custom gate options')
         if run_mode == 'full-update':
             if k_2q_batch not in ('auto', 1):
                 raise ValueError('full-update is gate-by-gate; use k_2q_batch=1 or auto')
@@ -3145,7 +3308,18 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 timing_before = self._phase_timer.snapshot() if self._phase_timer else None
                 evaluation_start = len(self.evaluation_records)
                 state_before = self.state
-                if k_2q_batch == "auto":
+                if k_2q_batch == 'strip':
+                    batch_entries, two_site_in_batch, next_idx = collect_strip_batch(
+                        self, idx, width=strip_batch_size,
+                    )
+                    target = layered_target(
+                        state_before, batch_entries, gate_bond_factor=self._gate_bond_factor,
+                    ) if layered else self._build_batch_target(
+                        state_before, batch_entries, cutoff=cutoff,
+                        cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                    )
+                    batch_stop, batch_bond_limit = 'strip', None
+                elif k_2q_batch == "auto":
                     batch_entries, two_site_in_batch, next_idx, target, batch_stop, batch_bond_limit = (
                         self._collect_auto_batch_target(
                             idx, cutoff=cutoff, cutoff_mode=cutoff_mode,
@@ -3154,9 +3328,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                 else:
                     batch_entries, two_site_in_batch, next_idx = self._collect_gate_batch(
-                        idx, k_2q_batch,
+                        idx, len(self.gates) if k_2q_batch == 'all' else k_2q_batch,
                     )
-                    target = self._build_batch_target(
+                    target = layered_target(
+                        state_before, batch_entries, gate_bond_factor=self._gate_bond_factor,
+                    ) if layered else self._build_batch_target(
                         state_before, batch_entries, cutoff=cutoff,
                         cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
                     )
@@ -3189,7 +3365,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                 target_max_bond = self._max_bond(target)
 
-                if target_max_bond is not None and target_max_bond <= self.chi:
+                if not layered and target_max_bond is not None and target_max_bond <= self.chi:
                     self.state = target
                     if normalize_final and not normalize_target:
                         self._normalize_state(
@@ -3200,14 +3376,22 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     final_infidelity = 0.0
                     reason = "within_chi"
                 else:
-                    warmstart = self._build_batch_warmstart(
-                        target,
-                        state_before,
-                        batch_entries,
-                        cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
-                        gate_kwargs=gate_kwargs,
-                    )
+                    if warmstart_method == 'simple-update':
+                        warmstart_state = simple_update_guess(
+                            state_before, batch_entries, chi=self.chi, cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                        )
+                    elif layered:
+                        warmstart_state = self._build_routed_batch_warmstart(
+                            state_before, batch_entries, cutoff=cutoff,
+                            cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                        )
+                    else:
+                        warmstart_state = self._build_batch_warmstart(
+                            target, state_before, batch_entries, cutoff=cutoff,
+                            cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                        )
+                    warmstart = warmstart_state
                     if adaptive_boundary:
                         calibration = self._calibrate_sweep_boundaries(
                             warmstart, target, normalize_chi=normalize_chi,
@@ -3370,6 +3554,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                                     "initial_loss", pre_infidelity if precheck_reliable
                                     else raw_pre_infidelity,
                                 )
+                        if k_2q_batch == 'strip' and run_mode == 'sweep':
+                            effective_sweep_options['_active_strip'] = strip_key(batch_entries[0][1])
                         final_state, opt_infidelity, optimizer_result = self._optimize_state(
                             warmstart,
                             target,
@@ -3474,6 +3660,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "batch_size": len(batch_entries),
                     "two_site_batch": int(two_site_in_batch),
                     "k_2q_batch": k_2q_batch,
+                    "strip_batch_size": strip_batch_size,
+                    "warmstart_method": warmstart_method,
+                    "target_representation": 'layered' if layered else 'peps',
+                    "strip": strip_key(batch_entries[0][1]) if k_2q_batch == 'strip' else None,
                     "batch_stop_reason": batch_stop,
                     "batch_target_bond_limit": batch_bond_limit,
                     "target_max_bond": target_max_bond,

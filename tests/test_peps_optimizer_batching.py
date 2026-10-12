@@ -83,7 +83,7 @@ def test_retained_output_is_normalized_without_rescaling_unitary_target(path, mo
         assert all(bond == 1 for bond, _ in normalized)
         return warmstart * 3, None, None
     monkeypatch.setattr(opt, "_optimize_state", fake_optimize)
-    out = opt.run(optimize=path != "warmstart", accept_if_improved=path == "optimizer_rejected",
+    out = opt.run(k_2q_batch="auto", gate_order="input", optimize=path != "warmstart", accept_if_improved=path == "optimizer_rejected",
                   improvement_tol=1e-12)
     vector = out.to_dense().reshape(-1)
     assert np.vdot(vector, vector).real == pytest.approx(1., abs=2e-12)
@@ -109,8 +109,7 @@ def test_batches_preserve_dense_circuit_and_single_gate_order(batch, counts):
     for payload, sites in zip([gate, x, gate, gate, gate], [(0, 3), (0,), (1, 4), (2, 5), (0, 1)]):
         vector = _dense_apply(vector, payload, sites)
     opt = PepsOptimizer(state, gates, chi=8, contraction_opt="greedy", boundary_convergence=False)
-    # Omit the option in the auto case to exercise the actual public default.
-    out = opt.run(**({} if batch == "auto" else {"k_2q_batch": batch}))
+    out = opt.run(k_2q_batch=batch, gate_order="input")
     np.testing.assert_allclose(out.to_dense().reshape(-1), vector, atol=2e-12)
     np.testing.assert_array_equal(state.to_dense().reshape(-1), original)
     assert [r["two_site_batch"] for r in opt.step_records] == counts
@@ -129,7 +128,7 @@ def test_auto_matches_index_and_coordinate_site_aliases_on_torch():
     gate = torch.as_tensor(_unitary())
     gates = [(gate, ((0, 0), (0, 1))), (gate, ("k0,0", "k1,0"))]
     opt = PepsOptimizer(state, gates, chi=8, contraction_opt="greedy", boundary_convergence=False)
-    out = opt.run()
+    out = opt.run(k_2q_batch="auto", gate_order="input")
     vector = np.zeros(16, complex)
     vector[0] = 1
     vector = _dense_apply(_dense_apply(vector, gate.numpy(), (0, 1)), gate.numpy(), (0, 2))
@@ -171,7 +170,7 @@ def test_auto_second_order_layer_builds_one_exact_target_before_refinement(monke
         return warmstart, None, {}
 
     monkeypatch.setattr(opt, "_optimize_state", capture)
-    output = opt.run(measure_infidelity=False, measure_final_infidelity=False)
+    output = opt.run(k_2q_batch="auto", gate_order="input", measure_infidelity=False, measure_final_infidelity=False)
     assert len(targets) == len(opt.step_records) == 1
     assert opt.step_records[0]["two_site_batch"] == len(edges) == 7
     assert opt.step_records[0]["step"] == len(gates)
@@ -225,8 +224,8 @@ def test_routed_batch_stops_at_bond_limit_without_consuming_next_gate():
     gates = [(gate, ((0, 0), (1, 2))), (gate, ((1, 0), (0, 2)))]
     auto = PepsOptimizer(state, gates, chi=1, contraction_opt="greedy", boundary_convergence=False)
     fixed = PepsOptimizer(state, gates, chi=1, contraction_opt="greedy", boundary_convergence=False)
-    actual = auto.run(optimize=False)
-    expected = fixed.run(k_2q_batch=1, optimize=False)
+    actual = auto.run(k_2q_batch="auto", gate_order="input", optimize=False)
+    expected = fixed.run(gate_order="input", k_2q_batch=1, optimize=False)
     np.testing.assert_allclose(actual.to_dense(), expected.to_dense(), atol=2e-12)
     assert auto.step_records[0]["batch_stop_reason"] == "bond_limit"
     assert auto.step_records[0]["target_max_bond"] <= 4
@@ -241,7 +240,7 @@ def test_bond_dim_alias_cannot_truncate_exact_target(per_call):
     opts = {"bond_dim": 1}
     opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=2,
                         gate_kwargs=None if per_call else opts, contraction_opt="greedy", boundary_convergence=False)
-    out = opt.run(gate_kwargs=opts if per_call else None)
+    out = opt.run(k_2q_batch="auto", gate_order="input", gate_kwargs=opts if per_call else None)
     expected = _dense_apply(state.to_dense().reshape(-1), gate, (0, 1))
     np.testing.assert_allclose(out.to_dense().reshape(-1), expected, atol=2e-12)
     assert opt.step_records[0]["target_max_bond"] == 2
@@ -337,14 +336,14 @@ def test_run_target_norm_policy_skips_actual_target_contraction(
     opt = PepsOptimizer(_product(2, 2), [(_unitary(), ((0, 0), (0, 1)))],
                         chi=1, contraction_opt="greedy",
                         sweep_optimize_kwargs={"n_cycles": 0}, **constructor_options, boundary_convergence=False)
-    opt.run(**run_options)
+    opt.run(k_2q_batch="auto", gate_order="input", **run_options)
     assert len(results) == 2  # Both pre- and post-optimization checks.
     assert all((result["norm_target_result"] is None) == (known is not None)
                for result in results)
     assert all(result["norm_result"] is not None for result in results)
 
 
-@pytest.mark.parametrize("fit_mode,overlap_checks", [("eff", 3), ("direct", 2)])
+@pytest.mark.parametrize("fit_mode,overlap_checks", [("eff", 2), ("direct", 2)])
 def test_default_sweep_skips_all_target_contractions_and_duplicate_normalization(
     monkeypatch, fit_mode, overlap_checks,
 ):
@@ -369,8 +368,8 @@ def test_default_sweep_skips_all_target_contractions_and_duplicate_normalization
     opt = PepsOptimizer(_product(2, 2), [(_unitary(), ((0, 0), (0, 1)))],
                         chi=1, contraction_opt="greedy", fit_mode=fit_mode, boundary_convergence=False)
     out = opt.run()
-    # Always retain outer pre/post checks. Only iterative FIT needs its own
-    # initial diagnostic; direct compression reuses the matching outer check.
+    # Strip fitting retains the outer pre/post checks without a whole-lattice
+    # sweep's extra initial diagnostic.
     assert contractions.count("bdy_overlap") == overlap_checks
     assert [owner for owner, _ in normalize_calls] == ["driver"] * 3
     assert opt.step_records[0]["optimizer_result"]["invalid_inner_loss_count"] == 0
@@ -463,8 +462,8 @@ def test_unknown_native_target_norm_preserves_torch_symmetry_storage(monkeypatch
         return value
     monkeypatch.setattr(peps_mod, "boundary_norm", measure)
     opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=1,
-                        contraction_opt="greedy", sweep_optimize_kwargs={"n_cycles": 0}, boundary_convergence=False)
-    out = opt.run(non_unitary=True, normalize_target=False, measure_infidelity=False)
+                        contraction_opt="greedy", sweep_optimize_kwargs={"n_cycles": 0}, boundary_convergence=False, optimizer="nlopt")
+    out = opt.run(k_2q_batch="auto", gate_order="input", non_unitary=True, normalize_target=False, measure_infidelity=False)
     assert len(norms) == 1
     mantissa, exponent = norms[0]
     assert float(abs(mantissa) * 10 ** exponent) == pytest.approx(4., abs=1e-12)
@@ -481,11 +480,11 @@ def test_metric_retries_are_bounded_and_can_be_disabled(monkeypatch):
     opt = PepsOptimizer(_product(2, 2), chi=1, boundary_convergence=False)
     with pytest.warns(RuntimeWarning), pytest.raises(ValueError, match="substantially negative"):
         opt.estimate_infidelity(opt.state, opt.state)
-    assert calls == [(4, 5), 10, 20]
+    assert calls == [(2, 4), 8, 16]
     calls.clear()
     with pytest.raises(ValueError, match="substantially negative"):
         opt.estimate_infidelity(opt.state, opt.state, evaluation_max_retries=0)
-    assert calls == [(4, 5)]
+    assert calls == [(2, 4)]
 
 
 @pytest.mark.parametrize("raw_error", [-6.86e-10, -3.267e-6, -5e-4])
@@ -519,7 +518,7 @@ def test_small_negative_metric_continues_gate_stream_and_preserves_raw_error(mon
     diagnostic = streamed[0]["evaluation_records"][0]
     assert diagnostic["clipped_negative"]
     assert diagnostic["raw_infidelity"] == raw_error
-    assert diagnostic["attempts"] == [{"chi": (4, 5), "infidelity": raw_error}]
+    assert diagnostic["attempts"] == [{"chi": (2, 4), "infidelity": raw_error}]
     assert [r["optimizer_attempted"] for r in streamed] == [True, False]
     assert streamed[0]["reason"] == "optimizer_failed"
     assert opt.get_evaluation_records()[0] == diagnostic
@@ -669,14 +668,14 @@ def test_sweep_fit_records_reach_public_getter(monkeypatch):
     opt = PepsOptimizer(_product(2, 2), [(_unitary(), ((0, 0), (0, 1)))], chi=1,
                         contraction_opt="greedy", fit_timing=True,
                         sweep_optimize_kwargs={"n_cycles": 0}, boundary_convergence=False)
-    opt.run()
+    opt.run(k_2q_batch="auto", gate_order="input")
     assert observed
     returned = opt.get_fit_diagnostics()
     assert all(any(record is item for item in returned) for record in observed)
 
 
 def test_nlopt_defaults_allow_constructor_and_run_overrides():
-    opt = PepsOptimizer(_product(2, 2), chi=2, optimizer_options={"maxeval": 25}, boundary_convergence=False)
+    opt = PepsOptimizer(_product(2, 2), chi=2, optimizer="nlopt", optimizer_options={"maxeval": 25}, boundary_convergence=False)
     defaults = opt._apply_sweep_optimizer_options({})["optimizer_options"]
     assert defaults == {"algorithm": "LD_LBFGS", "maxeval": 25,
                         "ftol_rel": 1e-9, "ftol_abs": 1e-9,
@@ -711,8 +710,8 @@ def test_native_fermionic_auto_batch_preserves_state_and_backend():
     gates = [(gate, ((0, 0), (0, 1))), (gate, ((1, 0), (1, 1)))]
     auto = PepsOptimizer(state, gates, chi=8, contraction_opt="greedy", boundary_convergence=False)
     fixed = PepsOptimizer(state, gates, chi=8, contraction_opt="greedy", boundary_convergence=False)
-    actual = auto.run()
-    expected = fixed.run(k_2q_batch=1)
+    actual = auto.run(k_2q_batch="auto", gate_order="input")
+    expected = fixed.run(gate_order="input", k_2q_batch=1)
     overlap = (actual.H & expected).contract(all, optimize="greedy")
     actual_norm = (actual.H & actual).contract(all, optimize="greedy")
     expected_norm = (expected.H & expected).contract(all, optimize="greedy")

@@ -133,8 +133,8 @@ def test_full_update_defaults_use_one_fixed_chi_and_cached_dmrg(monkeypatch, sel
     opt = PepsOptimizer(state, gates, chi=2, contraction_opt=policy,
                         full_update_kwargs={'max_iterations': 4}, **constructor)
     if selection == 'run-style':
-        assert opt.boundary_chi == (8, 10)
-        assert opt.boundary_convergence is not None
+        assert opt.boundary_chi == (8, 16)
+        assert opt.boundary_convergence is None
         assert opt.evaluation_max_retries == 2
     def unexpected_probe(*args, **kwargs):
         pytest.fail('default full update must not probe boundary chi convergence')

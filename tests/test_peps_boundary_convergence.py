@@ -53,11 +53,11 @@ def test_adaptive_fixed_fit_cap_rejected_before_state_changes(scope):
                {'sweep_kwargs': {'fit_max_bond': 1}} if scope == 'sweep' else {})
     opt = PepsOptimizer(state, [(torch.eye(4, dtype=torch.complex128),
                                  ((0, 0), (0, 1)))], chi=2,
-                        contraction_opt='greedy', fit_mode='direct', **options)
+                        contraction_opt='greedy', fit_mode='direct', **options, boundary_convergence=True)
     before = opt.state.to_dense().clone()
     run_kwargs = {'sweep_kwargs': {'fit_max_bond': 1}} if scope == 'run' else {}
     with pytest.raises(ValueError, match='fit_max_bond=None'):
-        opt.run(**run_kwargs)
+        opt.run(**run_kwargs, k_2q_batch="auto")
     torch.testing.assert_close(opt.state.to_dense(), before)
     assert not opt.normalizations
     # Also guard direct calibration consumers against the false plateau.
@@ -151,7 +151,7 @@ def optimizer(**kwargs):
     )
 
 
-def test_default_check_runs_without_readout_and_reuses_cap_and_target_norm(monkeypatch):
+def test_enabled_check_runs_without_readout_and_reuses_cap_and_target_norm(monkeypatch):
     calls, refinements = [], []
 
     def metric(*args, **kwargs):
@@ -168,7 +168,7 @@ def test_default_check_runs_without_readout_and_reuses_cap_and_target_norm(monke
         return state, .1, {'success': True}
 
     monkeypatch.setattr(opt, '_optimize_state', refine)
-    opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False)
+    opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False, k_2q_batch="auto")
     assert refinements[0]['sweep_kwargs']['chi'] == (8, 8)
     assert refinements[0]['normalize_chi'] == 8
     assert refinements[0]['target_norm'] == (2., 0.)
@@ -176,7 +176,7 @@ def test_default_check_runs_without_readout_and_reuses_cap_and_target_norm(monke
     assert opt.get_step_records()[0]['boundary_convergence']['selection_status'] == 'converged'
     json.dumps(opt.get_step_records(), allow_nan=False)
     calls.clear()
-    opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False)
+    opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False, k_2q_batch="auto")
     assert calls == [((4, 4), 'x'), ((4, 4), 'y'), ((8, 8), 'x'), ((8, 8), 'y')]
     assert opt._boundary_chi_floor == (8, 8)  # Survives reset_traces=True.
 
@@ -193,7 +193,7 @@ def test_nonconvergence_warns_and_uses_limit_without_claiming_convergence(monkey
     monkeypatch.setattr(opt, '_optimize_state', lambda state, target, **kw:
                         (used.append(kw) or state, .1, {'success': True}))
     with pytest.warns(RuntimeWarning, match='convergence was not established'):
-        opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False)
+        opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False, k_2q_batch="auto")
     assert used[0]['sweep_kwargs']['chi'] == (4, 4)
     assert not opt.get_step_records()[0]['boundary_convergence']['converged']
     assert opt.get_step_records()[0]['boundary_convergence']['selection_status'] == 'limit_unconverged'
@@ -211,7 +211,7 @@ def test_precheck_reuses_calibrated_contractions(monkeypatch):
     opt = optimizer()
     monkeypatch.setattr(opt, '_optimize_state', lambda state, target, **kw:
                         (state, .1, {'success': True}))
-    opt.run(measure_final_infidelity=False, normalize_final=False)
+    opt.run(measure_final_infidelity=False, normalize_final=False, k_2q_batch="auto")
     assert calls == [(2, 2), (2, 2), (4, 4), (4, 4)]
     assert opt.get_step_records()[0]['pre_infidelity'] == pytest.approx(.36)
     assert opt.get_evaluation_records()[0]['source'] == 'boundary_convergence'
@@ -225,7 +225,7 @@ def test_unusable_norm_never_enters_fit_and_diagnostics_are_serializable(monkeyp
     monkeypatch.setattr(opt, '_optimize_state', lambda *a, **kw: pytest.fail('invalid norm entered fit'))
     with pytest.warns(RuntimeWarning, match='convergence was not established'):
         with pytest.raises(ValueError, match='unusable norm'):
-            opt.run(measure_infidelity=False)
+            opt.run(measure_infidelity=False, k_2q_batch="auto")
     json.dumps(opt.get_boundary_convergence(), allow_nan=False)
 
 
@@ -242,7 +242,7 @@ def test_explicit_normalization_policy_is_preserved(monkeypatch):
     monkeypatch.setattr(opt, '_normalize_state', capture)
     monkeypatch.setattr(opt, '_optimize_state', lambda state, target, **kw:
                         (state, .1, {'success': True}))
-    opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False)
+    opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False, k_2q_batch="auto")
     assert len(calls) == 1 and calls[0]['normalize_chi'] == 4
 
 
@@ -260,7 +260,7 @@ def test_real_torch_sweep_uses_adaptive_caps_and_normalizes_output(dtype):
                         optimizer_options={'n_steps': 3},
                         sweep_optimize_kwargs={'n_round_trips': 0,
                                                'compute_initial_loss': False, 'compute_final_loss': False})
-    out = opt.run(measure_infidelity=False, measure_final_infidelity=False)
+    out = opt.run(measure_infidelity=False, measure_final_infidelity=False, k_2q_batch="auto")
     record = opt.get_step_records()[0]
     assert record['boundary_convergence']['converged']
     assert record['optimizer_attempted']
@@ -277,7 +277,7 @@ def test_legacy_and_global_paths_do_not_calibrate(monkeypatch, mode, enabled):
                         pytest.fail('unexpected calibration'))
     monkeypatch.setattr(opt, '_optimize_state', lambda state, target, **kw:
                         (state, .1, {'success': True}))
-    opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False)
+    opt.run(measure_infidelity=False, measure_final_infidelity=False, normalize_final=False, k_2q_batch="auto")
 
 
 @pytest.mark.parametrize('fit_mode,engine', [('direct', 'dmrg'), ('eff', 'dmrg'),
@@ -358,7 +358,7 @@ def test_d2_defaults_override_legacy_caps_and_output_uses_selected_norm_chi(monk
     opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=1,
                         boundary_chi=128, normalize_chi=128, evaluation_chi=128,
                         contraction_opt='greedy', fit_mode='direct',
-                        sweep_optimize_kwargs={'chi': (128, 128)})
+                        sweep_optimize_kwargs={'chi': (128, 128)}, boundary_convergence=True)
     monkeypatch.setattr(peps_mod, 'boundary_infidelity', lambda *a, **kw: sample_to_metric(sample()))
     used = []
     monkeypatch.setattr(opt, '_optimize_state', lambda state, target, **kw:
@@ -371,7 +371,7 @@ def test_d2_defaults_override_legacy_caps_and_output_uses_selected_norm_chi(monk
         return normalize(state, **kw)
 
     monkeypatch.setattr(opt, '_normalize_state', capture)
-    opt.run(measure_infidelity=False, measure_final_infidelity=False)
+    opt.run(measure_infidelity=False, measure_final_infidelity=False, k_2q_batch="auto")
     assert used[0]['sweep_kwargs']['chi'] == (3, 3)
     assert used[0]['sweep_optimize_kwargs']['chi'] is None
     assert used[0]['normalize_chi'] == 3

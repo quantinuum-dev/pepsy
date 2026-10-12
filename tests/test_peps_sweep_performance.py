@@ -199,7 +199,8 @@ def test_precheck_reuse_requires_matching_metric_policy(evaluation_chi, metric_o
     opt = PepsOptimizer(
         state, [(gate, ((0, 0), (0, 1)))], chi=1, fit_mode="direct",
         evaluation_chi=evaluation_chi, infidelity_kwargs=metric_options,
-        contraction_opt="greedy", optimizer_options={"maxeval": 4},
+        contraction_opt="greedy", optimizer="nlopt", optimizer_options={"maxeval": 4},
+        boundary_chi=(4, 5), fit_init_strategy="guess-src",
         sweep_optimize_kwargs={"n_round_trips": 1}, boundary_convergence=False,
     )
     opt.run(infidelity_tol=0.)

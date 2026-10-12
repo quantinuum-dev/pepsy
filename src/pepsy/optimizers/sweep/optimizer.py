@@ -134,10 +134,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         Optional layer tags and absorption order for direct sequential
         compression. The standard PEPS overlap target uses ``("KET", "BRA")``
         when this is omitted.
-    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+    fit_init_strategy : str, default="direct"
         Disposable initial boundary guess for DMRG/FIT modes. The guess
         compressors are applied to a copy of each exact boundary target;
         ``"auto"`` aliases the compatibility-preserving direct guess.
+        ``"reuse-direct/src/sdc"`` policies seed a cut once with the selected
+        compressor, then reuse its fitted MPS as the next FIT starting guess.
     fit_init_seed : int | None, default=0
         Seed forwarded to the disposable SRC boundary guess.
     fit_block_size : {1, 2, 3}, default=1
@@ -240,8 +242,6 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "debug_loss_kwargs",
         "renormalize",
         "normalize_boundaries",
-        "boundary_engine",
-        "boundary_options",
         "initial_loss",
         "compute_initial_loss",
         "compute_final_loss",
@@ -706,7 +706,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             self.normalize_kwargs = {}
         else:
             self.normalize_kwargs = self._pick_known_keys(normalize_kwargs, self._NORMALIZE_KEYS)
-        self.optimize_kwargs = self._pick_known_keys(optimize_kwargs, self._OPTIMIZE_KEYS)
+        self.optimize_kwargs = {}
+        self.set_optimize_kwargs(**(optimize_kwargs or {}))
 
         self.Lx, self.Ly = self._infer_shape(self.state)
         self._reset_run_traces()
@@ -1179,10 +1180,31 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def set_optimize_kwargs(self, **kwargs):
         """Update stored defaults for :meth:`run`."""
+        constructor_only = sorted(set(kwargs) & {'boundary_engine', 'boundary_options'})
+        if constructor_only:
+            raise ValueError(
+                f"{', '.join(constructor_only)} are constructor options; pass them "
+                "to SweepOptimizer(...) or PepsOptimizer(sweep_kwargs=...), "
+                "not sweep_optimize_kwargs."
+            )
+        self._validate_sweep_counts(**{
+            key: kwargs[key] for key in ('n_cycles', 'n_round_trips', 'env_n_iter')
+            if key in kwargs
+        })
         if not hasattr(self, "optimize_kwargs"):
             self.optimize_kwargs = {}
         self.optimize_kwargs.update(self._pick_known_keys(kwargs, self._OPTIMIZE_KEYS))
         return self
+
+    @staticmethod
+    def _validate_sweep_counts(*, n_cycles=1, n_round_trips=1, env_n_iter=4):
+        for name, value, minimum in (
+            ('n_cycles', n_cycles, 0), ('n_round_trips', n_round_trips, 0),
+            ('env_n_iter', env_n_iter, 1),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+                qualifier = 'positive' if minimum else 'nonnegative'
+                raise ValueError(f'{name} must be a {qualifier} integer')
 
     def normalize(self, state=None, **kwargs):
         """Normalize PEPS in place and return the old norm estimate."""
@@ -1331,7 +1353,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         chi=None,
         norm=None,
-        norm_target=None,
+        norm_target=_INHERIT_FIT_OPTION,
         contraction_opt=None,
         n_iter=5,
         direction="y",
@@ -1369,6 +1391,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         omitted, the optimizer's requested chi policy is used rather than the
         current warm-state rank. One-site FIT pads smaller boundaries eagerly;
         two-site FIT keeps them compact and grows rank through local SVDs.
+        The known ``self.target_norm`` is reused by default. Pass
+        ``norm_target=None`` explicitly to measure the target instead.
 
         Per-call ``fit_*`` and ``cutoff`` options inherit constructor values
         when omitted. Passing ``None`` remains meaningful for controls that
@@ -1386,6 +1410,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "Set it in constructor or via set_target()."
             )
 
+        if norm_target is _INHERIT_FIT_OPTION:
+            norm_target = self.target_norm
         uses_quimb = getattr(self, "boundary_engine", "dmrg") == "quimb-mps"
         if uses_quimb and method == "dmrg":
             method = "mps"
@@ -1492,22 +1518,28 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return float(result["infidelity"])
 
-    def metrics(self):
-        """Return exact ``(fidelity, infidelity)`` for current state pair."""
+    def metrics(self, *, norm_target=_INHERIT_FIT_OPTION):
+        """Contract exact state norm/overlap, reusing the known target norm.
+
+        Pass ``norm_target=None`` for an independent target-norm measurement.
+        """
         if self.state_target is None:
             raise ValueError(
                 "state_target is required for metrics(). "
                 "Set it in constructor or via set_target()."
             )
-        fidelity = float(
-            complex(
-                tn_fidelity(
-                    self.state,
-                    self.state_target,
-                    contraction_opt=self.contraction_opt,
-                )
-            ).real
-        )
+        if norm_target is _INHERIT_FIT_OPTION:
+            norm_target = self.target_norm
+        if norm_target is None:
+            fidelity = float(complex(tn_fidelity(
+                self.state, self.state_target, contraction_opt=self.contraction_opt,
+            )).real)
+        else:
+            norm = (self.state.H & self.state).contract(
+                all, optimize=self.contraction_opt, strip_exponent=True)
+            overlap = (self.state.H & self.state_target).contract(
+                all, optimize=self.contraction_opt, strip_exponent=True)
+            fidelity = float(self._scaled_overlap_fidelity(overlap, norm, norm_target))
         if fidelity < 0.0 and abs(fidelity) < 1e-12:
             fidelity = 0.0
         infid = 1.0 - fidelity
@@ -1521,7 +1553,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         kwargs = {} if kwargs is None else dict(kwargs)
 
         if mode == "exact":
-            _fidel, loss = self.metrics()
+            _fidel, loss = self.metrics(norm_target=kwargs.get('norm_target', self.target_norm))
             return float(loss)
 
         if mode == "infidelity":
@@ -2775,9 +2807,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if (isinstance(index, bool) or not isinstance(index, Integral)
                 or not 0 <= index < self._axis_n(axis)):
             raise ValueError("strip index is outside the lattice")
-        if (isinstance(env_n_iter, bool) or not isinstance(env_n_iter, Integral)
-                or env_n_iter < 1):
-            raise ValueError("env_n_iter must be a positive integer")
+        self._validate_sweep_counts(env_n_iter=env_n_iter)
         if self.state_target is None:
             raise ValueError("state_target is required for optimize_strip()")
         solver = self._resolve_user_solver(solver, solver_options=solver_options)
@@ -2797,6 +2827,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         *,
         n_round_trips=1,
+        start_index=0,
         solver="scipy",
         solver_options=None,
         env_n_iter=5,
@@ -2817,6 +2848,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             Axis to sweep.
         n_round_trips : int, default=1
             Number of backward+forward round-trips after the initial forward pass.
+        start_index : int, default=0
+            First optimized row/column on the initial forward pass. Earlier
+            strips only build the moving boundary. Return passes visit the
+            complete axis, using updated directional environments.
         solver : str, default="scipy"
             Gradient solver name. Supported values: ``torch-adam``, ``scipy``,
             and ``nlopt``. ``als`` instead fits one tensor at a time inside
@@ -2856,6 +2891,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "Set it in constructor or via set_target()."
             )
         n = self._axis_n(axis)
+        if (isinstance(start_index, bool) or not isinstance(start_index, Integral)
+                or not 0 <= start_index < n):
+            raise ValueError("start_index is outside the lattice")
+        self._validate_sweep_counts(n_round_trips=n_round_trips, env_n_iter=env_n_iter)
         resolved_solver = self._resolve_user_solver(
             solver,
             solver_options=solver_options,
@@ -2873,7 +2912,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if renormalize:
             old_norm = self._normalize_state(env_n_iter)
-            self.norm_trace.append({"state_norm": float(abs(complex(old_norm)))})
+            mantissa, exponent = self._as_scaled_scalar(old_norm)
+            self.norm_trace.append({
+                "state_norm": float(abs(complex(mantissa)) * self._safe_pow10(exponent)),
+            })
 
         if getattr(self, "boundary_engine", "dmrg") != "quimb-mps":
             self._refresh_right_boundaries_once(axis, env_n_iter=env_n_iter)
@@ -2897,6 +2939,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 update_side="left",
                 sweep_name="forward",
                 reuse_static=False,
+                active_indices=set(range(start_index, n)),
                 **sweep_kwargs,
             )
         )
@@ -2947,6 +2990,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         compute_initial_loss=True,
         compute_final_loss=True,
         collect_boundary_norms=False,
+        start_index=0,
+        retain_boundary_guesses=False,
     ):
         """Run alternating axis sweeps and return a result dict.
 
@@ -2959,6 +3004,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             Measure the initial global diagnostic when initial_loss is None.
             False skips this contraction and its global early-exit check;
             local fitting objectives and safeguards remain active.
+        start_index : int, default=0
+            Start each axis at this strip in the first cycle only. Later
+            cycles visit the full axis.
+        retain_boundary_guesses : bool, default=False
+            Include the fitted boundary pair in the result before restoring
+            the best state. These are starting guesses, not current environments.
         compute_final_loss : bool, default=True
             Measure the final global diagnostic. False reports loss_after=None
             unless the initial check already establishes convergence.
@@ -2997,6 +3048,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "state_target is required for run(). "
                 "Set it in constructor or via set_target()."
             )
+        self._validate_sweep_counts(
+            n_cycles=n_cycles, n_round_trips=n_round_trips, env_n_iter=env_n_iter,
+        )
+        axis_seq = list(axes)
+        for axis in axis_seq:
+            if (isinstance(start_index, bool) or not isinstance(start_index, Integral)
+                    or not 0 <= start_index < self._axis_n(axis)):
+                raise ValueError("start_index is outside the lattice")
         if isinstance(solver, str) and solver.strip().lower() == "als":
             from ._als import options, validate_input
             validate_input(self, options(solver_options))
@@ -3026,7 +3085,6 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             except (AttributeError, TypeError, ValueError):
                 loss_before = None
         all_runs = []
-        axis_seq = list(axes)
         # Early-exit threshold: do not waste sweeps refining infidelity below
         # this floor (boundary contractions don't resolve smaller losses
         # reliably anyway).
@@ -3098,6 +3156,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             return n + (2 * n_round_trips * max(n - 1, 0))
 
         total_steps = n_cycles * sum(_steps_for_axis(axis_name) for axis_name in axis_seq)
+        if n_cycles:
+            total_steps -= start_index * len(axis_seq)
         global_progress = None
         if progress:
             global_progress = tqdm(
@@ -3156,6 +3216,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 axis_runs = self._call_with_accepted_kwargs(
                     self.optimize_axis,
                     axis,
+                    start_index=start_index if cyc == 0 else 0,
                     n_round_trips=n_round_trips,
                     solver=solver,
                     solver_options=solver_options,
@@ -3183,6 +3244,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             if early_exit:
                 break
 
+        # Retain fitted guesses before restoring the best state and replacing
+        # its numerical environments. The next batch must refit these guesses.
+        boundary_guesses = ((self.bdy, self.bdy_overlap)
+                            if retain_boundary_guesses else None)
         # Restore the best snapshot so the returned state matches best_loss.
         # This must also happen on a normal sweep completion: a later local
         # move can be worse than the best state seen earlier in the sweep.
@@ -3206,7 +3271,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if renormalize:
             old_norm = self._normalize_state(env_n_iter=env_n_iter)
-            self.norm_trace.append({"state_norm": float(abs(complex(old_norm)))})
+            mantissa, exponent = self._as_scaled_scalar(old_norm)
+            self.norm_trace.append({
+                "state_norm": float(abs(complex(mantissa)) * self._safe_pow10(exponent)),
+            })
 
         if not compute_final_loss:
             loss_after = None
@@ -3275,6 +3343,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "bdy_norm": bdy_norm,
             "bdy_overlap_norm": bdy_overlap_norm,
             "normalize_boundaries": normalize_boundaries,
+            "boundary_guesses": boundary_guesses,
         })
 
     def run(

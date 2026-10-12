@@ -14,6 +14,8 @@ import quimb.tensor as qtn
 
 from .._internal.quimb import call_quimb_2d
 from ..backends import infer_backend_converter_from_sample
+from ..backends.config import _register_tn_autodiff_linalg
+from ..boundary._layers import prepare_quimb_site_layers
 from ..tensors.contractions import build_optimizer, contract_hypercompressed_tn
 
 __all__ = ["GlobalOptimizer"]
@@ -24,6 +26,7 @@ _DEFAULT_NLOPT_FTOL_REL = 1e-9
 _DEFAULT_NLOPT_FTOL_ABS = 0.0
 _DEFAULT_NLOPT_XTOL_REL = 1e-9
 _DEFAULT_NLOPT_XTOL_ABS = 0.0
+_INHERIT_TARGET_NORM = object()
 
 
 class _BestLossHistory(list):
@@ -66,6 +69,7 @@ class GlobalOptimizer:
     """
 
     _NORM_KEYS = frozenset({
+        "canonize",
         "opt",
         "copt",
         "contraction_opt",
@@ -83,6 +87,8 @@ class GlobalOptimizer:
         "strip_exponent",
     })
     _LOSS_KEYS = frozenset({
+        "canonize",
+        "layer_tags",
         "opt",
         "copt",
         "contraction_opt",
@@ -108,6 +114,9 @@ class GlobalOptimizer:
         state_target=None,
         *,
         chi: int | tuple[int, int] = 64,
+        target_norm=_INHERIT_TARGET_NORM,
+        register_linalg=True,
+        torch_linalg_config=None,
         norm_kwargs: Mapping[str, Any] | None = None,
         normalize_kwargs: Mapping[str, Any] | None = None,
         loss_kwargs: Mapping[str, Any] | None = None,
@@ -115,11 +124,18 @@ class GlobalOptimizer:
     ):
         self.state = state
         self.state_target = state_target
+        self.register_linalg = bool(register_linalg)
+        self.torch_linalg_config = torch_linalg_config
         self.losses: list[float] = []
         self.final_loss = None
         self.optimization_info = {}
         merged_loss_options = self._merge_opts(loss_kwargs, loss_opt)
         self.loss_opt = self._pick_known_keys(merged_loss_options, self._LOSS_KEYS)
+        # The constructor cap governs both objectives, not only normalization.
+        # Explicit loss options still take precedence over the shared cap.
+        self.loss_opt.setdefault('chi', chi)
+        if target_norm is not _INHERIT_TARGET_NORM:
+            self.set_target_norm(target_norm)
         self.norm_kwargs = self._pick_known_keys(norm_kwargs, self._NORM_KEYS)
 
         if not self.norm_kwargs and merged_loss_options:
@@ -135,6 +151,20 @@ class GlobalOptimizer:
             self.normalize_kwargs = self.norm_kwargs
         else:
             self.normalize_kwargs = self._pick_known_keys(normalize_kwargs, self._NORM_KEYS)
+            if self.normalize_kwargs:
+                self.normalize_kwargs.setdefault('chi', chi)
+
+    @property
+    def target_norm(self):
+        """Known squared norm of the fixed target (normalized by default)."""
+        value = self.loss_opt.get('target_norm')
+        return self.loss_opt.get('val_', 1.0) if value is None else value
+
+    def set_target_norm(self, target_norm=1.0):
+        """Reuse a known target squared norm without a target contraction."""
+        self.loss_opt['target_norm'] = 1.0 if target_norm is None else target_norm
+        self.loss_opt.pop('val_', None)
+        return self
 
     def set_norm_kwargs(self, **kwargs):
         """Update stored defaults for :meth:`norm`."""
@@ -155,7 +185,7 @@ class GlobalOptimizer:
         """Update stored loss defaults via :meth:`set_loss_opt`."""
         return self.set_loss_opt(**kwargs)
 
-    def set_target(self, state_target, *, inplace=True):
+    def set_target(self, state_target, *, inplace=True, target_norm=1.0):
         """Replace stored target state used by :meth:`loss` and optimizers.
 
         Parameters
@@ -165,6 +195,9 @@ class GlobalOptimizer:
         inplace : bool, default=True
             If ``True``, store ``state_target`` directly. If ``False`` and
             ``state_target`` has ``copy()``, store a shallow copy instead.
+        target_norm : scalar or (mantissa, exponent), default=1.0
+            Known squared norm of the replacement target. Replacing a target
+            resets the old norm; unitary targets of normalized states use one.
 
         Returns
         -------
@@ -174,6 +207,7 @@ class GlobalOptimizer:
         if (not inplace) and state_target is not None and hasattr(state_target, "copy"):
             state_target = state_target.copy()
         self.state_target = state_target
+        self.set_target_norm(target_norm)
         return self
 
     @classmethod
@@ -413,6 +447,7 @@ class GlobalOptimizer:
         hyper_contraction_opt=None,
         chi=64,
         layer_tags=None,
+        canonize=True,
         equalize_norms=False,
         mode="mps",
         mode_="mps",
@@ -453,13 +488,18 @@ class GlobalOptimizer:
                 stacklevel=2,
             )
 
+        # Quimb's layer union can rename shared inner indices. Keep temporary
+        # tags and index names off the caller's tensors, retaining array views.
+        state = state.copy()
         state.add_tag("KET")
         state_h = state.conj().retag({"KET": "BRA"})
         norm = state_h | state
 
         if mode == "mps":
+            norm = prepare_quimb_site_layers(norm, layer_tags)
             return call_quimb_2d(
                 norm.contract_boundary,
+                canonize=canonize,
                 max_bond=chi_norm,
                 mode=mode_,
                 sequence=sequence,
@@ -483,7 +523,7 @@ class GlobalOptimizer:
                 mode="projector",
                 max_separation=max_separation,
                 equalize_norms=equalize_norms,
-                layer_tags=list(_DEFAULT_LAYER_TAGS),
+                layer_tags=layer_tags,
                 final_contract=True,
                 final_contract_opts={
                     "optimize": contraction_opt,
@@ -535,6 +575,8 @@ class GlobalOptimizer:
         cost_f="fid",
         target_norm=None,
         val_=1.0,
+        layer_tags=None,
+        canonize=True,
         progbar=False,
         chi=64,
         mode="mps",
@@ -547,6 +589,8 @@ class GlobalOptimizer:
     ):
         """Compute overlap-based loss between trainable and target states."""
         mode = GlobalOptimizer._normalize_contraction_mode(mode)
+        if layer_tags is None:
+            layer_tags = list(_DEFAULT_LAYER_TAGS)
         if target_norm is not None:
             val_ = target_norm
 
@@ -575,6 +619,8 @@ class GlobalOptimizer:
                 stacklevel=2,
             )
 
+        state = state.copy()
+        state_target = state_target.copy()
         state.add_tag("KET")
         state_target.add_tag("KET")
 
@@ -583,8 +629,11 @@ class GlobalOptimizer:
         norm_ = state_h | state_target
 
         if mode == "mps":
+            norm = prepare_quimb_site_layers(norm, layer_tags)
+            norm_ = prepare_quimb_site_layers(norm_, layer_tags)
             val_0 = call_quimb_2d(
                 norm.contract_boundary,
+                canonize=canonize,
                 max_bond=chi_norm,
                 mode=mode_,
                 final_contract_opts={
@@ -592,7 +641,7 @@ class GlobalOptimizer:
                     "strip_exponent": strip_exponent,
                 },
                 progbar=progbar,
-                layer_tags=list(_DEFAULT_LAYER_TAGS),
+                layer_tags=layer_tags,
                 max_separation=max_separation,
                 cutoff=cutoff,
                 sequence=sequence,
@@ -600,6 +649,7 @@ class GlobalOptimizer:
             )
             val_1 = call_quimb_2d(
                 norm_.contract_boundary,
+                canonize=canonize,
                 max_bond=chi_overlap,
                 mode=mode_,
                 final_contract_opts={
@@ -607,7 +657,7 @@ class GlobalOptimizer:
                     "strip_exponent": strip_exponent,
                 },
                 progbar=progbar,
-                layer_tags=list(_DEFAULT_LAYER_TAGS),
+                layer_tags=layer_tags,
                 max_separation=max_separation,
                 cutoff=cutoff,
                 sequence=sequence,
@@ -622,7 +672,7 @@ class GlobalOptimizer:
                 mode="projector",
                 max_separation=max_separation,
                 equalize_norms=equalize_norms,
-                layer_tags=list(_DEFAULT_LAYER_TAGS),
+                layer_tags=layer_tags,
                 final_contract=True,
                 final_contract_opts={
                     "optimize": contraction_opt,
@@ -639,7 +689,7 @@ class GlobalOptimizer:
                 mode="projector",
                 max_separation=max_separation,
                 equalize_norms=equalize_norms,
-                layer_tags=list(_DEFAULT_LAYER_TAGS),
+                layer_tags=layer_tags,
                 final_contract=True,
                 final_contract_opts={
                     "optimize": contraction_opt,
@@ -765,7 +815,7 @@ class GlobalOptimizer:
         autodiff_backend: str = "torch",
         optimizer: str = "adam",
         progbar: bool = True,
-        jit_fn: bool = False,
+        jit_fn: bool | None = None,
         device: str = "cpu",
         **tnopt_kwargs,
     ):
@@ -783,6 +833,18 @@ class GlobalOptimizer:
                 "state_target is required for make_tn_optimizer(). "
                 "Provide it in constructor or via loss_constants={'state_target': ...}."
             )
+
+        if self.register_linalg:
+            _register_tn_autodiff_linalg(
+                autodiff_backend, self.state, constants['state_target'],
+                torch_config=self.torch_linalg_config,
+            )
+        is_jax = str(autodiff_backend).strip().lower() == 'jax'
+        if jit_fn is None:
+            jit_fn = is_jax
+        if is_jax:
+            merged_loss_opt.setdefault('cutoff', 0.0)
+            merged_loss_opt.setdefault('strip_exponent', False)
 
         return qtn.TNOptimizer(
             self.state,
@@ -808,7 +870,7 @@ class GlobalOptimizer:
         autodiff_backend: str = "torch",
         optimizer: str = "adam",
         progbar: bool = True,
-        jit_fn: bool = False,
+        jit_fn: bool | None = None,
         device: str = "cpu",
         return_losses: bool = False,
         normalize: bool = True,
@@ -865,7 +927,7 @@ class GlobalOptimizer:
         autodiff_backend: str = "torch",
         optimizer: str = "nlopt",
         progbar: bool = True,
-        jit_fn: bool = False,
+        jit_fn: bool | None = None,
         device: str = "cpu",
         return_losses: bool = False,
         normalize: bool = True,

@@ -91,11 +91,13 @@ def test_entangled_peps_boundary_engine_sweep_matches_exact_fidelity(engine, fit
 
     optimizer = PepsOptimizer(
         state, gates, chi=2,
+        optimizer="nlopt", gate_order="input", fit_init_strategy="guess-src",
+        sweep_optimize_kwargs={"n_round_trips": 4},
         boundary_engine=engine, fit_mode=fit_mode,
         boundary_chi=(8, 10), normalize_chi=(32, 48), evaluation_chi=(32, 48),
         contraction_opt="greedy", fit_timing=True, boundary_convergence=False,
     )
-    # Keep the real default LD_LBFGS budget (50) and four round trips per axis.
+    # Exercise the explicit LD_LBFGS recipe (50 evaluations, four round trips).
     output = optimizer.run(infidelity_tol=0., progress=False)
     records = optimizer.get_step_records()
     assert len(records) == 1

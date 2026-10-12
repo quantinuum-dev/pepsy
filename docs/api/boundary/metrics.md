@@ -6,6 +6,12 @@ all three contractions. `peps_normalize` also accepts this pair and uses only
 its first entry, since normalization has no overlap contraction. Both entries
 must be positive integers. Supplied norms still skip their contractions.
 
+For `method="mps"`, multiple factors at one site in a requested layer are
+contracted exactly on a temporary network before Quimb's sequential boundary
+compression. This supports split-gate targets while preserving layer order,
+backend gradients, and the original target arrays. No additional truncation
+is applied during site-layer preparation.
+
 `peps_norm`, `peps_normalize`, `peps_infidelity`, and `contract_flat` accept
 the following boundary-compression modes:
 
@@ -248,6 +254,18 @@ The direct Quimb `fit_mode` values are currently dense-only; use
 `fit_mode="dmrg"` or `"dmrg2"` for native Symmray boundaries.
 They replace each visited boundary directly and do not construct, copy, or
 globally expand an unused FIT initial guess.
+
+To retain fitted guesses on later passes, select `reuse-direct`, `reuse-src`,
+or `reuse-sdc`: the selected compressor initializes a cut on first use;
+subsequent FIT solves start from its stored MPS. The current boundary target
+is still rebuilt/refitted after tensor changes. This reuse requires the same
+boundary store. The PEPS strip-batch driver additionally copies compatible
+fitted guesses into each new strip fitter. Standalone new optimizers do not
+automatically inherit another optimizer's guesses.
+`guess-*` retains its fresh-compression behavior on every fit. On older Quimb
+builds without backend-native SRC noise, an SRC **guess** uses direct
+compression with a warning; diagnostics record the actual method. This does
+not change the exact target or silently substitute a direct `fit_mode`.
 
 For `fit_mode="eff"`, set `fit_block_size=2` or `3` to use native block-SVD
 growth through `FIT.run_eff`. Add `fit_adaptive_sweeps=2` to perform two

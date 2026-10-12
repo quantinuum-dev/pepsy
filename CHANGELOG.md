@@ -12,7 +12,51 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Changed
+
+- Quimb MPS strip boundaries now handle exact split-gate factors and singleton
+  lattice axes. Sweep budgets reject invalid counts, and constructor-only
+  boundary settings produce an actionable error when supplied as run options.
+  Global MPS loss/norm contractions also prepare split-gate factors exactly
+  and preserve caller tensor tags and index names during evaluation.
+- Strip sweeps share the standard sweep failure handling and honor explicit
+  normalization, diagnostic, cycle, and progress controls. All-invalid visits
+  retain the warm start instead of raising on an infinite best-loss sentinel.
+  Fitted boundary guesses remain available for the next strip batch.
+- `PepsOptimizer(mode="sweep")` now defaults to column strip batches, lazy
+  exact gate targets, simple-update guesses, one-site ALS with automatic
+  spectral/CG selection, and reusable direct boundary guesses. Fits start at
+  the gated strip, then traverse the complete parallel axis with two outer
+  backward/forward round trips and up to two inner ALS round trips per visit.
+  Per-visit infidelity and cache statistics are retained in step records.
+- Sweep/global automatic norm and overlap caps are now `(2*D**2, 4*D**2)`,
+  including normalization/evaluation defaults. Explicit caps take precedence;
+  two-site full update retains its scalar `2*D**2` policy. Default strip
+  batches use fixed caps. Non-strip batching and gradient solvers remain
+  explicit options; standalone `SweepOptimizer` defaults are unchanged.
+
 ### Added
+
+- Strip ALS accepts lazy split-gate targets with explicit lattice tags and
+  unchanged base PEPS bond dimensions. Global fitting can opt into the same
+  representation with direct boundary compression; `canonize` controls its
+  QR pass. Local ALS RHS contractions retain all target factors at a site.
+  Concrete JAX diagonal qubit gates now share the exact rank bound used for
+  other dense backends; traced/trainable values retain unrestricted ranks.
+
+- Global PEPS fits accept one/two-strip or full-queue exact gate targets with
+  simple-update guesses. Standalone global fitting now propagates constructor
+  norm/overlap caps into its loss, exposes bra/ket layer order, and registers
+  Torch/JAX derivative rules before tracing. Sweep metrics reuse the known
+  target norm by default; explicit `norm_target=None` requests a measurement.
+
+- PEPS strip gate batches (`k_2q_batch="strip"`) fit a fixed row/column
+  target with one-site ALS after a compressed or gate-by-gate simple-update
+  guess. Independent norm/overlap caps and known unitary target norms are
+  retained. `linear_solver="auto"` selects native spectral or matrix-free CG
+  solves by local matrix size. Boundary `reuse-direct/src/sdc` policies seed
+  cuts once and refit from stored MPS guesses; older Quimb SRC guess paths
+  now use the shared backend-safe direct fallback with a warning.
 
 - Fixed-chi sweep ALS reuses bounded contraction expressions with fresh input
   arrays. Optional endpoint skipping and absolute-tolerance/minimum/patience

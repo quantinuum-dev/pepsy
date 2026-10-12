@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import autoray as ar
 import numpy as np
@@ -229,6 +229,30 @@ class TorchLinalgConfig:
 def get_torch_linalg_config():
     """Return the last Pepsy Torch linalg policy, or ``None`` if unknown."""
     return _ACTIVE_TORCH_LINALG_CONFIG
+
+
+def _register_tn_autodiff_linalg(backend, *states, torch_config=None):
+    """Install tensor-network derivative rules before constructing a trace."""
+    backend = str(backend).strip().lower()
+    if backend == 'jax':
+        register_jax_linalg(stabilized=True)
+    elif backend == 'torch':
+        complex_data = False
+        block_data = False
+        for state in states:
+            for tensor in getattr(state, 'tensors', ()):
+                data = tensor.data
+                blocks = getattr(data, 'blocks', None)
+                block_data |= blocks is not None
+                for sample in blocks.values() if blocks is not None else (data,):
+                    complex_data |= 'complex' in str(getattr(sample, 'dtype', '')).lower()
+        config = torch_config or TorchLinalgConfig(
+            mode='complex' if complex_data else 'real', stabilized=True,
+            quimb_split_drivers=block_data,
+        )
+        if block_data and not config.quimb_split_drivers:
+            config = replace(config, quimb_split_drivers=True)
+        config.register()
 
 def _patch_unhashable_device_namespace_key():
     """Bypass broken legacy namespace caching without changing device objects."""

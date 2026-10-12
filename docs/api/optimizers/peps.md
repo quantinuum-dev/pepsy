@@ -1,5 +1,131 @@
 # `pepsy.optimizers.peps`
 
+## Fixed strip targets and global gate batches
+
+`PepsOptimizer(state, gates, chi=D, mode="sweep").run()` now selects strip
+ALS with column-oriented commuting-gate order, simple-update guesses,
+reusable direct boundary guesses, and fixed caps `(2*D**2, 4*D**2)`.
+The two entries control norm and overlap contractions respectively.
+Explicit options override these defaults. Consecutive column/row gates are
+kept as exact split-gate factors. Each factor
+has one site, row, and column tag; the original PEPS tensors keep their bond
+dimensions. Boundary FIT and the local overlap contractions consume the
+layered target directly. SU evolves a separate guess and absorbs its gauges
+once. The target never receives the guess's truncation.
+
+```python
+fit = PepsOptimizer(
+    state, gates, chi=D, optimizer="als", gate_order="column",
+    boundary_chi=(chi_norm, chi_overlap), boundary_convergence=False,
+    fit_mode="dmrg", boundary_kwargs={"fit_init_strategy": "reuse-direct"},
+    optimizer_options={"linear_solver": "auto", "max_matrix_size": 1024,
+                       "n_round_trips": 2},
+    sweep_optimize_kwargs={"n_round_trips": 2},
+)
+out = fit.run(k_2q_batch="strip", warmstart_method="simple-update")
+```
+
+ALS starts at the gated strip and continues to the last parallel strip,
+then performs two complete backward/forward round trips across that axis.
+Each strip visit permits two inner ALS forward/backward round trips, one
+tensor at a time, with inner convergence stopping. For three columns with
+gates on column 1, the default visit sequence is
+`1, 2, 1, 0, 1, 2, 1, 0, 1, 2` (zero-based).
+`optimizer_options["n_round_trips"]` controls inner ALS;
+`sweep_optimize_kwargs["n_round_trips"]` controls outer axis round trips.
+`gate_order="row"` or `update_style="row"` supplies the analogous row traversal. Reordering requires
+established commutation; one-site gates are strip-batch barriers.
+`reuse-direct/src/sdc` seeds each cut once, then refits its previous MPS.
+The driver copies compatible guesses between strip batches, never old
+numerical contraction caches.
+
+Per-visit approximate infidelity, direction, strip index, and local cache
+statistics are retained in `get_step_records()[i]["optimizer_result"]["sweep_history"]`.
+Moving boundaries absorb changed strips before the next solve. ALS caches
+the unchanged future and updates the past within a strip; direction changes
+rebuild the numerical environments. Contraction expressions reuse topology
+with fresh arrays. The final independent metric decides whether to retain
+the fitted candidate.
+
+Strip sweeps honor explicit normalization, boundary-norm collection,
+initial/final diagnostic, cycle-count, and progress controls through the
+shared sweep runner. Only the first cycle starts at the gated strip; later
+cycles start at strip zero. An explicit `axes` option must match the gated
+strip axis. If all local updates are invalid, the driver retains the warm
+start and records `success=False`, `termination_reason="no_valid_local_updates"`,
+and no optimizer infidelity. Requested per-visit boundary norms appear in
+`sweep_history` alongside the loss records.
+
+Cycle and outer round-trip counts must be nonnegative integers; boundary
+iteration counts must be positive integers. `boundary_engine` and
+`boundary_options` belong in constructor arguments or `sweep_kwargs`, not
+`sweep_optimize_kwargs`.
+
+The `quimb-mps` engine supports split-gate targets by contracting factors
+within each site/layer exactly on a temporary boundary network. It preserves
+the target and layer order, but can use larger intermediate site tensors than
+the native FIT engine. A single-row or single-column sweep has no boundary
+cuts along that singleton axis.
+
+For the former whole-state gradient sweep, explicitly select
+`optimizer="nlopt", gate_order="input", fit_init_strategy="guess-src"`
+and run with `k_2q_batch="auto", warmstart_method="compress"`.
+Set `sweep_optimize_kwargs={"n_round_trips": 4}` to restore its former
+outer budget. Adaptive boundary checks remain available with non-strip
+batches. JAX and native Symmray do not support the default ALS path;
+use global optimization or the explicit supported gradient sweep.
+
+For global fitting use `mode="global"`. Strip batches accept
+`strip_batch_size=2` for two adjacent parallel columns/rows. Alternatively
+`k_2q_batch="all"` absorbs the remaining queue, including intervening one-site
+gates, without a bond-growth budget. Large batches can be expensive. Global
+fitting optimizes every candidate tensor; strip batching controls the target.
+Global mode defaults to `target_representation="peps"`. Explicit
+`target_representation="layered"` retains split-gate factors for strip,
+all-queue, or integer batches, including one-site factors. Both representations
+are exact before boundary compression. Automatic bond-growth batches retain
+the PEPS representation; layered targets currently support dense arrays only.
+
+```python
+fit = PepsOptimizer(
+    state, gates, chi=D, mode="global", boundary_chi=(chi_norm, chi_overlap),
+    boundary_convergence=False,
+    global_kwargs={"loss_kwargs": {
+        "mode": "mps", "mode_": "direct", "layer_tags": ("BRA", "KET"),
+    }},
+    global_optimize_kwargs={"autodiff_backend": "jax", "n": 20},
+)
+out = fit.run(k_2q_batch="strip", strip_batch_size=2,
+              warmstart_method="simple-update", target_representation="layered")
+```
+
+`mode_="mps"` retains the existing Quimb method; `"direct"` uses direct boundary
+compression with the selected layer order. Both are separate from Pepsy's
+iterative FIT boundary solver. Torch/JAX derivative registration precedes
+optimizer construction. JAX defaults to JIT, zero loss cutoff for fixed ranks,
+and no exponent stripping in the differentiated loss. Explicit overrides win.
+
+Lazy targets reduce stored target data, not necessarily contraction work
+or peak workspace. The direct boundary can still form larger temporary
+tensors. With `layer_tags=("BRA", "KET")`, gates remain part of the KET group;
+this is not a separate compression after every gate. Quimb also compresses
+the initial boundary's layers jointly. Equal finite caps can therefore give
+different approximate losses for the two exact target representations.
+Constant diagonal qubit gates use their algebraic split-rank bound on
+NumPy/Torch/CuPy and concrete JAX arrays. Traced or trainable gates retain
+the unrestricted split. Rank-deficient QR factors can still make derivatives
+unreliable; `canonize=False` is an explicit alternative, not a general cure.
+Check gradients and convergence with the boundary cap for the intended circuit.
+
+For normalized inputs and unitary gates, the known target squared norm is one.
+The driver normalizes the initial state and each compressed candidate, and
+reuses the known target norm. Set `normalize_initial=False` only for an already
+normalized input. Nonunitary gates require `non_unitary=True` or an explicit,
+correct target-norm policy. Strip batches require final normalization and
+fixed caps. Long-run fidelity improvements need separate benchmarks.
+
+## Boundary caps
+
 Two-site full update defaults to reduced-tensor ALS, `gauge=False`, one
 `boundary_chi=2*D**2` shared by normalization and evaluation, and cached boundary
 MPS with `fit_mode="dmrg"`. Boundary/norm convergence probes and automatic
@@ -11,15 +137,15 @@ For global mode and fixed-cap row/column sweeps (`boundary_convergence=False`),
 
 - `chi` caps the optimized PEPS/PEPO virtual bonds.
 - `boundary_chi` controls sweep/global optimizer environments; when omitted,
-  it defaults to `(4*D, 5*D)`, where `D=chi`.
+  it defaults to `(2*D**2, 4*D**2)`, where `D=chi`.
 - `normalize_chi` controls PEPS normalization contractions.
 - `evaluation_chi` controls pre/post infidelity diagnostics used for accepting
   or rejecting a candidate.
 
-With no cap overrides, all three configured starting settings resolve to `(4*D, 5*D)`.
+With no cap overrides, all three configured starting settings resolve to `(2*D**2, 4*D**2)`.
 Each accepts a scalar or a `(norm cap, overlap cap)` pair. Normalization uses
 only the first entry; infidelity uses the first for both state norms and the
-second for their overlap. For example, `chi=4` gives `(16, 20)` throughout.
+second for their overlap. For example, `chi=4` gives `(32, 64)` throughout.
 Automatic normalization/evaluation caps remain independent of an explicit
 environment override. Explicit constructor and per-run metric caps still
 take precedence. A scalar applies equally to all contractions for that setting.
@@ -36,8 +162,8 @@ quality check without making every optimization environment more expensive.
 
 ## Adaptive boundary convergence before sweeps
 
-`boundary_convergence="auto"` enables checks for row/column sweeps and
-disables them for two-site full update.
+`boundary_convergence="auto"` disables checks for the default strip sweeps
+and two-site full update; it enables them for non-strip row/column sweeps.
 Before refining a compressed target, it probes the unchanged warm start and
 target at increasing `(chi_norm, chi_overlap)` caps. It measures both norms
 and the complex overlap in **both x and y**. Norms must agree relatively;
@@ -140,7 +266,7 @@ Quimb environment controls with `boundary_options`. In particular,
 `cutoff="auto"` uses the shared dtype-aware policy and `cutoff_mode` is
 forwarded to Quimb's boundary SVD via `compress_opts`.
 
-`PepsOptimizer.run()` now defaults to `k_2q_batch="auto"`. It absorbs gates
+Explicit `k_2q_batch="auto"` (also the global-mode default) absorbs gates
 in circuit order until the next gate would make any target bond exceed its budget:
 `2*chi` for diagonal two-qubit gates such as RZZ, increasing to `4*chi` when
 another kind of two-site gate enters the batch.
@@ -150,11 +276,11 @@ one target within `2*chi`. Long-range routes or repeated gates can grow the
 same bond again; actual target bond dimensions determine the stopping point.
 The gate that ends a batch remains queued for the next batch.
 
-For dense NumPy/Torch/CuPy diagonal qubit gates on nearest-neighbor coordinate
+For dense NumPy/Torch/CuPy and concrete JAX diagonal qubit gates on nearest-neighbor coordinate
 sites, the exact split uses the algebraic rank ceiling `2*current_bond`.
 This removes redundant SVD dimensions without an approximation cutoff; a
 diagonal qubit operator is a sum of at most two product operators. Other
-gates use unrestricted exact splits. Native symmetry arrays and JAX/traced
+gates use unrestricted exact splits. Native symmetry arrays and traced
 or trainable gates conservatively use the `4*chi` budget; their zero entries
 are not used to infer a smaller rank. Routed and physical-index gate splits
 also retain the unrestricted exact path. These are upper thresholds, not
@@ -162,7 +288,8 @@ requests to pad every bond to twice or four times `chi`.
 
 One-site gates inside an automatic batch are absorbed in their original order,
 including after its last two-site gate; they do not count toward the two-site
-limit. Leading one-site gates are applied directly. Gates are never reordered.
+limit. Leading one-site gates are applied directly. Batching preserves the
+order selected by `gate_order`; `gate_order="input"` retains circuit order.
 Use `k_2q_batch=1` for the previous behavior, or `2`, `3`, etc. to absorb up to
 that many two-site gates plus intervening one-site gates. Integer batches may
 contain overlapping gates and do not impose the automatic target bond budget.
@@ -578,7 +705,8 @@ Thus a disjoint circuit-depth layer can be sorted without assuming that
 overlapping non-diagonal gates commute. Single-site, trainable, or unsupported
 gates remain barriers, and a conflicting gate starts a new block.
 This preserves the exact circuit; different truncation order can still change
-the approximate result. The default `"input"` preserves the original order.
+the approximate result. Sweep mode defaults to `"column"` (`"row"` for
+`update_style="row"`); global and full-update modes default to `"input"`.
 The traversal is a cache-friendly heuristic, not a globally optimal scheduling
 search. When depth boundaries must remain strict, submit one depth per run.
 `optimizer.last_gate_order` records one-based original gate positions in
@@ -689,8 +817,8 @@ does not enable extra contractions or alter optimization settings.
 
 ### One-site ALS inside each row or column
 
-`mode="sweep", optimizer="als"` keeps the existing outer row/column schedule
-and boundary environments. Within each active strip it optimizes one complete
+`mode="sweep"` defaults to `optimizer="als"` and the gated-strip-first axis
+schedule described above. Within each visited strip it optimizes one complete
 site tensor at a time, with all other tensors fixed, first forward and then
 backward. Every inner round trip visits each site twice. Bond dimensions stay
 fixed; this is distinct from gate-by-gate two-site full update and from jointly
@@ -702,19 +830,22 @@ from pepsy.optimizers import PepsOptimizer
 optimizer = PepsOptimizer(
     state, gates, chi=4, mode="sweep", optimizer="als",
     optimizer_options={"n_round_trips": 2, "rtol": 1e-9},
-    sweep_optimize_kwargs={"axes": ("y", "x"), "n_round_trips": 1},
+    sweep_optimize_kwargs={"n_round_trips": 2},
 )
 result = optimizer.run()
 ```
 
 `optimizer_options["n_round_trips"]` controls passes **inside each strip**;
 `sweep_optimize_kwargs["n_round_trips"]` controls outer backward/forward trips
-over the strips after the initial forward pass. Use `axes=("y",)` for columns
+over the strips after the initial forward pass. Strip batches choose the axis
+from their gates; non-strip sweeps also accept `axes=("y",)` for columns
 at fixed y, traversing x within each column. The default local budget is two
 inner round trips. `rtol=0` or `None` runs the full budget; otherwise relative
 infidelity improvement is checked after each complete inner round trip.
 
-The default `linear_solver="dense-cg"` constructs the active site's norm matrix
+The PEPS driver defaults to `linear_solver="auto"`: spectral solves up to
+`max_matrix_size=1024`, then matrix-free CG. Standalone `SweepOptimizer`
+retains `"dense-cg"`. Explicit `linear_solver="dense-cg"` constructs the active site's norm matrix
 from cached environments, sets `N_H = (N + N.H) / 2`, and solves
 `N_H A = b` iteratively with Jacobi-preconditioned CG, without SVD,
 diagonalization, or direct factorization. Each next tensor sees updated
@@ -750,7 +881,7 @@ optimizer_options={
 ```
 
 These alternatives use analytic one-site quadratic gradients, rather than
-jointly optimizing a complete strip. The default remains `"dense-cg"`.
+jointly optimizing a complete strip. Neither changes the driver's `"auto"` default.
 SciPy owns host parameter/gradient vectors; contractions and returned tensors
 retain their backend/device. A finite L-BFGS budget may produce an improving
 unconverged candidate, which is accepted only by the original overlap check.
@@ -768,8 +899,8 @@ under `optimizer_result["als"]`.
 
 ### Gradient solvers
 
-The default sweep solver is NLopt `LD_LBFGS` for dense and Torch-backed Symmray
-states. Torch supplies autograd derivatives for Torch parameters; NumPy
+Explicit `optimizer="nlopt"` selects `LD_LBFGS` for dense and Torch-backed
+Symmray states. Torch supplies autograd derivatives for Torch parameters; NumPy
 parameters use finite differences. The optional NLopt dependency is provided
 by the `solvers` installation extra.
 
@@ -797,7 +928,7 @@ parameters; `ftol_abs` sets an absolute objective-change tolerance.
 `restore_best` retains the best valid iterate. Finite-difference
 gradients require extra underlying contractions per objective callback.
 These limits do not bound the full gate stream. Sweep cleanup uses one global
-cycle over `y,x`, four round trips per axis, and ten boundary FIT iterations
+cycle over `y,x`, two round trips per axis, and ten boundary FIT iterations
 per move. Override the schedule with `sweep_optimize_kwargs`; override solver
 controls with `optimizer_options` or per-run
 `sweep_optimize_kwargs={"optimizer_options": {...}}`.
@@ -1061,8 +1192,10 @@ optimizer = pepsy.PepsOptimizer(
 ```
 
 `fit_init_strategy` selects only the disposable FIT initial guess:
-`PepsOptimizer` defaults to `"guess-src"` (SRC initialization), with a boundary
-FIT iteration budget of `n_iter=10`. The spelling `"src"` belongs to
+Sweep mode defaults to `"reuse-direct"`, seeding each cut once by direct
+compression and then refitting from its previous MPS. Other modes retain
+`"guess-src"` (SRC initialization). The boundary FIT iteration budget is
+`n_iter=10`. The spelling `"src"` belongs to
 `fit_mode`; use `"guess-src"` for initialization followed by FIT refinement.
 Explicit `fit_init_strategy="direct"`, `"guess-direct"`, or `"guess-sdc"`
 overrides this default, as does an entry in `boundary_kwargs` when the direct
@@ -1188,16 +1321,16 @@ SWAP routing. Use `route_opts` for routing controls such as `sequence`,
   when you want to replay from a fresh input state.
 - If `normalize_chi` or `evaluation_chi` is left unset, standalone
   normalization and infidelity diagnostics inherit `boundary_chi` for
-  two-site full update, otherwise `(4*D, 5*D)` independently
+  two-site full update, otherwise `(2*D**2, 4*D**2)` independently
   of the optimizer environment cap. Increase these explicitly for stricter
   metric contractions, at extra computational cost.
 - `accept_if_improved=True` is most consistent with
   `measure_final_infidelity=True`. If final measurement is disabled, the
   fallback optimizer loss can come from the coarser `boundary_chi` environment
   while the pre-check used `evaluation_chi`.
-- Sweep mode defaults to optional NLopt `LD_LBFGS` for dense and Torch-backed
-  Symmray states. Pass an explicit `optimizer` /
-  `sweep_optimize_kwargs` value to override this choice.
+- Sweep mode defaults to dense one-site ALS. Native Symmray requires the
+  explicit supported gradient route, such as `optimizer="nlopt"`, with
+  non-strip batches and PEPS targets. Global mode supports Torch/JAX autodiff.
 - Unitary targets are not rescaled by default. `normalize_target=None` follows
   `non_unitary=False`; use `non_unitary=True` to normalize nonunitary targets,
   or override `normalize_target` explicitly. This does not implement the

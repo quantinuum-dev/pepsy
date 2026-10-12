@@ -333,6 +333,12 @@ def ordered_gate_run(method):
         context = data.device if ar.infer_backend(data) == 'cupy' else nullcontext()
         with context:
             requested = kwargs.get('gate_order')
+            if requested is None and self._gate_order_auto:
+                mode = kwargs.get('mode') or self.mode
+                style = kwargs.get('update_style') or self.update_style
+                requested = self._default_gate_order(
+                    self._normalize_mode(mode), self._normalize_update_style(style),
+                )
             policy = gate_order_option(self.gate_order if requested is None else requested)
             if policy == 'smart' and any(ar.infer_backend(t.data) not in {'numpy', 'torch', 'cupy'}
                                          for t in getattr(self.state, 'tensors', ())):

@@ -12,7 +12,9 @@ import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
 from .._internal.cutoff import dtype_auto_cutoff
-from .._internal.quimb import require_quimb_1d_compression_method, run_seeded_quimb
+from .._internal.quimb import (
+    quimb_fit_guess_method, require_quimb_1d_compression_method, run_seeded_quimb,
+)
 from ..tensors.observables import tn_fidelity
 from ..tensors.contractions import build_optimizer
 from ..fitting.local import FIT
@@ -124,7 +126,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         Layer tags and, for ``fit_layer_mode="sequential"``, their absorption
         order. The standard two-layer order is ``("KET", "BRA")``. Supply
         tags explicitly for a three-layer BRA--PEPO--KET network.
-    fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
+    fit_init_strategy : str, default="direct"
         Disposable initial guess for each boundary FIT solve. ``"direct"``
         reuses the existing boundary guess. ``"guess-src"`` first applies
         Quimb's successive randomized compression to a copy of the exact
@@ -132,6 +134,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         and ``"guess-sdc"`` use the corresponding Quimb compressors.
         ``"auto"`` is an alias for the compatibility-preserving direct
         strategy. This option is ignored by direct Quimb compression modes.
+        ``"reuse-direct"``, ``"reuse-src"``, and ``"reuse-sdc"`` seed a cut
+        once, then initialize FIT from its previous fitted MPS. These reuse
+        guesses, not stale contractions. Unsupported backend-native SRC
+        initialization uses direct compression with a warning.
     fit_init_seed : int | None, default=0
         Seed forwarded to randomized disposable boundary guesses.
     fit_block_size : {1, 2, 3}, default=1
@@ -960,10 +966,13 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             for tensor in network.tensors
         )
 
-    def _build_fit_initial_guess(self, tn, boundary_mps, site_tag_id):
+    def _build_fit_initial_guess(self, tn, boundary_mps, site_tag_id, *, fitted=False):
         """Build the disposable initial guess for one boundary FIT solve."""
         self._fit_init_strategy_used = "direct"
         if self.fit_init_strategy == "direct":
+            return boundary_mps
+        if self.fit_init_strategy.startswith("reuse-") and fitted:
+            self._fit_init_strategy_used = "reuse"
             return boundary_mps
 
         # There is no compression problem for a one-site MPS. Quimb's SRC
@@ -972,7 +981,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         if int(boundary_mps.L) <= 1:
             return boundary_mps
 
-        guess_method = self.fit_init_strategy.removeprefix("guess-")
+        guess_method = self.fit_init_strategy.removeprefix("guess-").removeprefix("reuse-")
 
         # Quimb's dense compressors cannot preserve Symmray block sectors or
         # fermionic metadata. Keep the exact native path safe and visible
@@ -988,6 +997,11 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 )
                 self._fit_init_warned = True
             return boundary_mps
+
+        # Older Quimb SRC builds allocate NumPy noise even for Torch/CuPy.
+        # Use the shared, explicit compatibility fallback for disposable
+        # guesses only; the exact FIT target and requested cap are unchanged.
+        guess_method = quimb_fit_guess_method(guess_method, tn)
 
         site_tags = tuple(
             site_tag_id.format(site) for site in range(int(boundary_mps.L))
@@ -1026,7 +1040,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         # Preserve the boundary's scale convention. The source target is a
         # disposable guess only; FIT still owns the exact target ``tn``.
         guess.exponent = complex(getattr(boundary_mps, "exponent", 0.0)).real
-        self._fit_init_strategy_used = self.fit_init_strategy
+        prefix = 'reuse-' if self.fit_init_strategy.startswith('reuse-') else 'guess-'
+        self._fit_init_strategy_used = prefix + guess_method
         return guess
 
     def _fit_boundary(
@@ -1076,6 +1091,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             tn,
             boundary_mps,
             site_tag_id,
+            fitted=getattr(self.mps_boundaries[boundary_key], '_pepsy_boundary_fitted', False),
         )
 
         fit = FIT(
@@ -1139,6 +1155,9 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             self.fidel.append(fidelity)
 
         if self.write_back:
+            # This is a reusable initial guess, not proof that the numerical
+            # environment is valid after a tensor changes. FIT still runs.
+            fit.p._pepsy_boundary_fitted = True
             self.mps_boundaries[boundary_key] = fit.p
 
         return fit.p

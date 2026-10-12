@@ -23,8 +23,8 @@ def options(values=None):
     if unknown:
         raise ValueError(f"Unknown ALS optimizer_options: {sorted(unknown)}")
     result.update(values or {})
-    if result['linear_solver'] not in ('dense-cg', 'dense', 'cg', 'pinv', 'lbfgs', 'dense-lbfgs'):
-        raise ValueError("ALS linear_solver must be 'dense-cg', 'dense', 'cg', 'pinv', 'lbfgs', or 'dense-lbfgs'")
+    if result['linear_solver'] not in ('auto', 'dense-cg', 'dense', 'cg', 'pinv', 'lbfgs', 'dense-lbfgs'):
+        raise ValueError("ALS linear_solver must be 'auto', 'dense-cg', 'dense', 'cg', 'pinv', 'lbfgs', or 'dense-lbfgs'")
     for key in ('cg_fallback', 'cache_contractions', 'skip_repeated_endpoints'):
         if not isinstance(result[key], bool):
             raise ValueError(f'ALS {key} must be boolean')
@@ -133,6 +133,9 @@ def _solve_site(norm, overlap, tag, *, optimize, rcond, controls=None, contract=
     left = tuple(i for i in bra.inds if i not in physical)
     size = math.prod(ket.ind_size(i) for i in right)
     controls = options(controls)
+    if controls['linear_solver'] == 'auto':
+        limit = controls['max_matrix_size']
+        controls['linear_solver'] = 'pinv' if limit is None or size <= limit else 'cg'
     matrix_free = controls['linear_solver'] in ('cg', 'lbfgs')
     lbfgs = controls['linear_solver'] in ('lbfgs', 'dense-lbfgs')
     if lbfgs:
@@ -145,11 +148,14 @@ def _solve_site(norm, overlap, tag, *, optimize, rcond, controls=None, contract=
     hole = _hole(norm, (ket, bra))
     if matrix_free:
         from ._als_cg import action_path, split_environment
-        target = next(t for t in overlap.select_tensors(tag) if t is not cross_bra)
-        parts, exponent = split_environment(_hole(overlap, (cross_bra, target)), optimize=optimize)
-        projected = qtn.TensorNetwork([*parts, target])
+        targets = tuple(t for t in overlap.select_tensors(tag) if t is not cross_bra)
+        parts, exponent = split_environment(_hole(overlap, (cross_bra, *targets)), optimize=optimize)
+        projected = qtn.TensorNetwork([*parts, *targets])
         projected.exponent = exponent
-        rhs_optimize = action_path(parts) if parts else optimize
+        # Layered targets can have a base site plus several split-gate factors.
+        # Keep all of them in the RHS contraction; the two-part action path is
+        # valid only when there is exactly one active target tensor.
+        rhs_optimize = action_path(parts) if parts and len(targets) == 1 else optimize
     else:
         projected = _hole(overlap, (cross_bra,))
         rhs_optimize = optimize
@@ -233,7 +239,7 @@ def validate_input(owner, controls):
     sizes = [t.size // math.prod(t.ind_size(i) for i in t.inds if i in outer)
              for t in owner.state]
     limit = controls['max_matrix_size']
-    if controls['linear_solver'] not in ('cg', 'lbfgs') and limit is not None and max(sizes) > limit:
+    if controls['linear_solver'] not in ('auto', 'cg', 'lbfgs') and limit is not None and max(sizes) > limit:
         raise ValueError(f'ALS local matrix size {max(sizes)} exceeds max_matrix_size={limit}')
     if controls['linear_solver'] in ('lbfgs', 'dense-lbfgs'):
         if backends != {'numpy'} and not getattr(owner, '_warned_als_lbfgs_host', False):
@@ -295,7 +301,7 @@ def _optimize_slice(owner, index, *, axis, controls):
     # These kernels have at most six tensors. An optimal small-network path
     # prevents a greedy contraction from forming a dense site metric (D^12
     # work at chi=D^2), even when the user's general optimizer is greedy.
-    iterative = controls['linear_solver'] in ('cg', 'dense-cg', 'lbfgs', 'dense-lbfgs')
+    iterative = controls['linear_solver'] in ('auto', 'cg', 'dense-cg', 'lbfgs', 'dense-lbfgs')
     scalar_optimize = 'optimal' if iterative else optimize
 
     def scalar(network):
