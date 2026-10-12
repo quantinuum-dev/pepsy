@@ -96,3 +96,74 @@ The [earlier random-state checks](2026-10-12-peps-4x4-review.md) remain valid
 for their own fixtures and do not establish this zero-state trajectory.
 No example notebook, production output, shared environment or implementation
 was edited. No new passing full-suite claim accompanies this numerical audit.
+
+## Follow-up: why ALS stops while Torch global advances
+
+Resume from the saved sweep state at t=1.4, with a fresh driver and the same
+next Trotter step. This drops the old driver's cached boundary guesses, so
+the reproduced negative estimate is −0.001039 rather than −0.001063; the
+failure remains at the post-fit metric check.
+
+The first **ALS fit succeeds and improves exact local infidelity** from
+0.003296932518130 to 0.002504557175305. Its summary is
+`success=True, termination_reason='partial_local_updates'`: six local
+updates apply and ten are rejected. The subsequent approximate postcheck,
+not an ALS linear solve, raises. Both candidate and target remain finite.
+
+Two errors combine. The incoming state's exact squared norm is
+1.001759938421066, while the unitary shortcut assumes target norm one.
+The small boundary caps also introduce contraction error. Holding the failed
+candidate/target tensors fixed separates these effects:
+
+| Norm/overlap caps | Target norm policy | Raw infidelity |
+| --- | --- | ---: |
+| `(8,16)` | Assume one | −0.001038587496458 |
+| `(8,16)` | Measure at these caps | −0.001143267913472 |
+| `(8,16)` | Supply exact norm | 0.000720083621780 |
+| `(16,64)` | Assume one | 0.000749026620631 |
+| `(16,64)` | Measure at these caps | 0.002504557175295 |
+| Exact dense reference | Normalize both vectors | 0.002504557175299 |
+
+The `(32,64)` result agrees with `(16,64)`. Supplying target norm one
+disables automatic metric retries by design, so the default stops when its
+raw estimate crosses −0.001. Raising the clipping allowance would hide the
+accuracy problem rather than resolve it.
+
+Torch global, started from the **same saved sweep state**, also underestimates
+the local error: its post-fit boundary loss is 0.015230112361629 versus exact
+0.022152548878851. It compresses the whole step in one batch, whereas sweep
+fits strips. Its larger local error stays positive despite the bias, so it
+passes the same guard and advances. Completion does not establish better
+accuracy or a more reliable metric. Its internal global objective also differs
+from the driver's boundary postcheck; the postcheck governs acceptance.
+
+Controlled one-step results from that common t=1.4 checkpoint:
+
+| Sweep configuration | Completed t=1.5? | Exact circuit fidelity | Fit summaries |
+| --- | --- | ---: | --- |
+| Default | No | — | First fit improves; postcheck raises |
+| Measure target norm, default caps/retries | Yes | 0.857397804901607 | All eight have partial updates |
+| Accurate normalization/evaluation, default fit caps | Yes | 0.851177120343672 | Seven partial, one failed |
+| Accurate normalization/evaluation **and fit caps** | Yes | 0.883113824503349 | All eight completed and accepted |
+
+The last configuration takes 26.82 s with concurrent probes and uses:
+
+```python
+PepsOptimizer(
+    state, gates, chi=2, mode="sweep", contraction_opt="greedy",
+    normalize_initial=False,
+    boundary_chi=(16, 64), normalize_chi=16, evaluation_chi=(16, 64),
+    infidelity_kwargs={"norm_target": None},
+)
+```
+
+This validates the remedy for the failing step, not a complete corrected
+t=5 trajectory or general sufficiency of these caps at larger D. The ALS
+algorithm, tolerances and acceptance guard were unchanged. JAX's early-time
+gradient failure is a separate issue and is not addressed by this check.
+
+New temporary evidence: `diagnose_sweep.py`, `check_failed_metric.py`, and
+`diagnosis/{default,global,measured,metrics,all,metric-controls}.json` under
+the same run directory. This follow-up changes only this record;
+`git diff --check` passes. No implementation test suite was rerun for the
+documentation-only change.
