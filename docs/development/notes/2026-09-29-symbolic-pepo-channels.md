@@ -46,7 +46,7 @@ from any additional error imposed by a channel cap.
 
 ## Measured preparation and replay
 
-Reproducer: [symbolic_pepo_channels_benchmark.py](../../../examples/symbolic_pepo_channels_benchmark.py).
+Reproducer: [symbolic_pepo_channels_benchmark.py](https://github.com/quantinuum-dev/pepsy/blob/5316cb03c5778cb116432539724231b864567e90/examples/symbolic_pepo_channels_benchmark.py).
 [All 48 result rows](2026-09-29-symbolic-pepo-channels.jsonl) retain one/six
 references, caps 1/4/full, both preparation modes, exact bond dimensions,
 operator/gradient errors and timing/storage fields.

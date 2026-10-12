@@ -22,6 +22,8 @@ sampling, and variational Monte Carlo. The Python package is `pepsy`.
 | Upgrade from 0.4.1 | [Migration guide](development/api-migration.md) |
 | Compatibility guarantees | [API stability](stability.md) |
 | Source ownership and design records | [Development documentation](development/README.md) |
+| Contribute or run tests | [Contributing](../CONTRIBUTING.md) and [test profiles](development/testing.md) |
+| Review proposals | [Planning index](development/plans/README.md) |
 
 The API guides cover MPS, PEPS, tree networks, operators, sampling, symmetry,
 belief propagation, and VMC. Optional features list their installation extras.

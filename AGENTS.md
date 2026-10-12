@@ -31,7 +31,9 @@ Follow the [concise mathematical Markdown policy](docs/development/markdown_poli
 for documentation, notebook prose, plans and skills: brief explanations, precise
 equations and colored important formula terms. Keep assumptions explicit.
 Use the [plan index](docs/development/plans/README.md) for planning routes;
-root [plan.md](plan.md) is the deferred fermionic PEPO proposal.
+the [native fermionic PEPO proposal](docs/development/plans/native_fermionic_pepo.md)
+remains deferred. Plans live under `docs/development/plans/`; do not create
+competing root `plan.md` or `PLAN.md` files.
 
 | Source | Purpose |
 | --- | --- |
@@ -165,7 +167,9 @@ Choose checks by the change, after activating the selected environment:
 
 Use deterministic regressions that test observable behavior. Keep optional,
 integration, and slow checks out of the default smoke loop; use
-`CONTRIBUTING.md` for test profiles. Report failures and missing backends
+[test profiles](docs/development/testing.md) for commands and coverage.
+Follow the [code-change policy](docs/development/code_policy.md) for rationale
+comments and behavior-change evidence. Report failures and missing backends
 explicitly. Do not infer full-suite success from a passing selection.
 
 Keep handwritten API docs under `docs/api/`, implementation maps under

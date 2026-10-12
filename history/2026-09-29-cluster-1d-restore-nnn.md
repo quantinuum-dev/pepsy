@@ -33,9 +33,9 @@ validated the earlier NN-only notebook, not the requested model.
 - Recomputed and saved all 22 code-cell outputs after successful execution.
   No Pepsy/Gaugy package source or 2D notebook was changed by this task.
 
-Primary files: [notebook](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb),
-[drawing helper](../../gaugy_examples/pauli_gaugy/cluster_1d_diagrams.py),
-[guide](../../gaugy_examples/pauli_gaugy/README.md).
+Primary files: [notebook](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb),
+[drawing helper](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d_diagrams.py),
+[guide](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/README.md).
 
 ## Validation performed now
 

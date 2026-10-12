@@ -1,4 +1,4 @@
-# Agent Code-Change Policy
+# Code-change policy
 
 This policy keeps the reasoning behind Pepsy changes available to future
 developers and agents. Code should explain not only what it does, but also

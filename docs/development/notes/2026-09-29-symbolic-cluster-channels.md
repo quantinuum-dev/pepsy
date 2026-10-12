@@ -39,7 +39,7 @@ under the new default gauge even though the uncompressed operator is preserved.
 
 ## Reproducible measurement
 
-Run [the benchmark](../../../examples/compact_cluster_channels_benchmark.py):
+Run [the benchmark](https://github.com/quantinuum-dev/pepsy/blob/5316cb03c5778cb116432539724231b864567e90/examples/compact_cluster_channels_benchmark.py):
 
 ```bash
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \

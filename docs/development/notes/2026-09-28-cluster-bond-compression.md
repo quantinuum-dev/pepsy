@@ -9,7 +9,7 @@ fixed factorization policy changed. Existing unrelated working-tree edits are
 preserved.
 
 The [MPO guide](../../api/operators/mpo_cluster.md#explicit-bond-compression-after-fixed-construction)
-now shows the explicit API. A runnable [benchmark](../../../examples/cluster_mpo_bond_compression.py)
+now shows the explicit API. A runnable [benchmark](https://github.com/quantinuum-dev/pepsy/blob/5316cb03c5778cb116432539724231b864567e90/examples/cluster_mpo_bond_compression.py)
 reports bond sizes, construction and compression times, and Frobenius error.
 It uses `factorization="fixed"`, `assembly="recursive"`, `cutoff=0`, no
 intermediate bond cap, then `compress_numerical(max_bond=chi, cutoff=0,

@@ -9,10 +9,10 @@
 
 ## Changes
 
-- [cluster_1d.ipynb](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb) now
+- [cluster_1d.ipynb](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb) now
   focuses on `exp(-it H)` for the existing ITF + NNN model. Removed its embedded
   joint section and added navigation to the new notebook.
-- [cluster_1d_joint.ipynb](../../gaugy_examples/pauli_gaugy/cluster_1d_joint.ipynb)
+- [cluster_1d_joint.ipynb](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d_joint.ipynb)
   is independently executable. It defines Hxx, Hyy, Hzz and the matrix product
   `exp(-it Hxx) @ exp(-it Hyy) @ exp(-it Hzz)`, in the order requested by the
   user. The earlier combined notebook's joint section used ZZ, XX, YY; its

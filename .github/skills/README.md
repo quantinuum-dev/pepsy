@@ -28,7 +28,8 @@ shared Torch/CTMRG safeguards previously embedded in the root guide.
 
 For Markdown and planning tasks, follow the
 [writing policy](../../docs/development/markdown_policy.md) and use the
-[plan index](../../docs/development/plans/README.md). Maintain these routes in
+[documentation ownership map](../../docs/development/README.md#document-ownership)
+and [plan index](../../docs/development/plans/README.md). Maintain these routes in
 the existing router instead of adding a duplicate writing skill.
 
 - [MPS optimizer](mps-optimizer/SKILL.md): gate replay, `dmrg`

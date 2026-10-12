@@ -1,7 +1,7 @@
 # 2026-09-30 — Improve cluster_1d plot styling
 
 - Scope: user-requested colors, markers, and marker-edge improvements in
-  [cluster_1d.ipynb](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb).
+  [cluster_1d.ipynb](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb).
 - Branch / baseline: Gaugy Examples `main` at `dbabafa`; Pepsy `develop`
   at `c1ff0f8`.
 - Commit status: working-tree edits only; nothing staged, committed, or

@@ -8,8 +8,8 @@
 
 ## Changes
 
-- In [cluster_1d.ipynb](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb) and
-  [cluster_1d_joint.ipynb](../../gaugy_examples/pauli_gaugy/cluster_1d_joint.ipynb),
+- In [cluster_1d.ipynb](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb) and
+  [cluster_1d_joint.ipynb](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d_joint.ipynb),
   separated term/geometry preparation, storage settings, a one-MPO example,
   and the longer sweep. The example calls `exp_mpo_cluster` or
   `exp_mpo_cluster_product` directly and returns an MPO without a report tuple.

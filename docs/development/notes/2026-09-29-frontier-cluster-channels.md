@@ -57,7 +57,7 @@ silently discarding terms. Default reference preparation and PEPOs are unchanged
 
 ## Reproducible bounded measurement
 
-Run [the benchmark](../../../examples/frontier_cluster_channels_benchmark.py)
+Run [the benchmark](https://github.com/quantinuum-dev/pepsy/blob/5316cb03c5778cb116432539724231b864567e90/examples/frontier_cluster_channels_benchmark.py)
 with the shared environment and single BLAS/OpenMP threads:
 
 ```bash

@@ -11,7 +11,7 @@
   Root instructions, development docs and the maintainer skill/catalog route to it.
 - Organized the [plan index](../docs/development/plans/README.md) by current
   behavior, validation, domain skills and historical/deferred designs.
-  Root [plan.md](../plan.md) keeps its deferred native fermionic PEPO scope.
+  Root [plan.md](../docs/development/plans/native_fermionic_pepo.md) keeps its deferred native fermionic PEPO scope.
 - Updated [skill policy](../.github/skills/SKILL_POLICY.md) and the
   [agent upload manifest](../.github/skills/agent-bundle.yaml) with writing and
   planning references. Existing domain skills keep their numerical ownership.

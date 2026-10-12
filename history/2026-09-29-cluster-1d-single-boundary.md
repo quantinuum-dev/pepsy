@@ -17,10 +17,10 @@
 - Refreshed all 24 code-cell outputs from a successful OBC-only run. No saved
   output combines boundaries. Kept the concise colored Markdown, NN + NNN
   Hamiltonian, direct Pepsy constructor, and compression settings.
-- Updated the [notebook guide](../../gaugy_examples/pauli_gaugy/README.md).
+- Updated the [notebook guide](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/README.md).
 
-Primary files: [notebook](../../gaugy_examples/pauli_gaugy/cluster_1d.ipynb),
-[drawing helper](../../gaugy_examples/pauli_gaugy/cluster_1d_diagrams.py), and
+Primary files: [notebook](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d.ipynb),
+[drawing helper](https://github.com/rezaquant/gaugy_examples/blob/af9ec7317bbc3d1d4f6d5242a1c88dd283bc00c5/pauli_gaugy/cluster_1d_diagrams.py), and
 the existing `test_cluster_1d_diagrams.py` / `test_explicit_cluster.py` tests.
 No package implementation was changed.
 

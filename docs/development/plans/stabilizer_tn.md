@@ -1,4 +1,6 @@
-# PLAN.md — `pepsy.optimizers.stabilizer_tn` roadmap
+# Stabilizer tensor-network roadmap
+
+<a id="planmd--pepsyoptimizersstabilizer_tn-roadmap"></a>
 
 Status: living document
 Scope: the Stabilizer Tensor Network (STN) simulator subpackage only.

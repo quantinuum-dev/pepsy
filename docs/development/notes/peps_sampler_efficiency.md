@@ -47,7 +47,7 @@ on their backend/device. The default reference proposal remains available.
    `amplitude_stats` exposes plan reuse. Neither ESS nor small repairs certify
    support, and per-chunk normalized weights cannot be combined as global
    normalized weights. No generic error bar or support guarantee is invented.
-5. [Benchmark](../../../benchmarks/peps_sampling.py) builds an evolved diagonal
+5. [Benchmark](https://github.com/quantinuum-dev/pepsy/blob/6486a616c1fc14290cd11fac6f077b1a029becc5/benchmarks/peps_sampling.py) builds an evolved diagonal
    product-wall PEPS using public simple-update gates. It reports setup,
    repeated batch timings, a separate synchronized stage profile, CUDA peak
    allocated bytes, process-lifetime peak RSS, and importance diagnostics.
