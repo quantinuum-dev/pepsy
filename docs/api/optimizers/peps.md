@@ -1193,11 +1193,15 @@ optimizer = pepsy.PepsOptimizer(
 
 `fit_init_strategy` selects only the disposable FIT initial guess:
 Sweep mode defaults to `"reuse-direct"`, seeding each cut once by direct
-compression and then refitting from its previous MPS. Other modes retain
-`"guess-src"` (SRC initialization). The boundary FIT iteration budget is
-`n_iter=10`. The spelling `"src"` belongs to
+compression and then refitting from its previous MPS. Other modes default to
+`"guess-direct"`, constructing a direct-compression guess before FIT.
+The boundary FIT iteration budget is `boundary_kwargs={"n_iter": 10}`
+per boundary update, separate from the inner and outer ALS round trips.
+Compatible boundary MPS guesses are reused by sweep FIT, but changed tensor
+dependencies are refitted; standalone metric calls construct fresh boundaries.
+The spelling `"src"` belongs to
 `fit_mode`; use `"guess-src"` for initialization followed by FIT refinement.
-Explicit `fit_init_strategy="direct"`, `"guess-direct"`, or `"guess-sdc"`
+Explicit `fit_init_strategy="direct"`, `"guess-src"`, or `"guess-sdc"`
 overrides this default, as does an entry in `boundary_kwargs` when the direct
 argument is omitted. Standalone boundary helpers and `SweepOptimizer` retain
 their own defaults. The exact boundary target, live state,

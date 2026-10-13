@@ -5,6 +5,7 @@ from unittest.mock import patch
 import autoray as ar
 import numpy as np
 import pytest
+import quimb.tensor as qtn
 
 from pepsy.optimizers import PepsOptimizer, SweepOptimizer
 from test_peps_strip_batches import inputs
@@ -73,7 +74,30 @@ def test_run_mode_override_resolves_sweep_defaults(constructor_mode, run_mode, m
     driver.run(mode=run_mode, infidelity_tol=0.)
     assert observed == [run_mode == 'sweep']
     assert driver.last_gate_order['policy'] == ('column' if run_mode == 'sweep' else 'input')
-    assert driver.boundary_kwargs['fit_init_strategy'] == ('reuse-direct' if run_mode == 'sweep' else 'guess-src')
+    assert driver.boundary_kwargs['fit_init_strategy'] == ('reuse-direct' if run_mode == 'sweep' else 'guess-direct')
+
+
+@pytest.mark.parametrize('backend', ['numpy', 'torch'])
+@pytest.mark.parametrize('mode', ['global', 'full-update'])
+def test_default_boundary_guess_normalizes_without_src(backend, mode, monkeypatch):
+    state, _ = inputs(backend)
+    state *= 3
+    original = ar.to_numpy(state.to_dense()).copy()
+    compress = qtn.tensor_network_1d_compress
+    methods = []
+
+    def capture(*args, **kwargs):
+        methods.append(kwargs['method'])
+        return compress(*args, **kwargs)
+
+    monkeypatch.setattr(qtn, 'tensor_network_1d_compress', capture)
+    driver = PepsOptimizer(state, [], chi=2, mode=mode, boundary_chi=32,
+                           boundary_convergence=False, contraction_opt='greedy')
+    result = driver.run()
+    vector = ar.to_numpy(result.to_dense())
+    assert methods and set(methods) == {'direct'}
+    np.testing.assert_allclose(vector, original / np.linalg.norm(original), atol=1e-10)
+    np.testing.assert_array_equal(ar.to_numpy(state.to_dense()), original)
 
 
 @pytest.mark.parametrize('axis', ['x', 'y'])

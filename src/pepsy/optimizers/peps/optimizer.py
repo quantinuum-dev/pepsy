@@ -61,7 +61,7 @@ __all__ = ["PepsOptimizer"]
 
 _DEFAULT_BOUNDARY_KWARGS = {
     "n_iter": 10,
-    "fit_init_strategy": "guess-src",
+    "fit_init_strategy": "guess-direct",
     "direction": "y",
     "max_separation": 1,
     "track_boundary_fidelity": False,
@@ -295,7 +295,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``n_iter=10``, ``direction="y"``, ``max_separation=1``,
         ``track_boundary_fidelity=False``, and ``strip_exponent=True``.
         Sweep boundary FIT defaults to ``fit_init_strategy="reuse-direct"``;
-        other modes retain ``"guess-src"``. Cuts are refitted after changes;
+        other modes use ``"guess-direct"``. Cuts are refitted after changes;
         explicit direct arguments or mapping entries override this policy.
         FIT controls such as ``fit_mode``, ``fit_layer_mode``, ``layer_tags``,
         the ``fit_*`` initialization/convergence options, and ``cutoff`` are

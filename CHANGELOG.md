@@ -14,6 +14,9 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Changed
 
+- `PepsOptimizer` now initializes boundary FIT with `guess-direct` outside
+  sweep mode. Sweep mode retains `reuse-direct`; explicit SRC initialization
+  remains available. The boundary FIT budget remains ten sweeps per update.
 - Quimb MPS strip boundaries now handle exact split-gate factors and singleton
   lattice axes. Sweep budgets reject invalid counts, and constructor-only
   boundary settings produce an actionable error when supplied as run options.
