@@ -2,13 +2,85 @@
 
 from copy import deepcopy
 
+import numpy as np
 import pytest
+import quimb as qu
+import quimb.tensor as qtn
 
 from pepsy.optimizers import MpsOptimizer
 from pepsy.optimizers.mps.diagnostics import _summarize_fit_timing
 
 
 pytestmark = [pytest.mark.core, pytest.mark.mps]
+
+
+@pytest.mark.parametrize("mode", ["direct", "mpo", "quimb-direct", "fit", "dmrg2",
+                                 "dmrg3", "mix", "svd", "swap", "perm", "exact", "batch-exact"])
+def test_public_progress_style_matches_standalone_native_bar(mode, monkeypatch):
+    created = []
+
+    class Bar:
+        def __init__(self, **options):
+            created.append(options)
+
+        def update(self, n):
+            pass
+
+        def set_postfix(self, values):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("tqdm.tqdm", Bar)
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    opt = MpsOptimizer(state, [(qu.pauli("X"), (0,))], chi=2, mode=mode)
+    opt.run(progbar=True)
+    assert len(created) == 1
+    style = MpsOptimizer.progress_style(mode)
+    assert style == {key: created[0][key] for key in ("ascii", "colour")}
+    style["colour"] = "changed"
+    assert MpsOptimizer.progress_style(mode)["colour"] == created[0]["colour"]
+
+
+@pytest.mark.parametrize("mode", ["direct", "dm", "zipup", "svd", "swap", "perm",
+                                 "dmrg", "dmrg2", "dmrg3", "mix", "exact", "exact-batch"])
+def test_caller_owned_progress_receives_native_gate_updates_without_changing_replay(mode):
+    class Display:
+        def __init__(self):
+            self.n = 0
+            self.updates = []
+            self.postfixes = []
+            self.closes = 0
+
+        def update(self, n):
+            self.n += n
+            self.updates.append(n)
+
+        def set_postfix(self, values):
+            self.postfixes.append(dict(values))
+
+        def close(self):
+            self.closes += 1
+
+    state = qtn.MPS_computational_state("0000", dtype="complex128")
+    stream = [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 2)), (qu.pauli("Y"), (1,))]
+    quiet = MpsOptimizer(state, stream, chi=2, mode=mode)
+    visible = MpsOptimizer(state, stream, chi=2, mode=mode)
+    display = Display()
+    for _ in range(2):
+        quiet.run(cutoff=0., n_iter=2)
+        visible.run(progbar=display, cutoff=0., n_iter=2)
+        np.testing.assert_allclose(visible.to_dense(), quiet.to_dense(), atol=1e-12)
+        assert visible.logical_order == quiet.logical_order
+        assert visible.info_c == quiet.info_c
+        assert visible.p.exponent == quiet.p.exponent
+    assert display.n == 2 * len(stream)
+    assert display.closes == 0
+    if mode != "exact-batch":
+        assert {"~F", "bond" if mode == "mix" else "bnd"} <= display.postfixes[-1].keys()
+    display.close()
+    assert display.closes == 1
 
 
 def test_fit_summary_preserves_call_counts_and_overlapping_phase_totals():

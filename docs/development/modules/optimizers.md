@@ -28,6 +28,8 @@ important downstream time-compression consumer that depends on Pepsy behavior.
     Its operations are bound onto `MpsOptimizer` and call the live instance's
     hooks, so the class retains state ownership and subclass dispatch.
   - `_controls.py`: measurement, reset, cap, and conditional control execution.
+  - `_progress.py`: native tqdm creation and borrowed display lifetime for
+    aggregating replay segments without changing numerical execution.
   - `_norm.py`: represented scale, local normalization, and norm diagnostics.
     Both receive the live optimizer and call its hooks; canonical state remains
     on the optimizer. Public methods retain their signatures and documentation.

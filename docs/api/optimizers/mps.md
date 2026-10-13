@@ -1184,6 +1184,27 @@ legacy `mpo-` prefix, while the `quimb` and `mpo` aliases display as `direct`.
 Named DMRG schedules display as `dmrg2` or `dmrg3`; generic `dmrg`
 and its `fit` alias display as `dmrg`.
 
+To combine several replays in one display, pass a caller-owned progress bar:
+
+```python
+from tqdm.auto import tqdm
+
+with tqdm(total=len(gates) * 2, desc="Two replays", unit="gate") as bar:
+    opt.run(progbar=bar)
+    opt.run(progbar=bar)
+```
+
+The display must implement `update(n)` and `set_postfix(mapping)`.
+Use `MpsOptimizer.progress_style(mode)` for the native `colour` and `ascii`
+options when constructing that display. It resolves compatibility aliases and
+named DMRG schedules, returning an independent dictionary. Direct compression
+uses dark red, other Quimb compressors use green, DMRG blue and exact replay purple.
+Each mode sends its native gate advances and diagnostic fields to that display;
+replay does not change its total, description or position, and never closes it.
+The caller owns cleanup, including on failure. Boolean `progbar=True` retains
+the standalone per-mode bars. `~F` measures retained compression survival;
+it does not measure a downstream objective or target-evolution accuracy.
+
 Replay timing is opt-in and does not print by itself:
 
 ```python

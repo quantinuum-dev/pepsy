@@ -14,6 +14,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- `MpsOptimizer.run(progbar=display)` can update a caller-owned progress bar
+  with native gate counts and diagnostics, without changing its labels or
+  closing it between replay segments. `MpsOptimizer.progress_style(mode)`
+  exposes the native mode palette and ASCII style for downstream displays.
+
 - NetKet-backed PEPS TDVP reuses native sampling, QGT solvers and Euler,
   midpoint or RK4 integration. Real/imaginary Flax coordinates support
   nonholomorphic compression; accepted endpoints are synchronized before
@@ -51,6 +56,9 @@ releases remain backwards-compatible. From 1.0 onward:
   against finite differences. The TFIM example supports total final time,
   exact references from the initial state, phase-aligned vector comparisons
   and an exact state-vector oracle with its global scale removed.
+
+- Direct MPS replay progress uses dark red; downstream stage bars can reuse
+  the same color through `MpsOptimizer.progress_style()`.
 
 - NetKet PEPS SR defaults now detect real/complex output instead of forcing
   real derivatives. Shared optimization settings delegate mode selection to

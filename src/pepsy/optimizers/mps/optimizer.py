@@ -128,6 +128,7 @@ from ...tensors.observables import mps_entanglement_entropy as _mps_entanglement
 from ...tensors.observables import tn_fidelity
 from ...operators.gates import gate as apply_gate
 from . import _execution, _layout_execution
+from ._progress import make_progress_bar as _make_progress_bar
 from ._streams import (  # noqa: F401 -- historical import aliases
     _MpsStreamPlan,
     _PAULI_1Q,
@@ -383,6 +384,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     LayoutFinder = MpsGateStreamLayoutFinder
     _ALLOWED_SUBMPO_METHODS = _MPO_COMPRESSION_METHODS
     _PROGBAR_COLORS = {
+        "direct": "#8b0000",
         "dmrg": "#1f77b4",
         "mpo": "#2ca02c",
         "mix": "#17becf",
@@ -402,6 +404,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         numerical kernel.
         """
         return tuple(sorted(cls._ALLOWED_MODES))
+
+    @classmethod
+    def progress_style(cls, mode="direct"):
+        """Return native tqdm color/ASCII options for a replay mode.
+
+        Downstream displays can use the same palette without copying private
+        mode/color tables. Compatibility aliases and named DMRG schedules
+        resolve to their native compression-family style.
+        """
+        normalized = cls._normalize_mode(mode)
+        family = "mpo" if cls._is_mpo_mode(normalized) else normalized
+        name = cls._progress_mode_name(normalized)
+        return {"ascii": True, "colour": cls._PROGBAR_COLORS.get(name, cls._PROGBAR_COLORS[family])}
 
     @classmethod
     def _normalize_mode(cls, mode):
@@ -3182,8 +3197,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             sweep budget. The adjacent
             two-site exact fast path is exempt.
             Ignored by ``mpo``/``swap``/``svd``/``exact``.
-        progbar : bool, default=False
-            Show per-mode progress bars.
+        progbar : bool or progress display, default=False
+            Show per-mode progress bars. A caller-owned display with
+            ``update(n)`` and ``set_postfix(mapping)`` receives the native
+            gate counts and diagnostics instead. Its total, labels and
+            lifetime remain with the caller; replay never closes it.
         cutoff : float | {"auto"}, default="auto"
             Truncation cutoff used in gate application and local fitting.
             The default ``"auto"`` selects a conservative dtype-aware value;
@@ -6346,9 +6364,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         pbar = None
         if progbar:
-            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
-
-            pbar = tqdm(
+            pbar = _make_progress_bar(
+                progbar,
                 total=len(G_seq),
                 desc="mix",
                 leave=True,
@@ -7808,10 +7825,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._start_unitary_norm_tracking(p)
 
         if progbar:
-            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
-
             progress_mode = self._dmrg_mode_alias or "dmrg"
-            pbar = tqdm(
+            pbar = _make_progress_bar(
+                progbar,
                 total=len(G_seq),
                 desc=progress_mode,
                 leave=True,
@@ -8069,10 +8085,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         pbar = None
         if progbar:
-            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
-
             progress_mode = self._progress_mode_name(self.mode)
-            pbar = tqdm(
+            pbar = _make_progress_bar(
+                progbar,
                 total=len(G_seq),
                 desc=progress_mode,
                 leave=True,
@@ -8305,9 +8320,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         pbar = None
         if progbar:
-            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
-
-            pbar = tqdm(
+            pbar = _make_progress_bar(
+                progbar,
                 total=len(G_seq),
                 desc=mode_name,
                 leave=True,
@@ -8475,9 +8489,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         pbar = None
         if progbar:
-            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
-
-            pbar = tqdm(
+            pbar = _make_progress_bar(
+                progbar,
                 total=len(G_seq),
                 desc="svd",
                 leave=True,
@@ -8630,9 +8643,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         tensor = self.p.tensors[0]
         pbar = None
         if progbar:
-            from tqdm import tqdm
-
-            pbar = tqdm(
+            pbar = _make_progress_bar(
+                progbar,
                 total=len(G_seq), desc="exact-batch", ascii=True,
                 colour=self._PROGBAR_COLORS["exact-batch"],
             )
@@ -8670,9 +8682,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         two_qubit_count = 0
         pbar = None
         if progbar:
-            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
-
-            pbar = tqdm(
+            pbar = _make_progress_bar(
+                progbar,
                 total=len(G_seq),
                 desc="exact",
                 leave=True,
