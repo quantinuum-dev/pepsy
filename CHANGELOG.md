@@ -20,6 +20,10 @@ releases remain backwards-compatible. From 1.0 onward:
   PEPS reconstruction. A bounded TFIM PEPO-to-NetKet example provides a
   small-system exact-evolution oracle.
 
+- `MpsOptimizer.supported_modes()` exposes accepted replay names and aliases
+  for downstream adapters without duplicating the mode registry. Named
+  DMRG schedules retain their existing dispatch and numerical behavior.
+
 - Rank-only boundary-MPS amplitudes (`cutoff=0`) support Torch export/compile
   for inference, retaining stabilized contractions for derivatives. Exact
   amplitudes also support compiled functional Jacobians in fixed chunks. A narrow
@@ -213,6 +217,9 @@ releases remain backwards-compatible. From 1.0 onward:
   `boundary_convergence={"reuse_environments": False}`.
 
 ### Fixed
+
+- DMRG replay accepts sub-MPO supports with more than two sites, fitting the
+  interval between the first and last support rather than assuming a pair.
 
 - PEPS full-update environment gauge conditioning now defaults to off;
   Hermitian positive norm projection remains active. The existing explicit

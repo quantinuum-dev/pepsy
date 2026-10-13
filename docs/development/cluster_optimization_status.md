@@ -10,6 +10,7 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Area | Supported scope | Owning guide |
 | --- | --- | --- |
 | Package ownership | Pepsy owns graph/tensor-network construction, contraction and general solvers; Gaugy consumes public APIs for its objectives | [Package layout](package_layout.md#pepsy-and-downstream-packages) |
+| Downstream MPS replay | Native mode discovery, named DMRG schedules and arbitrary-support sub-MPO fit windows; Gaugy preserves logical permutation indices and cached targets | [MPS guide](../api/optimizers/mps.md), [scoped alignment evidence](notes/2026-10-13-mps-mode-alignment.md) |
 | Interaction clusters | Shared graph inventories, ordered product adapters, structural reuse and explicit construction budgets | [Interaction clusters](../api/operators/interaction_clusters.md) |
 | Constructed PEPO traces | `trace_exp` traces the selected PEPO with its caps/compression; `partition_trace_exp` names the separate scalar shortcut | [Trace contract](../api/operators/cluster_expansion.md#trace-of-the-constructed-pepo) |
 | Native bosonic cluster MPOs | Exact Torch/JAX autodiff and sector-preserving NumPy/Torch compressed assembly within documented modes | [Native MPO scope](../api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos) |

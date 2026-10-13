@@ -394,6 +394,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     }
 
     @classmethod
+    def supported_modes(cls):
+        """Return accepted replay mode names, including compatibility aliases.
+
+        Names describe dispatch choices, not gradient/backend capabilities.
+        Named DMRG schedules remain distinct entries even when they share a
+        numerical kernel.
+        """
+        return tuple(sorted(cls._ALLOWED_MODES))
+
+    @classmethod
     def _normalize_mode(cls, mode):
         """Validate and normalize execution mode."""
         mode_norm = str(mode).strip().lower()
@@ -1794,7 +1804,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
             return result
 
-        start, stop = self._normalize_span(where)
+        start, stop = min(where), max(where)
         needs_growth = requested_strategy in {"random", "random_expand"} and not (
             FIT._active_bonds_at_rank_targets(p, start, stop, self.chi)  # pylint: disable=protected-access
         )
@@ -1825,7 +1835,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # request to grow rank. Apply it even after the active bonds reach
             # their attainable size; otherwise the one-site phase would use a
             # different initial state from the growth phase.
-            fit_guess = self._copy_fit_window_state(p, where)
+            fit_guess = self._copy_fit_window_state(p, (start, stop))
             opts = self._submpo_compress_opts(
                 guess_method,
                 cutoff=cutoff,
@@ -7039,7 +7049,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Return the updated MPS and window endpoints; the caller owns stream
         counters, normalization cadence, and progress reporting.
         """
-        xmin, xmax = sorted(where)
+        # Sub-MPO support can contain more than two sites; FIT owns the
+        # entire interval between its endpoints, including interior sites.
+        xmin, xmax = min(where), max(where)
         if fit_single_pair_n_iter is not None and xmax == xmin + 1:
             n_iter = min(n_iter, fit_single_pair_n_iter)
         active_fit_block_size = min(

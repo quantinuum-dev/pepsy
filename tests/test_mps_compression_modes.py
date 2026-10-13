@@ -20,6 +20,31 @@ from _mps_test_helpers import (
 pytestmark = [pytest.mark.core, pytest.mark.mps]
 
 
+def test_public_supported_modes_are_accepted_without_losing_named_schedules():
+    modes = py.MpsOptimizer.supported_modes()
+    assert modes == tuple(sorted(set(modes)))
+    assert {'dmrg', 'dmrg2', 'dmrg3', 'perm', 'svd', 'quimb-fit', 'mpo-direct'} <= set(modes)
+    assert 'dmrg1' not in modes
+    state = qtn.MPS_computational_state('000', dtype='complex128')
+    for mode in modes:
+        opt = py.MpsOptimizer(state, [], chi=4, mode=mode)
+        if mode in ('dmrg2', 'dmrg3'):
+            assert opt._dmrg_mode_alias == mode
+
+
+@pytest.mark.parametrize('mode', ['dmrg', 'dmrg2', 'dmrg3'])
+def test_variational_submpo_with_three_noncontiguous_support_sites(mode):
+    state = qtn.MPS_rand_state(5, bond_dim=2, seed=29, dtype='complex128')
+    arrays = [np.asarray(qu.pauli(c)).reshape(1, 1, 2, 2) for c in 'XYZ']
+    mpo = qtn.MatrixProductOperator(arrays, sites=(1, 2, 4), L=5, shape='lrud')
+    stream = [py.MpsOptimizer.submpo_event(mpo, (1, 2, 4))]
+    native = py.MpsOptimizer(state, stream, chi=16, mode=mode)
+    native.run(progbar=False, n_iter=6, cutoff=0., fit_init_strategy='guess-direct')
+    expected = np.asarray(qu.ikron([qu.pauli(c) for c in 'XYZ'], [2]*5, (1, 2, 4))) @ state.to_dense()
+    np.testing.assert_allclose(native.to_dense(), expected, atol=1e-10)
+    assert set(native.info_c['cur_orthog']) <= set(range(1, 5))
+
+
 @pytest.mark.parametrize("mode", ["dmrg", "fit"])
 @pytest.mark.parametrize("block_options", [{}, {"fit_block_size": None}, {"fit_block_size": 1}])
 def test_generic_dmrg_default_one_site_sweeps(mode, block_options):

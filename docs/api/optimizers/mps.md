@@ -70,6 +70,16 @@ Use `complex128` as the standard initialization dtype. Pepsy's
 the supplied state's dtype and device, so explicitly created `complex64`
 states remain complex64.
 
+`MpsOptimizer.supported_modes()` returns the accepted names and compatibility
+aliases from the installed implementation. Keep `dmrg2`/`dmrg3` intact when
+forwarding a selection: their schedules differ from `dmrg`. The mode list
+describes dispatch names; backend, gate-event and derivative support must be
+checked separately.
+
+DMRG sub-MPO replay fits the interval from the first to the last support site,
+including gaps. Supports may contain more than two sites; the exact layered
+target remains separate from the disposable compression guess.
+
 `run()` defaults to `cutoff="auto"`, resolved from the live state precision:
 
 | State dtype | Automatic cutoff |
