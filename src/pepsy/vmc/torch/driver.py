@@ -3120,7 +3120,8 @@ class TorchVMCDriver:
                     "sr_method",
                     "minsr" if optimization.method == "minsr" else "auto",
                 )
-                mode = str(optimization.sr_mode).replace("_", "-").lower()
+                mode = ("real-imag" if optimization.sr_mode is None
+                        else str(optimization.sr_mode).replace("_", "-").lower())
                 if mode == "real":
                     mode = "real-imag"
                 elif mode in {"complex", "holomorphic-complex"}:

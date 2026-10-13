@@ -24,6 +24,11 @@ def restore_jax_mesh():
     jax = sys.modules.get("jax")
     set_mesh = getattr(getattr(jax, "sharding", None), "set_mesh", None)
     if callable(set_mesh):
+        if previous is None:
+            # First import occurred inside the test. Older supported JAX
+            # versions require an explicit empty Mesh rather than None.
+            import numpy as np
+            previous = jax.sharding.Mesh(np.empty((), dtype=object), ())
         set_mesh(previous)
 
 

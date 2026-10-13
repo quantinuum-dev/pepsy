@@ -366,7 +366,7 @@ class NetKetVMCSettings:
     n_chains: int
     chunks: NetKetChunkSettings
     use_sr: bool
-    sr_mode: str
+    sr_mode: str | None
     use_ntk: bool | None
     on_the_fly: bool | None
     auto_chunk: bool
@@ -1212,7 +1212,8 @@ class NetKetPEPSVMC:
                         f"expected {int(actual_chains)}, got {sampling.n_chains}. "
                         "Rebuild the setup with n_chains=... to change it."
                     )
-                if sampling.sweep_size != 1:
+                if (sampling.sweep_size != 1 and
+                        sampling.sweep_size != getattr(self.sampler, "sweep_size", None)):
                     warnings.warn(
                         "NetKet MCState.sample has no per-sample thinning option; "
                         "sampling.sweep_size is ignored.",
@@ -1237,13 +1238,20 @@ class NetKetPEPSVMC:
                 kwargs.pop("n_chains", None)
                 requested_chunk = sampling.chunk_size
                 old_chunk = getattr(self.vstate, "chunk_size", None)
+                old_discard = getattr(self.vstate, "n_discard_per_chain", None)
                 if requested_chunk is not None:
                     self.vstate.chunk_size = requested_chunk
+                if old_discard is not None:
+                    # NetKet 3.22.4 tests the state's default before honoring
+                    # the call-time burn-in override. Keep both consistent.
+                    self.vstate.n_discard_per_chain = sampling.n_discard_per_chain
                 try:
                     native = self.vstate.sample(**kwargs)
                 finally:
                     if requested_chunk is not None:
                         self.vstate.chunk_size = old_chunk
+                    if old_discard is not None:
+                        self.vstate.n_discard_per_chain = old_discard
         finally:
             resource_usage = monitor.stop() if monitor is not None else None
 
@@ -1419,7 +1427,7 @@ class NetKetPEPSVMC:
         progress=True,
         energy_shift=0.0,
         per_site=None,
-        sr_mode="real",
+        sr_mode=None,
         sr_diag_shift=0.01,
         use_sr=False,
         driver_options=None,
@@ -1618,7 +1626,8 @@ class NetKetVMCSetup:
         if not isinstance(sampling, SamplingConfig):
             raise TypeError("sampling must be a SamplingConfig or None.")
         unsupported = []
-        if sampling.sweep_size != 1:
+        if (sampling.sweep_size != 1 and sampling.sweep_size !=
+                getattr(getattr(self.setup, "sampler", None), "sweep_size", None)):
             unsupported.append("sweep_size (formerly thin)")
         if sampling.seed is not None or sampling.sampler_seed is not None:
             unsupported.append("seed/sampler_seed")
@@ -1991,6 +2000,12 @@ def _require_netket():
             "pepsy.vmc.netket requires optional dependency 'netket'. "
             "Install it with `pip install netket`."
         ) from exc
+    if not all(hasattr(nk, name) for name in ("hilbert", "vqs", "optimizer")):
+        raise ImportError(
+            "The imported 'netket' is incomplete or shadowed by a namespace "
+            "directory. Install the optional NetKet dependency in the active "
+            "environment and check its import path."
+        )
     return nk
 
 
@@ -2263,6 +2278,13 @@ def _resolve_sampling_build_config(
         sampling.seed if sampling.seed is not None else seed,
         sampling.sampler_seed if sampling.sampler_seed is not None else sampler_seed,
     )
+
+
+def _resolve_sampler_sweep_size(sampling, sampler_sweep_size=None):
+    """Honor build-time thinning while preserving native defaults otherwise."""
+    if sampling is not None and sampler_sweep_size is None:
+        sampler_sweep_size = sampling.sweep_size
+    return _check_positive_int("sampler_sweep_size", sampler_sweep_size)
 
 
 def _coerce_config_map(config_map):
@@ -2705,6 +2727,8 @@ def make_netket_tdvp_driver(
     diag_shift=1e-8,
     holomorphic=False,
     linear_solver=None,
+    linear_solver_kwargs=None,
+    max_dense_solver_bytes=1 << 30,
     linear_solver_restart=False,
     error_norm="euclidean",
 ):
@@ -2723,11 +2747,16 @@ def make_netket_tdvp_driver(
         raise ValueError("t0 must be finite.")
     if not np.isfinite(diag_shift) or diag_shift < 0:
         raise ValueError("diag_shift must be non-negative and finite.")
+    if max_dense_solver_bytes is not None:
+        max_dense_solver_bytes = _check_positive_int(
+            "max_dense_solver_bytes", max_dense_solver_bytes
+        )
     nk = _require_netket()
     jax, _ = _require_jax()
+    leaves = jax.tree_util.tree_leaves(setup.vstate.parameters)
     complex_parameters = any(
         np.issubdtype(leaf.dtype, np.complexfloating)
-        for leaf in jax.tree_util.tree_leaves(setup.vstate.parameters)
+        for leaf in leaves
     )
     # NetKet rotates the force after its VJP. A nonholomorphic complex VJP
     # combines the two coordinate forces too early for that rotation.
@@ -2737,8 +2766,35 @@ def make_netket_tdvp_driver(
             "setup with parameter_mode='real-imag'. Use holomorphic=True "
             "only for a verified holomorphic contraction."
         )
-    if holomorphic and not complex_parameters:
-        raise ValueError("holomorphic=True requires complex parameters.")
+    if holomorphic and not all(np.issubdtype(leaf.dtype, np.complexfloating) for leaf in leaves):
+        raise ValueError("holomorphic=True requires exclusively complex parameters.")
+    if isinstance(linear_solver, str):
+        if linear_solver == "cg":
+            from jax.scipy.sparse.linalg import cg
+            linear_solver = partial(cg, tol=1e-10, maxiter=2000)
+        elif linear_solver in {"cholesky", "pinv_smooth"}:
+            linear_solver = getattr(nk.optimizer.solver, linear_solver)
+        else:
+            raise ValueError("linear_solver must be 'cg', 'cholesky', 'pinv_smooth', or a callable.")
+    if linear_solver_kwargs:
+        if linear_solver is None:
+            linear_solver = nk.optimizer.solver.pinv_smooth
+        linear_solver = partial(linear_solver, **dict(linear_solver_kwargs))
+    solver_function = linear_solver
+    while isinstance(solver_function, partial):
+        solver_function = solver_function.func
+    dense_solver = (solver_function is None or
+                    getattr(solver_function, "__module__", "").startswith("netket.optimizer.solver"))
+    coordinates = sum(leaf.size for leaf in leaves)
+    metric_itemsize = np.result_type(*[leaf.dtype for leaf in leaves]).itemsize
+    dense_metric_bytes = coordinates * coordinates * metric_itemsize
+    if dense_solver and max_dense_solver_bytes is not None and dense_metric_bytes > max_dense_solver_bytes:
+        raise ValueError(
+            f"The dense TDVP metric alone needs {dense_metric_bytes / 2**30:.2f} GiB "
+            f"for {coordinates} coordinates, exceeding max_dense_solver_bytes. "
+            "Use linear_solver='cg' with qgt='jacobian_dense' and verify its "
+            "residual, or explicitly raise/disable the dense allocation limit."
+        )
     if isinstance(integrator, str):
         constructors = {
             "euler": nk.experimental.dynamics.Euler,
@@ -2752,6 +2808,15 @@ def make_netket_tdvp_driver(
     else:
         raise TypeError("integrator must be a supported integrator name.")
     constructor = _resolve_netket_qgt(nk, qgt)
+    compressed = getattr(setup.model, "contraction_method", "exact") != "exact"
+    if compressed and (constructor is None or constructor is nk.optimizer.qgt.QGTAuto):
+        constructor = nk.optimizer.qgt.QGTJacobianDense
+    if (constructor is nk.optimizer.qgt.QGTOnTheFly and
+            compressed):
+        raise ValueError(
+            "Compressed PEPS use custom VJPs without forward-mode JVPs; "
+            "use qgt='jacobian_dense' or 'jacobian_pytree', including with CG."
+        )
     if constructor is None:
         constructor = nk.optimizer.qgt.QGTAuto
     kwargs = {
@@ -2830,7 +2895,7 @@ def recommend_netket_vmc_settings(
     use_large_sr_driver = n_params > max_standard_sr_params
     driver = "vmc_sr" if use_large_sr_driver else "vmc"
     use_ntk = n_params > n_samples if use_large_sr_driver else None
-    on_the_fly = True if use_ntk else None
+    on_the_fly = False if use_large_sr_driver else None
     chunk_size_bwd = chunk_size if use_large_sr_driver else None
 
     notes = [
@@ -2865,7 +2930,7 @@ def recommend_netket_vmc_settings(
             chunk_size_bwd=chunk_size_bwd,
         ),
         use_sr=True,
-        sr_mode="real",
+        sr_mode=None,
         use_ntk=use_ntk,
         on_the_fly=on_the_fly,
         auto_chunk=auto_chunk,
@@ -3317,6 +3382,17 @@ def pack_fermionic_peps_ansatz(peps, *, lattice_shape=None, orbital_sites=None):
     )
 
 
+def _unpack_amplitude_peps(params, ansatz, contraction, method_opts):
+    """Strip boundary input scales once per batch, before physical selection."""
+    tn = qtn.unpack(params, ansatz.skeleton)
+    if contraction == "boundary" and bool(method_opts.get("equalize_norms", "auto")):
+        # MPS canonicalization can underflow before boundary exponents are
+        # accumulated. Full tensor norms are nonzero for a valid PEPS and
+        # shared across configurations; physical zero slices remain intact.
+        tn.equalize_norms_(value=1.0)
+    return tn
+
+
 def _make_jax_scaled_contractor(*, contraction, chi, cutoff, method_opts, jnp, real_dtype):
     """Build contraction dispatch shared by the JAX spin and fermion adapters.
 
@@ -3424,7 +3500,7 @@ def _make_peps_batched_amplitude_apply(
         )
 
     def apply(config_rows, params):
-        tn = qtn.unpack(params, ansatz.skeleton)
+        tn = _unpack_amplitude_peps(params, ansatz, contraction, method_opts)
         phys_rows = config_rows_to_phys_jax(config_rows)
 
         def evaluate_phys(phys):
@@ -3532,7 +3608,7 @@ def _make_peps_batched_amplitude_nojit(
     )
 
     def apply(config_rows, params):
-        tn = qtn.unpack(params, ansatz.skeleton)
+        tn = _unpack_amplitude_peps(params, ansatz, contraction, method_opts)
         phys_rows = config_to_phys_indices(
             config_rows,
             config_map,
@@ -3664,6 +3740,8 @@ def make_peps_log_amplitude_model(
 
     class PEPSLogAmplitude(nn.Module):
         """Flax module wrapping a packed PEPS log amplitude."""
+
+        contraction_method: str = contraction
 
         @nn.compact
         def __call__(self, x):
@@ -3823,7 +3901,7 @@ def _make_fermionic_peps_batched_amplitude_apply(
         )
 
     def apply(occ_rows, params):
-        tn = qtn.unpack(params, ansatz.skeleton)
+        tn = _unpack_amplitude_peps(params, ansatz, contraction, method_opts)
         phys_rows, phase = occ_rows_to_phys_jax(occ_rows)
 
         def evaluate_phys(phys):
@@ -3872,7 +3950,7 @@ def _make_fermionic_peps_batched_amplitude_nojit(
     )
 
     def apply(occ_rows, params):
-        tn = qtn.unpack(params, ansatz.skeleton)
+        tn = _unpack_amplitude_peps(params, ansatz, contraction, method_opts)
         occ_rows = np.asarray(occ_rows)
         phys_rows = occupation_to_phys_indices(
             occ_rows,
@@ -4004,6 +4082,8 @@ def make_fermionic_peps_log_amplitude_model(
     class FermionicPEPSLogAmplitude(nn.Module):
         """Flax module wrapping a packed fermionic PEPS log amplitude."""
 
+        contraction_method: str = contraction
+
         @nn.compact
         def __call__(self, x):
             x = jnp.atleast_2d(x).astype(jnp.int32)
@@ -4034,9 +4114,16 @@ def _maybe_make_sr_preconditioner(
     sr_qgt,
     sr_solver,
     sr_solver_restart,
+    contraction="exact",
 ):
+    if contraction != "exact" and (sr_qgt is None or sr_qgt == "auto"):
+        sr_qgt = "jacobian_dense"
     if use_sr == "auto":
         use_sr = ansatz.n_params <= max_sr_params
+    if use_sr and contraction != "exact":
+        nk = _require_netket()
+        if _resolve_netket_qgt(nk, sr_qgt) is nk.optimizer.qgt.QGTOnTheFly:
+            raise ValueError("Compressed PEPS custom VJPs require a reverse-Jacobian QGT.")
     return (
         make_netket_sr_preconditioner(
             qgt=sr_qgt,
@@ -4105,6 +4192,7 @@ def _build_netket_peps_vmc(
     )
     preconditioner = _maybe_make_sr_preconditioner(
         ansatz,
+        contraction=contraction,
         use_sr=use_sr,
         max_sr_params=max_sr_params,
         sr_diag_shift=sr_diag_shift,
@@ -4147,6 +4235,7 @@ def build_ising_vmc(
     chunk_size=256,
     sampling=None,
     sampler_chunk_size=None,
+    sampler_sweep_size=None,
     seed=None,
     sampler_seed=None,
     use_sr="auto",
@@ -4192,6 +4281,9 @@ def build_ising_vmc(
         dtype=float,
     )
     sampler_kwargs = {"n_chains": n_chains}
+    sweep_size = _resolve_sampler_sweep_size(sampling, sampler_sweep_size)
+    if sweep_size is not None:
+        sampler_kwargs["sweep_size"] = sweep_size
     if sampler_chunk_size is not None:
         sampler_kwargs["chunk_size"] = _check_positive_int(
             "sampler_chunk_size",
@@ -4251,6 +4343,7 @@ def build_heisenberg_vmc(
     chunk_size=256,
     sampling=None,
     sampler_chunk_size=None,
+    sampler_sweep_size=None,
     seed=None,
     sampler_seed=None,
     use_sr="auto",
@@ -4295,6 +4388,9 @@ def build_heisenberg_vmc(
         dtype=float,
     )
     sampler_kwargs = {"graph": graph, "d_max": d_max, "n_chains": n_chains}
+    sweep_size = _resolve_sampler_sweep_size(sampling, sampler_sweep_size)
+    if sweep_size is not None:
+        sampler_kwargs["sweep_size"] = sweep_size
     if sampler_chunk_size is not None:
         sampler_kwargs["chunk_size"] = _check_positive_int(
             "sampler_chunk_size",
@@ -5241,6 +5337,7 @@ def build_fermi_hubbard_vmc(
     chunk_size=256,
     sampling=None,
     sampler_chunk_size=None,
+    sampler_sweep_size=None,
     seed=None,
     sampler_seed=None,
     use_sr="auto",
@@ -5366,6 +5463,9 @@ def build_fermi_hubbard_vmc(
         "n_chains": n_chains,
         "spin_symmetric": True,
     }
+    sweep_size = _resolve_sampler_sweep_size(sampling, sampler_sweep_size)
+    if sweep_size is not None:
+        sampler_kwargs["sweep_size"] = sweep_size
     if sampler_chunk_size is not None:
         sampler_kwargs["chunk_size"] = _check_positive_int(
             "sampler_chunk_size",
@@ -5385,6 +5485,7 @@ def build_fermi_hubbard_vmc(
 
     preconditioner = _maybe_make_sr_preconditioner(
         ansatz,
+        contraction=contraction,
         use_sr=use_sr,
         max_sr_params=max_sr_params,
         sr_diag_shift=sr_diag_shift,
@@ -5733,6 +5834,7 @@ def build_fermion_vmc(
             "sampler_chunk_size",
             sampler_chunk_size,
         )
+    sampler_sweep_size = _resolve_sampler_sweep_size(sampling, sampler_sweep_size)
     if sampler_sweep_size is not None:
         sampler_kwargs["sweep_size"] = _check_positive_int(
             "sampler_sweep_size",
@@ -5753,6 +5855,7 @@ def build_fermion_vmc(
     mark_stage("MCState")
     preconditioner = _maybe_make_sr_preconditioner(
         ansatz,
+        contraction=contraction,
         use_sr=use_sr,
         max_sr_params=max_sr_params,
         sr_diag_shift=sr_diag_shift,
@@ -5832,8 +5935,6 @@ def build_netket_vmc(
         )
     if sampling is not None:
         unsupported = []
-        if sampling.sweep_size != 1:
-            unsupported.append("sweep_size (formerly thin)")
         if sampling.proposal is not None:
             unsupported.append("proposal")
         if unsupported:
@@ -6065,7 +6166,7 @@ def make_netket_vmc_driver(
     sr_diag_scale=None,
     sr_solver=None,
     sr_solver_restart=False,
-    sr_mode="real",
+    sr_mode=None,
     use_ntk=None,
     on_the_fly=None,
     chunk_size_bwd=None,
@@ -6085,6 +6186,11 @@ def make_netket_vmc_driver(
 
     driver_name = str(driver).replace("-", "_").lower()
     if driver_name in {"vmc_sr", "vmcsr", "sr"}:
+        compressed = getattr(setup.model, "contraction_method", "exact") != "exact"
+        if compressed:
+            if on_the_fly:
+                raise ValueError("Compressed PEPS custom VJPs require on_the_fly=False for VMC_SR.")
+            on_the_fly = False
         default_preconditioner = (
             preconditioner == "setup"
             or preconditioner is None
@@ -6112,7 +6218,9 @@ def make_netket_vmc_driver(
                 chunk_size_bwd,
             )
         if sr_mode is not None:
-            kwargs["mode"] = sr_mode
+            # Shared real/imaginary coordinates correspond to NetKet's
+            # complex-output Jacobian, without assuming holomorphicity.
+            kwargs["mode"] = "complex" if sr_mode == "real-imag" else sr_mode
         if use_ntk is not None:
             kwargs["use_ntk"] = use_ntk
         if on_the_fly is not None:
@@ -6133,6 +6241,11 @@ def make_netket_vmc_driver(
     if preconditioner == "setup":
         preconditioner = setup.preconditioner
     elif preconditioner is True or preconditioner == "sr":
+        if getattr(setup.model, "contraction_method", "exact") != "exact":
+            if qgt is None or qgt == "auto":
+                qgt = "jacobian_dense"
+            elif _resolve_netket_qgt(nk, qgt) is nk.optimizer.qgt.QGTOnTheFly:
+                raise ValueError("Compressed PEPS custom VJPs require a reverse-Jacobian QGT.")
         preconditioner = make_netket_sr_preconditioner(
             qgt=qgt,
             solver=sr_solver,

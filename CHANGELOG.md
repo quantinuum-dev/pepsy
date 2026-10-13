@@ -45,6 +45,22 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Changed
 
+- NetKet boundary-MPS amplitudes strip full-tensor scales before physical
+  selection, preserving mantissa/exponent values below the raw floating-point
+  range. Dense and flat-Z2 exact, MPS, HOTRG and CTMRG derivatives are checked
+  against finite differences. The TFIM example supports total final time,
+  exact references from the initial state, phase-aligned vector comparisons
+  and an exact state-vector oracle with its global scale removed.
+
+- NetKet PEPS SR defaults now detect real/complex output instead of forcing
+  real derivatives. Shared optimization settings delegate mode selection to
+  each backend; Torch retains general real/imaginary coordinates. Native
+  builders honor build-time sampler thinning, call-time burn-in also works
+  with a zero state default on NetKet 3.22.4, and incomplete optional imports
+  raise an actionable error. TDVP supports named native dense/JAX CG solvers,
+  guards single dense metric allocations above 1 GiB by default, and rejects
+  forward-mode QGTs for compressed custom-VJP PEPS amplitudes.
+
 - Strip ALS keeps its starting boundary caps until existing normalization,
   fidelity, or local-objective checks signal failure, then doubles affected
   norm/overlap caps and retries the restored gate batch. Retained caps never

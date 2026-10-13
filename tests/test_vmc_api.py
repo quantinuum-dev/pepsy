@@ -1419,6 +1419,21 @@ def test_netket_vmc_config_validates_shared_settings():
     assert config.sampler_sweep_size == 8
 
 
+def test_netket_optional_import_rejects_incomplete_namespace(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from pepsy.vmc.netket import _require_netket
+    monkeypatch.setitem(sys.modules, "netket", SimpleNamespace())
+    with pytest.raises(ImportError, match="incomplete or shadowed"):
+        _require_netket()
+
+
+def test_sr_defaults_delegate_backend_mode_selection():
+    from pepsy.vmc import recommend_netket_vmc_settings
+    assert OptimizationConfig().sr_mode is None
+    assert recommend_netket_vmc_settings(n_params=100).sr_mode is None
+
+
 def test_netket_native_geometry_helpers_accept_coordinate_terms():
     from pepsy.vmc.netket import (
         _edges_from_fermi_terms,

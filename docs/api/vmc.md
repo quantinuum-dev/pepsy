@@ -165,6 +165,31 @@ The default `qgt="jacobian_dense"` uses reverse derivatives compatible with
 the compression pullback. A QGT requiring forward-mode JVPs is not compatible
 with that custom-VJP compression path.
 
+Automatic QGT selection for compressed PEPS uses reverse Jacobians. Likewise,
+`VMC_SR` sets `on_the_fly=False` for compressed models; its sample-space
+solve remains available through `use_ntk=True`. Explicit forward-mode
+requests raise before evolution. Large-run recommendations keep
+`on_the_fly=False`; storing the Jacobian still costs memory proportional to
+samples times coordinates.
+
+For larger D, `linear_solver="cg"` uses public JAX conjugate gradients with
+NetKet's QGT matvecs, avoiding the dense parameter metric. Keep
+`qgt="jacobian_dense"` for compressed amplitudes: this stores a reverse-mode
+sample Jacobian and requires no forward-mode JVP. Set tolerances with
+`linear_solver_kwargs={"tol": 1e-10, "maxiter": 2000}` and check the
+regularized solve residual against a small dense reference before scaling.
+CG convergence depends on conditioning; a small algebraic residual does not
+certify sampling, contraction, tangent-space or integration accuracy.
+For pip-installed CUDA wheels, follow JAX's library-resolution guidance:
+launch with `env -u LD_LIBRARY_PATH python ...` if the shell prepends a
+different system CUDA installation. In the audited environment this resolved
+a real-coordinate dense GPU solve crash; see the
+[dated upstream audit](../development/notes/2026-10-13-netket-symmray-audit.md).
+The default native dense solver is retained. Its single-matrix allocation
+is limited to 1 GiB by `max_dense_solver_bytes`; set a larger explicit limit
+or `None` when sufficient memory is available. Factorizations need additional
+workspace. The limit cannot inspect arbitrary caller-supplied solvers.
+
 Use `advance(T)` or `iter(T, tstops=...)` on the Pepsy adapter. Iteration yields
 the requested stops and final endpoint; without `tstops`, it yields the endpoint.
 The final stop caps the last integration step, with a roundoff-level stopping
@@ -181,6 +206,37 @@ PEPO startup followed by JAX/NetKet tVMC. `--reference` compares every endpoint
 with sparse-matrix exact evolution for at most 16 spins. This workflow does not
 implement the paper's optimized PEPS gauge projection or tensor-local small-o
 storage, and does not convert a dense startup to a native Z2 ansatz.
+
+The example reports normalized Pauli X magnetization, nearest-neighbor ZZ
+correlation and global X parity alongside exact-reference values. It also
+records the raw state norm as a gauge scale. `--checkpoint-dir PATH` saves
+real/imaginary tensor parameters, metadata and optional normalized PEPS/exact
+vectors every `--checkpoint-every` steps and at the final endpoint. These
+snapshots support frozen-state accuracy checks; sampler/RNG and integrator
+state are not included, so they are not complete trajectory restart files.
+
+For a long-time comparison from the physical initial product-plus state, use
+`--reference-origin initial`; the default `handoff` retains the earlier
+comparison from the fitted PEPS. Both exact reference vectors are saved,
+along with physical-basis ordering and the phase-aligned vector distance.
+`--final-time 5` overrides the step count and includes startup time, shortening
+the final integration step as needed. A fixed D=3, χ=24 benchmark can run as:
+
+```bash
+env -u LD_LIBRARY_PATH python examples/tfim_netket_tdvp.py \
+  --lx 4 --ly 4 --d 3 --chi 24 --samples 1024 \
+  --chains 64 --chunk-size 256 \
+  --dt .005 --final-time 5 --solver cholesky \
+  --reference --reference-origin initial \
+  --checkpoint-dir /tmp/peps-t5 --checkpoint-every 20
+```
+
+This is a measured-accuracy experiment, not a guarantee of convergence at
+t=5. The state-vector oracle contracts each PEPS exactly before comparison;
+the TDVP amplitudes still use the requested fixed χ.
+The oracle strips harmless global tensor scale before exact contraction and
+reports its logarithmic squared norm; normalized vector comparisons remain
+valid even if the raw squared norm underflows.
 
 ### Portable Torch / NetKet VMC façade
 
@@ -252,6 +308,15 @@ to that representation when integrating existing code.
 The shared contracts do not import Torch, JAX, Flax, or NetKet. Each adapter
 compiles the same symbolic terms into its own connection/operator
 representation and preserves its native sampling and contraction strategy.
+
+`OptimizationConfig.sr_mode=None` delegates to the backend: NetKet detects
+real or complex model output, and Torch retains its general real/imaginary
+coordinate update. Native NetKet driver/run helpers and recommendations use
+the same default. Explicit `sr_mode="real"` discards imaginary derivatives
+in NetKet; reserve it for a verified real wavefunction. For NetKet's
+`VMC_SR`, shared `sr_mode="real-imag"` selects its complex-output Jacobian.
+Torch's explicitly
+holomorphic mode remains a separate numerical assumption.
 `ContractionConfig`, `SamplingConfig`, and `OptimizationConfig` use the same
 validated option names. The canonical sampling spelling follows NetKet:
 `n_samples` (total), `n_chains`, `n_discard_per_chain`, and `sweep_size`.
@@ -1511,6 +1576,13 @@ discard, sweep spacing, and batching. NetKet's Metropolis sampler also performs
 between retained samples; pass `sampler_sweep_size=...` to make that cost
 explicit (the NetKet default is the Hilbert-space size).
 
+All native spin and fermion builders honor `SamplingConfig.sweep_size` at
+construction. An explicit `sampler_sweep_size` takes precedence; omitting
+both preserves NetKet's default. An existing sampler cannot change thinning
+per call. Requested burn-in is applied temporarily and the state's default
+is restored, including on NetKet 3.22.4 where a zero default otherwise skips
+positive call-time burn-in.
+
 The generic fermion builder defaults to `conserving=False`, which constructs
 the exact ordinary NetKet fermion operator without a first-use conversion
 compile. Set `conserving="auto"` when the specialized conserving operator is
@@ -1682,6 +1754,39 @@ Quimb options. These options are method-specific: `sequence`,
 `max_separation`, and `canonize` are boundary-MPS controls, while CTMRG's
 stable default is `mode="projector"`.
 
+| Method | Contraction | Conditions for JAX PEPS amplitudes |
+| --- | --- | --- |
+| `exact` | Full scalar network | Small reference systems; no compression; global raw amplitude can underflow |
+| `boundary` / `mps` | Absorb rows/columns into a boundary MPS | Fixed χ and cutoff=0 for JIT; tune cap/direction against an exact reference |
+| `hotrg` | Coarse-grain x/y directions with projectors | Fixed χ and cutoff=0; check projector/truncation gradients and direction order |
+| `ctmrg` | Quimb finite-network projector contraction | Fixed χ and cutoff=0; retain the scoped cyclic compatibility context and validate the chosen projector options |
+
+Approximate amplitudes use `strip_exponent=True` internally and expose
+`output="log"` or `"mantissa_exponent"`, with
+`log(psi) = log(mantissa) + exponent * log(10)`. These outputs retain scale
+below the range of raw amplitudes. Boundary MPS additionally strips the full
+input tensor norms once per batch, before physical selection, because MPS
+canonicalization can underflow before upstream boundary scaling is applied.
+This uses native Quimb norm/exponent operations and leaves the represented
+wavefunction and physical zero slices intact. Explicit
+`contraction_opts={"equalize_norms": False}` disables that scaling policy.
+Finite nonzero full tensors and nonzero sampled amplitudes are required for
+defined log derivatives.
+
+Dense and native flat-Z2 forward values, genuine truncation derivatives, and
+extreme global rescaling are tested separately. Flat-Z2 blocks require
+compatible sector sizes; padding an odd D may increase the actual virtual
+dimension. Sparse symmetries remain on their supported eager path. Sampling
+must preserve the intended sector and be ergodic within it. Do not assume a
+single-spin flip can sample an even-parity PEPS.
+
+The Symmray example's `2*(x[::2] != x[1::2]) + x[1::2]` encoding assumes
+interleaved spin occupations and that example's four-state physical order.
+Use Pepsy's inferred spin-orbital columns and native local-index map when
+building a fermionic model; check it against exact amplitudes/signs before
+reusing an encoding on another PEPS. The binary TFIM benchmark requires no
+spinful pair conversion.
+
 For flat fermionic Symmray tensors under JAX, `max_separation=0` is accepted
 but has a guarded compatibility fallback to `1` if Quimb reaches its upstream
 empty-boundary-axis or block-matmul path. This applies to both boundary-MPS
@@ -1692,8 +1797,9 @@ For larger lattices use an approximate contraction with `chi=...`, and treat
 `chi`, `chunk_size`, `chunk_size_bwd`, `n_samples`, and the SR setting as
 performance/accuracy knobs. The dense sign checks from the notebook should
 remain capped to tiny systems. For large parameter counts prefer
-`driver="vmc_sr"` with `sr_mode="real"` so NetKet can use its SR/minSR driver at
-lower fermionic Jacobian cost, and use `make_netket_autochunk_callback(...)` on
+`driver="vmc_sr"` with automatic mode selection so NetKet retains the required
+derivatives. Select `sr_mode="real"` only for a verified real wavefunction.
+Use `make_netket_autochunk_callback(...)` on
 the first GPU run to tune sampler, forward, and backward chunks after
 compilation pressure is known.
 

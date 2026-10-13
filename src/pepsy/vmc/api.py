@@ -313,7 +313,7 @@ class OptimizationConfig:
     method: str = "sr"
     learning_rate: float = 1.0e-3
     diag_shift: float = 1.0e-2
-    sr_mode: str = "real"
+    sr_mode: str | None = None
     energy_shift: float = 0.0
     per_site: int | None = None
     progress: bool = False
@@ -331,8 +331,9 @@ class OptimizationConfig:
         }
         if method not in aliases:
             raise ValueError("method must be 'sgd', 'sr', or 'minsr'.")
-        sr_mode = str(self.sr_mode).replace("_", "-").lower()
+        sr_mode = None if self.sr_mode is None else str(self.sr_mode).replace("_", "-").lower()
         sr_mode_aliases = {
+            None: None,
             "real": "real",
             "complex": "complex",
             "holomorphic": "holomorphic",
@@ -342,7 +343,7 @@ class OptimizationConfig:
         }
         if sr_mode not in sr_mode_aliases:
             raise ValueError(
-                "sr_mode must be 'real', 'complex', 'holomorphic', or "
+                "sr_mode must be None, 'real', 'complex', 'holomorphic', or "
                 "'real-imag'."
             )
         learning_rate = float(self.learning_rate)

@@ -6,6 +6,35 @@ import numpy as np
 import pytest
 
 
+@pytest.mark.parametrize("jit", [True, False])
+def test_fermionic_boundary_input_scaling_preserves_native_signs_and_log_values(jit):
+    jax = pytest.importorskip("jax")
+    jax.config.update("jax_enable_x64", True)
+    nk = pytest.importorskip("netket")
+    if not hasattr(nk, "hilbert"):
+        pytest.skip("A working NetKet installation is required")
+    from pepsy.vmc.netket import (
+        fermionic_peps_rand, make_fermionic_peps_batched_amplitude_function,
+        netket_spin_orbital_columns, pack_fermionic_peps_ansatz,
+    )
+    peps = fermionic_peps_rand("Z2", 2, 2, 2, n_fermions_per_spin=(2, 2),
+                               dtype="complex128", seed=37, flat=True)
+    ansatz = pack_fermionic_peps_ansatz(peps)
+    hilbert = nk.hilbert.SpinOrbitalFermions(4, s=1/2, n_fermions_per_spin=(2, 2))
+    columns = netket_spin_orbital_columns(hilbert)
+    rows = np.asarray(hilbert.all_states())
+    exact = make_fermionic_peps_batched_amplitude_function(
+        ansatz, columns, contraction="exact", output="log", jit=jit)
+    boundary = make_fermionic_peps_batched_amplitude_function(
+        ansatz, columns, contraction="boundary", chi=4, cutoff=0., output="log", jit=jit)
+    baseline = np.asarray(boundary(rows))
+    np.testing.assert_allclose(np.exp(baseline), np.exp(exact(rows)), rtol=1e-10, atol=1e-12)
+    scaled_params = jax.tree_util.tree_map(lambda z: jax.numpy.asarray(z) * 1e-100, ansatz.params)
+    scaled = np.asarray(boundary(rows, params=scaled_params))
+    assert np.isfinite(scaled).all()
+    np.testing.assert_allclose(scaled, baseline + 4*np.log(1e-100), atol=1e-10)
+
+
 @pytest.mark.smoke
 def test_prepare_fermionic_peps_flattens_odd_z2_bond_dimension():
     """Odd D creates unequal Z2 blocks that must be padded before JAX VMC."""
