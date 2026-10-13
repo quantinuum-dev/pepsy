@@ -25,7 +25,7 @@ Fixed D=3, cutoff zero, 16 chains, burn-in 16, chunks 32, midpoint,
 native Cholesky with diagonal shift 1e-6. Individual trajectories retain
 their chosen chi. Compared chi 6/9, samples 256/512, dt 0.01/0.005/0.0025
 and seeds 44/45. All seven trajectories completed, with 240 accepted endpoints.
-[Retained note and full scalar records](../docs/development/notes/2026-10-13-netket-peps-convergence.md)
+[Measured summary](../docs/development/notes/2026-10-13-netket-peps-convergence.md)
 record the comparisons. Baseline final infidelity 5.2464e-6; dt=0.005/512
 samples gives 3.7609e-7; dt=0.0025/256 samples gives 6.9524e-7. Timestep
 reduction improves the observables/peak energy drift; late fidelity also
@@ -53,5 +53,6 @@ it does not isolate a globally converged D=3 error floor.
 - Ruff and diff checks passed before final handoff.
 - Existing compatible `/tmp` dependency overlays, CPU, native NetKet 3.22.4,
   JAX 0.8.3, Flax 0.12.2, Optax 0.2.6, Equinox 0.13.2. No shared package changes.
-- Runtime logs and parameter snapshots under `/tmp/pepsy-netket-long-20261013`.
+- Runtime logs and parameter snapshots were subsequently deleted at the user's
+  request, together with the full scalar JSON from the checkout.
 - No new full-suite claim or paper-scale reproduction.

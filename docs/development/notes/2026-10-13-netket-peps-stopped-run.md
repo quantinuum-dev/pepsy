@@ -27,12 +27,12 @@ Raw squared norm is 1.5898028897e-10; acceptance is 0.3634948730.
 The final accepted step took 3.964 s, including 3.656 s in TDVP. Its elapsed
 trajectory time was 784.83 s, including initialization and diagnostics.
 
-Artifacts remain under `/tmp/pepsy-netket-t5-20261013`: manifest, source
-snapshot, patch, trajectory, status, summary, PNG/PDF comparisons and ten
-tensor/vector snapshots. The latest saved snapshot is step 180, t=0.92;
-the later accepted endpoints have scalar records only. Snapshots omit RNG,
-sampler and integrator state and cannot provide an exact restart. The stop
-status records the user's request; the interrupt is not a numerical failure.
+The user subsequently requested deletion of generated simulation outputs.
+The temporary run directory, trajectories, figures and tensor/vector snapshots
+were removed. Before deletion, the latest saved snapshot was step 180, t=0.92;
+later accepted endpoints had scalar records only. Snapshots omitted RNG,
+sampler and integrator state. The interrupt was requested by the user and was
+not a numerical failure. This note retains the measured summary only.
 
 ## Frozen contraction and compilation evidence
 

@@ -15,7 +15,8 @@
 The simulation stopped at t=0.99, with latest tensors/vector saved at t=0.92.
 Final infidelity against physical-initial-state exact evolution was 0.18436;
 this does not validate t=5 dynamics. Logs and existing checkpoints were
-preserved and partial reports refreshed. No simulations were restarted.
+preserved and partial reports refreshed at wrap-up, then deleted at the user's
+subsequent request. No simulations were restarted.
 The [retained note](../docs/development/notes/2026-10-13-netket-peps-stopped-run.md)
 records setup, scalar results, frozen contraction checks and remaining work.
 

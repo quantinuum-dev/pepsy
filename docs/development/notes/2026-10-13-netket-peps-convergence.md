@@ -6,10 +6,10 @@ the same PEPO startup, ending at t=0.22. This extends the previous 0.002
 tVMC interval by a factor of 100. All 240 accepted endpoints were compared
 with exact sparse-matrix evolution from the fitted handoff state.
 
-[Full scalar trajectories and diagnostics](2026-10-13-netket-peps-convergence.json)
-retain the results. Parameter/reference snapshots, logs and exported
-`convergence.png`/`convergence.pdf` are under
-`/tmp/pepsy-netket-long-20261013`.
+The user subsequently requested deletion of generated simulation outputs.
+The full scalar JSON, parameter/reference snapshots, logs and exported figures
+were removed from the checkout and temporary run directory. This note retains
+the measured summary only.
 
 ## Fixed setup and comparisons
 
