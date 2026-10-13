@@ -847,13 +847,18 @@ def metropolis_exchange_sweep(
     compile_kernels=False,
     track_proposal_stats=False,
 ):
-    """Run one nearest-neighbor Metropolis sweep.
+    """Run one nearest-neighbor or binary single-site Metropolis sweep.
 
     ``amplitude_fn`` should accept a ``(batch, n_sites)`` torch integer tensor
     and return a batch of amplitudes. The sampler evaluates only changed
     proposals when possible. ``chunk_size`` caps proposal-amplitude batch size
     without changing the Markov chain. Set ``track_proposal_stats=True`` to
     retain move-wise selected, no-op, proposed, and accepted counts.
+    ``proposal="local"`` attempts a binary flip at each site with probability
+    one half. These lazy, symmetric moves explore all magnetization sectors
+    and remain aperiodic even for a uniform wave function.
+    ``proposal="parity"`` instead flips both binary endpoints of graph edges
+    with probability one half, preserving total Z2 charge.
     """
     torch = _require_torch()
     configs = _as_long_matrix(configs).clone()
@@ -901,8 +906,25 @@ def metropolis_exchange_sweep(
     n_accepted = 0
     proposal_stats = _empty_proposal_stats() if track_proposal_stats else None
 
-    for i, j in _iter_edges(graph):
-        if proposal in {"spin", "spin_exchange", "heisenberg"}:
+    if proposal in {"local", "parity"}:
+        if bool(torch.any((configs != 0) & (configs != 1))):
+            raise ValueError(f"proposal={proposal!r} requires binary configurations.")
+        edges = (((i, i) for i in range(configs.shape[1]))
+                 if proposal == "local" else _iter_edges(graph))
+    else:
+        edges = _iter_edges(graph)
+    for i, j in edges:
+        if proposal in {"local", "parity"}:
+            proposed = configs.clone()
+            flags = torch.rand(configs.shape[0], device=configs.device,
+                               generator=generator) < .5
+            proposed[flags, i] = 1 - proposed[flags, i]
+            if proposal == "parity" and i != j:
+                proposed[flags, j] = 1 - proposed[flags, j]
+            proposal_result = (proposed, flags)
+            if track_proposal_stats:
+                proposal_result += (torch.full_like(flags, _MOVE_SPIN_FLIP, dtype=torch.long),)
+        elif proposal in {"spin", "spin_exchange", "heisenberg"}:
             proposal_result = propose_spin_exchange(
                 i,
                 j,
@@ -974,7 +996,7 @@ def metropolis_exchange_sweep(
             )
         else:
             raise ValueError(
-                "proposal must be 'spin', 'spinful_exchange_hopping', or "
+                "proposal must be 'local', 'parity', 'spin', 'spinful_exchange_hopping', or "
                 "'spinful_u1', 'spinful_z2', or 'spinful_z2z2'."
             )
 

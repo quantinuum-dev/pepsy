@@ -41,8 +41,8 @@ from ...operators.gates import (
     gate as apply_gate,
 )
 from ..global_opt import GlobalOptimizer
-from ...tensors.contractions import build_optimizer
 from ..sweep import SweepOptimizer
+from ...tensors.contractions import build_optimizer
 from ..sweep.environments import (
     canonical_boundary_engine_selector,
     normalize_boundary_engine,
@@ -50,10 +50,19 @@ from ..sweep.environments import (
     uses_symmray_arrays,
 )
 from ._timing import profile_run, timed_phase
+from ._sweep_fit import SweepFitMixin
+from ._pepo_fit import PepoFitMixin
+from ._sweep_fit import _DEFAULT_SWEEP_OPTIMIZE_KWARGS as _DEFAULT_SWEEP_OPTIMIZE_KWARGS
+from .._boundary_control import (
+    BoundaryAccuracyError, BoundaryChiLimitError, BoundaryGrowth,
+    UNSET_METRIC_CHI as _UNSET_METRIC_CHI,
+    boundary_growth_scope, growth_options, metric_failure, norm_failure,
+    merge_options as _merge_opts,
+)
 from ._boundary_convergence import chi_pair, convergence_options, select_boundary_chi
 from ._gate_order import fixed_gate_sites, gate_order_option, ordered_gate_run
 from ._strip_batch import (
-    collect_strip_batch, layered_target, reuse_boundary_guesses,
+    collect_strip_batch, layered_target,
     simple_update_guess, strip_key,
 )
 
@@ -68,10 +77,6 @@ _DEFAULT_BOUNDARY_KWARGS = {
     "strip_exponent": True,
 }
 _DEFAULT_GLOBAL_SEQUENCE = ("xmax", "xmin", "ymin", "ymax")
-_DEFAULT_SWEEP_OPTIMIZE_KWARGS = {
-    "n_round_trips": 2,
-    "renormalize": False,
-}
 _DEFAULT_SWEEP_SOLVER = "als"
 _DEFAULT_SWEEP_NLOPT_ALGORITHM = "LD_LBFGS"
 _DEFAULT_SWEEP_NLOPT_OPTIONS = {
@@ -91,7 +96,6 @@ _DEFAULT_GLOBAL_FALLBACK_KWARGS = {
     "optimizer": "lbfgs",
 }
 _TRACE_FIDELITY_FLOOR = 1.0e-15
-_UNSET_METRIC_CHI = object()
 
 
 def _normalize_gate_queue(gates):
@@ -115,15 +119,6 @@ def _freeze_where(where):
     if isinstance(where, tuple):
         return tuple(_freeze_where(item) for item in where)
     return where
-
-
-def _merge_opts(*options):
-    """Merge optional mappings left-to-right, skipping ``None``."""
-    merged = {}
-    for option in options:
-        if option:
-            merged.update(dict(option))
-    return merged
 
 
 def _prefer_boundary_engine_mps(opts, boundary_engine, *states, normalize=False):
@@ -154,7 +149,7 @@ def _is_nlopt_optimizer(optimizer):
     return upper.startswith(("LD_", "LN_", "GD_", "GN_"))
 
 
-class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
+class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-instance-attributes
     """Apply a PEPS/PEPO gate stream while keeping bonds capped at ``chi``.
 
     ``PepsOptimizer`` is a gate-stream compression driver. One-site gates are
@@ -310,8 +305,18 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         inputs to Quimb MPS boundaries. The same selector supplies default
         ``method="mps"`` metric contractions when Quimb MPS is selected.
     boundary_convergence : bool | mapping | "auto", default="auto"
-        Auto disables probes for strip batches and two-site full update.
-        Explicit True or a mapping opts into probes with non-strip batching.
+        Auto selects bounded failure-triggered growth for strip ALS, pre-fit
+        probes for non-strip sweeps, and fixed caps for two-site full update.
+        'on_failure' or {'policy': 'on_failure', 'max_chi': (n, o)} performs
+        no routine probes or shrinking. Invalid existing diagnostics double
+        the affected norm/overlap cap and retry the failed gate batch. An
+        unattributed invalid fidelity doubles both caps. Automatic limits are
+        eight times each resolved initial cap; a required doubling above a
+        limit raises BoundaryChiLimitError after restoring the batch input.
+        Reports are available through get_boundary_growth(). This policy
+        requires sweep ALS and measures the target norm rather than assuming
+        it is one. Explicit True or a mapping without policy selects the
+        pre-fit convergence checks below, with non-strip batching.
         Before sweep refinement, recompute both state norms and their complex
         overlap in x and y at increasing boundary caps. Mapping controls are
         ``rtol=1e-5``, ``atol=1e-8`` (normalized overlap), ``schedule='d2'``,
@@ -511,6 +516,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                                     self.mode == 'sweep' and self.update_style == 'two-site')
         self._boundary_chi_auto = boundary_chi is None
         self._boundary_convergence_auto = boundary_convergence == 'auto'
+        self._boundary_growth_options = growth_options(boundary_convergence)
+        self._boundary_growth = None
+        self._active_boundary_growth = None
         self._evaluation_retries_auto = evaluation_max_retries is None
         self._boundary_fit_auto = fit_mode is None and 'fit_mode' not in (boundary_kwargs or {})
         self._boundary_init_auto = fit_init_strategy is None and 'fit_init_strategy' not in (boundary_kwargs or {})
@@ -532,7 +540,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             (0 if self._active_full_update else 2) if evaluation_max_retries is None
             else evaluation_max_retries)
         self.boundary_convergence = convergence_options(
-            self.mode == 'global' if self._boundary_convergence_auto else boundary_convergence,
+            self.mode == 'global' if self._boundary_convergence_auto else (
+                False if self._boundary_growth_options is not None else boundary_convergence),
             bond_dim=self.chi)
         self._boundary_chi_floor = None
         self.evaluation_negative_tol = float(evaluation_negative_tol)
@@ -913,9 +922,24 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             # historical scalar return from PepsOptimizer.normalize unless
             # the caller explicitly requested structured information.
             opts["return_info"] = True
-        result = boundary_normalize(state, **opts)
+        try:
+            result = boundary_normalize(state, **opts)
+        except (ZeroDivisionError, ValueError) as exc:
+            if (self._active_boundary_growth is None
+                    or str(opts.get('method', 'dmrg')).lower() == 'exact'
+                    or (not isinstance(exc, ZeroDivisionError)
+                        and not str(exc).startswith('Boundary norm cost'))):
+                raise
+            raise BoundaryAccuracyError('unusable_norm', components=('norm',),
+                                        stage='normalization') from exc
         self._append_fit_diagnostics(result)
         old_norm = getattr(result, "cost", result)
+        if (self._active_boundary_growth is not None
+                and str(opts.get('method', 'dmrg')).lower() != 'exact'):
+            failure = norm_failure(old_norm, tolerance=max(
+                self.evaluation_negative_tol, _resolve_gate_cutoff(state, 'auto')))
+            if failure:
+                raise BoundaryAccuracyError(failure, components=('norm',), stage='normalization')
         self.normalizations.append(self._normalization_record(state, old_norm))
         return result if requested_info else old_norm
 
@@ -928,11 +952,21 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         do_normalize = self.normalize_initial if normalize_initial is None else bool(normalize_initial)
         if do_normalize and not self._initial_normalized:
-            self._normalize_state(
-                self.state,
-                normalize_kwargs=normalize_kwargs,
-                normalize_chi=normalize_chi,
-            )
+            while True:
+                growth = self._active_boundary_growth
+                snapshot = self.state.copy() if growth is not None else None
+                try:
+                    self._normalize_state(
+                        self.state, normalize_kwargs=normalize_kwargs,
+                        normalize_chi=normalize_chi,
+                    )
+                    break
+                except BoundaryAccuracyError as failure:
+                    if growth is None:
+                        raise
+                    caps = self._increase_boundary_chi(failure, snapshot, step=0)
+                    normalize_chi = caps[0]
+                    normalize_kwargs = {**(normalize_kwargs or {}), 'chi': caps[0]}
             self._initial_normalized = True
 
     @staticmethod
@@ -1693,6 +1727,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         if 'balance_bonds' not in self.infidelity_kwargs and 'balance_bonds' not in kwargs:
             opts.pop('balance_bonds', None)
         opts["chi"] = self._boundary_chi_for_infidelity(evaluation_chi, options=kwargs)
+        if self._active_boundary_growth is not None and opts['chi'] is not None:
+            opts['chi'] = self._active_boundary_growth.retain(opts['chi'])
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
         opts.setdefault("norm", None)
@@ -1706,7 +1742,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         for attempt in range(retries + 1):
             self._last_evaluation_chi = opts["chi"]
-            result = boundary_infidelity(state, target, **opts)
+            try:
+                result = boundary_infidelity(state, target, **opts)
+            except ZeroDivisionError as exc:
+                if (self._active_boundary_growth is None
+                        or str(opts.get('method', 'dmrg')).lower() == 'exact'):
+                    raise
+                raise BoundaryAccuracyError('zero_norm_product', components=('norm',),
+                                            stage='evaluation') from exc
             self._last_target_norm = (
                 result.get("norm_target", 1.0) if isinstance(result, Mapping) else 1.0
             )
@@ -1714,6 +1757,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             raw = result.get("infidelity") if isinstance(result, Mapping) else result
             value = None if raw is None else _backend_to_float(raw)
             self._last_evaluation_raw_infidelity = value
+            growth = self._active_boundary_growth
+            if growth is not None and str(opts.get('method', 'dmrg')).lower() != 'exact':
+                scalars = {**result, 'infidelity': value} if isinstance(result, Mapping) else {'infidelity': value}
+                failure = metric_failure(scalars, tolerance=negative_tol, roundoff=roundoff_tol)
+                if failure is not None:
+                    record.update(effective_chi=opts['chi'], raw_infidelity=value,
+                                  boundary_failure=failure.reason)
+                    failure.context['stage'] = 'evaluation'
+                    raise failure
             record["attempts"].append({"chi": opts["chi"], "infidelity": value})
             if (value is not None and math.isfinite(value)
                     and -negative_tol <= value <= 1.0 + negative_tol
@@ -1776,7 +1828,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         _prefer_boundary_engine_mps(opts, self.boundary_engine, target)
         result = boundary_norm(target, **opts)
         self._append_fit_diagnostics(result)
-        return getattr(result, "cost", result)
+        cost = getattr(result, "cost", result)
+        if (self._active_boundary_growth is not None
+                and str(opts.get('method', 'dmrg')).lower() != 'exact'):
+            failure = norm_failure(cost, tolerance=max(
+                self.evaluation_negative_tol, _resolve_gate_cutoff(target, 'auto')))
+            if failure:
+                raise BoundaryAccuracyError(failure, components=('norm',), stage='target_norm')
+        return cost
 
     def _sweep_boundary_kwargs(self, *, progress, sweep_progress=None):
         opts = _merge_opts(self.boundary_kwargs)
@@ -1993,160 +2052,6 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.losses.append(float(geometric_fidelity))
         self.infidelities.append(float(1.0 - cumulative_fidelity))
         return float(fidelity), float(geometric_fidelity)
-
-    @timed_phase("sweep")
-    def _optimize_with_sweep(
-        self,
-        state,
-        target,
-        *,
-        progress,
-        target_norm=1.0,
-        sweep_progress=None,
-        normalize_chi=_UNSET_METRIC_CHI,
-        sweep_kwargs=None,
-        sweep_optimize_kwargs=None,
-    ):
-        sweep_kwargs = dict(sweep_kwargs or {})
-        checked_boundaries = sweep_kwargs.pop('_checked_boundaries', None)
-        checked_target = sweep_kwargs.pop('_checked_target', None)
-        is_strip = '_active_strip' in (sweep_optimize_kwargs or {})
-        # build_bra_ket already separates colliding ket/bra bonds. Keep the
-        # calibrated labels when transferring environments into this fitter.
-        target_opt = (checked_target if checked_boundaries is not None
-                      else self._copy_and_mangle_target(target))
-        if is_strip:
-            # Stable disjoint labels permit compatible overlap guesses to
-            # survive subsequent strip batches. No numerical cuts are reused.
-            target_opt = target.copy()
-            target_opt.mangle_inner_('__pepsy_strip_target')
-        boundary_init_kwargs, boundary_opt_kwargs, strip_exponent = self._sweep_boundary_kwargs(
-            progress=progress,
-            sweep_progress=sweep_progress,
-        )
-        init_kwargs = {
-            "chi": self.boundary_chi,
-            "target_norm": target_norm,
-            "contraction_opt": self.contraction_opt,
-            # run() already normalized the compressed warm start.
-            "renormalize_state": False,
-            "boundary_engine": self.boundary_engine,
-            **boundary_init_kwargs,
-        }
-        if self.boundary_options:
-            init_kwargs["boundary_options"] = dict(self.boundary_options)
-        init_kwargs.update(self.sweep_kwargs)
-        init_kwargs.update(dict(sweep_kwargs or {}))
-        if checked_boundaries is not None:
-            init_kwargs.update(checked_boundaries)
-        if init_kwargs.get("local_contraction_opt") is None:
-            # One reusable search cache across gate batches and run() calls.
-            # This plans local objectives only, never caches contraction values.
-            if self._sweep_local_contraction_opt is None:
-                self._sweep_local_contraction_opt = build_optimizer(progbar=False)
-            init_kwargs["local_contraction_opt"] = self._sweep_local_contraction_opt
-        init_kwargs.setdefault("evaluation_negative_tol", self.evaluation_negative_tol)
-        # ``full_simplify`` is not backend-safe for Symmray block trees. Make
-        # the supported default explicit here so SweepOptimizer does not need
-        # to correct it (and warn) during construction. An explicit
-        # ``simplify=True`` in sweep_kwargs remains visible and is corrected by
-        # SweepOptimizer with its actionable compatibility warning.
-        if uses_symmray_arrays(state, target_opt) and "simplify" not in init_kwargs:
-            init_kwargs["simplify"] = False
-        boundary_engine = normalize_boundary_engine(
-            init_kwargs.get("boundary_engine", "auto"),
-            state,
-            target_opt,
-        )
-        init_kwargs["boundary_engine"] = boundary_engine
-        normalize_payload = _merge_opts(
-            {"chi": self._boundary_chi_for_norm()
-             if normalize_chi is _UNSET_METRIC_CHI else normalize_chi},
-            init_kwargs.get("normalize_kwargs"),
-        )
-        if boundary_engine == "quimb-mps":
-            normalize_payload = _merge_opts(
-                {"method": "mps", "mode_": "mps", "balance_bonds": False},
-                normalize_payload,
-            )
-        if strip_exponent is not None:
-            normalize_payload = _merge_opts(
-                normalize_payload,
-                {"strip_exponent": bool(strip_exponent)},
-            )
-        if normalize_payload is not None:
-            init_kwargs["normalize_kwargs"] = normalize_payload
-
-        sweeper = SweepOptimizer(
-            state=state,
-            state_target=target_opt,
-            **init_kwargs,
-        )
-        guess_reuse = (reuse_boundary_guesses(sweeper, self._strip_guess_boundaries)
-                       if is_strip and sweeper.fit_init_strategy.startswith('reuse-') else None)
-
-        opt_kwargs = _merge_opts(
-            _DEFAULT_SWEEP_OPTIMIZE_KWARGS,
-            boundary_opt_kwargs,
-            self.sweep_optimize_kwargs,
-            sweep_optimize_kwargs,
-        )
-        opt_kwargs = self._apply_sweep_optimizer_options(opt_kwargs)
-        # Internal start/end diagnostics must use the same target norm as
-        # the local objective. Sweep's standalone diagnostic default measures
-        # it anew; its existing diagnostic options let this driver reuse it.
-        opt_kwargs["debug_loss_kwargs"] = _merge_opts(
-            {"norm_target": init_kwargs["target_norm"]},
-            opt_kwargs.get("debug_loss_kwargs"),
-        )
-        if sweep_progress is not None:
-            # A top-level explicit setting wins over legacy nested
-            # ``sweep_optimize_kwargs={"progress": ...}`` values.
-            opt_kwargs["progress"] = bool(sweep_progress)
-            opt_kwargs["progress_position"] = 1 if progress and sweep_progress else 0
-            opt_kwargs["progress_leave"] = False
-        opt_kwargs.setdefault("progress", bool(progress))
-        active_strip = opt_kwargs.pop('_active_strip', None)
-        if opt_kwargs:
-            sweeper.set_optimize_kwargs(**opt_kwargs)
-
-        if active_strip is None:
-            result = sweeper.run()
-        else:
-            axis, index = active_strip
-            strip_options = dict(sweeper.optimize_kwargs)
-            axes = tuple(strip_options.pop('axes', (axis,)))
-            if axes != (axis,):
-                raise ValueError('strip sweep axes must match the gated strip axis')
-            strip_options['solver'] = strip_options.pop('optimizer', 'als')
-            strip_options['solver_options'] = strip_options.pop('optimizer_options', None)
-            # The driver owns default pre/post metrics. Explicit diagnostic
-            # requests still run through the common sweep lifecycle.
-            strip_options.setdefault('compute_initial_loss', False)
-            strip_options.setdefault('compute_final_loss', False)
-            result = sweeper._run_global_sweeps(
-                axes=(axis,), start_index=index, retain_boundary_guesses=True,
-                **strip_options,
-            )
-            if sweeper.boundary_engine == 'dmrg':
-                self._strip_guess_boundaries = result.pop('boundary_guesses', None)
-        self._append_fit_diagnostics(getattr(sweeper, "fit_diagnostics", None))
-        best_state = result.get("best_state") if isinstance(result, Mapping) else None
-        state_out = best_state if best_state is not None else sweeper.state
-        final_infidelity = None
-        if isinstance(result, Mapping) and result.get('success') is not False:
-            final_infidelity = result.get("best_loss")
-            if final_infidelity is None:
-                final_infidelity = result.get("loss_after")
-        summary = self._summarize_sweep_result(result)
-        if guess_reuse is not None:
-            summary['boundary_guesses_reused'] = guess_reuse
-        if checked_boundaries is not None:
-            summary['environment_reuse'] = {
-                name: boundary.mps_b.environment_cache.report()
-                for name, boundary in checked_boundaries.items()
-            }
-        return state_out, self._clean_optimizer_infidelity(final_infidelity, summary), summary
 
     @timed_phase("global")
     def _optimize_with_global(
@@ -2891,6 +2796,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @profile_run
     @ordered_gate_run
+    @boundary_growth_scope
     def run(  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
         self,
         *,
@@ -3125,9 +3031,55 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         normalize_chi = self._boundary_chi_for_norm(normalize_chi, options=normalize_kwargs)
         evaluation_chi = self._boundary_chi_for_infidelity(evaluation_chi, options=infidelity_kwargs)
+        # Explicit None belongs to exact contractions or supplied boundary
+        # handles. Growing the fitter must not replace that metric policy.
+        uncapped_normalization = normalize_chi is None
+        uncapped_evaluation = evaluation_chi is None
         if run_mode == 'sweep' and k_2q_batch != 'strip' and style in {'row', 'column'}:
             sweep_optimize_kwargs = {**(sweep_optimize_kwargs or {}),
                                      'axes': ('x',) if style == 'row' else ('y',)}
+        growth_config = self._boundary_growth_options
+        if self._boundary_convergence_auto and run_mode == 'sweep' and k_2q_batch == 'strip':
+            growth_config = {"max_chi": "auto"}
+        if growth_config is not None:
+            if run_mode != 'sweep' or sweep_solver != 'als':
+                raise ValueError("on_failure boundary growth requires sweep ALS")
+            self._validate_adaptive_fit_caps(sweep_kwargs)
+            # A hidden fixed FIT rank in a metric would keep the failed
+            # contraction unchanged through every higher-chi retry.
+            metric_policies = (_merge_opts(self.normalize_kwargs, normalize_kwargs),
+                               _merge_opts(self.infidelity_kwargs, infidelity_kwargs))
+            if any(policy and policy.get('fit_max_bond') is not None
+                   for policy in metric_policies):
+                raise ValueError('on_failure boundary growth requires fit_max_bond=None '
+                                 'in normalization and infidelity options')
+            external_policies = (self.boundary_kwargs,
+                                 _merge_opts(self.sweep_kwargs, sweep_kwargs),
+                                 *metric_policies)
+            if any(policy.get(key) is not None for policy in external_policies
+                   for key in ('bdy', 'bdy_target', 'bdy_overlap')):
+                # Supplied boundary handles would survive a retry at their
+                # old rank. Only internally owned guesses can be discarded.
+                raise ValueError('on_failure boundary growth requires fresh boundary '
+                                 'environments; use boundary_convergence=False '
+                                 'with supplied boundary handles')
+            if optimize:
+                fit_caps = chi_pair(_merge_opts(self.sweep_kwargs, sweep_kwargs).get('chi', self.boundary_chi))
+                metric_caps = fit_caps if evaluation_chi is None else chi_pair(evaluation_chi)
+                norm_cap = fit_caps[0] if normalize_chi is None else chi_pair(normalize_chi)[0]
+                initial_caps = (max(fit_caps[0], norm_cap, metric_caps[0]),
+                                max(fit_caps[1], metric_caps[1]))
+                if self._boundary_growth is None:
+                    self._boundary_growth = BoundaryGrowth(initial_caps, **growth_config)
+                else:
+                    self._boundary_growth.retain(initial_caps)
+                self._active_boundary_growth = self._boundary_growth
+                self._boundary_growth.run_count += 1
+                self.boundary_chi = self._boundary_growth.chi
+                normalize_chi = None if uncapped_normalization else self.boundary_chi[0]
+                evaluation_chi = None if uncapped_evaluation else self.boundary_chi
+                normalize_kwargs = {**(normalize_kwargs or {}), 'chi': normalize_chi}
+                sweep_kwargs = {**(sweep_kwargs or {}), 'chi': self.boundary_chi}
         adaptive_boundary = run_mode in {"sweep", "full-update"} and optimize and self.boundary_convergence is not None
         if adaptive_boundary:
             self._validate_adaptive_fit_caps(sweep_kwargs)
@@ -3148,7 +3100,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         normalize_target = bool(non_unitary) if normalize_target is None else bool(normalize_target)
         metric_kwargs = dict(infidelity_kwargs or {})
-        default_target_norm = 1.0 if not non_unitary and normalize_final else None
+        default_target_norm = (1.0 if not non_unitary and normalize_final
+                               and self._active_boundary_growth is None else None)
         metric_kwargs.setdefault(
             "norm_target", self.infidelity_kwargs.get(
                 "norm_target", self.boundary_kwargs.get("norm_target", default_target_norm),
@@ -3224,6 +3177,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_kwargs=normalize_kwargs,
             normalize_chi=normalize_chi,
         )
+        if self._active_boundary_growth is not None:
+            caps = self._active_boundary_growth.chi
+            normalize_chi = None if uncapped_normalization else caps[0]
+            evaluation_chi = None if uncapped_evaluation else caps
+            normalize_kwargs = {**(normalize_kwargs or {}), 'chi': normalize_chi}
+            sweep_kwargs = {**(sweep_kwargs or {}), 'chi': caps}
         self._require_torch_symmray_backend(self.state, role="state")
         if run_mode == 'full-update':
             return self._run_full_update(
@@ -3255,6 +3214,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         two_site_count = 0
         needs_final_normalization = False
         idx = 0
+        growth_batch_events_start = len(self._active_boundary_growth.events) if self._active_boundary_growth else 0
         while idx < len(self.gates):
             step = idx + 1
             gate_payload, where, which = self.gates[idx]
@@ -3277,425 +3237,461 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             calibration = None
             effective_sweep_kwargs = sweep_kwargs
 
-            if site_count == 1:
-                opts = self._base_gate_options(
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    gate_kwargs=gate_kwargs,
-                )
-                self.state = self._apply_gate_entry(
-                    self.state,
-                    gate_payload,
-                    where,
-                    which,
-                    opts=opts,
-                    inplace=True,
-                )
-                self._require_torch_symmray_backend(
-                    self.state,
-                    role="state after gate application",
-                )
-                if normalize_target:
-                    self._normalize_state(
+            growth = self._active_boundary_growth
+            retry_state = self.state.copy() if growth is not None else None
+            retry_two_site_count = two_site_count
+            retry_context = {'step': step, 'where': _freeze_where(where)}
+            if growth is not None and site_count == 2 and k_2q_batch == 'strip':
+                retry_context.update(zip(('axis', 'index'), strip_key(where)))
+            try:
+                if site_count == 1:
+                    opts = self._base_gate_options(
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        gate_kwargs=gate_kwargs,
+                    )
+                    self.state = self._apply_gate_entry(
                         self.state,
-                        normalize_kwargs=normalize_kwargs,
-                        normalize_chi=normalize_chi,
+                        gate_payload,
+                        where,
+                        which,
+                        opts=opts,
+                        inplace=True,
                     )
-                needs_final_normalization = not normalize_target
-                final_state = self.state
-                idx += 1
-            elif site_count == 2:
-                timing_before = self._phase_timer.snapshot() if self._phase_timer else None
-                evaluation_start = len(self.evaluation_records)
-                state_before = self.state
-                if k_2q_batch == 'strip':
-                    batch_entries, two_site_in_batch, next_idx = collect_strip_batch(
-                        self, idx, width=strip_batch_size,
+                    self._require_torch_symmray_backend(
+                        self.state,
+                        role="state after gate application",
                     )
-                    target = layered_target(
-                        state_before, batch_entries, gate_bond_factor=self._gate_bond_factor,
-                    ) if layered else self._build_batch_target(
-                        state_before, batch_entries, cutoff=cutoff,
-                        cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
-                    )
-                    batch_stop, batch_bond_limit = 'strip', None
-                elif k_2q_batch == "auto":
-                    batch_entries, two_site_in_batch, next_idx, target, batch_stop, batch_bond_limit = (
-                        self._collect_auto_batch_target(
-                            idx, cutoff=cutoff, cutoff_mode=cutoff_mode,
-                            gate_kwargs=gate_kwargs,
-                        )
-                    )
-                else:
-                    batch_entries, two_site_in_batch, next_idx = self._collect_gate_batch(
-                        idx, len(self.gates) if k_2q_batch == 'all' else k_2q_batch,
-                    )
-                    target = layered_target(
-                        state_before, batch_entries, gate_bond_factor=self._gate_bond_factor,
-                    ) if layered else self._build_batch_target(
-                        state_before, batch_entries, cutoff=cutoff,
-                        cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
-                    )
-                    batch_stop = "gate_count" if next_idx < len(self.gates) else "end_of_queue"
-                    batch_bond_limit = None
-                if two_site_in_batch < 1:
-                    raise RuntimeError("Gate batch unexpectedly contains no two-site gates.")
-
-                two_site_count += two_site_in_batch
-                record_where, record_which = self._batch_record_payload(batch_entries)
-                if isinstance(record_which, tuple):
-                    record_which = tuple(
-                        self.which if which_i is None else which_i
-                        for which_i in record_which
-                    )
-                else:
-                    record_which = self.which if record_which is None else record_which
-                record_step = next_idx
-                advanced = next_idx - idx
-                self._require_torch_symmray_backend(
-                    state_before,
-                    target,
-                    role="state and gate-generated target",
-                )
-                if normalize_target:
-                    self._normalize_state(
-                        target,
-                        normalize_kwargs=normalize_kwargs,
-                        normalize_chi=normalize_chi,
-                    )
-                target_max_bond = self._max_bond(target)
-
-                if not layered and target_max_bond is not None and target_max_bond <= self.chi:
-                    self.state = target
-                    if normalize_final and not normalize_target:
+                    normalize_onsite = normalize_target or (
+                        growth is not None and normalize_final and idx + 1 == len(self.gates))
+                    if normalize_onsite:
                         self._normalize_state(
-                            self.state, normalize_kwargs=normalize_kwargs,
-                            normalize_chi=normalize_chi,
-                        )
-                    final_state = self.state
-                    final_infidelity = 0.0
-                    reason = "within_chi"
-                else:
-                    if warmstart_method == 'simple-update':
-                        warmstart_state = simple_update_guess(
-                            state_before, batch_entries, chi=self.chi, cutoff=cutoff,
-                            cutoff_mode=cutoff_mode,
-                        )
-                    elif layered:
-                        warmstart_state = self._build_routed_batch_warmstart(
-                            state_before, batch_entries, cutoff=cutoff,
-                            cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
-                        )
-                    else:
-                        warmstart_state = self._build_batch_warmstart(
-                            target, state_before, batch_entries, cutoff=cutoff,
-                            cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
-                        )
-                    warmstart = warmstart_state
-                    if adaptive_boundary:
-                        calibration = self._calibrate_sweep_boundaries(
-                            warmstart, target, normalize_chi=normalize_chi,
-                            evaluation_chi=evaluation_chi, sweep_kwargs=sweep_kwargs,
-                            sweep_optimize_kwargs=sweep_optimize_kwargs,
-                        )
-                        normalize_chi = calibration["chi"][0]
-                        evaluation_chi = calibration["chi"]
-                        step_evaluation_chi = evaluation_chi
-                        normalize_kwargs = {**(normalize_kwargs or {}), "chi": normalize_chi}
-                        metric_kwargs = {**metric_kwargs, "chi": evaluation_chi,
-                                         "norm_target": calibration["sample"]["norm_target"],
-                                         "evaluation_max_retries": 0}
-                        target_norm = metric_kwargs["norm_target"]
-                        effective_sweep_kwargs = {**(sweep_kwargs or {}), "chi": evaluation_chi,
-                                                  "target_norm": target_norm}
-                        if calibration.get('fit_boundaries') is not None:
-                            effective_sweep_kwargs['_checked_boundaries'] = calibration['fit_boundaries']
-                            effective_sweep_kwargs['_checked_target'] = calibration['fit_target']
-                        # Reuse the checked norm rather than contracting it again.
-                        checked_norm = calibration["sample"]["norm"]
-                        for checked in (checked_norm, target_norm):
-                            if (not all(math.isfinite(float(v)) for v in
-                                        (complex(checked[0]).real, complex(checked[0]).imag, checked[1]))
-                                    or complex(checked[0]).real <= 0):
-                                raise ValueError("Adaptive boundary check found an unusable norm.")
-                        custom_normalization = _merge_opts(self.normalize_kwargs, normalize_kwargs)
-                        if any(key != "chi" for key in custom_normalization):
-                            # Explicit normalization methods/options remain authoritative.
-                            self._normalize_state(warmstart, normalize_kwargs=normalize_kwargs,
-                                                  normalize_chi=normalize_chi)
-                        else:
-                            if calibration.get('fit_boundaries') is not None:
-                                # Keep normalization's global magnitude in the
-                                # TN exponent so all unchanged cuts stay valid.
-                                # Preserve the old complex phase convention on
-                                # one owned tensor, rather than scaling every site.
-                                self._normalize_without_rescaling_sites(warmstart, checked_norm)
-                            else:
-                                _normalize_by_scaled_norm(warmstart, checked_norm)
-                            self.normalizations.append(self._normalization_record(warmstart, checked_norm))
-                    else:
-                        self._normalize_state(
-                            warmstart,
+                            self.state,
                             normalize_kwargs=normalize_kwargs,
                             normalize_chi=normalize_chi,
                         )
-
-                    precheck_reliable = True
-                    raw_pre_infidelity = None
-                    if measure_infidelity:
-                        self._last_evaluation_raw_infidelity = None
-                        if calibration is not None:
-                            sample = calibration["sample"]
-                            raw = 1.0 - _scaled_overlap_fidelity(
-                                sample["overlap"], sample["norm"], sample["norm_target"],
+                    needs_final_normalization = not normalize_onsite
+                    final_state = self.state
+                    idx += 1
+                elif site_count == 2:
+                    timing_before = self._phase_timer.snapshot() if self._phase_timer else None
+                    evaluation_start = len(self.evaluation_records)
+                    state_before = self.state
+                    if k_2q_batch == 'strip':
+                        batch_entries, two_site_in_batch, next_idx = collect_strip_batch(
+                            self, idx, width=strip_batch_size,
+                        )
+                        target = layered_target(
+                            state_before, batch_entries, gate_bond_factor=self._gate_bond_factor,
+                        ) if layered else self._build_batch_target(
+                            state_before, batch_entries, cutoff=cutoff,
+                            cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                        )
+                        batch_stop, batch_bond_limit = 'strip', None
+                    elif k_2q_batch == "auto":
+                        batch_entries, two_site_in_batch, next_idx, target, batch_stop, batch_bond_limit = (
+                            self._collect_auto_batch_target(
+                                idx, cutoff=cutoff, cutoff_mode=cutoff_mode,
+                                gate_kwargs=gate_kwargs,
                             )
-                            roundoff = _resolve_gate_cutoff(warmstart, "auto")
-                            pre_infidelity = (self._clip_fidelity(raw)
-                                              if math.isfinite(raw) and -roundoff <= raw <= 1 + roundoff
-                                              else None)
-                            self._last_evaluation_chi = evaluation_chi
-                            self._last_evaluation_raw_infidelity = raw
-                            self._last_target_norm = sample["norm_target"]
-                            self.evaluation_records.append({
-                                "requested_chi": evaluation_chi, "effective_chi": evaluation_chi,
-                                "raw_infidelity": raw, "infidelity": pre_infidelity,
-                                "source": "boundary_convergence", "converged": calibration["converged"],
-                                "attempts": [{"chi": evaluation_chi, "infidelity": raw}],
-                            })
-                        else:
-                            pre_infidelity = self.estimate_infidelity(
-                                warmstart,
-                                target,
-                                evaluation_chi=evaluation_chi,
-                                **metric_kwargs,
-                            )
-                        step_evaluation_chi = self._last_evaluation_chi
-                        target_norm = self._last_target_norm
-                        raw_pre_infidelity = self._last_evaluation_raw_infidelity
-                        if run_mode == "sweep" and raw_pre_infidelity is not None:
-                            roundoff = _resolve_gate_cutoff(warmstart, "auto")
-                            precheck_reliable = (
-                                -roundoff <= raw_pre_infidelity <= 1.0 + roundoff
-                            )
-                            if calibration is not None:
-                                precheck_reliable = precheck_reliable and calibration["converged"]
-
-                    if (precheck_reliable and pre_infidelity is not None
-                            and pre_infidelity <= infidelity_tol):
-                        self.state = warmstart
-                        final_state = self.state
-                        final_infidelity = pre_infidelity
-                        reason = "below_tol"
-                    elif not optimize:
-                        self.state = warmstart
-                        final_state = self.state
-                        final_infidelity = pre_infidelity
-                        reason = "warmstart"
+                        )
                     else:
-                        optimizer_attempted = True
-                        if target_norm is None:
-                            target_norm = self._measure_target_norm(
-                                target, evaluation_chi=evaluation_chi,
-                                metric_kwargs=metric_kwargs,
-                            )
-                        if pbar is not None:
-                            pbar.set_postfix(self._progress_postfix(
-                                two_site_count=two_site_count,
-                                step=record_step,
-                                total_steps=len(self.gates),
-                                status="optimizing",
-                                input_infidelity=pre_infidelity,
-                            ))
-                        warmstart_snapshot = None
-                        if accept_if_improved and pre_infidelity is not None:
-                            warmstart_snapshot = (
-                                warmstart.copy()
-                                if hasattr(warmstart, "copy")
-                                else warmstart
-                            )
-                        effective_sweep_options = _merge_opts(
-                            self.sweep_optimize_kwargs, sweep_optimize_kwargs,
+                        batch_entries, two_site_in_batch, next_idx = self._collect_gate_batch(
+                            idx, len(self.gates) if k_2q_batch == 'all' else k_2q_batch,
                         )
-                        if calibration is not None:
-                            # The precheck selects the fit caps once. A stale
-                            # optimize-time chi must not reset them mid-sweep.
-                            # Constructor already received the selected pair;
-                            # None avoids a second eager boundary expansion.
-                            effective_sweep_options["chi"] = None
-                        if run_mode == "sweep" and not effective_sweep_options.get("debug", False):
-                            # The outer postcheck evaluates the retained candidate
-                            # after normalization. Keep that authoritative check.
-                            if (measure_infidelity and measure_final_infidelity
-                                    and not effective_sweep_options.get("debug_loss_kwargs")):
-                                effective_sweep_options.setdefault("compute_final_loss", False)
-                            # Direct compression is independent of the boundary
-                            # warm start and iteration budget. Reuse a precheck
-                            # only for the identical default metric policy/caps;
-                            # customized metrics keep a separate sweep check.
-                            if (
-                                pre_infidelity is not None
-                                and self.boundary_kwargs == {
-                                    **_DEFAULT_BOUNDARY_KWARGS, "fit_mode": "direct",
-                                    "fit_layer_mode": "sequential", "layer_tags": ("BRA", "KET"),
-                                }
-                                and not self.infidelity_kwargs and not infidelity_kwargs
-                                and not self.sweep_kwargs and not sweep_kwargs
-                                and not self.boundary_options
-                                and normalize_boundary_engine(
-                                    self.boundary_engine, warmstart, target,
-                                ) == "dmrg"
-                                and step_evaluation_chi == self.boundary_chi
-                                and not effective_sweep_options.get("debug_loss_kwargs")
-                                and not effective_sweep_options.get("renormalize", False)
-                                and not effective_sweep_options.get("normalize_boundaries", False)
-                                and "chi" not in effective_sweep_options
-                            ):
-                                effective_sweep_options.setdefault(
-                                    "initial_loss", pre_infidelity if precheck_reliable
-                                    else raw_pre_infidelity,
-                                )
-                        if k_2q_batch == 'strip' and run_mode == 'sweep':
-                            effective_sweep_options['_active_strip'] = strip_key(batch_entries[0][1])
-                        final_state, opt_infidelity, optimizer_result = self._optimize_state(
-                            warmstart,
+                        target = layered_target(
+                            state_before, batch_entries, gate_bond_factor=self._gate_bond_factor,
+                        ) if layered else self._build_batch_target(
+                            state_before, batch_entries, cutoff=cutoff,
+                            cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                        )
+                        batch_stop = "gate_count" if next_idx < len(self.gates) else "end_of_queue"
+                        batch_bond_limit = None
+                    if two_site_in_batch < 1:
+                        raise RuntimeError("Gate batch unexpectedly contains no two-site gates.")
+
+                    two_site_count += two_site_in_batch
+                    record_where, record_which = self._batch_record_payload(batch_entries)
+                    if isinstance(record_which, tuple):
+                        record_which = tuple(
+                            self.which if which_i is None else which_i
+                            for which_i in record_which
+                        )
+                    else:
+                        record_which = self.which if record_which is None else record_which
+                    record_step = next_idx
+                    advanced = next_idx - idx
+                    self._require_torch_symmray_backend(
+                        state_before,
+                        target,
+                        role="state and gate-generated target",
+                    )
+                    if normalize_target:
+                        self._normalize_state(
                             target,
-                            mode=run_mode,
-                            target_norm=target_norm,
-                            progress=show_progress,
-                            sweep_progress=effective_sweep_progress,
-                            cutoff=cutoff,
+                            normalize_kwargs=normalize_kwargs,
                             normalize_chi=normalize_chi,
-                            sweep_kwargs=effective_sweep_kwargs,
-                            sweep_optimize_kwargs=effective_sweep_options,
-                            global_kwargs=global_kwargs,
-                            global_optimize_kwargs=global_optimize_kwargs,
                         )
-                        candidate_state = final_state
-                        cleanup_failed = (
-                            isinstance(optimizer_result, Mapping)
-                            and optimizer_result.get("success") is False
-                        )
-                        if normalize_final and not cleanup_failed:
+                    target_max_bond = self._max_bond(target)
+
+                    if not layered and target_max_bond is not None and target_max_bond <= self.chi:
+                        self.state = target
+                        if normalize_final and not normalize_target:
                             self._normalize_state(
-                                candidate_state,
+                                self.state, normalize_kwargs=normalize_kwargs,
+                                normalize_chi=normalize_chi,
+                            )
+                        final_state = self.state
+                        final_infidelity = 0.0
+                        reason = "within_chi"
+                    else:
+                        if warmstart_method == 'simple-update':
+                            warmstart_state = simple_update_guess(
+                                state_before, batch_entries, chi=self.chi, cutoff=cutoff,
+                                cutoff_mode=cutoff_mode,
+                            )
+                        elif layered:
+                            warmstart_state = self._build_routed_batch_warmstart(
+                                state_before, batch_entries, cutoff=cutoff,
+                                cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                            )
+                        else:
+                            warmstart_state = self._build_batch_warmstart(
+                                target, state_before, batch_entries, cutoff=cutoff,
+                                cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                            )
+                        warmstart = warmstart_state
+                        if adaptive_boundary:
+                            calibration = self._calibrate_sweep_boundaries(
+                                warmstart, target, normalize_chi=normalize_chi,
+                                evaluation_chi=evaluation_chi, sweep_kwargs=sweep_kwargs,
+                                sweep_optimize_kwargs=sweep_optimize_kwargs,
+                            )
+                            normalize_chi = calibration["chi"][0]
+                            evaluation_chi = calibration["chi"]
+                            step_evaluation_chi = evaluation_chi
+                            normalize_kwargs = {**(normalize_kwargs or {}), "chi": normalize_chi}
+                            metric_kwargs = {**metric_kwargs, "chi": evaluation_chi,
+                                             "norm_target": calibration["sample"]["norm_target"],
+                                             "evaluation_max_retries": 0}
+                            target_norm = metric_kwargs["norm_target"]
+                            effective_sweep_kwargs = {**(sweep_kwargs or {}), "chi": evaluation_chi,
+                                                      "target_norm": target_norm}
+                            if calibration.get('fit_boundaries') is not None:
+                                effective_sweep_kwargs['_checked_boundaries'] = calibration['fit_boundaries']
+                                effective_sweep_kwargs['_checked_target'] = calibration['fit_target']
+                            # Reuse the checked norm rather than contracting it again.
+                            checked_norm = calibration["sample"]["norm"]
+                            for checked in (checked_norm, target_norm):
+                                if (not all(math.isfinite(float(v)) for v in
+                                            (complex(checked[0]).real, complex(checked[0]).imag, checked[1]))
+                                        or complex(checked[0]).real <= 0):
+                                    raise ValueError("Adaptive boundary check found an unusable norm.")
+                            custom_normalization = _merge_opts(self.normalize_kwargs, normalize_kwargs)
+                            if any(key != "chi" for key in custom_normalization):
+                                # Explicit normalization methods/options remain authoritative.
+                                self._normalize_state(warmstart, normalize_kwargs=normalize_kwargs,
+                                                      normalize_chi=normalize_chi)
+                            else:
+                                if calibration.get('fit_boundaries') is not None:
+                                    # Keep normalization's global magnitude in the
+                                    # TN exponent so all unchanged cuts stay valid.
+                                    # Preserve the old complex phase convention on
+                                    # one owned tensor, rather than scaling every site.
+                                    self._normalize_without_rescaling_sites(warmstart, checked_norm)
+                                else:
+                                    _normalize_by_scaled_norm(warmstart, checked_norm)
+                                self.normalizations.append(self._normalization_record(warmstart, checked_norm))
+                        else:
+                            self._normalize_state(
+                                warmstart,
                                 normalize_kwargs=normalize_kwargs,
                                 normalize_chi=normalize_chi,
                             )
-                        if measure_infidelity and measure_final_infidelity and not cleanup_failed:
-                            # A retry must not compare candidates measured at
-                            # different caps. Use the precheck's effective cap,
-                            # and remeasure the snapshot if the postcheck grows it.
-                            comparison_opts = dict(metric_kwargs)
-                            comparison_opts["chi"] = step_evaluation_chi
-                            post_infidelity = self.estimate_infidelity(
-                                candidate_state,
-                                target,
-                                **comparison_opts,
-                            )
-                            if self._last_evaluation_chi != step_evaluation_chi:
-                                step_evaluation_chi = self._last_evaluation_chi
-                                if warmstart_snapshot is not None:
-                                    comparison_opts["chi"] = step_evaluation_chi
-                                    comparison_opts.pop("evaluation_max_retries", None)
-                                    self._last_evaluation_raw_infidelity = None
-                                    pre_infidelity = self.estimate_infidelity(
-                                        warmstart_snapshot, target,
-                                        evaluation_max_retries=0, **comparison_opts,
-                                    )
-                                    if run_mode == "sweep":
-                                        raw_pre = self._last_evaluation_raw_infidelity
-                                        roundoff = _resolve_gate_cutoff(warmstart, "auto")
-                                        precheck_reliable = (
-                                            raw_pre is None
-                                            or -roundoff <= raw_pre <= 1.0 + roundoff
-                                        )
-                        final_infidelity = (
-                            post_infidelity
-                            if post_infidelity is not None
-                            else opt_infidelity
-                        )
-                        if final_infidelity is None:
-                            final_infidelity = pre_infidelity
 
-                        should_accept = not cleanup_failed
-                        if (
-                            not cleanup_failed
-                            and accept_if_improved
-                            and precheck_reliable
-                            and pre_infidelity is not None
-                            and final_infidelity is not None
-                        ):
-                            should_accept = (
-                                float(final_infidelity)
-                                < float(pre_infidelity) - float(improvement_tol)
-                            )
+                        precheck_reliable = True
+                        raw_pre_infidelity = None
+                        if measure_infidelity:
+                            self._last_evaluation_raw_infidelity = None
+                            if calibration is not None:
+                                sample = calibration["sample"]
+                                raw = 1.0 - _scaled_overlap_fidelity(
+                                    sample["overlap"], sample["norm"], sample["norm_target"],
+                                )
+                                roundoff = _resolve_gate_cutoff(warmstart, "auto")
+                                pre_infidelity = (self._clip_fidelity(raw)
+                                                  if math.isfinite(raw) and -roundoff <= raw <= 1 + roundoff
+                                                  else None)
+                                self._last_evaluation_chi = evaluation_chi
+                                self._last_evaluation_raw_infidelity = raw
+                                self._last_target_norm = sample["norm_target"]
+                                self.evaluation_records.append({
+                                    "requested_chi": evaluation_chi, "effective_chi": evaluation_chi,
+                                    "raw_infidelity": raw, "infidelity": pre_infidelity,
+                                    "source": "boundary_convergence", "converged": calibration["converged"],
+                                    "attempts": [{"chi": evaluation_chi, "infidelity": raw}],
+                                })
+                            else:
+                                pre_infidelity = self.estimate_infidelity(
+                                    warmstart,
+                                    target,
+                                    evaluation_chi=evaluation_chi,
+                                    **metric_kwargs,
+                                )
+                            step_evaluation_chi = self._last_evaluation_chi
+                            target_norm = self._last_target_norm
+                            raw_pre_infidelity = self._last_evaluation_raw_infidelity
+                            if run_mode == "sweep" and raw_pre_infidelity is not None:
+                                roundoff = _resolve_gate_cutoff(warmstart, "auto")
+                                precheck_reliable = (
+                                    -roundoff <= raw_pre_infidelity <= 1.0 + roundoff
+                                )
+                                if calibration is not None:
+                                    precheck_reliable = precheck_reliable and calibration["converged"]
 
-                        if should_accept:
-                            self.state = candidate_state
+                        if (precheck_reliable and pre_infidelity is not None
+                                and pre_infidelity <= infidelity_tol):
+                            self.state = warmstart
                             final_state = self.state
-                            reason = "optimized"
-                            optimized = True
+                            final_infidelity = pre_infidelity
+                            reason = "below_tol"
+                        elif not optimize:
+                            self.state = warmstart
+                            final_state = self.state
+                            final_infidelity = pre_infidelity
+                            reason = "warmstart"
                         else:
-                            self.state = (
-                                warmstart_snapshot
-                                if warmstart_snapshot is not None
-                                else warmstart
+                            optimizer_attempted = True
+                            if target_norm is None:
+                                target_norm = self._measure_target_norm(
+                                    target, evaluation_chi=evaluation_chi,
+                                    metric_kwargs=metric_kwargs,
+                                )
+                            if pbar is not None:
+                                pbar.set_postfix(self._progress_postfix(
+                                    two_site_count=two_site_count,
+                                    step=record_step,
+                                    total_steps=len(self.gates),
+                                    status="optimizing",
+                                    input_infidelity=pre_infidelity,
+                                ))
+                            warmstart_snapshot = None
+                            if accept_if_improved and pre_infidelity is not None:
+                                warmstart_snapshot = (
+                                    warmstart.copy()
+                                    if hasattr(warmstart, "copy")
+                                    else warmstart
+                                )
+                            effective_sweep_options = _merge_opts(
+                                self.sweep_optimize_kwargs, sweep_optimize_kwargs,
                             )
-                            final_state = self.state
-                            # This was measured before optimization on the
-                            # warm start snapshot that we just restored.
-                            final_infidelity = pre_infidelity
-                            reason = "optimizer_failed" if cleanup_failed else "optimizer_rejected"
+                            if calibration is not None:
+                                # The precheck selects the fit caps once. A stale
+                                # optimize-time chi must not reset them mid-sweep.
+                                # Constructor already received the selected pair;
+                                # None avoids a second eager boundary expansion.
+                                effective_sweep_options["chi"] = None
+                            if run_mode == "sweep" and not effective_sweep_options.get("debug", False):
+                                # The outer postcheck evaluates the retained candidate
+                                # after normalization. Keep that authoritative check.
+                                if (measure_infidelity and measure_final_infidelity
+                                        and not effective_sweep_options.get("debug_loss_kwargs")):
+                                    effective_sweep_options.setdefault("compute_final_loss", False)
+                                # Direct compression is independent of the boundary
+                                # warm start and iteration budget. Reuse a precheck
+                                # only for the identical default metric policy/caps;
+                                # customized metrics keep a separate sweep check.
+                                if (
+                                    pre_infidelity is not None
+                                and {**self.boundary_kwargs, 'fit_init_strategy':
+                                     _DEFAULT_BOUNDARY_KWARGS['fit_init_strategy']} == {
+                                        **_DEFAULT_BOUNDARY_KWARGS, "fit_mode": "direct",
+                                        "fit_layer_mode": "sequential", "layer_tags": ("BRA", "KET"),
+                                    }
+                                    and not self.infidelity_kwargs and not infidelity_kwargs
+                                    and not self.sweep_kwargs and not sweep_kwargs
+                                    and not self.boundary_options
+                                    and normalize_boundary_engine(
+                                        self.boundary_engine, warmstart, target,
+                                    ) == "dmrg"
+                                    and step_evaluation_chi == self.boundary_chi
+                                    and not effective_sweep_options.get("debug_loss_kwargs")
+                                    and not effective_sweep_options.get("renormalize", False)
+                                    and not effective_sweep_options.get("normalize_boundaries", False)
+                                    and "chi" not in effective_sweep_options
+                                ):
+                                    effective_sweep_options.setdefault(
+                                        "initial_loss", pre_infidelity if precheck_reliable
+                                        else raw_pre_infidelity,
+                                    )
+                            if k_2q_batch == 'strip' and run_mode == 'sweep':
+                                effective_sweep_options['_active_strip'] = strip_key(batch_entries[0][1])
+                            final_state, opt_infidelity, optimizer_result = self._optimize_state(
+                                warmstart,
+                                target,
+                                mode=run_mode,
+                                target_norm=target_norm,
+                                progress=show_progress,
+                                sweep_progress=effective_sweep_progress,
+                                cutoff=cutoff,
+                                normalize_chi=normalize_chi,
+                                sweep_kwargs=effective_sweep_kwargs,
+                                sweep_optimize_kwargs=effective_sweep_options,
+                                global_kwargs=global_kwargs,
+                                global_optimize_kwargs=global_optimize_kwargs,
+                            )
+                            candidate_state = final_state
+                            cleanup_failed = (
+                                isinstance(optimizer_result, Mapping)
+                                and optimizer_result.get("success") is False
+                            )
+                            if normalize_final and not cleanup_failed:
+                                self._normalize_state(
+                                    candidate_state,
+                                    normalize_kwargs=normalize_kwargs,
+                                    normalize_chi=normalize_chi,
+                                )
+                            if measure_infidelity and measure_final_infidelity and not cleanup_failed:
+                                # A retry must not compare candidates measured at
+                                # different caps. Use the precheck's effective cap,
+                                # and remeasure the snapshot if the postcheck grows it.
+                                comparison_opts = dict(metric_kwargs)
+                                if growth is not None:
+                                    # The unchanged target was already measured at
+                                    # these caps for the precheck/local objective.
+                                    comparison_opts['norm_target'] = target_norm
+                                comparison_opts["chi"] = step_evaluation_chi
+                                post_infidelity = self.estimate_infidelity(
+                                    candidate_state,
+                                    target,
+                                    **comparison_opts,
+                                )
+                                if self._last_evaluation_chi != step_evaluation_chi:
+                                    step_evaluation_chi = self._last_evaluation_chi
+                                    if warmstart_snapshot is not None:
+                                        comparison_opts["chi"] = step_evaluation_chi
+                                        comparison_opts.pop("evaluation_max_retries", None)
+                                        self._last_evaluation_raw_infidelity = None
+                                        pre_infidelity = self.estimate_infidelity(
+                                            warmstart_snapshot, target,
+                                            evaluation_max_retries=0, **comparison_opts,
+                                        )
+                                        if run_mode == "sweep":
+                                            raw_pre = self._last_evaluation_raw_infidelity
+                                            roundoff = _resolve_gate_cutoff(warmstart, "auto")
+                                            precheck_reliable = (
+                                                raw_pre is None
+                                                or -roundoff <= raw_pre <= 1.0 + roundoff
+                                            )
+                            final_infidelity = (
+                                post_infidelity
+                                if post_infidelity is not None
+                                else opt_infidelity
+                            )
+                            if final_infidelity is None:
+                                final_infidelity = pre_infidelity
 
-                needs_final_normalization = False
-                fidelity, geometric_fidelity = self._record_fidelity_progress(final_infidelity)
-                record = {
-                    "step": int(record_step),
-                    "start_step": int(step),
-                    "original_steps": [step for group in self.last_gate_order['original_step_groups'][idx:next_idx]
-                                       for step in group],
-                    "gate_order": self.last_gate_order['policy'], "update_style": style,
-                    "where": record_where,
-                    "which": record_which,
-                    "batch_size": len(batch_entries),
-                    "two_site_batch": int(two_site_in_batch),
-                    "k_2q_batch": k_2q_batch,
-                    "strip_batch_size": strip_batch_size,
-                    "warmstart_method": warmstart_method,
-                    "target_representation": 'layered' if layered else 'peps',
-                    "strip": strip_key(batch_entries[0][1]) if k_2q_batch == 'strip' else None,
-                    "batch_stop_reason": batch_stop,
-                    "batch_target_bond_limit": batch_bond_limit,
-                    "target_max_bond": target_max_bond,
-                    "state_max_bond": self._max_bond(self.state),
-                    "normalize_chi": normalize_chi,
-                    "evaluation_chi": evaluation_chi,
-                    "effective_evaluation_chi": step_evaluation_chi,
-                    "evaluation_records": deepcopy(self.evaluation_records[evaluation_start:]),
-                    "boundary_convergence": None if calibration is None else calibration["record"],
-                    "cutoff": cutoff,
-                    "cutoff_mode": cutoff_mode,
-                    "infidelity_tol": infidelity_tol,
-                    "pre_infidelity": pre_infidelity,
-                    "optimizer_infidelity": opt_infidelity,
-                    "post_infidelity": post_infidelity,
-                    "final_infidelity": final_infidelity,
-                    "fidelity": fidelity,
-                    "geometric_fidelity": geometric_fidelity,
-                    "optimized": optimized,
-                    "optimizer_attempted": optimizer_attempted,
-                    "reason": reason,
-                    "optimizer_result": optimizer_result,
-                }
-                self.step_records.append(record)
-                if timing_before is not None:
-                    record["timing"] = self._phase_timer.since(timing_before)
-                if step_callback is not None:
-                    step_callback(deepcopy(record))
-                idx = next_idx
-            else:
-                raise ValueError("PepsOptimizer supports one- and two-site gates only.")
+                            should_accept = not cleanup_failed
+                            if (
+                                not cleanup_failed
+                                and accept_if_improved
+                                and precheck_reliable
+                                and pre_infidelity is not None
+                                and final_infidelity is not None
+                            ):
+                                should_accept = (
+                                    float(final_infidelity)
+                                    < float(pre_infidelity) - float(improvement_tol)
+                                )
 
+                            if should_accept:
+                                self.state = candidate_state
+                                final_state = self.state
+                                reason = "optimized"
+                                optimized = True
+                            else:
+                                self.state = (
+                                    warmstart_snapshot
+                                    if warmstart_snapshot is not None
+                                    else warmstart
+                                )
+                                final_state = self.state
+                                # This was measured before optimization on the
+                                # warm start snapshot that we just restored.
+                                final_infidelity = pre_infidelity
+                                reason = "optimizer_failed" if cleanup_failed else "optimizer_rejected"
+
+                    needs_final_normalization = False
+                    fidelity, geometric_fidelity = self._record_fidelity_progress(final_infidelity)
+                    record = {
+                        "step": int(record_step),
+                        "start_step": int(step),
+                        "original_steps": [step for group in self.last_gate_order['original_step_groups'][idx:next_idx]
+                                           for step in group],
+                        "gate_order": self.last_gate_order['policy'], "update_style": style,
+                        "where": record_where,
+                        "which": record_which,
+                        "batch_size": len(batch_entries),
+                        "two_site_batch": int(two_site_in_batch),
+                        "k_2q_batch": k_2q_batch,
+                        "strip_batch_size": strip_batch_size,
+                        "warmstart_method": warmstart_method,
+                        "target_representation": 'layered' if layered else 'peps',
+                        "strip": strip_key(batch_entries[0][1]) if k_2q_batch == 'strip' else None,
+                        "batch_stop_reason": batch_stop,
+                        "batch_target_bond_limit": batch_bond_limit,
+                        "target_max_bond": target_max_bond,
+                        "state_max_bond": self._max_bond(self.state),
+                        "normalize_chi": normalize_chi,
+                        "evaluation_chi": evaluation_chi,
+                        "effective_evaluation_chi": step_evaluation_chi,
+                        "evaluation_records": deepcopy(self.evaluation_records[evaluation_start:]),
+                        "boundary_convergence": None if calibration is None else calibration["record"],
+                        "boundary_growth": (None if growth is None else {
+                            "chi": growth.chi, "max_chi": growth.max_chi,
+                            "events": deepcopy(growth.events[growth_batch_events_start:]),
+                        }),
+                        "cutoff": cutoff,
+                        "cutoff_mode": cutoff_mode,
+                        "infidelity_tol": infidelity_tol,
+                        "pre_infidelity": pre_infidelity,
+                        "optimizer_infidelity": opt_infidelity,
+                        "post_infidelity": post_infidelity,
+                        "final_infidelity": final_infidelity,
+                        "fidelity": fidelity,
+                        "geometric_fidelity": geometric_fidelity,
+                        "optimized": optimized,
+                        "optimizer_attempted": optimizer_attempted,
+                        "reason": reason,
+                        "optimizer_result": optimizer_result,
+                    }
+                    self.step_records.append(record)
+                    if timing_before is not None:
+                        record["timing"] = self._phase_timer.since(timing_before)
+                    if step_callback is not None:
+                        step_callback(deepcopy(record))
+                    idx = next_idx
+                else:
+                    raise ValueError("PepsOptimizer supports one- and two-site gates only.")
+            except BoundaryAccuracyError as failure:
+                if growth is None:
+                    raise
+                self.state = retry_state
+                two_site_count = retry_two_site_count
+                try:
+                    caps = self._increase_boundary_chi(failure, retry_state, **retry_context)
+                except BoundaryChiLimitError:
+                    if pbar is not None:
+                        pbar.close()
+                    raise
+                normalize_chi = None if uncapped_normalization else caps[0]
+                evaluation_chi = None if uncapped_evaluation else caps
+                normalize_kwargs = {**(normalize_kwargs or {}), 'chi': normalize_chi}
+                sweep_kwargs = {**(sweep_kwargs or {}), 'chi': caps}
+                continue
+
+            if growth is not None:
+                growth_batch_events_start = len(growth.events)
             self.last_result = {
                 "step": int(record_step),
                 "where": record_where,
@@ -3759,6 +3755,38 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         refinement. Their accumulated product is a diagnostic, not global fidelity.
         """
         return list(self.step_records)
+
+    def get_boundary_growth(self):
+        """Return retained caps, hard limits and every failure-triggered request."""
+        growth = self._boundary_growth
+        return (None if growth is None else {
+            'chi': growth.chi, 'max_chi': growth.max_chi,
+            'events': deepcopy(growth.events),
+        })
+
+    def _increase_boundary_chi(self, failure, snapshot, **context):
+        """Restore the failed attempt and report the same policy at every entry."""
+        self.state = snapshot
+        self._strip_guess_boundaries = None
+        try:
+            caps = self._active_boundary_growth.increase(failure, **context)
+        except BoundaryChiLimitError as limit:
+            self.last_result = {'step': context.get('step'), 'state': self.state,
+                                'reason': 'boundary_chi_limit', 'boundary_growth': limit.report}
+            raise
+        self.boundary_chi = caps
+        return caps
+
+    def _get_sweep_contraction_optimizer(self):
+        """Reuse expression planning across gate batches and replay calls."""
+        if self._sweep_local_contraction_opt is None:
+            self._sweep_local_contraction_opt = build_optimizer(progbar=False)
+        return self._sweep_local_contraction_opt
+
+    @staticmethod
+    def _make_sweep_optimizer(**kwargs):
+        """Build the shared fitter while preserving the driver injection point."""
+        return SweepOptimizer(**kwargs)
 
     def get_boundary_convergence(self):
         """Return scalar probe records from this run and the retained cap floor."""

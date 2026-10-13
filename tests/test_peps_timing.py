@@ -16,6 +16,7 @@ def make_optimizer():
     gate = np.diag(np.exp(-.2j * np.array([1., -1., -1., 1.])))
     return PepsOptimizer(
         state, [(gate, ((0, 0), (0, 1)))], chi=1,
+        optimizer='nlopt',
         optimizer_options={"maxeval": 4},
         sweep_optimize_kwargs={"n_round_trips": 1}, boundary_convergence=False,
     )

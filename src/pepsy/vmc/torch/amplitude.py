@@ -559,7 +559,7 @@ class TorchPEPSAmplitude:
         strict=False,
         compile_log=True,
     ):
-        """Export, batch, and compile the exact PEPS amplitude closure.
+        """Export, batch, and compile a fixed-rank PEPS amplitude closure.
 
         This follows the GPU VMC pipeline used by the reference
         ``vmc_torch`` implementation: export one configuration with
@@ -574,8 +574,10 @@ class TorchPEPSAmplitude:
         ``torch.compile``, but the default is static to match compiled GPU
         sampling.
 
-        Only ``contraction="exact"`` is supported. Approximate boundary,
-        CTMRG, and HOTRG paths retain their existing eager/vmap policies. The
+        Exact contraction supports compiled gradients. Rank-only
+        (``cutoff=0``) boundary MPS supports compiled inference; derivatives
+        retain the original contraction and its selected stabilized VJPs,
+        which torch.export does not preserve. CTMRG/HOTRG stay eager/vmap. The
         native ``graded_torch`` projector likewise keeps its own fixed-shape
         route.
 
@@ -604,10 +606,12 @@ class TorchPEPSAmplitude:
             This model, for setup chaining.
         """
         torch = _require_torch()
-        if self.contraction != "exact":
+        if self.contraction not in {"exact", "boundary"} or (
+            self.contraction == "boundary" and self.cutoff != 0.
+        ):
             raise ValueError(
-                "export_and_compile currently supports contraction='exact' "
-                "only; keep approximate PEPS paths on eager/vmap evaluation."
+                "export_and_compile supports exact contraction or boundary "
+                "contraction with cutoff=0; keep other paths on eager/vmap evaluation."
             )
         if self.graded_torch:
             raise ValueError(
@@ -714,7 +718,7 @@ class TorchPEPSAmplitude:
             except Exception as error:
                 name = "log-amplitude" if log else "amplitude"
                 raise RuntimeError(
-                    f"Could not export and compile the exact PEPS {name} "
+                    f"Could not export and compile the PEPS {name} "
                     "closure. Try strict=False, backend='eager' for a "
                     "diagnostic, or retain the ordinary vmap/serial path."
                 ) from error
@@ -741,8 +745,11 @@ class TorchPEPSAmplitude:
         self._compiled_backend = backend
         return self
 
-    def compiled_forward(self, configs):
+    def compiled_forward(self, configs, params=None):
         """Evaluate a fixed-size batch through the compiled graph."""
+        if self.contraction != "exact" and _require_torch().is_grad_enabled():
+            raise RuntimeError("Compiled boundary amplitudes require torch.no_grad(); "
+                               "use forward(..., params=...) for stabilized derivatives.")
         if self._compiled_amplitude_forward is None:
             raise RuntimeError(
                 "No compiled amplitude graph is available; call "
@@ -762,11 +769,14 @@ class TorchPEPSAmplitude:
         self.last_amplitude_batching = "export-vmap-compile"
         return self._compiled_amplitude_forward(
             configs,
-            *list(self.params),
+            *list(self.params if params is None else params),
         )
 
-    def compiled_forward_log(self, configs):
+    def compiled_forward_log(self, configs, params=None):
         """Evaluate stable ``(phase, log_abs)`` through the compiled graph."""
+        if self.contraction != "exact" and _require_torch().is_grad_enabled():
+            raise RuntimeError("Compiled boundary log amplitudes require torch.no_grad(); "
+                               "use forward_log(..., params=...) for stabilized derivatives.")
         if self._compiled_log_amplitude_forward is None:
             raise RuntimeError(
                 "No compiled log-amplitude graph is available; call "
@@ -786,7 +796,7 @@ class TorchPEPSAmplitude:
         self.last_amplitude_batching = "export-vmap-compile-log"
         return self._compiled_log_amplitude_forward(
             configs,
-            *list(self.params),
+            *list(self.params if params is None else params),
         )
 
     def _params_pytree(self, params=None):
@@ -1190,12 +1200,12 @@ class TorchPEPSAmplitude:
             ])
 
         if (
-            params is None
-            and chunk_size is None
+            chunk_size is None
             and self._compiled_amplitude_forward is not None
             and configs.shape[0] == self._compiled_batch_size
+            and (self.contraction == "exact" or (params is None and not torch.is_grad_enabled()))
         ):
-            return self.compiled_forward(configs)
+            return self.compiled_forward(configs, params=params)
 
         if self.graded_torch:
             self.last_amplitude_batching = (
@@ -1222,11 +1232,12 @@ class TorchPEPSAmplitude:
         """Return ``(phase, log_abs)`` for a batch of configurations."""
         configs = _as_long_matrix(configs)
         if (
-            params is None
-            and self._compiled_log_amplitude_forward is not None
+            self._compiled_log_amplitude_forward is not None
             and configs.shape[0] == self._compiled_batch_size
+            and (self.contraction == "exact" or
+                 (params is None and not _require_torch().is_grad_enabled()))
         ):
-            return self.compiled_forward_log(configs)
+            return self.compiled_forward_log(configs, params=params)
         if self.graded_torch:
             torch = _require_torch()
             amp = self.forward(configs, params=params)

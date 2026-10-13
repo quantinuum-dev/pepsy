@@ -34,7 +34,38 @@ control bra/ket absorption order (default `("KET", "BRA")`). Use
 `mode="mps", mode_="direct"` for Quimb direct boundary compression, or retain
 `mode_="mps"`. These are differentiable Quimb contractions, separate from
 Pepsy's iterative boundary FIT solver.
-For split-gate targets, MPS contractions temporarily combine factors within
+
+`mode="direct"` instead uses Pepsy's existing `contract_layered` worker with
+`fit_mode="direct", fit_layer_mode="sequential"`. It absorbs and compresses
+each tagged layer separately through Quimb's 1D compressor, retaining the
+backend scalar for Quimb `TNOptimizer` autodiff. `direction="y"` selects
+column boundaries; `"x"` selects rows. This mode does not precombine the
+operator and input ket into one effective site tensor. Its efficiency relative
+to native Quimb boundaries has not been benchmarked.
+
+For an explicit lazy PEPO target, give the operator factors the `PEPO` tag
+and pass `overlap_layer_tags=("BRA", "PEPO", "KET")`. `layer_tags` continues
+to control the two-layer candidate norm. The overlap-specific setting retains
+disjoint operator/ket layers instead of grouping the PEPO into the ket before
+compression; its ordered tags must be distinct, include `BRA` and `KET`, and
+reference existing target layers. Use `chi=(chi_norm, chi_overlap)` with a
+larger overlap cap for the extra operator layer. Both inputs remain unchanged.
+
+```python
+U = U.copy()
+U.add_tag("PEPO")
+target = U.apply(old_state, contract=False)
+fit = GlobalOptimizer(guess, target, chi=(chi_norm, chi_overlap),
+                      target_norm=measured_target_norm)
+out = fit.optimize(
+    n=100, optimizer="L-BFGS-B", autodiff_backend="torch", normalize=False,
+    loss_kwargs={"mode": "direct", "direction": "y", "cutoff": 0.,
+                 "layer_tags": ("BRA", "KET"),
+                 "overlap_layer_tags": ("BRA", "PEPO", "KET")},
+)
+```
+
+For split-gate targets, native MPS contractions temporarily combine factors within
 each site and layer exactly. Loss and norm evaluation preserve the caller's
 tensor data, tags, and index names; this preparation can enlarge temporary
 site tensors while retaining gradients.

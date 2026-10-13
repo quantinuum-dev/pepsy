@@ -1,0 +1,531 @@
+{
+  "description": "4x4 D=3 full bond-2 TFIM PEPO, dt=0.1, complex128 NumPy, cutoff=0, one outer round trip per axis, local defaults, one BLAS thread; timings observational, some runs overlapped",
+  "runs": {
+    "live": [
+      {
+        "event": "setup",
+        "elapsed": 2.4570035748183727e-06,
+        "shape": [
+          4,
+          4
+        ],
+        "D": 3,
+        "seed": 20261013,
+        "caps": [
+          18,
+          72
+        ],
+        "cutoff": 0.0,
+        "initial": "random"
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 23.66172184800962,
+        "step": 1,
+        "PEPS_D": 3,
+        "caps": [
+          18,
+          72
+        ],
+        "reason": "optimized",
+        "pre_infidelity": 0.21092565597783264,
+        "reported_infidelity": 0.1002500498274077,
+        "dense_step_infidelity": 0.10787218686034128,
+        "dense_circuit_infidelity": 0.10787218686034139,
+        "dense_squared_norm": 1.0077551034056844,
+        "growth": {
+          "chi": [
+            18,
+            72
+          ],
+          "max_chi": [
+            144,
+            576
+          ],
+          "events": []
+        },
+        "timing": {
+          "seconds": {
+            "normalization": 0.18021352899086196,
+            "fidelity": 2.0044576580112334,
+            "sweep": 21.16603223599668
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 23.508631876000436,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 24.65366727601213,
+        "step": 1,
+        "caps": [
+          18,
+          72
+        ],
+        "infidelity": 0.10102280305482869,
+        "dense_error": -0.006849383805512588
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 25.97780890201102,
+        "step": 1,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 0.10675597418867344,
+        "dense_error": -0.0011162126716678378
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 28.580534758002614,
+        "step": 1,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 0.10787619918293623,
+        "dense_error": 4.0123225949484365e-06
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 34.21009481701185,
+        "step": 1,
+        "caps": [
+          144,
+          576
+        ],
+        "infidelity": 0.10787218686034128,
+        "dense_error": 0.0
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 58.43937368399929,
+        "step": 2,
+        "PEPS_D": 3,
+        "caps": [
+          18,
+          72
+        ],
+        "reason": "optimized",
+        "pre_infidelity": 0.1748095108899922,
+        "reported_infidelity": 0.08058588846123205,
+        "dense_step_infidelity": 0.10064044482076273,
+        "dense_circuit_infidelity": 0.33618230794274384,
+        "dense_squared_norm": 1.015075103615454,
+        "growth": {
+          "chi": [
+            18,
+            72
+          ],
+          "max_chi": [
+            144,
+            576
+          ],
+          "events": []
+        },
+        "timing": {
+          "seconds": {
+            "normalization": 0.16402997900149785,
+            "fidelity": 2.03344334900612,
+            "sweep": 21.885411685987492
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 24.169389838993084,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 59.48354672500864,
+        "step": 2,
+        "caps": [
+          18,
+          72
+        ],
+        "infidelity": 0.08757725780281556,
+        "dense_error": -0.013063187017947175
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 60.874048847006634,
+        "step": 2,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 0.09932836417478397,
+        "dense_error": -0.0013120806459787637
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 63.497637603999465,
+        "step": 2,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 0.10064234890433221,
+        "dense_error": 1.9040835694816849e-06
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 69.17132429601043,
+        "step": 2,
+        "caps": [
+          144,
+          576
+        ],
+        "infidelity": 0.10064044482075252,
+        "dense_error": -1.021405182655144e-14
+      }
+    ],
+    "fixed81": [
+      {
+        "event": "setup",
+        "elapsed": 3.497989382594824e-06,
+        "shape": [
+          4,
+          4
+        ],
+        "D": 3,
+        "seed": 20261013,
+        "caps": [
+          81,
+          324
+        ],
+        "cutoff": 0.0,
+        "initial": "random"
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 109.34478823399695,
+        "step": 1,
+        "PEPS_D": 3,
+        "caps": [
+          81,
+          324
+        ],
+        "reason": "optimized",
+        "pre_infidelity": 0.2128056846510491,
+        "reported_infidelity": 0.09971974637334657,
+        "dense_step_infidelity": 0.09971974637335268,
+        "dense_circuit_infidelity": 0.09971974637335268,
+        "dense_squared_norm": 0.9999999999999999,
+        "growth": null,
+        "timing": {
+          "seconds": {
+            "normalization": 0.31495751699549146,
+            "fidelity": 6.209343537004315,
+            "sweep": 102.32882512800279
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 109.13613943799282,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 110.68769291100034,
+        "step": 1,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 0.0998679820644397,
+        "dense_error": 0.0001482356910870175
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 113.40527552999265,
+        "step": 1,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 0.0997262777346355,
+        "dense_error": 6.531361282813286e-06
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 117.68658350298938,
+        "step": 1,
+        "caps": [
+          81,
+          324
+        ],
+        "infidelity": 0.09971974637334602,
+        "dense_error": -6.661338147750939e-15
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 226.75677323999116,
+        "step": 2,
+        "PEPS_D": 3,
+        "caps": [
+          81,
+          324
+        ],
+        "reason": "optimized",
+        "pre_infidelity": 0.18597614119329053,
+        "reported_infidelity": 0.09059575979975132,
+        "dense_step_infidelity": 0.09059575979975654,
+        "dense_circuit_infidelity": 0.31356474053771777,
+        "dense_squared_norm": 1.0000000000000002,
+        "growth": null,
+        "timing": {
+          "seconds": {
+            "normalization": 0.2424410249950597,
+            "fidelity": 5.916953607011237,
+            "sweep": 102.7076010969904
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 109.00141161699139,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 228.02719460699882,
+        "step": 2,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 0.09092273432423514,
+        "dense_error": 0.0003269745244786071
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 230.62199562299065,
+        "step": 2,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 0.09059749614277357,
+        "dense_error": 1.7363430170336258e-06
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 233.52892518098815,
+        "step": 2,
+        "caps": [
+          81,
+          324
+        ],
+        "infidelity": 0.09059575979974965,
+        "dense_error": -6.8833827526759706e-15
+      }
+    ],
+    "growth": [
+      {
+        "event": "setup",
+        "elapsed": 3.3760006772354245e-06,
+        "shape": [
+          4,
+          4
+        ],
+        "D": 3,
+        "seed": 20261013,
+        "caps": [
+          1,
+          2
+        ],
+        "cutoff": 0.0,
+        "initial": "random"
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 30.238258356999722,
+        "step": 1,
+        "PEPS_D": 3,
+        "caps": [
+          16,
+          32
+        ],
+        "reason": "optimized",
+        "pre_infidelity": 0.20978213018616165,
+        "reported_infidelity": 0.1008474317386664,
+        "dense_step_infidelity": 0.10850678624557752,
+        "dense_circuit_infidelity": 0.10850678624557741,
+        "dense_squared_norm": 1.0075357846538788,
+        "growth": {
+          "chi": [
+            16,
+            32
+          ],
+          "max_chi": [
+            144,
+            576
+          ],
+          "events": [
+            {
+              "run": 1,
+              "step": 1,
+              "raw_infidelity": -0.2597125182995226,
+              "attribution": "ambiguous_norm_or_overlap",
+              "stage": "evaluation",
+              "reason": "invalid_fidelity",
+              "components": [
+                "norm",
+                "overlap"
+              ],
+              "old_chi": [
+                1,
+                2
+              ],
+              "required_chi": [
+                2,
+                4
+              ],
+              "max_chi": [
+                144,
+                576
+              ],
+              "status": "increased",
+              "new_chi": [
+                2,
+                4
+              ]
+            },
+            {
+              "run": 1,
+              "step": 1,
+              "axis": "y",
+              "index": 0,
+              "stage": "local_als",
+              "reason": "invalid_normalized_overlap",
+              "components": [
+                "norm",
+                "overlap"
+              ],
+              "old_chi": [
+                2,
+                4
+              ],
+              "required_chi": [
+                4,
+                8
+              ],
+              "max_chi": [
+                144,
+                576
+              ],
+              "status": "increased",
+              "new_chi": [
+                4,
+                8
+              ]
+            },
+            {
+              "run": 1,
+              "step": 1,
+              "raw_infidelity": -0.007953247353097881,
+              "attribution": "ambiguous_norm_or_overlap",
+              "stage": "evaluation",
+              "reason": "invalid_fidelity",
+              "components": [
+                "norm",
+                "overlap"
+              ],
+              "old_chi": [
+                4,
+                8
+              ],
+              "required_chi": [
+                8,
+                16
+              ],
+              "max_chi": [
+                144,
+                576
+              ],
+              "status": "increased",
+              "new_chi": [
+                8,
+                16
+              ]
+            },
+            {
+              "run": 1,
+              "step": 1,
+              "axis": "x",
+              "index": 1,
+              "stage": "local_als",
+              "reason": "invalid_normalized_overlap",
+              "components": [
+                "norm",
+                "overlap"
+              ],
+              "old_chi": [
+                8,
+                16
+              ],
+              "required_chi": [
+                16,
+                32
+              ],
+              "max_chi": [
+                144,
+                576
+              ],
+              "status": "increased",
+              "new_chi": [
+                16,
+                32
+              ]
+            }
+          ]
+        },
+        "timing": {
+          "seconds": {
+            "normalization": 0.6186317210231209,
+            "fidelity": 3.3664210209826706,
+            "sweep": 25.49323790500057
+          },
+          "calls": {
+            "normalization": 6,
+            "fidelity": 6,
+            "sweep": 3
+          },
+          "total_seconds": 30.033176830998855,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 33.58429945699754,
+        "step": 1,
+        "caps": [
+          81,
+          324
+        ],
+        "infidelity": 0.1085067862455712,
+        "dense_error": -6.328271240363392e-15
+      }
+    ]
+  }
+}

@@ -9,6 +9,7 @@ import warnings
 
 
 _SYMBOL_MODULES = {
+    "BoundaryChiLimitError": "._boundary_control",
     "EnergyEstimate": ".energy",
     "MpsEnergyOptimizer": ".energy",
     "PepsEnergyOptimizer": ".energy",

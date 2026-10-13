@@ -68,6 +68,8 @@ from .results import (
 )
 from .sampler import TorchBPMetropolisSampler, TorchMetropolisSampler, metropolis_local_sampler
 from .sr import TorchSRResult, apply_torch_sr_update, solve_torch_sr, torch_log_derivative_matrix
+from .tdvp import (TorchTDVPDriver, TorchTDVPResult, TorchTDVPStepResult,
+                   solve_torch_tdvp, torch_peps_gauge_vectors)
 
 __all__ = [
     "FermionSiteEncoding",
@@ -99,6 +101,11 @@ __all__ = [
     "TorchVMCStepResult",
     "TorchVMCWarmupResult",
     "TorchSRResult",
+    "TorchTDVPDriver",
+    "TorchTDVPResult",
+    "TorchTDVPStepResult",
+    "solve_torch_tdvp",
+    "torch_peps_gauge_vectors",
     "TorchSquareLattice",
     "apply_torch_sr_update",
     "benchmark_torch_amplitudes",

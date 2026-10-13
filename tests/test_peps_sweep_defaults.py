@@ -1,4 +1,4 @@
-"""Public sweep defaults select fixed strip ALS without recipe overrides."""
+"""Public strip ALS defaults keep healthy fits free of cap searches."""
 
 from unittest.mock import patch
 
@@ -145,6 +145,7 @@ def test_invalid_strip_losses_retain_warm_start(measure, accept_if_improved, fin
     state, gate = inputs(shape=(2, 3))
     gates = [(gate, ((0, 1), (1, 1)))]
     kwargs = dict(chi=2, fit_mode='direct', contraction_opt='greedy',
+                  boundary_convergence=False,
                   sweep_optimize_kwargs={'n_round_trips': 0, 'compute_final_loss': final_metric})
     warm = PepsOptimizer(state, gates, **kwargs).run(
         optimize=False, measure_infidelity=measure)

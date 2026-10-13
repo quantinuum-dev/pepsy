@@ -2024,6 +2024,7 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
     visualize=False,
     strip_exponent=False,
     return_info=False,
+    preserve_backend=False,
     cutoff=1.0e-12,
     equalize_norms=False,
 ):
@@ -2065,6 +2066,9 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
         when the explicitly tagged layers are mathematically interchangeable.
     fit_init_strategy : {"direct", "guess-direct", "guess-src", "guess-sdc", "auto"}, default="direct"
         Disposable initial boundary guess used by FIT modes.
+    preserve_backend : bool, default=False
+        Return the backend scalar (or scaled scalar pair) without converting
+        it to Python complex. Use this to retain gradients in an optimizer loss.
     strip_exponent : bool, default=False
         If ``True``, return the scalar as ``(mantissa, exponent)``.
     return_info : bool, default=False
@@ -2124,7 +2128,10 @@ def contract_layered(  # pylint: disable=too-many-arguments,too-many-positional-
         bdy_name="bdy",
         flat=False,
     )
-    cost = _format_scaled_output(result.cost, strip_exponent=strip_exponent)
+    # Formatting converts to Python complex. Optimizer losses need the raw
+    # scalar so reverse-mode differentiation still reaches the boundary data.
+    cost = (result.cost if preserve_backend else
+            _format_scaled_output(result.cost, strip_exponent=strip_exponent))
     if return_info:
         return replace(result, cost=cost)
     return cost

@@ -2739,6 +2739,17 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             t_opt = time.perf_counter() - t0
 
+            # No additional contraction: ALS already tested this fixed-cut
+            # objective. Replay owns rollback and a bounded higher-cap retry.
+            if (run_info is not None and getattr(self, '_boundary_growth', None) is not None
+                    and run_info.get('boundary_failure') is not None):
+                from .._boundary_control import BoundaryAccuracyError
+                failure = run_info['boundary_failure']
+                raise BoundaryAccuracyError(
+                    failure['reason'], components=failure['components'],
+                    axis=axis, index=index, stage='local_als',
+                )
+
             if uses_quimb:
                 t0 = time.perf_counter()
                 self._update_quimb_double_layer_slice(

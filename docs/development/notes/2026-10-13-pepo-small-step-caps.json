@@ -1,0 +1,497 @@
+{
+  "description": "4x4 PEPS cap D=3, product plus startup, full TFIM PEPO D=2, dt=0.01, J=h=1, cutoff=0, fixed boundary caps, three steps to t=0.03, same fit budgets as prior random-state probe",
+  "runs": {
+    "18": [
+      {
+        "event": "setup",
+        "elapsed": 2.529006451368332e-06,
+        "shape": [
+          4,
+          4
+        ],
+        "D": 3,
+        "seed": 20261013,
+        "caps": [
+          18,
+          72
+        ],
+        "cutoff": 0.0,
+        "initial": "plus"
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 0.8899225110071711,
+        "step": 1,
+        "PEPS_D": 2,
+        "caps": [
+          18,
+          72
+        ],
+        "reason": "optimized",
+        "pre_infidelity": 5.662137425588298e-15,
+        "reported_infidelity": 4.551914400963142e-15,
+        "dense_step_infidelity": -2.220446049250313e-16,
+        "dense_circuit_infidelity": -2.220446049250313e-16,
+        "dense_squared_norm": 1.0000000000000004,
+        "growth": null,
+        "timing": {
+          "seconds": {
+            "normalization": 0.1886258829908911,
+            "fidelity": 0.26847366501169745,
+            "sweep": 0.24478399399959017
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 0.7682807969977148,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 1.020719067993923,
+        "step": 1,
+        "caps": [
+          18,
+          72
+        ],
+        "infidelity": 4.551914400963142e-15,
+        "dense_error": 4.773959005888173e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 1.175964321999345,
+        "step": 1,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 4.551914400963142e-15,
+        "dense_error": 4.773959005888173e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 1.3971737940009916,
+        "step": 1,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 4.551914400963142e-15,
+        "dense_error": 4.773959005888173e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 1.6398363150074147,
+        "step": 1,
+        "caps": [
+          81,
+          324
+        ],
+        "infidelity": 4.551914400963142e-15,
+        "dense_error": 4.773959005888173e-15
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 2.9658855559973745,
+        "step": 2,
+        "PEPS_D": 3,
+        "caps": [
+          18,
+          72
+        ],
+        "reason": "optimizer_rejected",
+        "pre_infidelity": 9.282574708890934e-13,
+        "reported_infidelity": 9.282574708890934e-13,
+        "dense_step_infidelity": 9.241496456979803e-13,
+        "dense_circuit_infidelity": 9.243716903029053e-13,
+        "dense_squared_norm": 1.0000000000000033,
+        "growth": null,
+        "timing": {
+          "seconds": {
+            "normalization": 0.17641339199326467,
+            "fidelity": 0.5726842260046396,
+            "sweep": 0.4614279770030407
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 1.2740011129935738,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 3.24899276799988,
+        "step": 2,
+        "caps": [
+          18,
+          72
+        ],
+        "infidelity": 9.29256671611256e-13,
+        "dense_error": 5.10702591327572e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 3.739068203998613,
+        "step": 2,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 9.282574708890934e-13,
+        "dense_error": 4.107825191113079e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 4.582270982005866,
+        "step": 2,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 9.282574708890934e-13,
+        "dense_error": 4.107825191113079e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 5.509310048000771,
+        "step": 2,
+        "caps": [
+          81,
+          324
+        ],
+        "infidelity": 9.279244039817058e-13,
+        "dense_error": 3.774758283725532e-15
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 9.056898809998529,
+        "step": 3,
+        "PEPS_D": 3,
+        "caps": [
+          18,
+          72
+        ],
+        "reason": "optimizer_rejected",
+        "pre_infidelity": 3.566535955457084e-11,
+        "reported_infidelity": 3.566535955457084e-11,
+        "dense_step_infidelity": 3.56565887926763e-11,
+        "dense_circuit_infidelity": 4.6162851319309084e-11,
+        "dense_squared_norm": 0.9999999999999981,
+        "growth": null,
+        "timing": {
+          "seconds": {
+            "normalization": 0.16329419901012443,
+            "fidelity": 1.9968574510130566,
+            "sweep": 1.2442971810087329
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 3.492413582003792,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 10.066954195004655,
+        "step": 3,
+        "caps": [
+          18,
+          72
+        ],
+        "infidelity": 3.5668690223644717e-11,
+        "dense_error": 1.2101430968414206e-14
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 11.392095698000048,
+        "step": 3,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 3.5668690223644717e-11,
+        "dense_error": 1.2101430968414206e-14
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 13.98688385800051,
+        "step": 3,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 3.566891226824964e-11,
+        "dense_error": 1.2323475573339238e-14
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 16.918651875006617,
+        "step": 3,
+        "caps": [
+          81,
+          324
+        ],
+        "infidelity": 3.5666358755293004e-11,
+        "dense_error": 9.769962616701378e-15
+      }
+    ],
+    "36": [
+      {
+        "event": "setup",
+        "elapsed": 2.586995833553374e-06,
+        "shape": [
+          4,
+          4
+        ],
+        "D": 3,
+        "seed": 20261013,
+        "caps": [
+          36,
+          144
+        ],
+        "cutoff": 0.0,
+        "initial": "plus"
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 1.0571841330092866,
+        "step": 1,
+        "PEPS_D": 2,
+        "caps": [
+          36,
+          144
+        ],
+        "reason": "optimized",
+        "pre_infidelity": 5.662137425588298e-15,
+        "reported_infidelity": 4.551914400963142e-15,
+        "dense_step_infidelity": -2.220446049250313e-16,
+        "dense_circuit_infidelity": -2.220446049250313e-16,
+        "dense_squared_norm": 1.0000000000000004,
+        "growth": null,
+        "timing": {
+          "seconds": {
+            "normalization": 0.18870792401139624,
+            "fidelity": 0.31492635200265795,
+            "sweep": 0.3693026349938009
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 0.9383228999940911,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 1.1860789409984136,
+        "step": 1,
+        "caps": [
+          18,
+          72
+        ],
+        "infidelity": 4.551914400963142e-15,
+        "dense_error": 4.773959005888173e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 1.3414252869988559,
+        "step": 1,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 4.551914400963142e-15,
+        "dense_error": 4.773959005888173e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 1.5678167949954513,
+        "step": 1,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 4.551914400963142e-15,
+        "dense_error": 4.773959005888173e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 1.8095343690074515,
+        "step": 1,
+        "caps": [
+          81,
+          324
+        ],
+        "infidelity": 4.551914400963142e-15,
+        "dense_error": 4.773959005888173e-15
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 4.426870108000003,
+        "step": 2,
+        "PEPS_D": 3,
+        "caps": [
+          36,
+          144
+        ],
+        "reason": "optimizer_rejected",
+        "pre_infidelity": 9.272582701669307e-13,
+        "reported_infidelity": 9.272582701669307e-13,
+        "dense_step_infidelity": 9.241496456979803e-13,
+        "dense_circuit_infidelity": 9.243716903029053e-13,
+        "dense_squared_norm": 1.0000000000000033,
+        "growth": null,
+        "timing": {
+          "seconds": {
+            "normalization": 0.18418354899040423,
+            "fidelity": 0.946204250009032,
+            "sweep": 1.3714564950059867
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 2.565484998995089,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 4.717947509998339,
+        "step": 2,
+        "caps": [
+          18,
+          72
+        ],
+        "infidelity": 9.29256671611256e-13,
+        "dense_error": 5.10702591327572e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 5.192644042996108,
+        "step": 2,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 9.282574708890934e-13,
+        "dense_error": 4.107825191113079e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 6.022439706008299,
+        "step": 2,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 9.282574708890934e-13,
+        "dense_error": 4.107825191113079e-15
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 6.931044989003567,
+        "step": 2,
+        "caps": [
+          81,
+          324
+        ],
+        "infidelity": 9.279244039817058e-13,
+        "dense_error": 3.774758283725532e-15
+      },
+      {
+        "event": "fit_complete",
+        "elapsed": 12.145735525002237,
+        "step": 3,
+        "PEPS_D": 3,
+        "caps": [
+          36,
+          144
+        ],
+        "reason": "optimizer_rejected",
+        "pre_infidelity": 3.566535955457084e-11,
+        "reported_infidelity": 3.566535955457084e-11,
+        "dense_step_infidelity": 3.56565887926763e-11,
+        "dense_circuit_infidelity": 4.6162851319309084e-11,
+        "dense_squared_norm": 0.9999999999999981,
+        "growth": null,
+        "timing": {
+          "seconds": {
+            "normalization": 0.1742697839945322,
+            "fidelity": 2.6184160810225876,
+            "sweep": 2.2750517999957083
+          },
+          "calls": {
+            "normalization": 2,
+            "fidelity": 2,
+            "sweep": 1
+          },
+          "total_seconds": 5.160078767003142,
+          "status": "complete",
+          "synchronized": false
+        }
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 13.165993155998876,
+        "step": 3,
+        "caps": [
+          18,
+          72
+        ],
+        "infidelity": 3.5668690223644717e-11,
+        "dense_error": 1.2101430968414206e-14
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 14.47279807200539,
+        "step": 3,
+        "caps": [
+          36,
+          144
+        ],
+        "infidelity": 3.5668690223644717e-11,
+        "dense_error": 1.2101430968414206e-14
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 17.016842523997184,
+        "step": 3,
+        "caps": [
+          72,
+          288
+        ],
+        "infidelity": 3.566891226824964e-11,
+        "dense_error": 1.2323475573339238e-14
+      },
+      {
+        "event": "metric_complete",
+        "elapsed": 19.826053395998315,
+        "step": 3,
+        "caps": [
+          81,
+          324
+        ],
+        "infidelity": 3.5666358755293004e-11,
+        "dense_error": 9.769962616701378e-15
+      }
+    ]
+  }
+}

@@ -20,6 +20,13 @@ The evaluator captures only the supplied ansatz and contraction settings;
 it does not own sampler state, observables, or optimizer updates. JAX/NetKet
 remain optional and are resolved by the existing requirement helpers.
 
+`make_netket_tdvp_driver` reuses the upstream QGT and ODE machinery.
+`NetKetTDVPDriver` synchronizes accepted integrator parameters into the setup
+after native Runge--Kutta stages. The Ising builder and Flax amplitude model
+support real/imaginary coordinate trees; the existing inverse packer rebuilds
+their complex tensor leaves for `to_peps`. The default reverse-mode QGT avoids
+JVPs through custom-VJP compression. See the [time-evolution API](../../api/vmc.md#netket-peps-time-evolution).
+
 ## Torch implementation
 
 The Torch VMC package keeps the public surface in
@@ -31,6 +38,9 @@ The Torch VMC package keeps the public surface in
 - `amplitude.py`: physically-owned PEPS amplitude models, boundary reuse, and
   connected-configuration batching
 - `sr.py`: physically-owned log derivatives and stochastic reconfiguration
+- `tdvp.py`: fixed-shape real-time integration, analytic dense-PEPS gauge
+  vectors, projected direct TDVP, holomorphic uncentered minSR and explicit
+  real/imaginary coordinate dynamics for truncated amplitudes
 - `metadata.py`: physically-owned PEPS/Fermion layout, basis, and sector
   inference
 - `connections.py`: physically-owned operator-to-connection compilation

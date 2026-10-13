@@ -330,7 +330,8 @@ def _optimize_slice(owner, index, *, axis, controls):
         log_target = _log_norm(owner.target_norm, roundoff)
     except ValueError:
         return {**report, 'loss_initial': float('nan'), 'loss_final': None,
-                'loss_best': None, 'invalid_loss': True, 'rejection_reason': 'invalid_initial_loss'}
+                'loss_best': None, 'invalid_loss': True, 'rejection_reason': 'invalid_initial_loss',
+                'boundary_failure': {'reason': 'invalid_norm', 'components': ('norm',)}}
     norm.exponent -= log_norm
     overlap.exponent -= .5 * (log_norm + log_target)
     rcond = controls['rcond']
@@ -349,7 +350,9 @@ def _optimize_slice(owner, index, *, axis, controls):
         initial = score()
     except ValueError:
         return {**report, 'loss_initial': float('nan'), 'loss_final': None,
-                'loss_best': None, 'invalid_loss': True, 'rejection_reason': 'invalid_initial_loss'}
+                'loss_best': None, 'invalid_loss': True, 'rejection_reason': 'invalid_initial_loss',
+                'boundary_failure': {'reason': 'invalid_normalized_overlap',
+                                     'components': ('norm', 'overlap')}}
     best = initial
     report.update(loss_initial=max(0., initial), raw_loss_initial=initial,
                   history=[initial], best_history=[max(0., initial)],

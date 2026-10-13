@@ -122,6 +122,66 @@ Lower-level functions such as `pack_peps_ansatz(...)`,
 `make_peps_batched_amplitude_function(...)`, and `make_netket_vmc_driver(...)`
 remain public for custom flows and profiling.
 
+### NetKet PEPS time evolution
+
+`setup.make_tdvp_driver(...)` / `make_netket_tdvp_driver(setup, ...)` connects
+the current PEPS variational state and Hamiltonian to NetKet's experimental
+TDVP integrator. It returns `NetKetTDVPDriver`; `.native` exposes the upstream
+driver. Sampling, forces, QGT construction, linear solves and integration
+remain owned by NetKet.
+
+```python
+setup = pvmc.build_ising_vmc(
+    peps, Lx=4, Ly=4, J=-1.0, h=1.0,
+    contraction="boundary", chi=9, cutoff=0.0,
+    parameter_mode="real-imag", n_samples=256, n_chains=16,
+    chunk_size=32, use_sr=False,
+)
+dynamics = setup.make_tdvp_driver(
+    dt=0.001, t0=0.02, integrator="midpoint", diag_shift=1e-6,
+)
+dynamics.advance(0.002)
+evolved = setup.to_peps()
+```
+
+NetKet's Ising convention is `+J sum ZZ - h sum X` with Pauli matrices, so
+`J=-1` matches the TFIM PEPO example's ferromagnetic coupling. The existing
+builder's default `J` is unchanged. Keep the single-layer amplitude cap
+separate from PEPO fitting's norm/overlap caps; the values above are bounded
+development settings, not a convergence certificate.
+
+`build_ising_vmc` and `make_peps_log_amplitude_model` accept
+`parameter_mode="real-imag"`: each complex tensor leaf becomes real `real`
+and `imag` parameter leaves and is rebuilt inside the contraction. This retains
+the original tensor values, topology and native storage. The real coordinate
+mode registers the existing truncation-safe JAX SVD pullback for approximate
+contraction. An explicit `param_dtype` in this mode must be real.
+`setup.to_peps()` reconstructs the updated complex tensors from either chart.
+
+The TDVP adapter requires real parameter leaves unless `holomorphic=True` is
+explicitly selected. Exact complex PEPS contraction can use that flag;
+truncated boundary/HOTRG/CTMRG amplitudes must not be assumed holomorphic.
+The default `qgt="jacobian_dense"` uses reverse derivatives compatible with
+the compression pullback. A QGT requiring forward-mode JVPs is not compatible
+with that custom-VJP compression path.
+
+Use `advance(T)` or `iter(T, tstops=...)` on the Pepsy adapter. Iteration yields
+the requested stops and final endpoint; without `tstops`, it yields the endpoint.
+The final stop caps the last integration step, with a roundoff-level stopping
+check to prevent an extra step. At yielded stop
+times and completion it copies NetKet's accepted `integrator.y` into the
+shared state and clears cached samples. This prevents a Runge--Kutta stage
+from being mistaken for the endpoint during measurement or reconstruction.
+Calling `.native.advance(...)` bypasses this synchronization. `estimate(...)`
+delegates endpoint measurements to NetKet. Integrators are `euler`, `midpoint`
+or `rk4`; `linear_solver` accepts a native NetKet/JAX solver.
+
+[The bounded TFIM example](../../examples/tfim_netket_tdvp.py) performs dense
+PEPO startup followed by JAX/NetKet tVMC. `--reference` compares every endpoint
+with sparse-matrix exact evolution for at most 16 spins. This workflow does not
+implement the paper's optimized PEPS gauge projection or tensor-local small-o
+storage, and does not convert a dense startup to a native Z2 ansatz.
+
 ### Portable Torch / NetKet VMC façade
 
 The native Torch and NetKet entry points deliberately retain their own
@@ -405,27 +465,39 @@ never used for gradient-enabled or custom-parameter calls.
 
 ### Native Torch throughput probes and rank-sharded sampling
 
-For exact dense or flat-Z2 PEPS on a stable GPU workload, the Torch amplitude
+For dense or flat-Z2 PEPS on a stable GPU workload, the Torch amplitude
 model also has an explicit compiled path matching the
 `torch.export -> torch.vmap -> torch.compile` pipeline:
 
 ```python
 # Compile once using the same fixed number of walkers used by the sampler.
 model.export_and_compile(configs, compile_log=True)
-amplitudes = model.compiled_forward(configs)
-phase, log_abs = model.compiled_forward_log(configs)
+with torch.no_grad():
+    amplitudes = model.compiled_forward(configs)
+    phase, log_abs = model.compiled_forward_log(configs)
 ```
 
-`forward` and `forward_log` automatically use the compiled graph when their
-batch has the compiled size. During Metropolis sweeps, proposal rows are
+For exact contraction, `forward` and `forward_log`, including explicit
+functional `params=`, use the compiled graph when their batch has the compiled
+size. For rank-only boundary MPS, compilation is **inference only**, under
+`torch.no_grad()`. Gradient-enabled or functional calls retain the original
+contraction and its stabilized SVD/QR pullbacks: export removes those custom
+pullbacks, and native compiled derivatives failed a finite-difference check.
+Direct compiled boundary calls with gradients enabled raise an actionable
+error. During Metropolis sweeps, proposal rows are
 temporarily padded to that fixed size and the auxiliary results are discarded;
 this avoids recompiling for every changing subset of walkers. Parameter values
 remain explicit graph inputs, so optimizer updates do not require rebuilding
 the graph. Moving or casting the model invalidates it; call
 `export_and_compile` again afterward. This opt-in path for ordinary amplitudes
-currently supports only `contraction="exact"`; approximate CTMRG/HOTRG
-contractions retain their existing eager/vmap behavior. Boundary-MPS models
-have a separate compiled reuse path described below.
+supports `contraction="exact"` and rank-only boundary-MPS contraction with
+`cutoff=0`. CTMRG/HOTRG retain eager/vmap execution. Boundary-MPS models also
+have the separate compiled reuse path described below. The functional log
+Jacobian for exact contraction uses fixed compiled chunks and discards padded
+rows; duplicate removal therefore does not require exporting a new batch.
+Native complex-SVD backward can lack Torch's legacy-vmap `allclose` rule;
+Pepsy then retains the shared batched forward graph and uses output-wise VJPs.
+That compatibility path adds no alternative contraction algorithm.
 
 For the diagnostic `backend="eager"`, Pepsy uses the exported/vmapped graph
 directly rather than wrapping it in TorchDynamo's eager backend. This avoids a
@@ -691,6 +763,141 @@ model = pvmc.TorchPEPSBoundaryAmplitude(
 
 If a reusable cotengra search cannot produce a tree for a previously unseen
 closure, VMC emits one warning and retries that closure with `"auto-hq"`.
+
+### Fixed-bond real-time PEPS evolution
+
+After a few `PepsOptimizer.run_pepo(..., unitary=True)` steps, pass the fitted
+state to `TorchPEPSAmplitude` and build a `TorchVMCDriver` for the **same
+Hamiltonian**. `TorchTDVPDriver` then evolves complex holomorphic tensor
+parameters without changing their shapes or PEPS bond dimension $D$:
+
+$$
+{\color{blue}S}\,{\color{purple}\dot\theta}=-iF,
+\qquad S=C^\dagger W C,\quad
+F=C^\dagger W(E_{\mathrm{loc}}-\langle E_{\mathrm{loc}}\rangle).
+$$
+
+$C$ is the centered log Jacobian and $W$ contains normalized sample weights.
+Use `parameter_mode="real-imag"` when compression is actively truncating
+complex boundary tensors: truncated SVD depends on conjugate parameters and
+does not generally preserve holomorphic dependence. This explicit coordinate
+route rotates the complex force **before** projecting it onto real coordinates:
+
+$$
+{\color{blue}\operatorname{Re}S}\,{\color{purple}\dot\theta}
+=\operatorname{Im}F.
+$$
+
+Each complex tensor entry contributes interleaved real/imaginary coordinates.
+Direct TDVP and centered minSR reuse the existing doubled-real design solver.
+The default `parameter_mode="holomorphic"` retains the paper's complex chart
+and its uncentered minSR formulation.
+For actively compressed native Symmray Torch gradients, select the existing
+`TorchLinalgConfig(stabilized=True, quimb_split_drivers=True,
+qr_rank_policy="native")` policy around the run. The explicit native QR rank
+policy avoids a data-dependent diagnostic branch during graph export;
+singular charts still require independent numerical validation.
+For an existing native Torch VMC driver `vmc`:
+
+```python
+dynamics = pvmc.TorchTDVPDriver(
+    vmc, dt=0.01, t0=startup_time, integrator="midpoint",
+    method="auto", diag_shift=1e-8, parameter_mode="real-imag",
+)
+step = dynamics.step(sampling=pvmc.SamplingConfig(
+    n_samples=512, n_chains=16, n_discard_per_chain=8, sweep_size=2,
+))
+print(step.time, step.stages[-1].info["tdvp_relative_residual"])
+peps = vmc.model.to_peps()
+```
+
+Every midpoint stage resamples at its own tensor values. Alternatively pass
+`samples=...` and `proposal_log_probs=...`; importance weights are recomputed
+at both stages. Fixed `weights=...` are supported only by Euler. Stage
+estimates refer to the stage's state, rather than the final updated state.
+Failures restore tensor values and leave the recorded time unchanged; walkers
+may advance, and their amplitudes are refreshed against the restored tensors.
+
+`method="direct"` projects out dense-PEPS bond-gauge and scaling vectors
+before solving the reduced covariance system. Dependent generators are
+removed by rank-revealing SVD, so this route is intended for small reference
+systems. `gauge_projection=False` retains the existing unprojected solver.
+For holomorphic coordinates, `method="minsr"` uses the uncentered formulation of
+[Wu and Nys, Eq. (17)](https://journals.aps.org/prxquantum/pdf/10.1103/tggc-8fjx).
+With $A=W^{1/2}O$, it solves
+
+$$
+({\color{blue}AA^\dagger}+\epsilon I)y=-iW^{1/2}E_{\mathrm{loc}},
+\qquad {\color{purple}\dot\theta}=A^\dagger y.
+$$
+
+It avoids forming parameter-space gauge vectors.
+`auto` compares the number of unique sampled configurations (twice that number
+for real/imaginary coordinates) with the parameter count, choosing minSR for
+the smaller sample system. This count is a heuristic;
+sample dependencies or additional null modes can still require the shared
+pseudoinverse fallback. Repeated configurations share Jacobian rows and retain
+their aggregate weights. Diagnostics report solver, matrix shape, removed
+gauge rank, sample counts, and the **unregularized centered** TDVP residual.
+
+For TFIM use `proposal="local"`, whose lazy binary flips explore all
+magnetization sectors. The native `transverse_ising` connection helper uses
+spin-$1/2$ matrices: `J=-4*j, h=-2*h` represents
+$H=-j\sum ZZ-h\sum X$. A complete example is:
+
+```bash
+python examples/tfim_pepo.py --initial plus --steps 3 --d 2 \
+    --tvmc-steps 2 --tvmc-dt 0.01 --tvmc-chi 32
+```
+
+The tVMC amplitude cap `chi` belongs to a **single-layer** contraction and is
+independent of PEPO-fit norm/overlap caps. Startup must provide useful tensor
+ranks and sampling support; filling virtual dimensions alone is insufficient.
+Check energy, sampling, time-step and amplitude-cap convergence. This driver
+does not implement the paper's small-o memory optimization or reproduce its
+large-system results. Native Symmray analytic gauge projection remains
+unsupported: use sample-space minSR or `gauge_projection=False` there.
+
+For flat bosonic Z2 PEPS, TFIM must be expressed in the parity-preserving
+rotated basis $H=-J\sum XX-h\sum Z$. Binary `proposal="parity"` uses lazy
+edge-pair flips, preserving total charge. Flat storage needs equal sector
+sizes; the current constructor rejects odd total $D$ instead of silently
+padding it. The compiled example uses boundary MPS at `cutoff=0`:
+
+```bash
+python examples/tvmc_flat_z2.py --d 4 --chi 16 --compile-backend aot_eager
+# Ground-state SR updates first, then real-time midpoint steps:
+python examples/tvmc_flat_z2.py --optimize-steps 3 --steps 2
+# CTMRG keeps eager/vmap execution:
+python examples/tvmc_flat_z2.py --contraction ctmrg --compile-backend none
+```
+
+`aot_eager` checks graph execution without optimizing kernels; `inductor`
+requests code generation. Choose the backend explicitly and measure
+throughput separately from correctness. The dense PEPO startup example and
+this independent flat-Z2 tVMC example currently use distinct representations;
+`run_pepo` still rejects native Symmray PEPS/PEPO fits.
+
+Optimization uses the existing `TorchVMCDriver.step(sr=True, ...)` with fresh
+stage samples; `--learning-rate` and `--sr-diag-shift` set its SR update.
+Optimization records report the energy **before** each update. The subsequent
+TDVP stages use their independent time step and small regularizer. Both routes
+are validated on small systems; this does not establish the long-time,
+large-system accuracy or memory efficiency of the cited paper. The current
+driver stores a full log Jacobian and lacks the paper's small-o optimization.
+
+The [Symmray JAX GPU example](https://symmray.readthedocs.io/en/latest/examples/batch-gpu-fermionic-amplitudes-jax.html)
+uses flat equal-sector Z2 tensors, Quimb packing, `jax.jit(jax.vmap(...))`,
+HOTRG at cutoff zero, and mantissa/exponent amplitudes. Pepsy already exposes
+that workflow through `pack_fermionic_peps_ansatz` and
+`make_fermionic_peps_batched_amplitude_function`; these helpers do not require
+NetKet merely to evaluate amplitudes. The
+[JAX validation example](../../examples/flat_z2_jax_amplitudes.py) checks
+matched complex128 eager/JIT amplitudes, scaled output and a fully JIT
+real-loss gradient against finite differences, with the chosen boundary
+MPS/CTMRG/HOTRG method. Synchronize returned JAX arrays before timing and
+separate compile/warm-up cost from throughput. This example is an amplitude
+and derivative check, not a separate JAX TDVP driver.
 
 For a compact no-JIT torch loop, `TorchVMCDriver` keeps walker configurations,
 current amplitudes, Hamiltonian connection metadata, sampling, local-energy

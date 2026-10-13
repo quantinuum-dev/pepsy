@@ -9,6 +9,7 @@ from __future__ import annotations
 from pepsy._internal.quimb import call_quimb_2d
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 from numbers import Integral
 import os
 import time
@@ -29,6 +30,7 @@ __all__ = [
     "NetKetVMCConfig",
     "NetKetEtaPairObservable",
     "NetKetPEPSVMC",
+    "NetKetTDVPDriver",
     "NetKetFermiHubbardVMC",
     "NetKetVMCSetup",
     "NetKetSparseFermiHubbardVMC",
@@ -56,6 +58,7 @@ __all__ = [
     "make_fermionic_peps_batched_amplitude_function",
     "make_netket_autochunk_callback",
     "make_netket_sr_preconditioner",
+    "make_netket_tdvp_driver",
     "make_netket_vmc_driver",
     "netket_spin_orbital_columns",
     "occupation_to_phys_indices",
@@ -1046,6 +1049,10 @@ class NetKetPEPSVMC:
         This is a convenience wrapper around :func:`make_netket_vmc_driver`.
         """
         return make_netket_vmc_driver(self, **kwargs)
+
+    def make_tdvp_driver(self, **kwargs):
+        """Create NetKet time evolution sharing this setup's current state."""
+        return make_netket_tdvp_driver(self, **kwargs)
 
     def warmup(
         self,
@@ -2627,6 +2634,140 @@ def make_netket_sr_preconditioner(
     return nk.optimizer.SR(**kwargs)
 
 
+class NetKetTDVPDriver:
+    """NetKet TDVP with the shared PEPS state synchronized at accepted times.
+
+    ``native`` exposes NetKet's driver and solver controls. Use this adapter's
+    ``advance``/``iter`` methods when reconstructing the PEPS from its setup.
+    """
+
+    def __init__(self, native):
+        self.native = native
+
+    @property
+    def state(self):
+        return self.native.state
+
+    @property
+    def t(self):
+        return self.native.t
+
+    @property
+    def dt(self):
+        return self.native.dt
+
+    def _sync_state(self):
+        # NetKet's RHS mutates MCState at intermediate Runge--Kutta stages.
+        # The integrator's public y contains the accepted endpoint; leaving
+        # the stage parameters visible biases observables and PEPS handoff.
+        self.state.parameters = self.native.integrator.y
+        self.state.reset()
+
+    def iter(self, T, *, tstops=None):
+        """Yield requested stop times, including the final accepted endpoint."""
+        T = float(T)
+        if not np.isfinite(T) or T < 0:
+            raise ValueError("T must be non-negative and finite.")
+        endpoint = float(self.t) + T
+        stops = [endpoint] if tstops is None else sorted(set([*tstops, endpoint]))
+        tolerance = 8 * np.finfo(float).eps * max(1., abs(endpoint))
+        try:
+            # A final tstop caps the last native step. Stop at roundoff-level
+            # agreement too: the native strict t < t_end loop can otherwise
+            # take an extra full step after an endpoint a few ulps below t_end.
+            for time_value in self.native.iter(T, tstops=stops):
+                self._sync_state()
+                yield time_value
+                if abs(float(time_value) - endpoint) <= tolerance:
+                    break
+        finally:
+            self._sync_state()
+
+    def advance(self, T):
+        """Advance by ``T`` and leave the setup at the accepted final state."""
+        for _ in self.iter(T):
+            pass
+
+    def estimate(self, observables):
+        """Use NetKet to estimate observables at the accepted endpoint."""
+        self._sync_state()
+        return self.native.estimate(observables)
+
+
+def make_netket_tdvp_driver(
+    setup,
+    *,
+    dt,
+    integrator="midpoint",
+    t0=0.0,
+    propagation_type="real",
+    qgt="jacobian_dense",
+    diag_shift=1e-8,
+    holomorphic=False,
+    linear_solver=None,
+    linear_solver_restart=False,
+    error_norm="euclidean",
+):
+    """Connect an existing PEPS setup to NetKet's native TDVP driver.
+
+    The returned driver updates ``setup.vstate`` in place. Nonholomorphic
+    amplitudes require real parameters, e.g. ``build_ising_vmc`` with
+    ``parameter_mode='real-imag'``. Set ``holomorphic=True`` only for a
+    verified holomorphic complex ansatz, such as exact PEPS contraction.
+    This uses NetKet's QGT solve, not the paper's gauge-projected/minSR solve.
+    """
+    dt, t0, diag_shift = float(dt), float(t0), float(diag_shift)
+    if not np.isfinite(dt) or dt <= 0:
+        raise ValueError("dt must be positive and finite.")
+    if not np.isfinite(t0):
+        raise ValueError("t0 must be finite.")
+    if not np.isfinite(diag_shift) or diag_shift < 0:
+        raise ValueError("diag_shift must be non-negative and finite.")
+    nk = _require_netket()
+    jax, _ = _require_jax()
+    complex_parameters = any(
+        np.issubdtype(leaf.dtype, np.complexfloating)
+        for leaf in jax.tree_util.tree_leaves(setup.vstate.parameters)
+    )
+    # NetKet rotates the force after its VJP. A nonholomorphic complex VJP
+    # combines the two coordinate forces too early for that rotation.
+    if complex_parameters and not holomorphic:
+        raise ValueError(
+            "Nonholomorphic TDVP requires real coordinates; build the PEPS "
+            "setup with parameter_mode='real-imag'. Use holomorphic=True "
+            "only for a verified holomorphic contraction."
+        )
+    if holomorphic and not complex_parameters:
+        raise ValueError("holomorphic=True requires complex parameters.")
+    if isinstance(integrator, str):
+        constructors = {
+            "euler": nk.experimental.dynamics.Euler,
+            "midpoint": nk.experimental.dynamics.Midpoint,
+            "rk4": nk.experimental.dynamics.RK4,
+        }
+        try:
+            ode_solver = constructors[integrator.lower()](dt=dt)
+        except KeyError as exc:
+            raise ValueError("integrator must be 'euler', 'midpoint', or 'rk4'.") from exc
+    else:
+        raise TypeError("integrator must be a supported integrator name.")
+    constructor = _resolve_netket_qgt(nk, qgt)
+    if constructor is None:
+        constructor = nk.optimizer.qgt.QGTAuto
+    kwargs = {
+        "t0": t0,
+        "propagation_type": propagation_type,
+        "qgt": partial(constructor, diag_shift=diag_shift, holomorphic=holomorphic),
+        "linear_solver_restart": linear_solver_restart,
+        "error_norm": error_norm,
+    }
+    if linear_solver is not None:
+        kwargs["linear_solver"] = linear_solver
+    return NetKetTDVPDriver(
+        nk.experimental.TDVP(setup.hamiltonian, setup.vstate, ode_solver, **kwargs)
+    )
+
+
 def make_netket_autochunk_callback(
     *,
     sampler_chunk_size=None,
@@ -3487,6 +3628,7 @@ def make_peps_log_amplitude_model(
     cutoff=0.0,
     contraction_opts=None,
     param_dtype=None,
+    parameter_mode="complex",
 ):
     """Build a Flax model returning batched ``log(psi(config_row))``."""
     contraction, chi, cutoff, contraction_opts = _resolve_netket_contraction(
@@ -3501,6 +3643,15 @@ def make_peps_log_amplitude_model(
     jax, jnp = _require_jax()
     nn = _require_flax_linen()
     init_values = tuple(np.asarray(leaf) for leaf in ansatz.leaves)
+    if parameter_mode not in ("complex", "real-imag"):
+        raise ValueError("parameter_mode must be 'complex' or 'real-imag'.")
+    if parameter_mode == "real-imag" and param_dtype is not None:
+        if np.issubdtype(np.dtype(param_dtype), np.complexfloating):
+            raise ValueError("real-imag coordinates require a real param_dtype.")
+    if parameter_mode == "real-imag":
+        _maybe_register_stable_jax_svd(contraction)
+        init_values = tuple({"real": value.real, "imag": value.imag}
+                            for value in init_values)
     batched_log_amplitude = _make_peps_batched_amplitude_apply(
         ansatz,
         config_map,
@@ -3520,21 +3671,21 @@ def make_peps_log_amplitude_model(
             leaves = [
                 self.param(
                     f"t{k}",
-                    lambda key, value=value: (
-                        jnp.asarray(value)
-                        if param_dtype is None
-                        else jnp.asarray(value, dtype=param_dtype)
+                    lambda key, value=value: jax.tree_util.tree_map(
+                        lambda leaf: jnp.asarray(leaf, dtype=param_dtype), value
                     ),
                 )
                 for k, value in enumerate(init_values)
             ]
+            if parameter_mode == "real-imag":
+                leaves = [leaf["real"] + 1j * leaf["imag"] for leaf in leaves]
             params = jax.tree_util.tree_unflatten(ansatz.treedef, leaves)
             return batched_log_amplitude(x, params)
 
     return PEPSLogAmplitude()
 
 
-def _netket_variables_from_ansatz(ansatz, param_dtype=None):
+def _netket_variables_from_ansatz(ansatz, param_dtype=None, *, parameter_mode="complex"):
     """Build Flax variables directly from an already-packed PEPS ansatz.
 
     ``MCState`` otherwise calls ``model.init`` with a dummy configuration.
@@ -3543,6 +3694,12 @@ def _netket_variables_from_ansatz(ansatz, param_dtype=None):
     """
     _, jnp = _require_jax()
     dtype = None if param_dtype is None else param_dtype
+    if parameter_mode == "real-imag":
+        return {"params": {
+            f"t{k}": {"real": jnp.asarray(np.real(leaf), dtype=dtype),
+                      "imag": jnp.asarray(np.imag(leaf), dtype=dtype)}
+            for k, leaf in enumerate(ansatz.leaves)
+        }}
     return {
         "params": {
             f"t{k}": jnp.asarray(leaf, dtype=dtype)
@@ -3571,6 +3728,10 @@ def _peps_params_from_netket_variables(ansatz, variables, *, device_get=True):
     expected = tuple(f"t{k}" for k in range(len(ansatz.leaves)))
     try:
         leaves = tuple(parameters[name] for name in expected)
+        leaves = tuple(
+            leaf["real"] + 1j * leaf["imag"] if isinstance(leaf, Mapping) else leaf
+            for leaf in leaves
+        )
     except KeyError as error:
         raise ValueError(
             "NetKet PEPS parameters are missing leaf "
@@ -3916,6 +4077,7 @@ def _build_netket_peps_vmc(
     sr_solver=None,
     sr_solver_restart=False,
     param_dtype=None,
+    parameter_mode="complex",
 ):
     config_map = _coerce_config_map(config_map)
     ansatz = pack_peps_ansatz(peps, lattice_shape=(Lx, Ly))
@@ -3927,11 +4089,14 @@ def _build_netket_peps_vmc(
         cutoff=cutoff,
         contraction_opts=contraction_opts,
         param_dtype=param_dtype,
+        parameter_mode=parameter_mode,
     )
     vstate = _require_netket().vqs.MCState(
         sampler,
         model,
-        variables=_netket_variables_from_ansatz(ansatz, param_dtype),
+        variables=_netket_variables_from_ansatz(
+            ansatz, param_dtype, parameter_mode=parameter_mode
+        ),
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         chunk_size=_check_positive_int("chunk_size", chunk_size),
@@ -3992,6 +4157,7 @@ def build_ising_vmc(
     sr_solver=None,
     sr_solver_restart=False,
     param_dtype=None,
+    parameter_mode="complex",
 ):
     """Create NetKet VMC objects for a spin-1/2 transverse-field Ising PEPS."""
     (
@@ -4058,6 +4224,7 @@ def build_ising_vmc(
         sr_solver=sr_solver,
         sr_solver_restart=sr_solver_restart,
         param_dtype=param_dtype,
+        parameter_mode=parameter_mode,
     )
 
 

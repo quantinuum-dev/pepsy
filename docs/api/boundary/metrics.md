@@ -119,6 +119,11 @@ interchangeable. It does not flatten the stack into one giant tensor network.
 Use `contract_boundary` when you need lower-level control over an
 already-created `BdyMPS` or Quimb's native `method="mps"` path.
 
+`contract_layered(..., preserve_backend=True)` returns the original backend
+scalar, retaining autodiff gradients. The default formats a Python complex
+scalar for compatibility. This is the path used by `GlobalOptimizer`'s
+`mode="direct"` loss to differentiate sequential BRA--PEPO--KET compression.
+
 The layer policy applies to the package `method="dmrg"` path. Quimb's native
 `method="mps"` path already handles `layer_tags` itself and rejects
 `fit_layer_mode="sequential"` rather than silently ignoring the option.

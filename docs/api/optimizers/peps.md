@@ -1,11 +1,114 @@
 # `pepsy.optimizers.peps`
 
+## One full PEPO step per fit
+
+`PepsOptimizer.run_pepo(U)` applies a complete operator step and fits one
+untruncated target, keeping the operator and input PEPS as separate site
+factors. It uses the current state, updates that state on completion, and
+leaves the queued gate stream untouched. Repeat the call to evolve.
+
+For the open-boundary TFIM convention
+$$
+H=-J\sum_{\langle ij\rangle}Z_iZ_j-h\sum_i X_i,
+\qquad
+{\color{blue}U_{\Delta t}}=
+e^{ih\Delta t\sum_iX_i/2}
+e^{iJ\Delta t\sum_{\langle ij\rangle}Z_iZ_j}
+e^{ih\Delta t\sum_iX_i/2},
+$$
+the complete second-order step has **PEPO bond dimension two**: every
+commuting ZZ edge appears once, and the onsite rotations do not increase
+operator bonds. Build it with the existing `build_pepo_from_gates` using
+`max_bond=2, cutoff=0`. This exact rank statement is specific to this
+Hamiltonian and ordering; it does not apply to arbitrary repeated gate products.
+
+The runnable [TFIM PEPO example](../../../examples/tfim_pepo.py) builds this
+operator and selects ALS, column L-BFGS, or global L-BFGS-B:
+
+```bash
+python examples/tfim_pepo.py --method als --steps 3
+python examples/tfim_pepo.py --method column-lbfgs --steps 3
+python examples/tfim_pepo.py --method global --steps 3
+```
+
+For an already constructed PEPO:
+
+```python
+fit = PepsOptimizer(
+    state, [], chi=D, mode="sweep", optimizer="als",
+    boundary_chi=(chi_norm, chi_overlap),
+    normalize_chi=chi_norm, evaluation_chi=(chi_norm, chi_overlap),
+    boundary_convergence={"policy": "on_failure",
+                          "max_chi": (max_norm, max_overlap)},
+    fit_mode="dmrg", contraction_opt="greedy",
+)
+state = fit.run_pepo(U)
+```
+
+For a known unitary operator, use `fit.run_pepo(U, unitary=True)`. This trusts
+unitarity and measures only the input PEPS squared norm, then reuses it for
+`U @ state`. It avoids the full target self-overlap. If the input's exact
+squared norm is known to be one, add
+`infidelity_kwargs={"norm_target": 1.0}` to skip that norm contraction too.
+Finite-chi normalization alone does not prove exact unit norm, so the unitary
+hint defaults to measuring the input. Explicit known target norms retain
+precedence. Without the hint, arbitrary PEPOs still measure their target norm.
+
+Sweep mode refines the lattice against the same fixed target through
+the existing sweep optimizer and DMRG/FIT boundaries. The target carries the
+operator's `PEPO` tag and the usual site/row/column tags. Boundary FIT jointly
+consumes the target factors; no gate or strip batching occurs. A disposable
+copy of `U @ state` is contracted and compressed to `D` for the warm start.
+Target construction has no PEPS truncation. `cutoff`/`cutoff_mode` control
+only the guess and retain the dtype-aware defaults.
+Full-PEPO boundary seeding and metrics default to **zero cutoff**, retaining
+all channels allowed by the boundary chi. Near a product state, dropping
+small channels during one-site FIT initialization can create norm/overlap
+errors that increasing chi alone cannot repair. Explicit boundary, sweep,
+normalization, or infidelity cutoffs retain precedence.
+
+Select `optimizer="scipy", update_style="column"` for column-by-column
+L-BFGS-B instead of ALS. It optimizes a complete column's tensor parameters
+jointly, with the exterior fixed by the existing sweep environments. Configure
+`sweep_optimize_kwargs={"optimizer_options": {"n_steps": 100}}` for its
+per-column budget. It defaults to column traversal; explicit `axes` or row
+style can override it. Columns share the one full PEPO target. This uses the
+existing column solver, independently of per-site ALS/L-BFGS choices.
+
+For global mode, select `mode="global", optimizer="L-BFGS-B"` and configure
+iterations/autodiff through `global_optimize_kwargs`. The default loss uses
+Pepsy's sequential direct boundary worker inside Quimb `TNOptimizer`:
+**candidate norm** layers `("BRA", "KET")`,
+**overlap** layers `("BRA", "PEPO", "KET")`, with zero
+boundary cutoff. `global_kwargs["loss_kwargs"]` can override these choices.
+The operator and input ket remain distinct during layer absorption. See
+[global layer controls](global_opt.md#norms-and-target-loss).
+
+The overlap virtual bonds combine the candidate, operator, and old ket, so
+allow a larger `chi_overlap` than `chi_norm`. A cap ratio is a starting cost
+choice, not a convergence certificate. The small example uses `(32,128)`.
+Each attempt measures the target norm once, normalizes the warm start,
+optionally fits it, and independently checks acceptance using the same caps.
+It retains the warm start if the solver fails or does not improve it.
+`infidelity_tol` can skip a fit whose warm start already meets the threshold.
+The recorded fidelity compares the output with **U applied to the previous
+approximate state**, not with an independent ideal circuit trajectory.
+
+Sweep ALS uses the bounded failure-growth policy below; column L-BFGS and global mode keep
+fixed caps. `boundary_convergence=False` makes sweep caps fixed too. Exact
+metric `chi=None` remains supported. `get_step_records()` returns one record
+per full step with `target_representation="pepo"`, caps, loss, and solver
+summary. Initial normalization follows the constructor setting. Dense arrays
+are supported; native Symmray full-PEPO fitting is explicitly unvalidated.
+
 ## Fixed strip targets and global gate batches
 
 `PepsOptimizer(state, gates, chi=D, mode="sweep").run()` now selects strip
 ALS with column-oriented commuting-gate order, simple-update guesses,
-reusable direct boundary guesses, and fixed caps `(2*D**2, 4*D**2)`.
+reusable direct boundary guesses, and starting caps `(2*D**2, 4*D**2)`.
 The two entries control norm and overlap contractions respectively.
+Healthy batches keep these caps; invalid boundary diagnostics trigger bounded
+upward growth. Set `boundary_convergence=False` for strictly fixed caps.
 Explicit options override these defaults. Consecutive column/row gates are
 kept as exact split-gate factors. Each factor
 has one site, row, and column tag; the original PEPS tensors keep their bond
@@ -122,7 +225,9 @@ The driver normalizes the initial state and each compressed candidate, and
 reuses the known target norm. Set `normalize_initial=False` only for an already
 normalized input. Nonunitary gates require `non_unitary=True` or an explicit,
 correct target-norm policy. Strip batches require final normalization and
-fixed caps. Long-run fidelity improvements need separate benchmarks.
+use fixed caps within each fit attempt. Failure-triggered growth measures
+the target norm by default, since finite-cap normalization need not give an
+exact unit norm. Long-run fidelity improvements need separate benchmarks.
 
 ## Boundary caps
 
@@ -160,10 +265,70 @@ existing DMRG boundary handles. Named caps require positive integers or pairs.
 With `boundary_convergence=False`, use `evaluation_chi` larger than `boundary_chi` when you want a stricter final
 quality check without making every optimization environment more expensive.
 
+## Keep large caps and grow only on failure
+
+For strip ALS, `boundary_convergence="auto"` selects `"on_failure"`.
+Choose a large starting pair and a ceiling:
+
+```python
+fit = PepsOptimizer(
+    state, gates, chi=D,
+    boundary_chi=(chi_norm, chi_overlap),
+    boundary_convergence={"policy": "on_failure",
+                          "max_chi": (max_norm, max_overlap)},
+)
+out = fit.run()
+report = fit.get_boundary_growth()
+```
+
+This policy adds **no convergence probes**. It inspects already computed
+normalization, target-norm, acceptance, and initial local ALS diagnostics.
+Nonfinite, nonpositive, or substantially nonreal norms double only the norm
+cap; an explicitly nonfinite overlap doubles only the overlap cap. Invalid
+fidelity with otherwise usable components doubles both: the ratio alone
+cannot attribute a positive norm underestimate to one component. Acceptance
+uses the existing `evaluation_negative_tol` allowance (default `1e-3`) and
+dtype roundoff floor; ALS keeps its existing local validity thresholds.
+Set `evaluation_negative_tol=0` to grow on smaller physical-range violations.
+A poor but admissible fidelity or a rejected solver proposal does not by
+itself request growth: PEPS compression error and solver conditioning can
+also cause those outcomes.
+
+On failure, restore the state entering that gate batch, discard cached
+boundary guesses, double the affected cap, and repeat the
+batch at fixed caps. Normalization, fitting, and acceptance use the retained
+pair, starting at the componentwise maximum of the configured fitting,
+normalization, and evaluation caps. Remeasure the target
+norm once for that attempt and reuse it for the local objective and postcheck.
+Compared with assuming a unit target norm, this costs one target self-overlap
+per batch attempt; healthy batches do not repeat it for the postcheck.
+Both candidates are compared at the same caps. Larger caps persist across
+subsequent batches and `run()` calls; they never shrink. Explicit metric
+`chi=None`, including exact readout/normalization, remains unchanged.
+
+`"on_failure"` without a ceiling permits at most eight times each resolved
+starting cap. A required doubling above either ceiling raises
+`pepsy.optimizers.BoundaryChiLimitError`; its `report` describes the failure,
+location, current caps, required caps, and ceiling. The failed batch is
+restored and earlier accepted batches remain. No partial doubling is clamped.
+`get_boundary_growth()` exposes detached events and retained caps; batch
+records include their growth events. Explicit `fit_max_bond` in shared,
+sweep, normalization, or infidelity options is rejected before state changes
+because it would prevent the actual FIT rank from following chi. Supplied
+boundary handles likewise require `boundary_convergence=False`; recovery
+needs fresh environments whose caps follow the retained pair.
+
+Growth requires sweep ALS. `boundary_convergence=False` retains fixed-cap
+behavior and the known-unit-target-norm shortcut; explicit `True` or a mapping
+without `policy` selects the more expensive convergence checks below.
+Failure-triggered recovery does not certify an in-range fidelity estimate;
+use convergence probes or an independent reference when that evidence is needed.
+
 ## Adaptive boundary convergence before sweeps
 
-`boundary_convergence="auto"` disables checks for the default strip sweeps
-and two-site full update; it enables them for non-strip row/column sweeps.
+`boundary_convergence="auto"` uses failure-triggered growth for default strip
+ALS, disables probes for two-site full update, and enables the following
+checks for non-strip row/column sweeps.
 Before refining a compressed target, it probes the unchanged warm start and
 target at increasing `(chi_norm, chi_overlap)` caps. It measures both norms
 and the complex overlap in **both x and y**. Norms must agree relatively;
@@ -965,7 +1130,8 @@ default of one, avoids that measurement. Disabling both measurement and
 optimization needs no target norm contraction.
 
 An inconsistent finite-cap contraction can still produce a negative
-infidelity. Outside adaptive sweep fits, `evaluation_max_retries=2` allows up to two retries
+infidelity. Outside adaptive sweep fits and `on_failure` recovery,
+`evaluation_max_retries=2` allows up to two retries
 (the default for row/column and global modes; two-site full update defaults to zero),
 each using the same cap for both norms and overlap, twice the preceding
 maximum cap. Every retry warns. Use `evaluation_max_retries=0` to enforce

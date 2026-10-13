@@ -12,8 +12,41 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Added
+
+- NetKet-backed PEPS TDVP reuses native sampling, QGT solvers and Euler,
+  midpoint or RK4 integration. Real/imaginary Flax coordinates support
+  nonholomorphic compression; accepted endpoints are synchronized before
+  PEPS reconstruction. A bounded TFIM PEPO-to-NetKet example provides a
+  small-system exact-evolution oracle.
+
+- Rank-only boundary-MPS amplitudes (`cutoff=0`) support Torch export/compile
+  for inference, retaining stabilized contractions for derivatives. Exact
+  amplitudes also support compiled functional Jacobians in fixed chunks. A narrow
+  complex-SVD batching fallback shares the batched forward and uses
+  output-wise VJPs when Torch lacks the `allclose` batching rule.
+  Real/imaginary TDVP coordinates handle nonholomorphic boundary truncation;
+  binary `proposal="parity"` preserves bosonic Z2 sectors. A flat-Z2 tVMC
+  example, existing-factory JAX GPU validation example and dense-oracle
+  4x4 D=3 PEPO cap probe expose these workflows.
+
+- Native `TorchTDVPDriver` performs fixed-bond real-time PEPS evolution after
+  PEPO startup, reusing VMC sampling and estimators. Direct TDVP projects out
+  analytic dense-PEPS gauge vectors; uncentered minSR solves in sample space.
+  Euler/midpoint integration refreshes stage samples or importance weights,
+  aggregates repeated Jacobian rows, and restores tensors on stage failure.
+  Binary `proposal="local"` supplies lazy single-site moves for TFIM sampling.
+  The TFIM PEPO example exposes the optional handoff and its independent
+  single-layer contraction cap.
+
 ### Changed
 
+- Strip ALS keeps its starting boundary caps until existing normalization,
+  fidelity, or local-objective checks signal failure, then doubles affected
+  norm/overlap caps and retries the restored gate batch. Retained caps never
+  shrink; an explicit ceiling stops recovery with `BoundaryChiLimitError`.
+  Healthy batches add no convergence probes. `boundary_convergence=False`
+  retains strictly fixed caps; exact metric `chi=None` is preserved.
 - `PepsOptimizer` now initializes boundary FIT with `guess-direct` outside
   sweep mode. Sweep mode retains `reuse-direct`; explicit SRC initialization
   remains available. The boundary FIT budget remains ten sweeps per update.
@@ -35,11 +68,23 @@ releases remain backwards-compatible. From 1.0 onward:
 - Sweep/global automatic norm and overlap caps are now `(2*D**2, 4*D**2)`,
   including normalization/evaluation defaults. Explicit caps take precedence;
   two-site full update retains its scalar `2*D**2` policy. Default strip
-  batches use fixed caps. Non-strip batching and gradient solvers remain
+  batches keep fixed caps within each attempt, with bounded failure recovery.
+  Non-strip batching and gradient solvers remain
   explicit options; standalone `SweepOptimizer` defaults are unchanged.
 
 ### Added
 
+- Full-PEPO fits accept `unitary=True` to reuse the measured input PEPS norm
+  instead of contracting the operator-target norm. An explicitly known target
+  norm skips that measurement too; generic nonunitary behavior is unchanged.
+- `PepsOptimizer.run_pepo` fits one full lazy `PEPO @ PEPS` target per step
+  with ALS/FIT, column L-BFGS, or global Quimb `TNOptimizer`. Global losses accept
+  `overlap_layer_tags` independently of candidate-norm layers, enabling direct
+  BRA--PEPO--KET absorption with a separate larger overlap cap. `mode="direct"`
+  reuses Pepsy's sequential boundary worker; `contract_layered` can preserve
+  backend scalars for autodiff. Full-PEPO boundaries default to zero cutoff
+  to retain small singular channels during FIT initialization. The TFIM
+  example constructs an exact bond-two second-order step from existing gates.
 - Strip ALS accepts lazy split-gate targets with explicit lattice tags and
   unchanged base PEPS bond dimensions. Global fitting can opt into the same
   representation with direct boundary compression; `canonize` controls its

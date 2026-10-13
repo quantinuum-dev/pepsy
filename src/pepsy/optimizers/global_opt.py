@@ -16,6 +16,7 @@ from .._internal.quimb import call_quimb_2d
 from ..backends import infer_backend_converter_from_sample
 from ..backends.config import _register_tn_autodiff_linalg
 from ..boundary._layers import prepare_quimb_site_layers
+from ..boundary.metrics import contract_layered
 from ..tensors.contractions import build_optimizer, contract_hypercompressed_tn
 
 __all__ = ["GlobalOptimizer"]
@@ -70,6 +71,7 @@ class GlobalOptimizer:
 
     _NORM_KEYS = frozenset({
         "canonize",
+        "direction",
         "opt",
         "copt",
         "contraction_opt",
@@ -88,7 +90,9 @@ class GlobalOptimizer:
     })
     _LOSS_KEYS = frozenset({
         "canonize",
+        "direction",
         "layer_tags",
+        "overlap_layer_tags",
         "opt",
         "copt",
         "contraction_opt",
@@ -456,8 +460,9 @@ class GlobalOptimizer:
         progbar=False,
         cutoff=1e-12,
         strip_exponent=False,
+        direction='y',
     ):
-        """Compute ``<state|state>`` using exact, mps, ctmrg, or hyper modes."""
+        """Compute ``<state|state>`` using exact, direct, mps, ctmrg, or hyper modes."""
         mode = GlobalOptimizer._normalize_contraction_mode(mode)
         chi_norm, _ = GlobalOptimizer._split_chi(chi)
         kw = GlobalOptimizer._normalize_contraction_option_keys(
@@ -494,6 +499,14 @@ class GlobalOptimizer:
         state.add_tag("KET")
         state_h = state.conj().retag({"KET": "BRA"})
         norm = state_h | state
+
+        if mode == 'direct':
+            return contract_layered(
+                norm, layer_tags=layer_tags, chi=chi_norm, fit_mode='direct',
+                fit_layer_mode='sequential', contraction_opt=contraction_opt,
+                direction=direction, max_separation=max_separation, cutoff=cutoff,
+                equalize_norms=equalize_norms, strip_exponent=strip_exponent,
+                preserve_backend=True, progress=progbar, n_iter=1)
 
         if mode == "mps":
             norm = prepare_quimb_site_layers(norm, layer_tags)
@@ -576,6 +589,7 @@ class GlobalOptimizer:
         target_norm=None,
         val_=1.0,
         layer_tags=None,
+        overlap_layer_tags=None,
         canonize=True,
         progbar=False,
         chi=64,
@@ -586,11 +600,24 @@ class GlobalOptimizer:
         equalize_norms=False,
         sequence=_DEFAULT_SEQUENCE,
         strip_exponent=False,
+        direction='y',
     ):
         """Compute overlap-based loss between trainable and target states."""
         mode = GlobalOptimizer._normalize_contraction_mode(mode)
         if layer_tags is None:
             layer_tags = list(_DEFAULT_LAYER_TAGS)
+        if overlap_layer_tags is not None:
+            if isinstance(overlap_layer_tags, str):
+                raise ValueError('overlap_layer_tags must be a sequence of distinct layer tags')
+            overlap_layer_tags = tuple(overlap_layer_tags)
+            if (len(set(overlap_layer_tags)) != len(overlap_layer_tags)
+                    or not {'BRA', 'KET'}.issubset(overlap_layer_tags)):
+                raise ValueError('overlap_layer_tags must contain distinct BRA and KET tags')
+            extras = set(overlap_layer_tags) - {'BRA', 'KET'}
+            if not extras.issubset(state_target.tags):
+                raise ValueError('overlap_layer_tags references a missing target layer')
+            if any(len(extras.intersection(t.tags)) > 1 for t in state_target):
+                raise ValueError('Each target tensor must belong to one overlap layer')
         if target_norm is not None:
             val_ = target_norm
 
@@ -622,15 +649,38 @@ class GlobalOptimizer:
         state = state.copy()
         state_target = state_target.copy()
         state.add_tag("KET")
-        state_target.add_tag("KET")
+        if overlap_layer_tags is None:
+            state_target.add_tag("KET")
+            overlap_layer_tags = layer_tags
+        else:
+            # A lazy operator target has several physical layers. Tagging
+            # every factor KET would merge PEPO into KET before compression.
+            extra_layers = set(overlap_layer_tags) - {'BRA', 'KET'}
+            for tensor in state_target:
+                if extra_layers.intersection(tensor.tags):
+                    if 'KET' in tensor.tags:
+                        tensor.drop_tags('KET')
+                else:
+                    tensor.add_tag('KET')
 
         state_h = state.conj().retag({"KET": "BRA"})
         norm = state_h | state
         norm_ = state_h | state_target
 
-        if mode == "mps":
+        if mode == 'direct':
+            # Reuse Pepsy's sequential direct boundary worker, preserving the
+            # backend scalar for TNOptimizer's differentiation. Norm and
+            # overlap have different physical stacks and independent caps.
+            common = dict(fit_mode='direct', fit_layer_mode='sequential',
+                contraction_opt=contraction_opt, direction=direction,
+                max_separation=max_separation, cutoff=cutoff,
+                equalize_norms=equalize_norms, strip_exponent=strip_exponent,
+                preserve_backend=True, progress=progbar, n_iter=1)
+            val_0 = contract_layered(norm, layer_tags=layer_tags, chi=chi_norm, **common)
+            val_1 = contract_layered(norm_, layer_tags=overlap_layer_tags, chi=chi_overlap, **common)
+        elif mode == "mps":
             norm = prepare_quimb_site_layers(norm, layer_tags)
-            norm_ = prepare_quimb_site_layers(norm_, layer_tags)
+            norm_ = prepare_quimb_site_layers(norm_, overlap_layer_tags)
             val_0 = call_quimb_2d(
                 norm.contract_boundary,
                 canonize=canonize,
@@ -657,7 +707,7 @@ class GlobalOptimizer:
                     "strip_exponent": strip_exponent,
                 },
                 progbar=progbar,
-                layer_tags=layer_tags,
+                layer_tags=overlap_layer_tags,
                 max_separation=max_separation,
                 cutoff=cutoff,
                 sequence=sequence,
@@ -689,7 +739,7 @@ class GlobalOptimizer:
                 mode="projector",
                 max_separation=max_separation,
                 equalize_norms=equalize_norms,
-                layer_tags=layer_tags,
+                layer_tags=overlap_layer_tags,
                 final_contract=True,
                 final_contract_opts={
                     "optimize": contraction_opt,

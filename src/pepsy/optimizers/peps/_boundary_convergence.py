@@ -4,16 +4,9 @@ import math
 from collections.abc import Mapping
 from numbers import Integral
 
+from .._boundary_control import chi_pair as chi_pair
+
 from ...boundary.metrics import _as_scaled_scalar
-
-
-def chi_pair(value):
-    if isinstance(value, Integral) and not isinstance(value, bool) and value > 0:
-        return (int(value), int(value))
-    if isinstance(value, (tuple, list)) and len(value) == 2:
-        if all(isinstance(v, Integral) and not isinstance(v, bool) and v > 0 for v in value):
-            return tuple(map(int, value))
-    raise ValueError("Adaptive boundary chi must be a positive integer or pair.")
 
 
 def convergence_options(value, *, bond_dim=1):

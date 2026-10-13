@@ -7,6 +7,11 @@ builds exact two-site targets, compresses warm starts to the requested PEPS
 bond dimension, and optionally refines those warm starts with either
 `SweepOptimizer` or `GlobalOptimizer`.
 
+`_pepo_fit.py` owns `run_pepo`: one full, lazy operator target per fit with a
+separate compressed guess, existing sweep/global solvers, target-norm reuse,
+acceptance, and bounded ALS cap recovery. Operator site factors remain tagged
+`PEPO`; global overlap layers are distinct from candidate-norm layers.
+
 ## Boundary controls
 
 Keep the chi controls separated by job:
@@ -15,6 +20,13 @@ Keep the chi controls separated by job:
 - `boundary_chi`: sweep/global optimizer environment bond dimension.
 - `normalize_chi`: standalone normalization bond dimension.
 - `evaluation_chi`: diagnostic infidelity bond dimension.
+
+`_boundary_control.py` owns contraction-free failure signals and the retained
+norm/overlap cap pair. Strip ALS defaults to bounded `on_failure` growth:
+replay restores a failed batch and retries with larger caps, while
+`_sweep_fit.py` constructs each fixed-cap fitter. Healthy attempts add no
+convergence probes. See the [public policy](../../api/optimizers/peps.md#keep-large-caps-and-grow-only-on-failure)
+for overrides, ceilings, diagnostics, and exact-metric preservation.
 
 `boundary_engine` selects the sweep cleanup boundary implementation:
 

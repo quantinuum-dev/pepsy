@@ -145,27 +145,37 @@ def _batched_model_log_derivatives(
         real_imag_mode or not all(complex_parameters)
     )
 
+    def jacobian_of(fn):
+        vectorize = getattr(model, "_jacobian_vectorize", True)
+        try:
+            return torch.autograd.functional.jacobian(
+                fn, params, create_graph=create_graph, strict=False, vectorize=vectorize,
+            )
+        except RuntimeError as error:
+            # Native complex SVD checks phase-invariant cotangents with
+            # allclose, which has no legacy-vmap batching rule. Share the
+            # batched forward graph and use output-wise VJPs in that case;
+            # never replace a boundary contraction or suppress other errors.
+            if not vectorize or "Batching rule not implemented for aten::allclose" not in str(error):
+                raise
+            model._jacobian_vectorize = False
+            return torch.autograd.functional.jacobian(
+                fn, params, create_graph=create_graph, strict=False, vectorize=False,
+            )
+
     if need_real_and_imag:
-        jacobian = torch.autograd.functional.jacobian(
+        jacobian = jacobian_of(
             lambda *values: torch.view_as_real(amplitudes_with_params(*values)),
-            params,
-            create_graph=create_graph,
-            strict=False,
-            vectorize=True,
         )
         jacobian_real = tuple(value[:, 0, ...] for value in jacobian)
         jacobian_imag = tuple(value[:, 1, ...] for value in jacobian)
     else:
-        jacobian_real = torch.autograd.functional.jacobian(
+        jacobian_real = jacobian_of(
             lambda *values: (
                 amplitudes_with_params(*values).real
                 if complex_output
                 else amplitudes_with_params(*values)
             ),
-            params,
-            create_graph=create_graph,
-            strict=False,
-            vectorize=True,
         )
         jacobian_real = tuple(jacobian_real)
         jacobian_imag = (None,) * len(params)
@@ -377,6 +387,10 @@ def torch_log_derivative_matrix(
     derivative is returned per complex parameter. In ``"real-imag"`` mode,
     each complex parameter contributes interleaved real and imaginary
     coordinate derivatives.
+    Compiled PEPS models evaluate functional Jacobians in their exported
+    fixed-size batches. The last partial batch is padded with a valid row;
+    its auxiliary derivatives are discarded. This preserves compiled
+    execution when sampling or duplicate removal changes the row count.
     """
     backend = str(derivative_backend).replace("_", "-").lower()
     if backend not in {"auto", "batched", "loop", "scalar"}:
@@ -385,6 +399,22 @@ def torch_log_derivative_matrix(
         )
     if backend in {"auto", "batched"}:
         try:
+            compiled_size = getattr(model, "_compiled_batch_size", None)
+            if (compiled_size and getattr(model, "_compiled_amplitude_forward", None) is not None
+                    and getattr(model, "contraction", "exact") == "exact"):
+                torch = _require_torch()
+                configs = _as_long_matrix(configs)
+                rows = []
+                for start in range(0, configs.shape[0], compiled_size):
+                    batch = configs[start:start + compiled_size]
+                    count = batch.shape[0]
+                    if count < compiled_size:
+                        batch = torch.cat((batch, batch[:1].expand(compiled_size - count, -1)))
+                    rows.append(_batched_model_log_derivatives(
+                        model, batch, amplitude_floor=amplitude_floor,
+                        create_graph=create_graph, complex_parameter_mode=complex_parameter_mode,
+                    )[:count])
+                return torch.cat(rows, dim=0)
             return _batched_model_log_derivatives(
                 model,
                 configs,

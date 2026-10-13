@@ -4,6 +4,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 _SYMBOL_MODULES = {
+    "BoundaryChiLimitError": ".._boundary_control",
     "PepsOptimizer": ".optimizer",
     "SimpleUpdateGen": ".simple_update",
 }
@@ -19,6 +20,7 @@ _SUBMODULES = (
 )
 
 __all__ = [
+    "BoundaryChiLimitError",
     "PepsOptimizer",
     "SimpleUpdateGen",
     "diagnostics",
