@@ -4,9 +4,12 @@
   Quimb methods and Pepsy FIT, review stable gradients and fixed-point
   literature, then commit and push the reviewed changes.
 - Branch / baseline: `develop` / `9b2bef2`.
-- Commit status at validation: scoped changes staged for the requested commit
-  and push. Existing TDVP edits and earlier draft journals remain outside this
-  commit. The remote was fetched and matched the baseline before publication.
+- Published implementation: `7a29270` committed and pushed to
+  `origin/develop`; successful push verified after the initial sandbox DNS
+  failure was retried with authorized network access. Existing TDVP edits and
+  earlier draft journals remain outside this commit. The remote was fetched
+  and matched the baseline before publication. This status correction is a
+  documentation-only follow-up commit.
 
 ## What changed
 
