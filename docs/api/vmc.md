@@ -173,6 +173,41 @@ TDVP integrator. It returns `NetKetTDVPDriver`; `.native` exposes the upstream
 driver. Sampling, forces, QGT construction, linear solves and integration
 remain owned by NetKet.
 
+The basic equation uses centered log derivatives $C$, normalized Born weights
+$W$, centered local energies $e$, $S=C^\dagger WC$ and $F=C^\dagger We$:
+
+$$
+{\color{blue}(A+\lambda I)v=b},\qquad
+(A,b)=\begin{cases}
+(S,\gamma F)&\text{holomorphic coordinates},\\
+(\operatorname{Re}S,\operatorname{Re}(\gamma F))&\text{real coordinates},
+\end{cases}
+\quad
+\gamma=\begin{cases}-i&\text{real time},\\-1&\text{imaginary time}.\end{cases}
+$$
+
+Here $\lambda$ is `diag_shift`; custom QGT constructors can supply additional
+regularization. Use the force from `expect_and_forces`, not the energy gradient
+with its separate factor-of-two convention. The time step belongs to the ODE
+integrator and is independent of a VMC optimizer learning rate.
+
+| Basic element | Pepsy/NetKet contract | Focused reference coverage |
+| --- | --- | --- |
+| Parameters | Verified holomorphic complex or explicit real/imaginary leaves | PEPS reconstruction and coordinate directional derivatives |
+| Amplitudes and local energies | Same ansatz and Hamiltonian throughout each native stage | Exact contractions, sparse Hamiltonians and truncated boundary paths |
+| Sampling and weights | Native MC Born batches, or exact full-sum probabilities | Chain counts, burn-in, thinning and independent sample covariances |
+| QGT and solve | `auto`, `jacobian_dense`, `jacobian_pytree`, or compatible `on_the_fly`; native `pinv_smooth`, `cholesky`, JAX `cg`, or a callable | Independent two-spin equations for both charts and MC/full-sum states |
+| Integration | Euler, midpoint or RK4; real or imaginary time | PEPS exact-evolution comparisons and timestep-order checks |
+| State handoff | Accepted integrator parameters synchronized at requested stops | Tiny intervals, adjacent stops and evolved tensor reconstruction |
+| Diagnostics | Fresh accepted-state solve/tangent residuals and chain statistics | Analytic residuals, zero projected force and preserved native caches |
+
+`qgt="auto"` instantiates NetKet's selector before constructing a metric;
+compressed models select a reverse-mode Jacobian instead. CG avoids a dense
+parameter metric but reverse-Jacobian QGTs still store sample derivatives.
+These checks establish the basic implementation contract, not trajectory
+convergence, gauge removal or sample-space TDVP. The
+[numerical tests](../../tests/test_netket_tdvp.py) own the detailed checks.
+
 ```python
 setup = pvmc.build_ising_vmc(
     peps, Lx=4, Ly=4, J=-1.0, h=1.0,
@@ -184,6 +219,7 @@ dynamics = setup.make_tdvp_driver(
     dt=0.001, t0=0.02, integrator="midpoint", diag_shift=1e-6,
 )
 dynamics.advance(0.002)
+diagnostics = dynamics.diagnostics()  # optional fresh endpoint measurement
 evolved = setup.to_peps()
 ```
 
@@ -204,6 +240,8 @@ contraction. An explicit `param_dtype` in this mode must be real.
 The TDVP adapter requires real parameter leaves unless `holomorphic=True` is
 explicitly selected. Exact complex PEPS contraction can use that flag;
 truncated boundary/HOTRG/CTMRG amplitudes must not be assumed holomorphic.
+The builder rejects `holomorphic=True` for these compressed contraction modes;
+use `parameter_mode="real-imag"` and `holomorphic=False`.
 The default `qgt="jacobian_dense"` uses reverse derivatives compatible with
 the compression pullback. A QGT requiring forward-mode JVPs is not compatible
 with that custom-VJP compression path.
@@ -240,15 +278,58 @@ check to prevent an extra step. At yielded stop
 times and completion it copies NetKet's accepted `integrator.y` into the
 shared state and clears cached samples. This prevents a Runge--Kutta stage
 from being mistaken for the endpoint during measurement or reconstruction.
+Stops must be finite and within the requested interval. A start sentinel
+prevents released NetKet's proximity check from skipping very nearby stops.
+Non-finite accepted parameters raise `RuntimeError` before a successful
+handoff; this is a failure signal, not automatic rollback or recovery.
 Calling `.native.advance(...)` bypasses this synchronization. `estimate(...)`
 delegates endpoint measurements to NetKet. Integrators are `euler`, `midpoint`
 or `rk4`; `linear_solver` accepts a native NetKet/JAX solver.
+
+`diagnostics(max_jacobian_bytes=1 << 30)` recomputes the force, configured
+QGT solve and complex tangent mismatch at the accepted time. It draws a fresh
+endpoint MC batch shared by the force, QGT and tangent check; it does not reuse
+RK-stage quantities or overwrite the native integrator's stage caches.
+The measurement advances the sampler/RNG and stores a reverse-mode Jacobian.
+The allocation limit covers that Jacobian alone; differentiation and the QGT
+need additional memory. Raise the limit explicitly, or use `None`, only when
+that memory is available.
+
+For centered log derivatives $C$, centered local energies $e$, normalized Born
+weights $W$, and the recomputed endpoint velocity $v$:
+
+$$
+{\color{blue}\epsilon_{\mathrm{solve}}}
+=\frac{\|Av-b\|^2}{\|b\|^2},\qquad
+{\color{purple}r_{\mathrm{tangent}}}
+=\frac{\|W^{1/2}(Cv-\gamma e)\|}{\|W^{1/2}\gamma e\|}.
+$$
+
+Here $\gamma=-i$ for real time and $-1$ for imaginary time. Holomorphic
+coordinates use $A=C^\dagger WC$, $b=C^\dagger W\gamma e$; explicit real
+coordinates use their real parts and retain the complex tangent mismatch.
+`tdvp_relative_residual` is the unsquared **unregularized** solve residual;
+`tdvp_relative_residual_squared` reports $\epsilon_{\mathrm{solve}}$.
+`regularized_relative_residual` checks the actual configured QGT equation.
+`tangent_relative_residual`, `tangent_residual_norm` and `tangent_rhs_norm`
+report the complex mismatch and its absolute numerator/denominator. A zero
+denominator gives zero for a zero numerator, otherwise infinity.
+
+The returned dictionary includes `time`, energy statistics, coordinate count,
+and `sampling`: acceptance, burn-in, thinning, sample/chain counts and
+local-energy standard error, split Rhat and autocorrelation estimates.
+Unavailable/nonfinite chain statistics are `None`. `FullSumState` uses exact
+Born weights on nonzero-amplitude support and reports no MC mixing statistics.
+Both routes miss tangent directions supported entirely at wavefunction zeros;
+these are in-batch checks, not independent trajectory convergence certificates.
 
 [The bounded TFIM example](../../examples/tfim_netket_tdvp.py) performs dense
 PEPO startup followed by JAX/NetKet tVMC. `--reference` compares every endpoint
 with sparse-matrix exact evolution for at most 16 spins. This workflow does not
 implement the paper's optimized PEPS gauge projection or tensor-local small-o
 storage, and does not convert a dense startup to a native Z2 ansatz.
+Add `--tdvp-diagnostics` to emit fresh endpoint solve/tangent/sampling records
+under `tdvp_diagnostics` in each step's JSON output.
 
 The example reports normalized Pauli X magnetization, nearest-neighbor ZZ
 correlation and global X parity alongside exact-reference values. It also

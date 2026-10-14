@@ -25,6 +25,10 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- `NetKetTDVPDriver.diagnostics()` recomputes accepted-state solve and complex
+  tangent residuals with endpoint sampling statistics, preserving native RK
+  caches. The TFIM example exposes it through `--tdvp-diagnostics`.
+
 - `MpsOptimizer.run(progbar=display)` can update a caller-owned progress bar
   with native gate counts and diagnostics, without changing its labels or
   closing it between replay segments. `MpsOptimizer.progress_style(mode)`
@@ -252,6 +256,10 @@ releases remain backwards-compatible. From 1.0 onward:
   `boundary_convergence={"reuse_environments": False}`.
 
 ### Fixed
+
+- NetKet TDVP instantiates automatic QGT selection correctly for exact
+  amplitudes, caps very short evolution intervals without skipping requested
+  stops, validates stop times, and rejects non-finite accepted parameters.
 
 - DMRG replay accepts sub-MPO supports with more than two sites, fitting the
   interval between the first and last support rather than assuming a pair.

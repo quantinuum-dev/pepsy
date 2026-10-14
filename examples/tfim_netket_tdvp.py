@@ -80,6 +80,8 @@ def main():
     parser.add_argument("--j", type=float, default=1.)
     parser.add_argument("--h", type=float, default=1.)
     parser.add_argument("--reference", action="store_true")
+    parser.add_argument("--tdvp-diagnostics", action="store_true",
+                        help="Recompute solve, tangent and sampling diagnostics at each accepted endpoint")
     parser.add_argument("--reference-origin", choices=("handoff", "initial"), default="handoff")
     parser.add_argument("--checkpoint-dir", type=Path)
     parser.add_argument("--checkpoint-every", type=int, default=5)
@@ -233,6 +235,8 @@ def main():
                 raise RuntimeError("The accepted endpoint does not match the requested time")
         if (step + 1) % args.checkpoint_every == 0 or step + 1 == args.steps:
             checkpoint(step + 1, vector)
+        if args.tdvp_diagnostics:
+            diagnostics["tdvp_diagnostics"] = dynamics.diagnostics()
         emit("tdvp_step", step=step + 1, time=float(dynamics.t),
              step_seconds=time.perf_counter() - step_started,
              tdvp_seconds=tdvp_seconds,

@@ -9,7 +9,7 @@ from __future__ import annotations
 from pepsy._internal.quimb import call_quimb_2d
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from numbers import Integral
 import os
 import time
@@ -2712,6 +2712,17 @@ def make_netket_sr_preconditioner(
     return nk.optimizer.SR(**kwargs)
 
 
+@lru_cache(maxsize=1)
+def _netket_tdvp_finite_checker():
+    """Reduce endpoint finiteness on device without copying tensor leaves."""
+    jax, _ = _require_jax()
+    import jax.numpy as jnp
+
+    return jax.jit(lambda parameters: jax.tree_util.tree_reduce(
+        lambda finite, leaf: finite & jnp.all(jnp.isfinite(leaf)),
+        parameters, initializer=jnp.array(True)))
+
+
 class NetKetTDVPDriver:
     """NetKet TDVP with the shared PEPS state synchronized at accepted times.
 
@@ -2738,7 +2749,10 @@ class NetKetTDVPDriver:
         # NetKet's RHS mutates MCState at intermediate Runge--Kutta stages.
         # The integrator's public y contains the accepted endpoint; leaving
         # the stage parameters visible biases observables and PEPS handoff.
-        self.state.parameters = self.native.integrator.y
+        parameters = self.native.integrator.y
+        if not bool(_netket_tdvp_finite_checker()(parameters)):
+            raise RuntimeError("NetKet TDVP produced non-finite accepted parameters; check the QGT solve.")
+        self.state.parameters = parameters
         self.state.reset()
 
     def iter(self, T, *, tstops=None):
@@ -2746,14 +2760,26 @@ class NetKetTDVPDriver:
         T = float(T)
         if not np.isfinite(T) or T < 0:
             raise ValueError("T must be non-negative and finite.")
-        endpoint = float(self.t) + T
-        stops = [endpoint] if tstops is None else sorted(set([*tstops, endpoint]))
+        start = float(self.t)
+        endpoint = start + T
+        if not np.isfinite(endpoint):
+            raise ValueError("The final time must be finite.")
+        stops = [] if tstops is None else [float(stop) for stop in tstops]
+        if any(not np.isfinite(stop) or stop < start or stop > endpoint for stop in stops):
+            raise ValueError("All tstops must be finite and within [t, t + T].")
+        stops = sorted(set([*stops, endpoint]))
+        # Released NetKet uses np.isclose to consume its first stop before
+        # stepping. A nearby endpoint can then be dropped and a full dt taken.
+        # Consume a start sentinel first so every real stop caps an actual step.
+        native_stops = sorted(set([start, *stops]))
         tolerance = 8 * np.finfo(float).eps * max(1., abs(endpoint))
         try:
             # A final tstop caps the last native step. Stop at roundoff-level
             # agreement too: the native strict t < t_end loop can otherwise
             # take an extra full step after an endpoint a few ulps below t_end.
-            for time_value in self.native.iter(T, tstops=stops):
+            for time_value in self.native.iter(T, tstops=native_stops):
+                if float(time_value) == start and start not in stops:
+                    continue
                 self._sync_state()
                 yield time_value
                 if abs(float(time_value) - endpoint) <= tolerance:
@@ -2770,6 +2796,127 @@ class NetKetTDVPDriver:
         """Use NetKet to estimate observables at the accepted endpoint."""
         self._sync_state()
         return self.native.estimate(observables)
+
+    def diagnostics(self, *, max_jacobian_bytes=1 << 30):
+        """Recompute solve, tangent and sampling diagnostics at the accepted state.
+
+        This opt-in measurement draws a fresh MC batch and solves the endpoint
+        equation with the configured native QGT/solver. It does not overwrite
+        the integrator or its cached stage velocity/forces. The tangent check
+        stores a reverse-mode sample Jacobian, limited to 1 GiB by default.
+        FullSumState uses exact Born weights on nonzero-amplitude support.
+        """
+        if max_jacobian_bytes is not None:
+            max_jacobian_bytes = _check_positive_int("max_jacobian_bytes", max_jacobian_bytes)
+        nk = _require_netket()
+        jax, _ = _require_jax()
+        import jax.numpy as jnp
+        from jax.flatten_util import ravel_pytree
+
+        state = self.state
+        if not isinstance(state, (nk.vqs.MCState, nk.vqs.FullSumState)):
+            raise TypeError("TDVP diagnostics require a pure MCState or FullSumState.")
+        model = state.model
+        if model is None or not callable(getattr(model, "apply", None)):
+            raise ValueError("TDVP diagnostics require a model with an apply method.")
+        self._sync_state()
+        parameters = state.parameters
+        theta, _ = ravel_pytree(parameters)
+        holomorphic = np.issubdtype(theta.dtype, np.complexfloating)
+        operator = self.native.generator(self.t)
+
+        full_sum = isinstance(state, nk.vqs.FullSumState)
+        if full_sum:
+            vector = np.asarray(state.to_array())
+            support = np.abs(vector) > 0
+            configurations = jnp.asarray(state.hilbert.all_states()[support])
+            weights = jnp.asarray(np.abs(vector[support]) ** 2)
+            weights = weights / weights.sum()
+            # Log derivatives are undefined at wavefunction zeros. Like Born
+            # sampling, this check measures the tangent only on retained support.
+            energies = jnp.asarray((operator.to_sparse() @ vector)[support] / vector[support])
+            sampling = {"method": "full_sum", "n_configurations": int(support.sum()),
+                        "hilbert_size": int(vector.size)}
+        else:
+            samples = state.samples
+            configurations = samples.reshape(-1, samples.shape[-1])
+            weights = jnp.full((configurations.shape[0],), 1 / configurations.shape[0])
+            sampling = _netket_sampling_diagnostics(state, state.sampler)
+            sampling["method"] = "monte_carlo"
+
+        complex_dtype = np.result_type(theta.dtype, np.complex64)
+        jacobian_bytes = configurations.shape[0] * theta.size * complex_dtype.itemsize
+        if max_jacobian_bytes is not None and jacobian_bytes > max_jacobian_bytes:
+            raise ValueError(
+                f"The TDVP diagnostic Jacobian alone needs {jacobian_bytes / 2**30:.2f} GiB, "
+                "exceeding max_jacobian_bytes. Reduce the diagnostic batch or explicitly "
+                "raise/disable the limit; differentiation needs additional workspace."
+            )
+
+        # Do not use native.ode(): it writes RK-stage caches and warm-starts.
+        # Force, QGT and local energies below all share this endpoint batch.
+        stats, forces = state.expect_and_forces(operator)
+        factor = -1j if self.native.propagation_type == "real" else -1.
+        rhs = nk.jax.tree_cast(jax.tree_util.tree_map(lambda z: factor * z, forces), parameters)
+        qgt = self.native.qgt(state)
+        velocity, _ = qgt.solve(self.native.linear_solver, rhs, x0=None)
+        velocity = nk.jax.tree_cast(velocity, parameters)
+        v, _ = ravel_pytree(velocity)
+        b, _ = ravel_pytree(rhs)
+        regularized, _ = ravel_pytree(qgt @ velocity)
+
+        if not full_sum:
+            local_energies = state.local_estimators(operator)
+            # Released NetKet returns an array; newer builds expose the same
+            # chain-shaped values through the public LocalEstimators.data.
+            chain_energies = jnp.asarray(getattr(local_energies, "data", local_energies))
+            energies = chain_energies.reshape(-1)
+            chain_stats = nk.stats.statistics(chain_energies)
+            for key, attribute in (("energy_standard_error", "error_of_mean"),
+                                   ("r_hat", "R_hat"), ("tau_corr", "tau_corr"),
+                                   ("tau_corr_max", "tau_corr_max")):
+                value = float(getattr(chain_stats, attribute, np.nan))
+                sampling[key] = value if np.isfinite(value) else None
+
+        # Real-coordinate models can have genuinely real output. NetKet's
+        # complex VJP requires complex output even when its imaginary part is zero.
+        complex_output = np.issubdtype(state.log_value(configurations[:1]).dtype, np.complexfloating)
+        mode = "holomorphic" if holomorphic else ("complex" if complex_output else "real")
+        jacobian = nk.jax.jacobian(model.apply, parameters, configurations,
+                                  state.model_state, mode=mode, dense=True,
+                                  chunk_size=state.chunk_size)
+        if mode == "complex":
+            jacobian = jacobian[:, 0, :] + 1j * jacobian[:, 1, :]
+        centered = jacobian - jnp.sum(weights[:, None] * jacobian, axis=0)
+        centered_energy = energies - jnp.sum(weights * energies)
+        tangent_rhs = factor * centered_energy
+        tangent_residual = centered @ v - tangent_rhs
+        unregularized = centered.conj().T @ (weights * (centered @ v))
+        if not holomorphic:
+            unregularized = unregularized.real
+        residual = unregularized - b
+        tangent_norm = jnp.sqrt(jnp.sum(weights * jnp.abs(tangent_rhs) ** 2))
+        tangent_residual_norm = jnp.sqrt(jnp.sum(weights * jnp.abs(tangent_residual) ** 2))
+        norms = np.asarray([jnp.linalg.norm(residual), jnp.linalg.norm(regularized - b),
+                            jnp.linalg.norm(b), tangent_residual_norm, tangent_norm])
+        if not np.isfinite(norms).all() or not bool(jnp.all(jnp.isfinite(v))):
+            raise RuntimeError("Non-finite accepted-state TDVP solve or tangent diagnostic.")
+
+        def relative(numerator, denominator):
+            # A zero force does not guarantee a zero physical tangent RHS.
+            return float(numerator / denominator) if denominator > 0 else (0. if numerator == 0 else np.inf)
+
+        solve_relative = relative(norms[0], norms[2])
+        return {"time": float(self.t), "parameter_mode": "holomorphic" if holomorphic else "real-imag",
+                "propagation_type": self.native.propagation_type,
+                "n_coordinates": int(theta.size), "jacobian_bytes": int(jacobian_bytes),
+                "tdvp_relative_residual": solve_relative,
+                "tdvp_relative_residual_squared": solve_relative ** 2,
+                "regularized_relative_residual": relative(norms[1], norms[2]),
+                "tangent_relative_residual": relative(norms[3], norms[4]),
+                "tangent_residual_norm": float(norms[3]), "tangent_rhs_norm": float(norms[4]),
+                "energy_mean": {"real": float(np.real(stats.mean)), "imag": float(np.imag(stats.mean))},
+                "energy_variance": float(stats.variance), "sampling": sampling}
 
 
 def make_netket_tdvp_driver(
@@ -2803,6 +2950,28 @@ def make_netket_tdvp_driver(
         raise ValueError("t0 must be finite.")
     if not np.isfinite(diag_shift) or diag_shift < 0:
         raise ValueError("diag_shift must be non-negative and finite.")
+    if not isinstance(integrator, str):
+        raise TypeError("integrator must be a supported integrator name.")
+    integrator = integrator.lower()
+    if integrator not in {"euler", "midpoint", "rk4"}:
+        raise ValueError("integrator must be 'euler', 'midpoint', or 'rk4'.")
+    if propagation_type not in ("real", "imag"):
+        raise ValueError("propagation_type must be 'real' or 'imag'.")
+    if not callable(error_norm) and error_norm not in ("euclidean", "maximum", "qgt"):
+        raise ValueError("error_norm must be 'euclidean', 'maximum', 'qgt', or a callable.")
+    if isinstance(linear_solver, str):
+        if linear_solver not in {"cg", "cholesky", "pinv_smooth"}:
+            raise ValueError("linear_solver must be 'cg', 'cholesky', 'pinv_smooth', or a callable.")
+    elif linear_solver is not None and not callable(linear_solver):
+        raise TypeError("linear_solver must be a supported solver name or a callable.")
+    compressed = getattr(setup.model, "contraction_method", "exact") != "exact"
+    if compressed and holomorphic:
+        # Truncated complex SVD depends on conjugate parameters. Declaring
+        # holomorphicity would discard part of the physical TDVP force.
+        raise ValueError(
+            "holomorphic=True is unsupported for compressed PEPS; "
+            "use parameter_mode='real-imag' and holomorphic=False."
+        )
     if max_dense_solver_bytes is not None:
         max_dense_solver_bytes = _check_positive_int(
             "max_dense_solver_bytes", max_dense_solver_bytes
@@ -2830,8 +2999,6 @@ def make_netket_tdvp_driver(
             linear_solver = partial(cg, tol=1e-10, maxiter=2000)
         elif linear_solver in {"cholesky", "pinv_smooth"}:
             linear_solver = getattr(nk.optimizer.solver, linear_solver)
-        else:
-            raise ValueError("linear_solver must be 'cg', 'cholesky', 'pinv_smooth', or a callable.")
     if linear_solver_kwargs:
         if linear_solver is None:
             linear_solver = nk.optimizer.solver.pinv_smooth
@@ -2851,30 +3018,29 @@ def make_netket_tdvp_driver(
             "Use linear_solver='cg' with qgt='jacobian_dense' and verify its "
             "residual, or explicitly raise/disable the dense allocation limit."
         )
-    if isinstance(integrator, str):
-        constructors = {
-            "euler": nk.experimental.dynamics.Euler,
-            "midpoint": nk.experimental.dynamics.Midpoint,
-            "rk4": nk.experimental.dynamics.RK4,
-        }
-        try:
-            ode_solver = constructors[integrator.lower()](dt=dt)
-        except KeyError as exc:
-            raise ValueError("integrator must be 'euler', 'midpoint', or 'rk4'.") from exc
-    else:
-        raise TypeError("integrator must be a supported integrator name.")
+    constructors = {
+        "euler": nk.experimental.dynamics.Euler,
+        "midpoint": nk.experimental.dynamics.Midpoint,
+        "rk4": nk.experimental.dynamics.RK4,
+    }
+    ode_solver = constructors[integrator](dt=dt)
     constructor = _resolve_netket_qgt(nk, qgt)
-    compressed = getattr(setup.model, "contraction_method", "exact") != "exact"
     if compressed and (constructor is None or constructor is nk.optimizer.qgt.QGTAuto):
         constructor = nk.optimizer.qgt.QGTJacobianDense
-    if (constructor is nk.optimizer.qgt.QGTOnTheFly and
-            compressed):
+    qgt_function = constructor
+    while isinstance(qgt_function, partial):
+        qgt_function = qgt_function.func
+    if qgt_function is nk.optimizer.qgt.QGTOnTheFly and compressed:
         raise ValueError(
             "Compressed PEPS use custom VJPs without forward-mode JVPs; "
             "use qgt='jacobian_dense' or 'jacobian_pytree', including with CG."
         )
     if constructor is None:
-        constructor = nk.optimizer.qgt.QGTAuto
+        # QGTAuto is a factory object: calling its class with MCState creates
+        # another factory, not a metric with solve(). Instantiate it first.
+        constructor = nk.optimizer.qgt.QGTAuto(solver=linear_solver)
+    elif qgt_function is nk.optimizer.qgt.QGTAuto:
+        constructor = constructor(solver=linear_solver)
     kwargs = {
         "t0": t0,
         "propagation_type": propagation_type,
