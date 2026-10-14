@@ -249,7 +249,8 @@ def test_native_qgt_solver_choices_match_independent_tdvp(holomorphic, qgt, solv
     setup = _product_tdvp_setup(holomorphic, sampled)
     shift = .03
     driver = make_netket_tdvp_driver(setup, dt=.001, diag_shift=shift,
-                                    holomorphic=holomorphic, qgt=qgt, linear_solver=solver)
+                                    holomorphic=holomorphic, qgt=qgt, linear_solver=solver,
+                                    solver_max_relative_residual=1e-8)
     velocity = np.asarray(driver.native.ode()["coefficients"])
     if sampled:
         import jax.numpy as jnp
@@ -312,6 +313,60 @@ def test_tdvp_failed_solver_cannot_silently_return_nonfinite_parameters():
     driver = make_netket_tdvp_driver(setup, dt=.001, diag_shift=.01, linear_solver=failed_solver)
     with pytest.raises(RuntimeError, match="non-finite accepted parameters"):
         driver.advance(.001)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("qgt", ["auto", "jacobian_dense", "jacobian_pytree", "on_the_fly"])
+def test_tdvp_stage_guard_rejects_finite_inaccurate_solver(qgt):
+    import jax
+    import jax.numpy as jnp
+    setup = _product_tdvp_setup()
+
+    def inaccurate_solver(matrix, rhs, x0=None):
+        return jax.tree_util.tree_map(jnp.zeros_like, rhs), None
+
+    driver = make_netket_tdvp_driver(setup, dt=.001, diag_shift=.01, qgt=qgt,
+                                    linear_solver=inaccurate_solver, solver_max_relative_residual=1e-5)
+    with pytest.raises(RuntimeError, match="stage solver residual guard"):
+        driver.advance(.001)
+
+
+def test_tdvp_stage_guard_accepts_zero_rhs_without_dividing_by_zero():
+    import jax
+    import jax.numpy as jnp
+    from pepsy.vmc.netket import _netket_tdvp_checked_solver
+
+    def solve(matrix, rhs):
+        return rhs, None
+
+    checked = jax.jit(_netket_tdvp_checked_solver(solve, 1e-8))
+    result, _ = checked(jnp.eye(2), jnp.zeros(2))
+    np.testing.assert_array_equal(result, np.zeros(2))
+    result, _ = checked(2 * jnp.eye(2), jnp.ones(2))
+    assert np.isnan(result).all()
+
+
+@pytest.mark.integration
+def test_tdvp_stage_guard_checks_later_runge_kutta_stages():
+    import jax.numpy as jnp
+    nk = require_netket()
+    setup = _product_tdvp_setup(holomorphic=True)
+    _, forces = setup.vstate.expect_and_forces(setup.hamiltonian)
+    initial_rhs = -1j * forces["coefficients"]
+
+    def inaccurate_later(matrix, rhs, x0=None):
+        exact, info = nk.optimizer.solver.cholesky(matrix, rhs, x0=x0)
+        # The initial solve is accurate, but a later stage with changed
+        # parameters returns a finite zero velocity despite a nonzero force.
+        return jnp.where(jnp.linalg.norm(rhs - initial_rhs) < 1e-12, exact,
+                         jnp.zeros_like(exact)), info
+
+    driver = make_netket_tdvp_driver(setup, dt=.01, diag_shift=.03,
+                                    linear_solver=inaccurate_later,
+                                    solver_max_relative_residual=1e-8, holomorphic=True)
+    assert np.isfinite(np.asarray(driver.native.ode()["coefficients"])).all()
+    with pytest.raises(RuntimeError, match="stage solver residual guard"):
+        driver.advance(.01)
 
 
 def _independent_diagnostic_reference(configurations, weights, energies, *, holomorphic,
@@ -453,7 +508,7 @@ def test_truncated_boundary_tdvp_uses_reverse_derivatives_without_dense_metric(m
     from netket.optimizer.qgt.qgt_jacobian_dense import QGTJacobianDenseT
     monkeypatch.setattr(QGTJacobianDenseT, "to_dense", forbidden_dense)
     driver = setup.make_tdvp_driver(dt=.001, diag_shift=.02, linear_solver="cg", qgt="auto",
-                                    max_dense_solver_bytes=1)
+                                    max_dense_solver_bytes=1, solver_max_relative_residual=1e-8)
     driver.advance(.001)
     after = jax.tree_util.tree_leaves(setup.vstate.parameters)
     assert sum(np.linalg.norm(np.asarray(z) - old)
@@ -515,6 +570,10 @@ def test_tdvp_rejects_invalid_dt_before_optional_import(dt):
     ({"error_norm": "bad"}, ValueError, "error_norm"),
     ({"linear_solver": "bad"}, ValueError, "linear_solver"),
     ({"linear_solver": 3}, TypeError, "linear_solver"),
+    ({"solver_max_relative_residual": 0}, ValueError, "solver_max_relative_residual"),
+    ({"solver_max_relative_residual": -1}, ValueError, "solver_max_relative_residual"),
+    ({"solver_max_relative_residual": np.nan}, ValueError, "solver_max_relative_residual"),
+    ({"solver_max_relative_residual": np.inf}, ValueError, "solver_max_relative_residual"),
 ])
 def test_tdvp_rejects_invalid_controls_before_optional_import(monkeypatch, options, exception, message):
     import pepsy.vmc.netket as bridge
@@ -650,6 +709,37 @@ def test_example_dense_oracle_preserves_states_below_raw_float_range(monkeypatch
     assert np.exp(scaled_log_norm) == 0.
 
 
+def test_example_checkpoint_write_failure_preserves_previous_snapshot(monkeypatch, tmp_path):
+    examples = Path(__file__).resolve().parents[1] / "examples"
+    monkeypatch.syspath_prepend(str(examples))
+    require_netket()
+    write = runpy.run_path(str(examples / "tfim_netket_tdvp.py"))["write_checkpoint"]
+    destination = tmp_path / "saved.npz"
+    write(destination, {"state": np.arange(4)})
+    previous = destination.read_bytes()
+
+    def interrupted_write(stream, **arrays):
+        stream.write(b"incomplete archive")
+        raise OSError("Interrupted checkpoint write")
+
+    monkeypatch.setattr(np, "savez_compressed", interrupted_write)
+    with pytest.raises(OSError, match="Interrupted checkpoint write"):
+        write(destination, {"state": np.zeros(4)})
+    assert destination.read_bytes() == previous
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_example_old_snapshot_cannot_silently_resume(monkeypatch, tmp_path):
+    examples = Path(__file__).resolve().parents[1] / "examples"
+    monkeypatch.syspath_prepend(str(examples))
+    require_netket()
+    load = runpy.run_path(str(examples / "tfim_netket_tdvp.py"))["load_checkpoint"]
+    old = tmp_path / "old.npz"
+    np.savez(old, metadata=np.asarray(json.dumps({"step": 3, "time": .1})))
+    with pytest.raises(ValueError, match="lacks restart layout"):
+        load(old)
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("reference_origin", ["handoff", "initial"])
 def test_example_snapshots_reconstruct_evolved_complex_parameters(monkeypatch, tmp_path, capsys, reference_origin):
@@ -659,10 +749,13 @@ def test_example_snapshots_reconstruct_evolved_complex_parameters(monkeypatch, t
     import pepsy.vmc as pvmc
     original = pvmc.build_ising_vmc
     setups = []
+    initial_parameters = []
 
     def capture(*args, **kwargs):
         setup = original(*args, **kwargs)
         setups.append(setup)
+        initial_parameters.append({name: {part: np.asarray(value).copy() for part, value in leaf.items()}
+                                   for name, leaf in setup.vstate.parameters.items()})
         return setup
 
     monkeypatch.setattr(pvmc, "build_ising_vmc", capture)
@@ -707,3 +800,40 @@ def test_example_snapshots_reconstruct_evolved_complex_parameters(monkeypatch, t
     reconstructed = reconstructed[initial_data["basis_physical_positions"]]
     reconstructed /= np.linalg.norm(reconstructed)
     np.testing.assert_allclose(initial_data["peps_vector"], reconstructed, atol=1e-12)
+
+    def forbidden_startup(*args, **kwargs):
+        raise AssertionError("Resume must use the saved PEPS without rerunning startup")
+
+    monkeypatch.setattr("pepsy.optimizers.PepsOptimizer", forbidden_startup)
+    resumed_dir = tmp_path / "resumed"
+    monkeypatch.setattr("sys.argv", ["tfim_netket_tdvp.py", "--resume", str(tmp_path / "step-0002.npz"),
+                                    "--steps", "1", "--checkpoint-dir", str(resumed_dir),
+                                    "--tdvp-diagnostics"])
+    runpy.run_path(str(examples / "tfim_netket_tdvp.py"), run_name="__main__")
+    resumed_rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert not any(row["event"] == "startup_step" for row in resumed_rows)
+    restored = next(row for row in resumed_rows if row["event"] == "resumed")
+    assert restored["time"] == pytest.approx(.0215)
+    assert restored["step"] == 2 and restored["sampling"] == "fresh"
+    for name, leaf in initial_parameters[1].items():
+        np.testing.assert_array_equal(leaf["real"], data[f"{name}_real"])
+        np.testing.assert_array_equal(leaf["imag"], data[f"{name}_imag"])
+    with np.load(resumed_dir / "step-0003.npz", allow_pickle=False) as continued:
+        continued_metadata = json.loads(str(continued["metadata"]))
+        assert continued_metadata["time"] == pytest.approx(.0225)
+        assert continued_metadata["simulation_settings"] == metadata["simulation_settings"]
+        expected = expm_multiply(-1j * .001 * setups[1].hamiltonian.to_sparse(), data["reference_vector"])
+        np.testing.assert_allclose(continued["reference_vector"], expected, atol=1e-12)
+        np.testing.assert_array_equal(continued["handoff_vector"], data["handoff_vector"])
+    assert not (resumed_dir / "step-0002.npz").exists()
+    final = next(row for row in resumed_rows if row["event"] == "tdvp_step")
+    assert final["step"] == 3
+    assert final["tdvp_diagnostics"]["regularized_relative_residual"] < 1e-6
+
+    # Refuse incompatible physics/settings before constructing a new sampler.
+    monkeypatch.setattr("sys.argv", ["tfim_netket_tdvp.py", "--resume", str(tmp_path / "step-0002.npz"),
+                                    "--h", "2"])
+    with pytest.raises(SystemExit):
+        runpy.run_path(str(examples / "tfim_netket_tdvp.py"), run_name="__main__")
+    assert "must match the resumed checkpoint" in capsys.readouterr().err
+    assert len(setups) == 2

@@ -25,6 +25,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- NetKet TDVP can check every stage solve with
+  `solver_max_relative_residual`. The TFIM example enables this check and adds
+  atomic, self-contained checkpoints with `--resume` for physical-state
+  continuation using fresh sampling.
+
 - `NetKetTDVPDriver.diagnostics()` recomputes accepted-state solve and complex
   tangent residuals with endpoint sampling statistics, preserving native RK
   caches. The TFIM example exposes it through `--tdvp-diagnostics`.

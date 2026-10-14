@@ -217,6 +217,7 @@ setup = pvmc.build_ising_vmc(
 )
 dynamics = setup.make_tdvp_driver(
     dt=0.001, t0=0.02, integrator="midpoint", diag_shift=1e-6,
+    solver_max_relative_residual=1e-5,
 )
 dynamics.advance(0.002)
 diagnostics = dynamics.diagnostics()  # optional fresh endpoint measurement
@@ -286,6 +287,24 @@ Calling `.native.advance(...)` bypasses this synchronization. `estimate(...)`
 delegates endpoint measurements to NetKet. Integrators are `euler`, `midpoint`
 or `rk4`; `linear_solver` accepts a native NetKet/JAX solver.
 
+Set `solver_max_relative_residual` to a positive finite tolerance to check
+every actual solver call, including RK stages and endpoint diagnostic solves.
+The default `None` preserves the solver's own truncation policy. This checks
+the regularized (and, when applicable, scaled) equation supplied to the solver:
+
+$$
+{\color{blue}\|Av-b\|}\leq
+\texttt{solver\_max\_relative\_residual}\,{\color{purple}\|b\|}.
+$$
+
+A zero right-hand side requires a zero residual. The check adds one metric
+application per solve and does not allocate a dense metric. An inaccurate or
+nonfinite velocity is marked nonfinite, causing the accepted-state guard to
+raise; this is a failure signal without rollback or automatic retry. It does
+not bound the unregularized residual, sampling error or tangent mismatch.
+The TFIM example enables this guard with a default tolerance of `1e-5` through
+`--solver-max-relative-residual`.
+
 `diagnostics(max_jacobian_bytes=1 << 30)` recomputes the force, configured
 QGT solve and complex tangent mismatch at the accepted time. It draws a fresh
 endpoint MC batch shared by the force, QGT and tangent check; it does not reuse
@@ -330,6 +349,23 @@ implement the paper's optimized PEPS gauge projection or tensor-local small-o
 storage, and does not convert a dense startup to a native Z2 ansatz.
 Add `--tdvp-diagnostics` to emit fresh endpoint solve/tangent/sampling records
 under `tdvp_diagnostics` in each step's JSON output.
+
+The example's `--checkpoint-dir` writes complete tensor layouts and saved
+simulation settings atomically. Restart a current-format checkpoint with:
+
+```bash
+python examples/tfim_netket_tdvp.py --resume checkpoints/step-0010.npz \
+    --steps 10 --checkpoint-dir continued
+```
+
+Restart restores the PEPS, physical time, step numbering and optional exact
+reference, skips PEPO startup, and draws fresh samples with the saved burn-in
+settings. `--steps` counts additional steps; `--final-time` is an absolute
+target after the saved time. Simulation settings are restored and conflicting
+overrides are rejected. Sampler/RNG state and solver warm starts are not
+restored, so this is physical-state continuation rather than bitwise trajectory
+replay. Older snapshots without tensor layouts remain readable for analysis
+but cannot use `--resume`.
 
 The example reports normalized Pauli X magnetization, nearest-neighbor ZZ
 correlation and global X parity alongside exact-reference values. It also

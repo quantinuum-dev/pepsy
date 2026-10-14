@@ -2723,6 +2723,31 @@ def _netket_tdvp_finite_checker():
         parameters, initializer=jnp.array(True)))
 
 
+def _netket_tdvp_checked_solver(solver, tolerance):
+    """Keep an inaccurate stage velocity from reaching a successful handoff."""
+    jax, _ = _require_jax()
+    import jax.numpy as jnp
+    from jax.flatten_util import ravel_pytree
+
+    def checked(matrix, rhs, **kwargs):
+        velocity, info = solver(matrix, rhs, **kwargs)
+        applied = matrix @ velocity
+        residual = jax.tree_util.tree_map(lambda a, b: a - b, applied, rhs)
+        r, _ = ravel_pytree(residual)
+        b, _ = ravel_pytree(rhs)
+        v, _ = ravel_pytree(velocity)
+        # Compare the actual (regularized, possibly scaled) solver equation.
+        # No dense metric or host callback is needed. NaN marks failure for the
+        # adapter's existing endpoint guard; this does not implement rollback.
+        valid = (jnp.all(jnp.isfinite(v)) & jnp.all(jnp.isfinite(r)) &
+                 (jnp.linalg.norm(r) <= tolerance * jnp.linalg.norm(b)))
+        velocity = jax.tree_util.tree_map(
+            lambda z: jnp.where(valid, z, jnp.full_like(z, jnp.nan)), velocity)
+        return velocity, info
+
+    return checked
+
+
 class NetKetTDVPDriver:
     """NetKet TDVP with the shared PEPS state synchronized at accepted times.
 
@@ -2730,8 +2755,9 @@ class NetKetTDVPDriver:
     ``advance``/``iter`` methods when reconstructing the PEPS from its setup.
     """
 
-    def __init__(self, native):
+    def __init__(self, native, *, solver_max_relative_residual=None):
         self.native = native
+        self.solver_max_relative_residual = solver_max_relative_residual
 
     @property
     def state(self):
@@ -2751,7 +2777,11 @@ class NetKetTDVPDriver:
         # the stage parameters visible biases observables and PEPS handoff.
         parameters = self.native.integrator.y
         if not bool(_netket_tdvp_finite_checker()(parameters)):
-            raise RuntimeError("NetKet TDVP produced non-finite accepted parameters; check the QGT solve.")
+            detail = ""
+            if self.solver_max_relative_residual is not None:
+                detail = (" The stage solver residual guard is enabled "
+                          f"with limit {self.solver_max_relative_residual:g}.")
+            raise RuntimeError("NetKet TDVP produced non-finite accepted parameters; check the QGT solve." + detail)
         self.state.parameters = parameters
         self.state.reset()
 
@@ -2931,6 +2961,7 @@ def make_netket_tdvp_driver(
     holomorphic=False,
     linear_solver=None,
     linear_solver_kwargs=None,
+    solver_max_relative_residual=None,
     max_dense_solver_bytes=1 << 30,
     linear_solver_restart=False,
     error_norm="euclidean",
@@ -2950,6 +2981,10 @@ def make_netket_tdvp_driver(
         raise ValueError("t0 must be finite.")
     if not np.isfinite(diag_shift) or diag_shift < 0:
         raise ValueError("diag_shift must be non-negative and finite.")
+    if solver_max_relative_residual is not None:
+        solver_max_relative_residual = float(solver_max_relative_residual)
+        if not np.isfinite(solver_max_relative_residual) or solver_max_relative_residual <= 0:
+            raise ValueError("solver_max_relative_residual must be positive and finite, or None.")
     if not isinstance(integrator, str):
         raise TypeError("integrator must be a supported integrator name.")
     integrator = integrator.lower()
@@ -3041,6 +3076,9 @@ def make_netket_tdvp_driver(
         constructor = nk.optimizer.qgt.QGTAuto(solver=linear_solver)
     elif qgt_function is nk.optimizer.qgt.QGTAuto:
         constructor = constructor(solver=linear_solver)
+    if solver_max_relative_residual is not None:
+        linear_solver = _netket_tdvp_checked_solver(
+            linear_solver or nk.optimizer.solver.pinv_smooth, solver_max_relative_residual)
     kwargs = {
         "t0": t0,
         "propagation_type": propagation_type,
@@ -3051,7 +3089,8 @@ def make_netket_tdvp_driver(
     if linear_solver is not None:
         kwargs["linear_solver"] = linear_solver
     return NetKetTDVPDriver(
-        nk.experimental.TDVP(setup.hamiltonian, setup.vstate, ode_solver, **kwargs)
+        nk.experimental.TDVP(setup.hamiltonian, setup.vstate, ode_solver, **kwargs),
+        solver_max_relative_residual=solver_max_relative_residual,
     )
 
 
