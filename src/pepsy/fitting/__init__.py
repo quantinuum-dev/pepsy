@@ -4,6 +4,11 @@ from importlib import import_module
 
 _SYMBOL_MODULES = {
     "FIT": ".local",
+    "FunctionalFIT": ".jax",
+    "make_jax_fit": ".jax",
+    "compress_jax_fit": ".jax",
+    "TorchFunctionalFIT": ".torch",
+    "make_torch_fit": ".torch",
     "TreeFIT": ".tree",
     "internal_inds": ".local",
 }

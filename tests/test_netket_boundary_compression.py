@@ -7,6 +7,53 @@ import quimb.tensor as qtn
 from pepsy.vmc import make_peps_batched_amplitude_function, pack_peps_ansatz
 
 
+@pytest.mark.parametrize("method, bsz", [("dmrg", 1), ("dmrg2", 2)])
+def test_dmrg_dispatch_uses_pepsy_compressor_and_explicit_differentiation(method, bsz):
+    from pepsy.fitting import compress_jax_fit
+    from pepsy.vmc.netket import _boundary_contraction_options
+    options = _boundary_contraction_options({"method": method}, jit=True)
+    assert options["method"] is compress_jax_fit
+    assert options["differentiation"] == "auto" and options["bsz"] == bsz
+    unrolled = _boundary_contraction_options({"method": method, "differentiation": "unrolled"}, jit=True)
+    assert unrolled["max_iterations"] == 2
+    implicit = _boundary_contraction_options({"method": method, "differentiation": "implicit"}, jit=True)
+    assert implicit["max_iterations"] == 100
+
+
+def test_native_explicit_implicit_fit_reports_unsupported_chart():
+    jax = pytest.importorskip("jax")
+    sr = pytest.importorskip("symmray")
+    with jax.enable_x64():
+        peps = sr.PEPS_abelian_rand("Z2", 3, 3, bond_dim=4, flat=True,
+                                   dtype="complex128", seed=82)
+        ansatz = pack_peps_ansatz(peps)
+        fn = make_peps_batched_amplitude_function(ansatz, contraction="boundary", chi=2,
+            cutoff=0., contraction_opts={"method": "dmrg", "differentiation": "implicit"})
+        with pytest.raises(NotImplementedError, match="Implicit native Symmray"):
+            fn(np.ones((1, 9), dtype=int))
+
+
+def test_implicit_dmrg_gradient_through_multiple_boundary_compressions_and_configurations():
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    with jax.enable_x64():
+        ansatz = pack_peps_ansatz(qtn.PEPS.rand(4, 3, bond_dim=2, dtype="complex128", seed=82))
+        params = jax.tree.map(jnp.asarray, ansatz.params)
+        fn = make_peps_batched_amplitude_function(ansatz, contraction="boundary", chi=1,
+            cutoff=0., contraction_opts={"method": "dmrg", "sequence": ("xmin",),
+                                        "max_separation": 1}, output="log")
+        rows = np.asarray([[1, -1]*6, [-1, 1]*6])
+        rng = np.random.default_rng(28)
+        direction = jax.tree.map(lambda z: jnp.asarray(rng.normal(size=z.shape)
+                                                        + 1j*rng.normal(size=z.shape)), params)
+        def loss(t):
+            shifted = jax.tree.map(lambda p, d: p+t*d, params, direction)
+            return jnp.real(fn(rows, shifted)).sum()
+        derivative = jax.jit(jax.grad(loss))(0.)
+        numerical = (loss(1e-5)-loss(-1e-5))/2e-5
+        np.testing.assert_allclose(derivative, numerical, atol=1e-7, rtol=3e-6)
+
+
 @pytest.mark.parametrize("method", ["zipup", "src", "sdc", "dm", "dmrg", "dmrg2"])
 def test_jit_compression_matches_eager_and_directional_derivative(method):
     jax = pytest.importorskip("jax")
@@ -126,7 +173,7 @@ def test_native_fermionic_compression_preserves_jit_values_and_complex_derivativ
         rows = np.array([[1, 0] * 4 + [0, 1] * 4 + [0, 0]], dtype=np.int32)
         options = {"method": method, "sequence": ("xmin",), "max_separation": 1}
         if method.startswith("dmrg"):
-            options.update(max_iterations=2, tol=0., optimize="greedy")
+            options.update(tol=0., optimize="greedy")
         kwargs = dict(contraction="boundary", chi=2, cutoff=0.,
                       contraction_opts=options, output="amplitude")
         compiled = make_fermionic_peps_batched_amplitude_function(ansatz, columns, **kwargs)
@@ -182,7 +229,8 @@ def test_fixed_sweep_boundary_fit_runs_native_netket_sr_and_real_coordinate_tdvp
         register_jax_linalg(stabilized=True, qr_rank_policy="adaptive")
         setup = build_ising_vmc(qtn.PEPS.rand(3, 3, bond_dim=2, dtype="complex128", seed=24),
             Lx=3, Ly=3, J=-1., h=.7, contraction="boundary", chi=1, cutoff=0.,
-            contraction_opts={"method": "dmrg", "max_iterations": 2, "optimize": "greedy"},
+            contraction_opts={"method": "dmrg", "differentiation": "unrolled",
+                              "max_iterations": 2, "optimize": "greedy"},
             parameter_mode="real-imag", n_samples=16, n_chains=2, chunk_size=8,
             n_discard_per_chain=1, seed=44, sampler_seed=45)
         shapes = [z.shape for z in jax.tree_util.tree_leaves(setup.vstate.parameters)]

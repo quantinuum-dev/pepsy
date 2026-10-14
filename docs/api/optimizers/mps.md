@@ -828,6 +828,35 @@ are `1,1,1,1,1,1,1,1`, `2,2,1,1,1,1,1,1`, and `3,3,2,1,1,1,1,1`.
 on one-site `dmrg`. Tolerance comparisons reset whenever the block size changes.
 Three-site updates shorten to two-site updates for an adjacent two-site window.
 
+### Implicit Torch FIT derivatives
+
+For Torch-backed dense MPS replay, set `fit_differentiation="implicit"` on
+`MpsOptimizer` to differentiate the converged local FIT fixed point:
+
+```python
+optimizer = pepsy.MpsOptimizer(
+    state, gates, chi=chi, mode="dmrg2",
+    fit_differentiation="implicit",
+)
+optimizer.run(cutoff=0.0)
+loss = torch.real((optimizer.p.H & optimizer.p).contract(all))
+loss.backward()
+```
+
+The default is `"unrolled"`, preserving ordinary replay. Implicit mode
+performs a two-sweep `dmrg2`/`dmrg3` rank-opening phase (and the `dmrg3`
+two-site transition), then converges one-site `RL` cycles. Backward solves
+the fixed-point adjoint with GMRES; the block warm-up is treated as a warm
+start. This path can require many more forward sweeps, raises if either solve
+fails, and currently requires `k_2q_batch=1` and `cutoff=0.0`. Dense Torch
+arrays and `fit_sweep_sequence="RL"` are required; layered Torch gate targets
+use the paired projector split so exact zero gate-Schmidt values do not pass
+through a square-root SVD gauge. Native Symmray, MPS shot batching, and
+higher-order gradients are unsupported. Set a finite
+iteration/tolerance policy through
+[`make_torch_fit`](../fitting/local.md#functional-torch-fitting) when using
+the lower-level API directly.
+
 FIT holds the exact target separate from its disposable initial guess. The
 default initialization is `guess-src` (`fit_init_strategy=None` or `auto`).
 Supported strategies include `direct` (current MPS), `random` (fixed-rank

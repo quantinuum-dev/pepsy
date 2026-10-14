@@ -39,6 +39,50 @@ def test_minsr_duplicate_samples_use_pseudoinverse():
     assert result.info["solver"] == "pinv"
 
 
+@pytest.mark.parametrize("parameter_mode", ["holomorphic", "real-imag"])
+def test_solved_normal_equation_can_leave_unit_tangent_residual(parameter_mode):
+    # Energy is orthogonal to the entire sampled tangent span. The TDVP
+    # normal equation is exactly solved by zero velocity, yet misses H|psi>.
+    o = torch.tensor([[-1.], [0.], [1.]], dtype=torch.complex128)
+    energy = torch.tensor([1., -2., 1.], dtype=torch.complex128)
+    result = solve_torch_tdvp(o, energy, method="direct", diag_shift=0,
+                              parameter_mode=parameter_mode)
+    assert result.info["tdvp_relative_residual"] == 0
+    assert result.info["tdvp_relative_residual_squared"] == 0
+    assert result.info["tangent_relative_residual"] == pytest.approx(1.)
+    assert result.info["tangent_residual_norm"] == pytest.approx(np.sqrt(2.))
+    assert result.info["tangent_rhs_norm"] == pytest.approx(np.sqrt(2.))
+
+
+@pytest.mark.parametrize("parameter_mode", ["holomorphic", "real-imag"])
+@pytest.mark.parametrize("method", ["direct", "minsr"])
+def test_tdvp_residual_diagnostics_match_weighted_wavefunction_equation(parameter_mode, method):
+    rng = torch.Generator().manual_seed(36)
+    o = torch.randn(4, 7, dtype=torch.complex128, generator=rng)
+    energy = torch.randn(4, dtype=torch.complex128, generator=rng)
+    weights = torch.tensor([.1, .2, .3, .4], dtype=torch.float64)
+    result = solve_torch_tdvp(o, energy, sample_weights=weights, method=method,
+                              diag_shift=.01, parameter_mode=parameter_mode)
+    c = o - (weights[:, None] * o).sum(dim=0)
+    centered_energy = energy - (weights * energy).sum()
+    tangent = c @ result.velocity.to(c.dtype) + 1j * centered_energy
+    expected = (weights * tangent.abs().square()).sum().sqrt()
+    denominator = (weights * centered_energy.abs().square()).sum().sqrt()
+    assert result.info["tangent_residual_norm"] == pytest.approx(float(expected))
+    assert result.info["tangent_relative_residual"] == pytest.approx(float(expected / denominator))
+    assert result.info["tdvp_relative_residual_squared"] == pytest.approx(
+        result.info["tdvp_relative_residual"] ** 2)
+
+
+def test_constant_energy_has_zero_centered_residual_diagnostics():
+    result = solve_torch_tdvp(torch.eye(2, dtype=torch.complex128),
+                              torch.full((2,), 3., dtype=torch.complex128),
+                              method="direct", diag_shift=1e-8)
+    for name in ("tdvp_relative_residual", "tdvp_relative_residual_squared",
+                 "tangent_relative_residual", "tangent_residual_norm", "tangent_rhs_norm"):
+        assert result.info[name] == 0
+
+
 def test_analytic_peps_gauges_annihilate_centered_jacobian():
     peps = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=12)
     model = TorchPEPSAmplitude(peps, dtype=torch.complex128,
@@ -219,3 +263,13 @@ def test_midpoint_rejects_fixed_weights_and_real_model():
     model.state = torch.nn.Parameter(model.state.detach().real)
     with pytest.raises(ValueError, match="complex parameters"):
         TorchTDVPDriver(vmc, dt=.01)
+
+
+@pytest.mark.parametrize("contraction", ["boundary", "hotrg", "ctmrg"])
+def test_tdvp_compressed_peps_require_real_coordinates(contraction):
+    model = TorchPEPSAmplitude(qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=19),
+                               dtype=torch.complex128, contraction=contraction, chi=1, cutoff=0.)
+    vmc = TorchVMCDriver(model, [], configs(4), terms={0: torch.eye(2)}, proposal="local")
+    with pytest.raises(ValueError, match="requires parameter_mode='real-imag'"):
+        TorchTDVPDriver(vmc, dt=.001)
+    TorchTDVPDriver(vmc, dt=.001, parameter_mode="real-imag", gauge_projection=False)

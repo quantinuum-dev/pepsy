@@ -134,21 +134,33 @@ Symmray compression depends on upstream RNG capabilities.
 ```python
 compression = pvmc.ContractionConfig(
     method="boundary", chi=16, cutoff=0.0,
-    options={"method": "dmrg2", "max_iterations": 2},
+    options={"method": "dmrg2", "differentiation": "implicit",
+             "max_iterations": 100, "tolerance": 1e-9},
 )
 ```
 
-Here `dmrg` selects Quimb `fit` with `bsz=1`; `dmrg2` selects `bsz=2`.
-Both aliases default to two directional sweeps and a differentiable zip-up
-guess. They are boundary fitting choices, separate from `MpsOptimizer`'s
-warm-up/refinement schedules and Pepsy `FIT`. Plain `fit` keeps Quimb's
-ten-sweep budget and defaults to a zip-up guess. Specify `tn_fit` to change
-the guess. JIT fitting requires a finite positive `max_iterations`, `tol=0`
-and disabled progress; JIT SRC requires an integer `seed`. These gradients
-differentiate the chosen finite algorithm, including its initialization.
+Here `dmrg` selects Pepsy's `compress_jax_fit` with `bsz=1`; `dmrg2` selects
+`bsz=2`. Both start from a tensor-derived zip-up guess. The default
+`differentiation="auto"` uses Pepsy `FunctionalFIT` implicit derivatives for
+dense boundaries, checking both forward and adjoint convergence. Its default
+budget is 100 complete `RL` cycles; `tolerance`, `adjoint_tolerance` and
+`adjoint_maxiter` control the checked solves. The warm-start guess has zero
+implicit derivative. This changes the dense default from finite fitting to a
+converged fit, which can change amplitudes and evaluation cost.
+
+Native Symmray boundaries retain Quimb's two-sweep, differentiable finite FIT
+path under `auto`, preserving charges and fermionic phases. Explicit native
+`differentiation="implicit"` raises: its gauge chart is not validated.
+Select `differentiation="unrolled", max_iterations=2` for finite-sweep
+derivatives, including the initialization. These boundary choices remain
+separate from `MpsOptimizer` warm-up/refinement schedules. Plain `fit` keeps
+Quimb's ten-sweep budget. Specify `tn_fit` to change the guess; Pepsy's aliases
+require a tensor-derived or supplied network guess, not random initialization.
+JIT fitting requires a finite positive `max_iterations`, `tol=0` and disabled
+progress; JIT SRC requires an integer `seed`.
 Put fitting controls directly in `contraction_opts`, rather than inside the
 low-level `compress_opts` mapping. An explicitly random FIT guess
-(`tn_fit=None`) requires an integer seed under JIT. Unsupported native
+(`tn_fit=None`) with plain `fit` requires an integer seed under JIT. Unsupported native
 Symmray RNG operations raise clearly without converting the graded arrays.
 For rank-deficient QR charts, explicitly select the existing backend policy:
 
@@ -1017,6 +1029,9 @@ Each complex tensor entry contributes interleaved real/imaginary coordinates.
 Direct TDVP and centered minSR reuse the existing doubled-real design solver.
 The default `parameter_mode="holomorphic"` retains the paper's complex chart
 and its uncentered minSR formulation.
+`TorchTDVPDriver` rejects this chart for known compressed PEPS models; specify
+`parameter_mode="real-imag"` even with `cutoff=0`, since a finite rank cap can
+still truncate.
 For actively compressed native Symmray Torch gradients, select the existing
 `TorchLinalgConfig(stabilized=True, quimb_split_drivers=True,
 qr_rank_policy="native")` policy around the run. The explicit native QR rank
@@ -1064,6 +1079,25 @@ sample dependencies or additional null modes can still require the shared
 pseudoinverse fallback. Repeated configurations share Jacobian rows and retain
 their aggregate weights. Diagnostics report solver, matrix shape, removed
 gauge rank, sample counts, and the **unregularized centered** TDVP residual.
+
+`info["tdvp_relative_residual"]` is the unsquared normal-equation residual;
+`tdvp_relative_residual_squared` matches the squared convention in
+[Wu and Nys, Eq. (26)](https://journals.aps.org/prxquantum/pdf/10.1103/tggc-8fjx).
+`tangent_relative_residual` instead measures the sampled wavefunction mismatch:
+
+$$
+{\color{blue}r_{\mathrm{tangent}}}=
+\frac{\|W^{1/2}(C\dot\theta+i(E_{\mathrm{loc}}-\langle E_{\mathrm{loc}}\rangle))\|}
+{\|W^{1/2}(E_{\mathrm{loc}}-\langle E_{\mathrm{loc}}\rangle)\|}.
+$$
+
+The complex mismatch is retained for real/imaginary coordinates too.
+`tangent_residual_norm` and `tangent_rhs_norm` expose its absolute numerator
+and denominator. Ratios clamp the denominator to the dtype's smallest normal
+number; a stationary zero numerator and denominator reports zero.
+A small normal-equation residual can coexist with a large tangent residual.
+Both use the solve's sample batch and need independent sampling, contraction,
+time-step and $D$ checks before drawing conclusions about trajectory accuracy.
 
 For TFIM use `proposal="local"`, whose lazy binary flips explore all
 magnetization sectors. The native `transverse_ising` connection helper uses

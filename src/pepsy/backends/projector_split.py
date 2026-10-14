@@ -1,9 +1,10 @@
 """Isometric factors of a retained matrix subspace for boundary contraction.
 
 This is a composed-factor derivative, not an SVD-vector derivative. Losses
-must be invariant under (Q, B) -> (Q W, W^H B) for unitary W. Numerical null
-directions are removed at matrix-size times machine precision. Rank-changing
-points and a closed kept/discarded spectral gap are not smooth charts.
+must be invariant under (Q, B) -> (Q W, W^H B) for unitary W. NumPy/Torch
+remove numerical null directions at matrix-size times machine precision;
+JAX uses explicit positive fixed ranks. Rank-changing points and a closed
+kept/discarded spectral gap are not smooth charts.
 """
 
 import autoray as ar
@@ -81,7 +82,8 @@ def projector_split(x, cutoff=-1.0, cutoff_mode="rsum2", max_bond=-1,
     Only left/right absorption is supported. The boundary algorithm uses
     both factors together. Native symmetry, other backends, renormalization,
     singular values as independent outputs, and higher derivatives are outside
-    this first-order dense NumPy/Torch route.
+    this composed-factor route. JAX requires a fixed positive bond cap and
+    zero cutoff so that the retained shapes are static.
     """
     import quimb.tensor.decomp as qd
 
@@ -108,10 +110,26 @@ def projector_split(x, cutoff=-1.0, cutoff_mode="rsum2", max_bond=-1,
             q, b = u[:, :rank], s[:rank, None] * vh[:rank]
         else:
             q, b = np.eye(x.shape[0], 1, dtype=x.dtype), np.zeros((1, x.shape[1]), dtype=x.dtype)
+    elif backend == "jax":
+        from numbers import Integral
+        from .linalg_jax_projector import jax_projector_split
+
+        if cutoff not in (0., -1.) or isinstance(max_bond, bool) or not isinstance(max_bond, Integral) or max_bond < 1:
+            raise ValueError("JAX projector splitting requires cutoff=0 and a positive static max_bond")
+        rank = min(int(max_bond), *x.shape)
+        q, b = jax_projector_split(x, rank)
     else:
-        raise TypeError("projector splitting currently supports dense NumPy/Torch arrays")
+        raise TypeError("projector splitting supports dense NumPy/Torch/JAX arrays")
     if info is not None:
         info["retained_rank"] = q.shape[1]
+        # FIT uses this public diagnostic to decide whether a local bond cap
+        # should grow. A missing error silently disables adaptive fitting.
+        # Measure the discarded Frobenius norm without a second decomposition;
+        # full-rank splits have exactly zero truncation error.
+        info["error"] = (
+            ar.do("linalg.norm", x - q @ b)
+            if q.shape[1] < min(x.shape) else 0.0
+        )
     if transposed:
         return ar.do("transpose", b), None, ar.do("transpose", q)
     return q, None, b

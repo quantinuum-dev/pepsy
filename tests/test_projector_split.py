@@ -138,3 +138,26 @@ def test_public_flat_projector_preserves_backend_exponent_inputs_and_dense_deriv
         contract_flat(network, method="exact", mps_factorization="projector")
     with pytest.raises(ValueError, match="direct boundary"):
         contract_flat(network, method="mps", chi=2, compression_mode="dm", mps_factorization="projector")
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_projector_error_diagnostic_allows_adaptive_fit_to_grow(backend):
+    import quimb.tensor as qtn
+    from pepsy.fitting import FIT
+
+    target = qtn.MPS_rand_state(4, 3, dtype="complex128", seed=1)
+    guess = qtn.MPS_rand_state(4, 1, dtype="complex128", seed=2)
+    if backend == "torch":
+        for state in (target, guess):
+            state.apply_to_arrays(lambda a: torch.tensor(a))
+    fit = FIT(target, p=guess, cutoffs=0., split_method="projector", contraction_opt="greedy")
+    fit.run_eff(n_iter=4, block_size=2, max_bond=3, cutoff=1e-10, adaptive_bond_growth=True)
+    assert fit.info.get("adaptive_bond_events")
+    assert fit.p.max_bond() == 3
+    error = fit.info["two_site_splits"][0]["truncation_error"]
+    assert float(error) > 1e-4
+    actual, expected = fit.p.to_dense(), target.to_dense()
+    if backend == "torch":
+        torch.testing.assert_close(actual, expected, atol=2e-11, rtol=2e-11)
+    else:
+        np.testing.assert_allclose(actual, expected, atol=2e-11, rtol=2e-11)

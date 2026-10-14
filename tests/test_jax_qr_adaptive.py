@@ -58,6 +58,34 @@ def test_reset_restores_qr():
     assert ar.get_lib_fn('jax', 'linalg.qr') is not qr_jax
 
 
+@pytest.mark.parametrize('singular', [False, True])
+def test_qr_pullback_is_linear_and_can_be_transposed(singular):
+    qr = ar.get_lib_fn('jax', 'linalg.qr')
+    matrix = jnp.asarray([[2., 0.], [1., 3.], [0., 1.]])
+    if singular:
+        matrix = matrix.at[:, 1].set(0.)
+    (q, r), pullback = jax.vjp(qr, matrix)
+    first = (jnp.ones_like(q), jnp.ones_like(r))
+    second = (jnp.arange(q.size).reshape(q.shape)*.1, -jnp.ones_like(r)*.3)
+    total = jax.tree.map(lambda a, b: a+b, first, second)
+    np.testing.assert_allclose(pullback(total)[0], pullback(first)[0]+pullback(second)[0], atol=1e-10)
+    transposed = jax.linear_transpose(lambda cot: pullback(cot)[0], first)(matrix)[0]
+    assert all(np.isfinite(x).all() for x in jax.tree.leaves(transposed))
+
+
+@pytest.mark.parametrize('explicit_vmap', [False, True])
+def test_batched_qr_pullback_can_be_transposed_for_implicit_solves(explicit_vmap):
+    qr = ar.get_lib_fn('jax', 'linalg.qr')
+    matrix = jnp.asarray([[[2., 0.], [1., 3.], [0., 1.]],
+                          [[1., 0.], [2., 0.], [0., 0.]]], dtype=jnp.complex128)
+    if explicit_vmap:
+        qr = jax.vmap(qr)
+    (q, r), pullback = jax.vjp(qr, matrix)
+    cotangent = (jnp.ones_like(q), jnp.ones_like(r))
+    actual = jax.jit(lambda a: jax.linear_transpose(lambda cot: pullback(cot)[0], cotangent)(a))(matrix)[0]
+    assert all(np.isfinite(x).all() for x in jax.tree.leaves(actual))
+
+
 @pytest.mark.parametrize('chi', [1, 4])
 def test_direct_jit_nonlocal_gate_value_and_gradient(chi):
     import quimb.tensor as qtn

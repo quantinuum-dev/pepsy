@@ -738,10 +738,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     ):
         """Compress one boundary target with a direct Quimb method."""
         started = time.perf_counter() if self.fit_timing else None
-        if self._uses_symmray_arrays(tn):
+        if self._uses_symmray_arrays(tn) and self.fit_mode not in {"direct", "zipup", "dm"}:
             raise NotImplementedError(
-                f"fit_mode={self.fit_mode!r} is currently dense-only for "
-                "native Symmray boundary targets; use fit_mode='dmrg'."
+                f"fit_mode={self.fit_mode!r} is not supported for native "
+                "Symmray boundary targets; use 'direct', 'zipup', 'dm', or 'dmrg'."
             )
 
         max_bond = self.fit_max_bond

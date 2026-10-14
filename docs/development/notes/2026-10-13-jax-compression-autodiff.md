@@ -44,6 +44,11 @@ generic factor-wise rule: review found that a symmetric correction in `U`
 would repair reconstruction but incorrectly change a subspace projector.
 That attempted extension was removed; composed-factor differentiation needs
 its own forward map and gauge-invariant derivative contract.
+At this revision, an independent minimal symmetric-perturbation case was a
+strict expected failure in `tests/test_jax_svd_stability.py`. The
+[2026-10-14 composed reconstruction](2026-10-14-functional-fit-and-native-compression.md)
+now passes that case through its own physical forward map; the generic
+factor-wise SVD rule retains this limitation.
 
 The rule transposes a real-linear differential with public JAX APIs, preserving
 complex cotangent conventions and rectangular complement terms. It reuses
@@ -53,6 +58,22 @@ projectors, real/complex rectangular matrices, zero singular values and
 scales `1e-30` through `1e30`.
 These checks do not certify every gauge-dependent factor observable or higher
 derivatives. The custom VJP does not add forward-mode support.
+
+## Independent checks after publication
+
+Against `8f8695b` plus preserved working-tree TDVP edits, the decomposition,
+QR, boundary compression, Pepsy FIT and backend selection passed:
+**100 passed, 63 deselected**, 261.17 s. The explicit retained-degeneracy
+reconstruction limitation produced **1 expected failure**, 2.16 s, separately.
+
+The final GPU selection was independently repeated with clean CUDA library
+resolution: **4 passed, 22 deselected**, 241.40 s. It covers genuinely
+truncated native fermionic zip-up/DMRG/DMRG2 contractions and a dense-spin
+NetKet SR/TDVP integration check. Torch zero-log cleanup passed its eager/
+exported inference regression separately. Ruff and whitespace checks passed.
+A full-suite attempt was stopped after source/test changes during collection
+made that run stale. No full-suite success or physical convergence is claimed.
+See the [independent handoff](../../../history/2026-10-13-jax-compression-independent-validation.md).
 
 ## Literature and decision
 

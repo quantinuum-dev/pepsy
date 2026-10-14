@@ -14,8 +14,34 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Compression differentiation
 
+- NetKet `dmrg`/`dmrg2` route through `pepsy.fitting.compress_jax_fit`.
+  Dense boundaries use checked implicit fixed-point gradients by default;
+  `differentiation="unrolled"` retains finite-sweep differentiation. Native
+  Symmray retains its finite-sweep path and rejects explicit implicit requests.
+  Batched JAX QR pullbacks can be transposed by implicit linear solvers.
+- Functional FIT snapshots caller-owned geometry and arrays, checks replacement
+  parameter layouts/dtypes, retains target/guess logarithmic scales, and clears
+  stale isometry annotations on reconstruction. Gauge alignment uses a smooth
+  composed polar rule with unitary forward factors, including repeated spectra.
+  Projector splits now supply the discarded-norm diagnostic required by
+  imperative FIT's adaptive bond growth.
+- `make_torch_fit` adds a dense Torch fixed-point VJP with a matrix-free GMRES
+  adjoint. `MpsOptimizer(fit_differentiation="implicit")` can opt Torch
+  `dmrg`, `dmrg2`, and `dmrg3` gate fits into converged one-site refinement
+  after their rank-opening warm-up.
+- `pepsy.fitting.make_jax_fit` provides pure packed-parameter FIT calls,
+  checkpointed finite-sweep gradients and checked, gauge-aligned dense
+  implicit gradients using JAX GMRES. Native Symmray implicit charts are
+  explicitly rejected; flat bosonic finite-sweep FIT uses native products.
+- `svd_reconstruct_jax` and dense JAX `pepsy:projector` splits differentiate
+  repeated retained singular subspaces through their paired factors. Closed
+  rank cuts produce invalid derivatives rather than finite surrogate values.
+  The JAX QR pullback now selects its chart from primal factors, retaining
+  linearity required by implicit linear solves.
+- BdyMPS `direct`, `zipup`, and `dm` compressors accept native Symmray targets,
+  with flat bosonic/fermionic exact-norm and truncated JAX derivative checks.
 - NetKet/JAX boundary amplitudes honor explicit Quimb compression methods;
-  `dmrg`/`dmrg2` select fixed-budget one-/two-site fitting with zip-up guesses.
+  `dmrg`/`dmrg2` select one-/two-site fitting with zip-up guesses.
   JIT rejects adaptive sweep stopping and unseeded SRC initialization.
   Unavailable native Symmray RNGs raise clearly without dense conversion.
 - JAX SVD reverse derivatives retain the full spectrum and regularize unresolved
@@ -69,6 +95,12 @@ releases remain backwards-compatible. From 1.0 onward:
   single-layer contraction cap.
 
 ### Changed
+
+- PEPS TDVP diagnostics distinguish the squared normal-equation residual from
+  the sampled complex tangent residual, exposing projection error even when
+  the linear solve converges. Torch and NetKet TDVP reject holomorphic
+  compressed PEPS; NetKet also rejects invalid solver/integration controls
+  before optional dependency imports.
 
 - NetKet boundary-MPS amplitudes strip full-tensor scales before physical
   selection, preserving mantissa/exponent values below the raw floating-point

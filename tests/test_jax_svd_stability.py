@@ -4,6 +4,28 @@ import numpy as np
 import pytest
 
 
+def test_retained_degenerate_reconstruction_keeps_symmetric_perturbation():
+    """Differentiate the smooth reconstruction as one composed operation."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from pepsy.backends import svd_reconstruct_jax
+
+    with jax.enable_x64():
+        matrix = jnp.diag(jnp.asarray([4., 4., 1.]))
+        direction = jnp.asarray([[0., 1., 0.], [1., 0., 0.], [0., 0., 0.]])
+        target = jnp.asarray([[0., 1., 0.], [2., 0., 0.], [0., 0., 0.]])
+
+        def loss(t):
+            retained = svd_reconstruct_jax(matrix + t * direction, max_bond=2)
+            return jnp.sum((retained - target) ** 2)
+
+        # The rank cut is gapped: the reconstruction is smooth even though
+        # the separate singular-vector chart inside the retained block is not.
+        numerical = (loss(1e-5) - loss(-1e-5)) / 2e-5
+        np.testing.assert_allclose(jax.jit(jax.grad(loss))(0.), numerical,
+                                   atol=1e-8, rtol=1e-7)
+
+
 @pytest.mark.parametrize("shape", [(5, 3), (3, 5), (4, 4)])
 @pytest.mark.parametrize("complex_input", [False, True])
 @pytest.mark.parametrize("scale", [1e-30, 1., 1e30])

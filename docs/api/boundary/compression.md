@@ -54,5 +54,9 @@ These options apply to compression replay, including dense gates and MPS
 sub-MPO events. They do not configure disposable DMRG/FIT guesses or change
 exact fitting targets. Native Symmray MPS/MPO replay, MPO channel events, and
 non-Quimb replay modes reject explicit advanced settings. Native PEPS direct
-compression retains its existing restriction; use its established DMRG path.
+compression supports `fit_mode="direct"`, `"zipup"`, and `"dm"` through
+the existing Quimb native compressors. Flat Z2 bosonic and fermionic inputs
+have exact-norm and genuinely truncated JAX gradient checks. Other native
+direct modes retain their explicit capability restriction; no dense conversion
+is used as a fallback.
 No speedup is implied by choosing a larger intermediate cap.

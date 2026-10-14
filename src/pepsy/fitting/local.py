@@ -328,6 +328,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         Copy ``tn`` before its internal indices are randomized. Optimizer
         integrations that construct a disposable target can pass ``False``
         and transfer ownership, avoiding one complete target-network copy.
+    split_method : str, default="svd"
+        Quimb split driver for block updates. ``"projector"`` selects the
+        package-owned composed-factor driver for dense NumPy/Torch/JAX
+        arrays. Its losses must depend on gauge-invariant paired factors;
+        JAX requires zero cutoff and a fixed positive bond cap.
     Attributes
     ----------
     tn : qtn.TensorNetwork | tuple[qtn.TensorNetwork, ...]
@@ -395,6 +400,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         *,
         environment_strategy: str = "auto",
         copy_target: bool = True,
+        split_method: str = "svd",
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
 
         # Validate the fitted network before taking ownership of either input.
@@ -444,6 +450,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.contraction_opt = contraction_opt
         self.cutoffs = cutoffs
         self.backend = backend
+        if split_method == "projector":
+            from ..backends import register_projector_split
+
+            split_method = register_projector_split()
+        self.split_method = split_method
 
         environment_strategy = str(environment_strategy).strip().lower()
         if environment_strategy not in {
@@ -599,6 +610,44 @@ class FIT:  # pylint: disable=too-many-instance-attributes
     # ------------------------------------------------------------------
     # Target cache, public inspection, and visualization
     # ------------------------------------------------------------------
+
+    def as_functional(self, *, backend, differentiation="implicit", **kwargs):
+        """Create a fixed-point autodiff wrapper from this FIT configuration.
+
+        The returned wrapper snapshots ``self.tn`` and ``self.p``. JAX callers
+        can pass it to ``jax.jit``; Torch callers can pass it to
+        ``torch.compile``. This does not execute or mutate this ``FIT`` object.
+
+        Parameters
+        ----------
+        backend : {"jax", "torch"}
+            Array/autodiff implementation to use.
+        differentiation : {"implicit", "unrolled"}, default="implicit"
+            JAX supports both modes. Torch currently supports the implicit
+            fixed-point VJP only.
+        **kwargs
+            Backend-specific options accepted by :func:`make_jax_fit` or
+            :func:`make_torch_fit`.
+        """
+        backend = str(backend).strip().lower()
+        options = dict(kwargs)
+        options.setdefault("max_bond", self.p.max_bond())
+        options.setdefault("contraction_opt", self.contraction_opt)
+        if backend == "jax":
+            if self.range_int:
+                raise ValueError("JAX functional FIT currently requires a full-chain FIT")
+            from .jax import make_jax_fit
+
+            options.setdefault("differentiation", differentiation)
+            return make_jax_fit(self.tn, self.p, **options)
+        if backend == "torch":
+            if differentiation != "implicit":
+                raise ValueError("Torch FIT currently supports implicit differentiation only")
+            from .torch import make_torch_fit
+
+            options.setdefault("range_int", tuple(self.range_int) or None)
+            return make_torch_fit(self.tn, self.p, **options)
+        raise ValueError("backend must be 'jax' or 'torch'")
 
     def _build_target_site_cache(self):
         """Return one target tensor per site, or ``None`` for a layered TN.
@@ -1913,7 +1962,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             data = result.data.tensordot(
                 right.data,
                 axes=(left_axes, right_axes),
-                mode="blockwise",
+                # Flat Symmray has batched native products rather than the
+                # sparse backend's blockwise mode. Preserve its storage and
+                # let that namespace select its supported contraction path.
+                mode="auto" if "Flat" in type(result.data).__name__ else "blockwise",
                 preserve_array=True,
             )
             inds = (
@@ -2781,7 +2833,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             new_left, new_right = theta.split(
                 left_inds=left_inds,
                 right_inds=right_inds,
-                method="svd",
+                method=self.split_method,
                 absorb="right" if direction == "R" else "left",
                 max_bond=self._split_max_bond(bond, max_bond),
                 cutoff=cutoff,
@@ -3039,7 +3091,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 new_left, middle_right = theta.split(
                     left_inds=left_inds,
                     right_inds=middle_inds + right_inds,
-                    method="svd",
+                    method=self.split_method,
                     absorb="right",
                     max_bond=self._split_max_bond(left_bond, max_bond),
                     cutoff=cutoff,
@@ -3059,7 +3111,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 new_middle, new_right = middle_right.split(
                     left_inds=middle_left_inds,
                     right_inds=right_inds,
-                    method="svd",
+                    method=self.split_method,
                     absorb="right",
                     max_bond=self._split_max_bond(right_bond, max_bond),
                     cutoff=cutoff,
@@ -3075,7 +3127,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 left_middle, new_right = theta.split(
                     left_inds=left_inds + middle_inds,
                     right_inds=right_inds,
-                    method="svd",
+                    method=self.split_method,
                     absorb="left",
                     max_bond=self._split_max_bond(right_bond, max_bond),
                     cutoff=cutoff,
@@ -3095,7 +3147,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 new_left, new_middle = left_middle.split(
                     left_inds=left_inds,
                     right_inds=middle_right_inds,
-                    method="svd",
+                    method=self.split_method,
                     absorb="left",
                     max_bond=self._split_max_bond(left_bond, max_bond),
                     cutoff=cutoff,

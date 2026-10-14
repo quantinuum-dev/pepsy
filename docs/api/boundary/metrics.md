@@ -138,6 +138,14 @@ absorption and gauge-invariant paired factors. This exposes the existing
 primitive; its fixed-rank, resolved-gap and first-order derivative limits
 remain unchanged. Registration itself does not import Torch.
 
+For a dense JAX matrix, `pepsy.backends.svd_reconstruct_jax(a, max_bond=chi)`
+returns a native truncated reconstruction with composed JVP/VJP derivatives.
+Repeated retained singular values are supported when the cut is gapped;
+closed rank cuts produce nonfinite derivatives. The registered paired-factor
+split also supports dense JAX with a positive static cap and zero cutoff,
+for gauge-invariant losses. This does not change the raw SVD-vector rule or
+extend the `contract_flat(..., mps_factorization="projector")` facade below.
+
 For a closed dense 2D NumPy/Torch network, select the composed-factor path:
 
 ```python

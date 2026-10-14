@@ -302,6 +302,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         tracks MPS canonical metadata.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
+    fit_differentiation : {"unrolled", "implicit"}, default="unrolled"
+        Derivative policy for dense Torch DMRG replay. ``"implicit"``
+        converges each local one-site FIT fixed point and uses a custom VJP
+        with a GMRES adjoint. It supports ``dmrg``, ``dmrg2``, and ``dmrg3``;
+        it requires ``k_2q_batch=1`` and does not support Symmray arrays.
     ind_id : str, default="k{}"
         Format string for site index labels used by exact gate application.
         Use "k{},{}" when gate sites are 2D coordinates like ``(i, j)``.
@@ -1017,6 +1022,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         _capture_initial=True,
         to_backend=None,
         qubit_roles=None,
+        fit_differentiation="unrolled",
     ):
         if chi is None:
             if isinstance(gates, Integral):
@@ -1075,6 +1081,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         self._dmrg_mode_block_size = self._dmrg_alias_block_size(mode_name)
         self.mode = self._normalize_mode(mode_name)
+        fit_differentiation = str(fit_differentiation).strip().lower()
+        if fit_differentiation not in {"unrolled", "implicit"}:
+            raise ValueError("fit_differentiation must be 'unrolled' or 'implicit'.")
+        if fit_differentiation == "implicit" and self.mode != "dmrg":
+            raise ValueError(
+                "fit_differentiation='implicit' currently requires mode='dmrg', "
+                "'dmrg2', or 'dmrg3'."
+            )
+        self.fit_differentiation = fit_differentiation
         self._validate_canonical_boundary(self.p, self.mode)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
         self.ind_id = str(ind_id)
@@ -1662,6 +1677,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         sites = tuple(int(site) for site in where)
         inds = tuple(self._format_ind(site) for site in sites)
+        split_method = "svd"
+        if self.fit_differentiation == "implicit" and ar.infer_backend(gate) == "torch":
+            from ...backends import register_projector_split
+
+            split_method = register_projector_split()
         self._timed_call(
             "gate.apply",
             qtn.tensor_network_gate_inds,
@@ -1670,8 +1690,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             inds,
             contract="split-gate",
             inplace=True,
-            method="svd",
-            absorb="both",
+            method=split_method,
+            absorb="right" if split_method != "svd" else "both",
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
         )
@@ -2187,6 +2207,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 inplace=True,
                 _capture_initial=False, to_backend=self._symbolic_gate_to_backend,
                 qubit_roles=self._qubit_roles,
+                fit_differentiation=self.fit_differentiation,
             )
         copied._dmrg_mode_block_size = self._dmrg_mode_block_size
         copied._dmrg_mode_alias = self._dmrg_mode_alias
@@ -6765,6 +6786,44 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 record["record_index"] = len(self._timing_state["fit_steps"])
                 self._timing_state["fit_steps"].append(record)
 
+    def _run_implicit_torch_fit(self, fit, *, block_size, adaptive_sweeps):
+        """Run a converged Torch FIT map behind a matrix-free implicit VJP."""
+        if self.fit_differentiation != "implicit":
+            raise RuntimeError("implicit FIT requested while differentiation is disabled")
+        from ...fitting import make_torch_fit
+
+        implicit = make_torch_fit(
+            fit.tn,
+            fit.p,
+            range_int=fit.range_int,
+            max_bond=self.chi,
+            warmup_block_size=block_size,
+            warmup_sweeps=max(1, int(adaptive_sweeps)),
+            transition_block_size=(
+                2 if self._dmrg_mode_alias == "dmrg3" and block_size == 3 else 1
+            ),
+            contraction_opt=self.contraction_opt,
+        )
+        parameters = implicit()
+        fit.p = implicit.to_network(parameters)
+        start, _ = fit.range_int
+        transition_sweeps = int(
+            self._dmrg_mode_alias == "dmrg3" and block_size == 3
+        )
+        fit.iterations_run = int(
+            2 * implicit.iterations_run
+            + (adaptive_sweeps if block_size > 1 else 0)
+            + transition_sweeps
+        )
+        fit.adaptive_sweeps_run = int(adaptive_sweeps if block_size > 1 else 0)
+        fit.one_site_sweeps_run = int(2 * implicit.iterations_run)
+        fit.converged = bool(implicit.converged)
+        fit.convergence_reason = "implicit_fixed_point"
+        fit.last_relative_change = implicit.relative_residual
+        fit.final_center_site = int(start)
+        fit.final_norm = fit.p[fit.final_center_site].norm()
+        fit.local_norm_trace = [fit.final_norm]
+
     def _run_dmrg_measurement(
         self,
         submpo,
@@ -6887,25 +6946,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 inplace=True,
                 copy_target=False,
             )
-            self._run_fit_gate(
-                fit,
-                n_iter=n_iter,
-                verbose=False,
-                min_iter=fit_min_iter,
-                rtol=fit_rtol,
-                patience=fit_patience,
-                finite_check=finite_check,
-                block_size=active_fit_block_size,
-                sweep_sequence=fit_sweep_sequence,
-                max_bond=self.chi,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                single_pair_fast_path=fit_single_pair_fast_path,
-                adaptive_block_sweeps=adaptive_sweeps,
-                adaptive_until_rank=adaptive_rank_schedule,
-                final_one_site_sweeps=0,
-                collect_split_diagnostics=False,
-            )
+            if self.fit_differentiation == "implicit":
+                self._run_implicit_torch_fit(
+                    fit, block_size=active_fit_block_size,
+                    adaptive_sweeps=adaptive_sweeps,
+                )
+            else:
+                self._run_fit_gate(
+                    fit,
+                    n_iter=n_iter,
+                    verbose=False,
+                    min_iter=fit_min_iter,
+                    rtol=fit_rtol,
+                    patience=fit_patience,
+                    finite_check=finite_check,
+                    block_size=active_fit_block_size,
+                    sweep_sequence=fit_sweep_sequence,
+                    max_bond=self.chi,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    single_pair_fast_path=fit_single_pair_fast_path,
+                    adaptive_block_sweeps=adaptive_sweeps,
+                    adaptive_until_rank=adaptive_rank_schedule,
+                    final_one_site_sweeps=0,
+                    collect_split_diagnostics=False,
+                )
         except Exception as exc:  # retain the direct compressed fallback
             # FIT failures are transactional for this multi-site window.
             # Restore both tensor data and canonical metadata before using the
@@ -6916,6 +6981,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_norm = None if fit is None else fit.final_norm
         fit_center = None if fit is None else fit.final_center_site
         if fit_error is not None:
+            if self.fit_differentiation == "implicit":
+                self.p = self._install_represented_norm(state_snapshot)
+                self.info_c = info_snapshot
+                raise fit_error.with_traceback(fit_error.__traceback__)
             self.p = self._install_represented_norm(state_snapshot)
             self.info_c = info_snapshot
             try:
@@ -7094,7 +7163,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # result.
         fit_state_snapshot = (
             self._fit_rollback_snapshot(p, (xmin, xmax))
-            if xmax - xmin > 1 and self.mode != "mix"
+            if self.fit_differentiation == "implicit"
+            or (xmax - xmin > 1 and self.mode != "mix")
             else None
         )
         fit_info_snapshot = (
@@ -7258,25 +7328,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # both sides while leaving the rest of the MPS fixed.
         fit_error = None
         try:
-            self._run_fit_gate(
-                fit,
-                n_iter=n_iter,
-                verbose=False,
-                min_iter=fit_min_iter,
-                rtol=fit_rtol,
-                patience=fit_patience,
-                finite_check=fit_finite_check,
-                block_size=active_fit_block_size,
-                sweep_sequence=fit_sweep_sequence,
-                max_bond=self.chi,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                single_pair_fast_path=active_single_pair_fast_path,
-                adaptive_block_sweeps=active_adaptive_sweeps,
-                adaptive_until_rank=active_adaptive_rank_schedule,
-                final_one_site_sweeps=0,
-                collect_split_diagnostics=False,
-            )
+            if self.fit_differentiation == "implicit":
+                self._run_implicit_torch_fit(
+                    fit, block_size=active_fit_block_size,
+                    adaptive_sweeps=active_adaptive_sweeps,
+                )
+            else:
+                self._run_fit_gate(
+                    fit,
+                    n_iter=n_iter,
+                    verbose=False,
+                    min_iter=fit_min_iter,
+                    rtol=fit_rtol,
+                    patience=fit_patience,
+                    finite_check=fit_finite_check,
+                    block_size=active_fit_block_size,
+                    sweep_sequence=fit_sweep_sequence,
+                    max_bond=self.chi,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    single_pair_fast_path=active_single_pair_fast_path,
+                    adaptive_block_sweeps=active_adaptive_sweeps,
+                    adaptive_until_rank=active_adaptive_rank_schedule,
+                    final_one_site_sweeps=0,
+                    collect_split_diagnostics=False,
+                )
         except Exception as exc:
             fit_error = exc
         finally:
@@ -7327,6 +7403,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fit_fallback_reason = None
         if fit_error is not None and self.mode != "mix":
             fit_fallback_reason = "fit_exception"
+
+        if fit_error is not None and self.fit_differentiation == "implicit":
+            # An implicit solve failure is a failed derivative contract; do
+            # not silently replace it with a different MPO compression map.
+            if fit_state_snapshot is not None:
+                self.p = self._install_represented_norm(fit_state_snapshot)
+                self.info_c = fit_info_snapshot
+            raise fit_error.with_traceback(fit_error.__traceback__)
 
         if fit_fallback_reason is not None:
             if fit_state_snapshot is None:
@@ -7792,6 +7876,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError("DMRG event metadata must match the gate stream length.")
         if k_2q_batch < 1:
             raise ValueError("k_2q_batch must be >= 1.")
+        if self.fit_differentiation == "implicit" and k_2q_batch != 1:
+            raise ValueError(
+                "Torch implicit FIT currently requires k_2q_batch=1 so each "
+                "gate retains its own fixed-point map."
+            )
+        if self.fit_differentiation == "implicit" and cutoff != 0.0:
+            raise ValueError(
+                "Torch implicit FIT uses fixed ranks and requires cutoff=0.0."
+            )
+        if (
+            self.fit_differentiation == "implicit"
+            and FIT._validate_sweep_sequence(fit_sweep_sequence) != "RL"
+        ):
+            raise ValueError(
+                "Torch implicit FIT requires fit_sweep_sequence='RL'."
+            )
         fit_target_strategy = self._validate_fit_target_strategy(
             fit_target_strategy
         )

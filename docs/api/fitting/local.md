@@ -24,6 +24,133 @@ guess. `copy_target=True` protects the supplied target. With `False`, FIT
 can reindex and retag that target during setup. Fitting preserves absolute
 scale and does not normalize the result.
 
+The imperative class also provides `fit.as_functional(backend=...)` to build
+the fixed-point wrapper from its target, guess, active interval, and contraction
+settings. Choose `backend="jax"` for a full-chain JAX wrapper or
+`backend="torch"` for Torch; the returned wrapper snapshots the inputs and
+does not mutate `fit.p`.
+
+## Functional JAX fitting
+
+`make_jax_fit(target, p, ...)` reconstructs a fresh `FIT` on every call and
+returns fitted Quimb-packed parameter arrays. Its immutable `FunctionalFIT`
+wrapper retains topology and native metadata, accepts replacement target and
+guess parameters, and works with `jax.jit` and `jax.grad`:
+
+```python
+import jax
+import jax.numpy as jnp
+from pepsy.fitting import make_jax_fit
+
+jax.config.update("jax_enable_x64", True)
+fit = make_jax_fit(target, guess, n_iter=2, block_size=2, checkpoint=True)
+
+def loss(params):
+    fitted = fit.to_network(fit(params))
+    return jnp.real((fitted.H & fitted).contract(all, optimize="greedy"))
+
+value, gradient = jax.jit(jax.value_and_grad(loss))(fit.target_params)
+```
+
+Construction snapshots numeric arrays and geometry: reusing or retagging the
+caller's networks cannot change an existing wrapper. Replacement parameters
+must keep their packed tree, shapes and dtypes. Stored target/guess log10
+exponents are accounted for in the full-chain fit, preserving absolute scale.
+Reconstruction clears old tensor isometry annotations because changed arrays
+need not satisfy the caller's original gauge; topology and native charges
+remain intact.
+
+The default `differentiation="unrolled"` differentiates the requested finite
+sweeps and the supplied guess. `checkpoint=True` uses `jax.checkpoint` to
+recompute intermediates during backward. Prepare the open MPS/MPO guess at
+the desired ranks before constructing the wrapper; cutoff is zero, topology
+is static, and rank growth is rejected. Native Symmray arrays remain native
+on routes supported by the existing FIT kernel.
+Dense block splits use `pepsy:projector` to differentiate paired factors
+through repeated retained singular values with a resolved truncation gap.
+Its derivative contract requires gauge-invariant network losses.
+Native splits retain the existing SVD chart limitations.
+
+For a converged dense fit, select `differentiation="implicit"`. It converges
+complete `RL` cycles, aligns right-canonical bond gauges, and differentiates
+one accepted cycle through a real-coordinate adjoint solve:
+
+$$
+{\color{blue}(I-\partial_y F)^T\lambda=\partial_y L},\qquad
+{\color{purple}\mathrm{d}L/\mathrm{d}\theta}
+=\partial_\theta L+(\partial_\theta F)^T\lambda.
+$$
+
+This uses a custom VJP and public JAX GMRES, whose implementation uses
+`lax.custom_linear_solve`. `lax.custom_root` requires forward-mode derivatives
+of the sweep; the existing QR/SVD custom-VJP path does not provide them.
+`fit.residual(target_params, fitted_params)` reports the aligned fixed-point
+residual. Failed forward or adjoint convergence raises under JIT too.
+`max_iterations`, `tolerance`, `adjoint_maxiter`, and `adjoint_tolerance`
+control the two solves. Default tolerances follow array precision: 1e-9 in
+float64 and 64 machine epsilons in float32.
+
+Implicit mode treats the guess as a warm start with zero derivative. Its
+first-order contract requires positive fixed ranks, resolved rank cuts, and
+well-resolved invertible gauge-alignment overlaps. Alignment uses a composed
+polar derivative that stays defined at repeated overlap spectra and returns
+unitary forward factors. Implicit guesses must use a uniformly real or complex
+parameter chart. Native Symmray implicit gauge alignment,
+adaptive ranks, higher derivatives, and global-minimum guarantees are outside
+this interface. Neither checkpointing nor a few sweeps establishes convergence.
+
+For the imperative class API, `FIT(..., split_method="projector")` reports
+the discarded Frobenius norm in split diagnostics so explicit adaptive bond
+growth can respond to compression error. Adaptive ranks remain separate from
+the fixed-topology functional wrapper.
+
+`compress_jax_fit(tn, max_bond=chi, ...)` adapts the wrapper to Quimb's public
+callable compression dispatch, including layered dense PEPS boundaries. It
+contracts each target site exactly, preserves its outer legs/tags and stored
+scale, and fits a zip-up guess without truncating the target. It supports
+`bsz=1` or `2`, zero cutoff, reverse site order, and inplace reconstruction.
+Its default `differentiation="auto"` uses checked implicit dense fitting;
+native Symmray retains Quimb's finite-sweep FIT. Explicit native implicit
+requests raise. `max_iterations` defaults to 100 complete cycles for implicit
+or two directional sweeps for unrolled differentiation. NetKet's `dmrg` and
+`dmrg2` aliases use this Pepsy-owned adapter.
+
+## Functional Torch fitting
+
+`make_torch_fit(target, p, ...)` provides a fixed-point adjoint for dense
+Torch-backed MPS fits. Its eager forward converges a one-site `RL` FIT map;
+backward applies one linearized FIT cycle and solves the adjoint with
+matrix-free GMRES. A two- or three-site warm-up may open ranks before the
+one-site fixed point; the warm-up is initialization and receives zero
+gradient. Tensors outside `range_int` remain direct paths to the initial MPS.
+
+```python
+import torch
+from pepsy.fitting import make_torch_fit
+
+fit = make_torch_fit(
+    target, guess, range_int=(1, 4), max_bond=chi,
+    warmup_block_size=2, warmup_sweeps=2,
+)
+fitted = fit.to_network(fit())
+loss = torch.real((fitted.H & fitted).contract(all, optimize="greedy"))
+loss.backward()
+```
+
+The target and guess must use dense Torch arrays. This path supports first-order
+target gradients, fixed-rank one-site refinement, and local windows. It works
+when called through `torch.compile`, with a graph break around the Python-driven
+FIT solve; use `fullgraph=False` (the default). JAX's functional path is traced
+through `jax.jit`. Native Symmray storage, higher derivatives, and gradients
+through rank changes are unsupported. Failed forward or adjoint residual
+checks raise.
+
+`MpsOptimizer(..., fit_differentiation="implicit")` opts Torch-backed
+`dmrg`, `dmrg2`, and `dmrg3` replay into this path. DMRG2 uses its two-site
+rank-opening warm-up before the implicit one-site fixed point; DMRG3 adds its
+two-site transition. Forward work may exceed ordinary fixed-sweep replay.
+This option requires `k_2q_batch=1`; ordinary replay remains the default.
+
 ## Controls shared by the fitting APIs
 
 | Control or result | Chain `FIT` | `TreeFIT` |

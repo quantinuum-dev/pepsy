@@ -51,10 +51,15 @@ def _qr_bwd(residual, tangents):
     dq, dr = (jnp.conj(t) for t in tangents)
     scale = jnp.max(jnp.abs(a))
     eps = max(1e-6, jnp.finfo(a.real.dtype).eps**.5)
-    singular = jnp.any(jnp.diag(r) == 0)
+    singular = jnp.any(jnp.abs(jnp.diag(r)) <= eps * scale)
 
     def native(_):
-        _, pullback = jax.vjp(lambda x: tuple(_NATIVE_QR(x)), a)
+        # vmap lowers cond into masked branches with stop_gradient on the
+        # operands. That prevents transposing the pullback in GMRES. Use a
+        # primal-selected, nonsingular dummy chart for inactive native blocks
+        # and select between the two linear pullbacks below instead.
+        safe_a = jnp.where(singular, jnp.eye(*a.shape, dtype=a.dtype), a)
+        _, pullback = jax.vjp(lambda x: tuple(_NATIVE_QR(x)), safe_a)
         return pullback(tangents)[0]
 
     def regularized(_):
@@ -79,15 +84,11 @@ def _qr_bwd(residual, tangents):
             gradient = jnp.pad(leading, ((0, 0), (0, n-m))) + q @ dr
         return jnp.conj(jnp.where(scale == 0, jnp.zeros_like(a), gradient))
 
-    def adaptive(_):
-        candidate = native(None)
-        return jax.lax.cond(jnp.all(jnp.isfinite(candidate)),
-                            lambda _: candidate, regularized, operand=None)
-
-    active = jnp.any(dq != 0) | jnp.any(dr != 0)
-    return (jax.lax.cond(active,
-        lambda _: jax.lax.cond(singular, regularized, adaptive, operand=None),
-        lambda _: jnp.zeros_like(a), operand=None),)
+    # A pullback must be linear in its incoming cotangents. Selecting a
+    # branch by whether those cotangents or their resulting gradient are
+    # finite breaks transposition in JAX's implicit linear solvers. Select
+    # the chart exclusively from primal QR pivots instead.
+    return (jnp.where(singular, regularized(None), native(None)),)
 
 
 _qr_jax.defvjp(_qr_fwd, _qr_bwd)

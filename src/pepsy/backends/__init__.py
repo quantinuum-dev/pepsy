@@ -33,6 +33,7 @@ _SYMBOL_MODULES = {
     "set_default_grad_backend": ".config",
     "TorchLinalgConfig": ".config",
     "register_projector_split": ".projector_split",
+    "svd_reconstruct_jax": ".linalg_jax_projector",
     "ProjectorDerivativeError": ".projector_split",
     "capture_projector_derivative_errors": ".projector_split",
     "reg_native_svd_torch": ".config",

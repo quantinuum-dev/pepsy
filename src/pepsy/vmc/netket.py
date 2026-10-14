@@ -2114,12 +2114,30 @@ def _boundary_contraction_options(contraction_opts, *, jit):
     if legacy is not None and "method" in opts and method != legacy:
         raise ValueError("Conflicting boundary compression mode and method.")
     if method in {"dmrg", "dmrg2"}:
-        opts.setdefault("max_iterations", 2)
+        from ..fitting import compress_jax_fit
+
+        differentiation = opts.setdefault("differentiation", "auto")
+        if differentiation not in {"auto", "implicit", "unrolled"}:
+            raise ValueError("differentiation must be 'auto', 'implicit' or 'unrolled'.")
+        if differentiation != "auto":
+            opts.setdefault("max_iterations", 100 if differentiation == "implicit" else 2)
         block_size = 1 if method == "dmrg" else 2
         if opts.get("bsz", block_size) != block_size:
             raise ValueError(f"Boundary method={method!r} requires bsz={block_size}.")
         opts["bsz"] = block_size
-        method = "fit"
+        opts.setdefault("tn_fit", "zipup")
+        opts.setdefault("tol", 0.0)
+        iterations = opts.get("max_iterations", 100)
+        if (isinstance(iterations, bool)
+                or not isinstance(iterations, (int, np.integer)) or iterations < 1):
+            raise ValueError("JAX boundary fitting requires a positive integer max_iterations.")
+        if opts["tol"] != 0.0 or opts.get("progbar", False):
+            raise ValueError("Use tolerance for implicit FIT; unrolled FIT requires fixed sweeps.")
+        if opts["tn_fit"] is None:
+            raise ValueError("Pepsy JAX FIT requires a tensor-derived tn_fit; random integer seed initialization is unsupported.")
+        if isinstance(opts["tn_fit"], Mapping):
+            opts["tn_fit"] = dict(opts["tn_fit"])
+        method = compress_jax_fit
     opts["method"] = method
     if isinstance(method, str) and method.startswith("fit"):
         opts.setdefault("max_iterations", 10 if method == "fit" else 8)
@@ -2128,7 +2146,7 @@ def _boundary_contraction_options(contraction_opts, *, jit):
             # A deterministic tensor-derived guess is differentiable and
             # avoids freezing a random initialization during JAX tracing.
             opts.setdefault("tn_fit", "zipup")
-            if isinstance(opts["tn_fit"], dict):
+            if isinstance(opts["tn_fit"], Mapping):
                 # Quimb fills in guess defaults while tracing. Isolate that
                 # disposable initialization from the caller's option mapping.
                 opts["tn_fit"] = dict(opts["tn_fit"])

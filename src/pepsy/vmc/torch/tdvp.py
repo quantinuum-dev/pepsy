@@ -187,6 +187,18 @@ def solve_torch_tdvp(log_derivatives, local_energies, *, sample_weights=None,
     norm = rhs.norm()
     info["tdvp_relative_residual"] = float((residual.norm() / norm.clamp_min(
         torch.finfo(norm.dtype).tiny)).detach().cpu())
+    info["tdvp_relative_residual_squared"] = info["tdvp_relative_residual"] ** 2
+    # A solved normal equation can hide dynamics outside the tangent span.
+    # Keep the complex wavefunction residual even for real coordinates: its
+    # imaginary component is physical information lost by Re(S) projection.
+    tangent_rhs = -1j * weights.sqrt() * (energy - mean)
+    tangent_residual = weights.sqrt() * (c @ velocity.to(c.dtype)) - tangent_rhs
+    tangent_norm = tangent_rhs.norm()
+    tangent_residual_norm = tangent_residual.norm()
+    info["tangent_relative_residual"] = float((tangent_residual_norm / tangent_norm.clamp_min(
+        torch.finfo(tangent_norm.dtype).tiny)).detach().cpu())
+    info["tangent_residual_norm"] = float(tangent_residual_norm.detach().cpu())
+    info["tangent_rhs_norm"] = float(tangent_norm.detach().cpu())
     info["diag_shift"] = shift
     info["parameter_mode"] = parameter_mode
     return TorchTDVPResult(velocity, mean, (weights * (energy - mean).abs().square()).sum(),
@@ -219,6 +231,13 @@ class TorchTDVPDriver:
             raise ValueError("method must be 'auto', 'direct', or 'minsr'.")
         if parameter_mode not in {"holomorphic", "real-imag"}:
             raise ValueError("parameter_mode must be 'holomorphic' or 'real-imag'.")
+        from .amplitude import TorchPEPSAmplitude
+
+        if (parameter_mode == "holomorphic" and isinstance(vmc.model, TorchPEPSAmplitude)
+                and vmc.model.contraction != "exact"):
+            # Compression can depend on conjugate tensor entries even with
+            # zero cutoff; a rank cap still truncates the complex SVD.
+            raise ValueError("Compressed PEPS TDVP requires parameter_mode='real-imag'.")
         if any(not _require_torch().is_complex(p)
                for p in _torch_model_parameters(vmc.model)):
             raise ValueError("Real-time holomorphic TDVP requires complex parameters.")
