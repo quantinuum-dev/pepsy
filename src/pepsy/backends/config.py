@@ -742,7 +742,9 @@ def register_jax_linalg(*, stabilized=False, qr_rank_policy="native"):
     ----------
     stabilized : bool, default=False
         Keep native thin SVD by default. Set this to ``True`` to install the
-        custom VJP that restores cotangents from Quimb fixed-rank truncation.
+        full-spectrum VJP that restores Quimb's truncated cotangents and uses
+        a bounded relative extension at unresolved spectral gaps. The forward
+        SVD remains native; cutting a degenerate multiplet is still nonsmooth.
     qr_rank_policy : {"native", "adaptive"}, default="native"
         ``adaptive`` retains finite native reduced-QR derivatives and uses a
         relative-regularized extension at singular/nonfinite QR charts.

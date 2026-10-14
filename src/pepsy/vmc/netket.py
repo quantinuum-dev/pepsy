@@ -2084,8 +2084,8 @@ def _maybe_register_stable_jax_svd(contraction):
 
     HOTRG/CTMRG/boundary-MPS contractions compress with SVDs. Quimb may retain
     only the leading singular-vector columns, so Pepsy's registered thin-SVD
-    pullback restores the omitted zero cotangents before using JAX's native
-    derivative. Exact contraction has no SVD, so registration is skipped. This
+    pullback restores the omitted zero cotangents and regularizes unresolved
+    spectral gaps. Exact contraction has no SVD, so registration is skipped. This
     is a global autoray side effect and a soft no-op when JAX is unavailable.
     """
     from .api import ContractionConfig
@@ -2104,6 +2104,50 @@ def _maybe_register_stable_jax_svd(contraction):
 
 def _contraction_options(contraction_opts):
     return {} if contraction_opts is None else dict(contraction_opts)
+
+
+def _boundary_contraction_options(contraction_opts, *, jit):
+    """Resolve boundary compression without overriding an explicit method."""
+    opts = _contraction_options(contraction_opts)
+    legacy = opts.pop("mode", None)
+    method = opts.get("method", legacy or "mps")
+    if legacy is not None and "method" in opts and method != legacy:
+        raise ValueError("Conflicting boundary compression mode and method.")
+    if method in {"dmrg", "dmrg2"}:
+        opts.setdefault("max_iterations", 2)
+        block_size = 1 if method == "dmrg" else 2
+        if opts.get("bsz", block_size) != block_size:
+            raise ValueError(f"Boundary method={method!r} requires bsz={block_size}.")
+        opts["bsz"] = block_size
+        method = "fit"
+    opts["method"] = method
+    if isinstance(method, str) and method.startswith("fit"):
+        opts.setdefault("max_iterations", 10 if method == "fit" else 8)
+        opts.setdefault("tol", 0.0)
+        if method == "fit":
+            # A deterministic tensor-derived guess is differentiable and
+            # avoids freezing a random initialization during JAX tracing.
+            opts.setdefault("tn_fit", "zipup")
+            if isinstance(opts["tn_fit"], dict):
+                # Quimb fills in guess defaults while tracing. Isolate that
+                # disposable initialization from the caller's option mapping.
+                opts["tn_fit"] = dict(opts["tn_fit"])
+        if jit:
+            iterations = opts["max_iterations"]
+            if (isinstance(iterations, bool)
+                    or not isinstance(iterations, (int, np.integer)) or iterations < 1):
+                raise ValueError("JIT boundary fitting requires a positive integer max_iterations.")
+            if opts["tol"] != 0.0 or opts.get("progbar", False):
+                raise ValueError("JIT boundary fitting requires tol=0.0 and progbar=False (fixed sweeps).")
+            if method == "fit" and opts["tn_fit"] is None:
+                seed = opts.get("seed")
+                if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
+                    raise ValueError("JIT random FIT initialization requires an explicit integer seed.")
+    if jit and isinstance(method, str) and method.startswith("src"):
+        seed = opts.get("seed")
+        if not isinstance(seed, (int, np.integer)) or isinstance(seed, bool):
+            raise ValueError("JIT SRC boundary compression requires an explicit integer seed.")
+    return opts
 
 
 _FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED = False
@@ -2140,6 +2184,18 @@ def _contract_boundary_for_vmc(tn, *, max_bond, cutoff, method_opts):
             strip_exponent=True,
             **kwargs,
         )
+    except ImportError as exc:
+        # Current native Symmray namespaces do not expose backend RNGs to
+        # Quimb's randomized compressors. Keep the graded arrays intact and
+        # report this capability gap rather than substituting a dense target.
+        if "random." in str(exc) and "backend 'symmray'" in str(exc):
+            raise NotImplementedError(
+                "The installed native Symmray backend cannot initialize "
+                "randomized boundary compression or random FIT guesses. "
+                "Use method='zipup', 'fit-zipup', or 'dmrg' with tn_fit='zipup'; "
+                "native charges and fermionic phases remain preserved."
+            ) from exc
+        raise
     except (AttributeError, TypeError, ValueError):
         if (
             kwargs.get("max_separation", 1) == 0
@@ -3450,9 +3506,8 @@ def _make_peps_batched_amplitude_apply(
         )
 
     config_map = _coerce_config_map(config_map)
-    method_opts = _contraction_options(contraction_opts)
-    if contraction == "boundary":
-        method_opts.setdefault("mode", "mps")
+    method_opts = (_boundary_contraction_options(contraction_opts, jit=True)
+                   if contraction == "boundary" else _contraction_options(contraction_opts))
     jax, jnp = _require_jax()
     values = jnp.asarray(config_map.values)
     phys_indices = jnp.asarray(config_map.phys_indices, dtype=jnp.int32)
@@ -3595,9 +3650,8 @@ def _make_peps_batched_amplitude_nojit(
         raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
 
     config_map = _coerce_config_map(config_map)
-    method_opts = _contraction_options(contraction_opts)
-    if contraction == "boundary":
-        method_opts.setdefault("mode", "mps")
+    method_opts = (_boundary_contraction_options(contraction_opts, jit=False)
+                   if contraction == "boundary" else _contraction_options(contraction_opts))
     jax, jnp = _require_jax()
     real_dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
     complex_dtype = jnp.complex128 if jax.config.x64_enabled else jnp.complex64
@@ -3840,9 +3894,8 @@ def _make_fermionic_peps_batched_amplitude_apply(
         raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
     _require_static_cutoff_for_jit("contraction", contraction, cutoff)
 
-    method_opts = _contraction_options(contraction_opts)
-    if contraction == "boundary":
-        method_opts.setdefault("mode", "mps")
+    method_opts = (_boundary_contraction_options(contraction_opts, jit=True)
+                   if contraction == "boundary" else _contraction_options(contraction_opts))
     jax, jnp = _require_jax()
     col_up = jnp.asarray(columns.up, dtype=jnp.int32)
     col_down = jnp.asarray(columns.down, dtype=jnp.int32)
@@ -3937,9 +3990,8 @@ def _make_fermionic_peps_batched_amplitude_nojit(
     if output not in {"log", "amplitude", "mantissa_exponent"}:
         raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
 
-    method_opts = _contraction_options(contraction_opts)
-    if contraction == "boundary":
-        method_opts.setdefault("mode", "mps")
+    method_opts = (_boundary_contraction_options(contraction_opts, jit=False)
+                   if contraction == "boundary" else _contraction_options(contraction_opts))
     jax, jnp = _require_jax()
     real_dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
     complex_dtype = jnp.complex128 if jax.config.x64_enabled else jnp.complex64

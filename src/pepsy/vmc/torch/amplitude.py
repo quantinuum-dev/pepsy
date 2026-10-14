@@ -1093,14 +1093,19 @@ class TorchPEPSAmplitude:
             )
         abs_mantissa = mantissa.abs()
         tiny = _torch_finfo_tiny(abs_mantissa.dtype)
+        # Quimb can return a non-finite mantissa with exponent=-inf after
+        # stripping a symmetry-forbidden zero slice. Preserve its exact zero
+        # weight in both eager and exported proposal acceptance kernels.
+        zero = (abs_mantissa == 0) | torch.isneginf(exponent_10)
         phase = torch.where(
-            abs_mantissa > 0,
-            mantissa / abs_mantissa.to(dtype=mantissa.dtype),
+            (abs_mantissa > 0) & ~zero,
+            mantissa / abs_mantissa.clamp_min(tiny).to(dtype=mantissa.dtype),
             torch.zeros_like(mantissa),
         )
         log_abs = torch.log(abs_mantissa.clamp_min(tiny)) + exponent_10 * torch.log(
             torch.as_tensor(10.0, dtype=exponent_10.dtype, device=mantissa.device)
         )
+        log_abs = torch.where(zero, torch.full_like(log_abs, -torch.inf), log_abs)
         return phase, log_abs
 
     def _graded_torch_forward(self, configs, *, params=None):

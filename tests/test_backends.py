@@ -1260,7 +1260,12 @@ def test_jax_svd_vjp_restores_quimb_truncated_cotangents(complex_input):
 
     from pepsy.backends.linalg_jax import jaxsvd_bwd, jaxsvd_fwd
 
-    matrix = jnp.arange(64, dtype=jnp.float32).reshape(8, 8) + jnp.eye(8)
+    # Native SVD is an accuracy oracle only on a resolved spectrum. The old
+    # arange-plus-identity matrix has repeated singular values and its native
+    # pullback can be NaN; degeneracy behavior has separate regressions.
+    matrix = jnp.asarray(np.diag(np.arange(8., 0., -1.))
+                         + .01 * np.random.default_rng(91).normal(size=(8, 8)),
+                         dtype=jnp.float32)
     if complex_input:
         matrix = matrix * (1.0 + 0.1j)
 

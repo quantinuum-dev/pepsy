@@ -12,6 +12,17 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### Compression differentiation
+
+- NetKet/JAX boundary amplitudes honor explicit Quimb compression methods;
+  `dmrg`/`dmrg2` select fixed-budget one-/two-site fitting with zip-up guesses.
+  JIT rejects adaptive sweep stopping and unseeded SRC initialization.
+  Unavailable native Symmray RNGs raise clearly without dense conversion.
+- JAX SVD reverse derivatives retain the full spectrum and regularize unresolved
+  gaps, with retained-degeneracy projector checks. Torch boundary log
+  amplitudes represent symmetry-forbidden zeros as zero phase and `-inf`
+  magnitude in eager and compiled inference.
+
 ### Added
 
 - `MpsOptimizer.run(progbar=display)` can update a caller-owned progress bar

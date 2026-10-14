@@ -17,8 +17,8 @@ def _svd_jax(A):
 
     Quimb's ``svd_truncated`` can pass cotangents only for the singular-vector
     columns it retained. The custom VJP restores those leading columns to the
-    full thin-SVD output shape before delegating the actual derivative to
-    JAX's maintained SVD pullback. This is important for approximate tensor
+    full thin-SVD output shape before applying a relative-regularized
+    pullback. This is important for approximate tensor
     contractions, where a fixed ``max_bond`` is the normal JIT-compatible
     path.
     """
@@ -144,7 +144,13 @@ def jaxsvd_fwd(A):
 
 
 def jaxsvd_bwd(residual, tangents):
-    """Differentiate a thin SVD after restoring Quimb's truncated tangents."""
+    """Full-spectrum pullback, exact outside unresolved spectral gaps.
+
+    Retaining discarded vectors avoids the zero-discarded-spectrum
+    approximation discussed in Francuz et al., arXiv:2311.11894. At an
+    unresolved gap this is a bounded surrogate, not an exact derivative of
+    a rank selection that cuts a degenerate multiplet.
+    """
     A, outputs = residual
     U, S, Vh = outputs
     dU, dS, dVh = tangents
@@ -153,25 +159,54 @@ def jaxsvd_bwd(residual, tangents):
         _restore_truncated_tangent(dS, S, axis=-1),
         _restore_truncated_tangent(dVh, Vh, axis=-2),
     )
-    _, pullback = jax.vjp(
-        lambda matrix: jnp.linalg.svd(matrix, full_matrices=False),
-        A,
-    )
-    cotangent_tree = jax.tree_util.tree_unflatten(
-        jax.tree_util.tree_structure(outputs),
-        cotangents,
-    )
-    return pullback(cotangent_tree)
+    if S.shape[-1] == 0:
+        return (jnp.zeros_like(A),)
+    scale = jnp.max(S, axis=-1, keepdims=True)
+    # Use the same compact stabilizer as Torch, with no squared spectrum.
+    def reciprocal(x, spectral_scale, rtol=1e-6):
+        threshold = jnp.maximum(spectral_scale * rtol, jnp.finfo(S.dtype).tiny)
+        resolved = jnp.abs(x) >= threshold
+        safe = jnp.where(resolved, x, jnp.ones_like(x))
+        y = jnp.clip(x, -threshold, threshold) / threshold
+        return jnp.where(resolved, 1 / safe, (2 * y - y**3) / threshold)
+
+    sj, si = S[..., None, :], S[..., :, None]
+    off_diagonal = 1 - jnp.eye(S.shape[-1], dtype=S.dtype)
+    gap = reciprocal(sj - si, scale[..., None]) * off_diagonal
+    total = reciprocal(sj + si, scale[..., None]) * off_diagonal
+    inverse = reciprocal(S, scale, max(A.shape[-2:]) * jnp.finfo(S.dtype).eps)
+    V = h(Vh)
+
+    def differential(dA):
+        # JAX fixes the diagonal phase in U. Transpose this real-linear map
+        # with JAX itself so complex cotangent conventions stay consistent.
+        core = h(U) @ dA @ V
+        ds = jnp.diagonal(core.real, axis1=-2, axis2=-1)
+        phase = .5 * (core - h(core)) * jnp.eye(S.shape[-1], dtype=S.dtype) * inverse[..., None, :]
+        du = U @ (.5 * ((gap + total) * core + (gap - total) * h(core)) + phase)
+        dv = V @ (.5 * ((gap - total) * core + (gap + total) * h(core)))
+        if A.shape[-2] > S.shape[-1]:
+            dav = dA @ V
+            du = du + (dav - U @ (h(U) @ dav)) * inverse[..., None, :]
+        if A.shape[-1] > S.shape[-1]:
+            dahu = h(dA) @ U
+            dv = dv + (dahu - V @ (Vh @ dahu)) * inverse[..., None, :]
+        return du, ds, h(dv)
+
+    return jax.linear_transpose(differential, A)(cotangents)
 
 
 _svd_jax.defvjp(jaxsvd_fwd, jaxsvd_bwd)
 
 
 def svd_jax(A, full_matrices=False, compute_uv=True, hermitian=False):
-    """Truncation-safe thin SVD with standard JAX decomposition options.
+    """Truncation-safe, relative-regularized thin SVD.
 
     Options outside the thin, general-matrix rule use JAX's native SVD.
     Explicit ``full_matrices=False`` follows the same custom VJP as omission.
+    The forward decomposition is unchanged. Reverse derivatives are exact at
+    resolved spectra; unresolved gaps use a bounded surrogate.
+    A degeneracy across the retained/discarded boundary remains nonsmooth.
     """
     if full_matrices or not compute_uv or hermitian:
         return jnp.linalg.svd(

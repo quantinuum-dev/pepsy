@@ -122,6 +122,49 @@ Lower-level functions such as `pack_peps_ansatz(...)`,
 `make_peps_batched_amplitude_function(...)`, and `make_netket_vmc_driver(...)`
 remain public for custom flows and profiling.
 
+### JAX boundary compression
+
+For boundary contraction, select Quimb compression through
+`contraction_opts={"method": "zipup"}` (legacy `mode` is accepted).
+The selection is honored by both spin and fermion amplitude builders.
+Dense JAX checks cover `zipup`, seeded `src`, `sdc`, `dm`, and variational
+fitting. Flat Z2 checks cover the deterministic methods; randomized native
+Symmray compression depends on upstream RNG capabilities.
+
+```python
+compression = pvmc.ContractionConfig(
+    method="boundary", chi=16, cutoff=0.0,
+    options={"method": "dmrg2", "max_iterations": 2},
+)
+```
+
+Here `dmrg` selects Quimb `fit` with `bsz=1`; `dmrg2` selects `bsz=2`.
+Both aliases default to two directional sweeps and a differentiable zip-up
+guess. They are boundary fitting choices, separate from `MpsOptimizer`'s
+warm-up/refinement schedules and Pepsy `FIT`. Plain `fit` keeps Quimb's
+ten-sweep budget and defaults to a zip-up guess. Specify `tn_fit` to change
+the guess. JIT fitting requires a finite positive `max_iterations`, `tol=0`
+and disabled progress; JIT SRC requires an integer `seed`. These gradients
+differentiate the chosen finite algorithm, including its initialization.
+Put fitting controls directly in `contraction_opts`, rather than inside the
+low-level `compress_opts` mapping. An explicitly random FIT guess
+(`tn_fit=None`) requires an integer seed under JIT. Unsupported native
+Symmray RNG operations raise clearly without converting the graded arrays.
+For rank-deficient QR charts, explicitly select the existing backend policy:
+
+```python
+from pepsy.backends import register_jax_linalg
+register_jax_linalg(stabilized=True, qr_rank_policy="adaptive")
+```
+
+The JAX SVD pullback retains the full discarded spectrum and stabilizes
+unresolved gaps without changing forward factors. Retained degenerate
+subspaces have projector-gradient checks; a rank cut through a
+degenerate multiplet remains nonsmooth. Density-matrix compression uses
+eigendecomposition and does not inherit an SVD degeneracy guarantee.
+See the [compression differentiation review](../development/notes/2026-10-13-jax-compression-autodiff.md)
+for Pepsy `FIT`, checkpointing, literature and fixed-point requirements.
+
 ### NetKet PEPS time evolution
 
 `setup.make_tdvp_driver(...)` / `make_netket_tdvp_driver(setup, ...)` connects
