@@ -27,6 +27,25 @@ def test_native_jax_invalid_loss_does_not_update_parameters():
     assert np.isnan(result.final_loss)
 
 
+@pytest.mark.parametrize("scan_steps", [1, 4, 50])
+def test_jax_adam_scan_respects_nonnegative_best_filter(scan_steps):
+    pytest.importorskip("optax")
+
+    def loss(params):
+        return ((params["x"] - .5) ** 2 - .01).sum()
+
+    result = GradientOptimizer(
+        solver="jax-adam", n_steps=12,
+        options={"lr": .1, "scan_steps": scan_steps,
+                 "assume_nonnegative": True},
+    ).run(params_init={"x": jnp.array([1.])}, loss_fn=loss)
+
+    assert len(result.history) == 12
+    assert result.best_loss >= -1e-12
+    assert result.final_loss >= -1e-12
+    assert result.final_loss == pytest.approx(float(loss(result.params)))
+
+
 @pytest.mark.parametrize("solver", ["jax-sgd", "jax-adam", "jax-adamw", "jax-rmsprop"])
 def test_native_complex_gradient_descends(solver):
     pytest.importorskip("optax")

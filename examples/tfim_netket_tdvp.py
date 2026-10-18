@@ -22,14 +22,14 @@ import quimb.tensor as qtn
 from scipy.sparse.linalg import expm_multiply
 
 from pepsy.optimizers import PepsOptimizer
-from pepsy.tensors import ps_to_peps
+from pepsy.tensors import SymHamiltonian, SymPEPS, ps_to_peps, site_charge_uniform
 from pepsy.vmc import build_ising_vmc
 
 from tfim_pepo import trotter_pepo
 
 
 _RESUME_SETTINGS = (
-    "lx", "ly", "d", "startup_steps", "startup_dt", "norm_chi", "overlap_chi",
+    "lx", "ly", "d", "basis", "startup_steps", "startup_dt", "norm_chi", "overlap_chi",
     "dt", "chi", "samples", "chains", "discard", "chunk_size", "diag_shift",
     "solver", "cg_tol", "cg_maxiter", "solver_max_relative_residual", "seed",
     "j", "h", "reference", "reference_origin",
@@ -43,6 +43,7 @@ def load_checkpoint(path):
     metadata = json.loads(str(arrays["metadata"]))
     if metadata.get("checkpoint_version") != 2:
         raise ValueError("This snapshot lacks restart layout; use a checkpoint from the current example")
+    metadata["simulation_settings"].setdefault("basis", "z")
     if set(_RESUME_SETTINGS) - metadata["simulation_settings"].keys():
         raise ValueError("The checkpoint is missing simulation settings")
     if not np.isfinite(metadata["time"]) or metadata["time"] < 0 or metadata["step"] < 0:
@@ -77,10 +78,25 @@ def write_checkpoint(path, arrays):
 def normalized_peps_vector(peps, positions=None):
     """Exactly contract a PEPS after stripping its harmless overall scale."""
     scaled = peps.copy()
-    scaled.equalize_norms_(value=1.)
-    exponent = float(scaled.exponent)
-    scaled.exponent = 0.
-    vector = np.asarray(scaled.to_dense(optimize="greedy")).reshape(-1)
+    network = getattr(scaled, "psi", scaled)
+    has_symmray = any(
+        hasattr(tensor.data, "symmetry") and hasattr(tensor.data, "to_dense")
+        for tensor in network
+    )
+    if not has_symmray:
+        # Keep dense contractions in range even when many local tensors carry
+        # tiny scales; the network exponent records the removed global factor.
+        network.equalize_norms_(value=1.)
+    exponent = float(network.exponent)
+    network.exponent = 0.
+    # Expanding each local Symmray tensor restores the zero-filled odd sector
+    # too; the network-level symmetry contraction otherwise returns only the
+    # globally allowed charge block and cannot align with NetKet's full basis.
+    for tensor in network:
+        data = tensor.data
+        if hasattr(data, "symmetry") and hasattr(data, "to_dense"):
+            tensor.modify(data=data.to_dense())
+    vector = np.asarray(network.to_dense(optimize="greedy")).reshape(-1)
     if positions is not None:
         vector = vector[positions]
     norm = np.linalg.norm(vector)
@@ -90,17 +106,26 @@ def normalized_peps_vector(peps, positions=None):
     return vector / norm, log_squared_norm
 
 
-def dense_spin_observables(vector, configurations, edges):
-    """Pauli observables in NetKet's complete spin-1/2 basis ordering."""
+def dense_spin_observables(vector, configurations, edges, *, basis="z"):
+    """Original TFIM observables in NetKet's complete spin basis ordering."""
     n = configurations.shape[1]
     indices = np.arange(vector.size)
     probabilities = abs(vector)**2
-    mx = sum(np.vdot(vector, vector[indices ^ (1 << (n - i - 1))]).real
-             for i in range(n)) / n
-    zz = sum(np.dot(probabilities, configurations[:, i] * configurations[:, j])
-             for i, j in edges) / len(edges) if edges else 0.
-    return {"mx": float(mx), "zz": float(zz),
-            "parity_x": float(np.vdot(vector, vector[::-1]).real)}
+    if basis == "x":
+        mx = np.dot(probabilities, np.mean(configurations, axis=1))
+        zz = sum(
+            np.vdot(vector, vector[indices ^ (1 << (n - i - 1)) ^
+                                     (1 << (n - j - 1))]).real
+            for i, j in edges
+        ) / len(edges) if edges else 0.
+        parity_x = np.dot(probabilities, np.prod(configurations, axis=1))
+    else:
+        mx = sum(np.vdot(vector, vector[indices ^ (1 << (n - i - 1))]).real
+                 for i in range(n)) / n
+        zz = sum(np.dot(probabilities, configurations[:, i] * configurations[:, j])
+                 for i, j in edges) / len(edges) if edges else 0.
+        parity_x = np.vdot(vector, vector[::-1]).real
+    return {"mx": float(mx), "zz": float(zz), "parity_x": float(parity_x)}
 
 
 def main():
@@ -108,6 +133,8 @@ def main():
     parser.add_argument("--lx", type=int, default=2)
     parser.add_argument("--ly", type=int, default=2)
     parser.add_argument("--d", type=int, default=2)
+    parser.add_argument("--basis", choices=("z", "x"), default="z",
+                        help="Use dense Z basis, or flat-Z2 PEPS in the X basis and even sector")
     parser.add_argument("--startup-steps", type=int, default=2)
     parser.add_argument("--startup-dt", type=float, default=.01)
     parser.add_argument("--norm-chi", type=int, default=18)
@@ -161,6 +188,8 @@ def main():
         parser.error("The dense oracle supports at most 16 spins")
     if args.checkpoint_every < 1:
         parser.error("checkpoint-every must be positive")
+    if args.basis == "x" and (args.resume is not None or args.checkpoint_dir is not None):
+        parser.error("Flat-Z2 runs do not yet support the dense NPZ checkpoint format")
     startup_time = args.startup_steps * args.startup_dt
     initial_time = startup_time if resumed is None else resumed[0]["time"]
     initial_step = 0 if resumed is None else resumed[0]["step"]
@@ -171,36 +200,63 @@ def main():
     if args.checkpoint_dir:
         args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     jax.config.update("jax_enable_x64", True)
-    # A named sample mesh keeps NetKet sharding explicit rather than relying
-    # on process-global mesh state installed by an earlier optional import.
-    jax.sharding.set_mesh(jax.make_mesh((len(jax.devices()),), ("S",),
-                                      axis_types=(jax.sharding.AxisType.Auto,)))
+    # NetKet installs its own Manual mesh around sampler kernels. A global
+    # Auto mesh conflicts with that context on a single GPU; leave single-device
+    # arrays unsharded and only install this explicit mesh for multi-device runs.
+    if len(jax.devices()) > 1:
+        jax.sharding.set_mesh(jax.make_mesh(
+            (len(jax.devices()),), ("S",),
+            axis_types=(jax.sharding.AxisType.Auto,),
+        ))
     started = time.perf_counter()
 
     def emit(event, **data):
         print(json.dumps({"event": event, "elapsed_seconds": time.perf_counter() - started,
                           **data}), flush=True)
 
-    emit("setup", shape=[args.lx, args.ly], D=args.d, amplitude_chi=args.chi,
+    emit("setup", shape=[args.lx, args.ly], D=args.d, basis=args.basis,
+         amplitude_chi=args.chi,
          fit_chis=[args.norm_chi, args.overlap_chi], cutoff=0., samples=args.samples,
          chains=args.chains, discard=args.discard, dt=args.dt, diag_shift=args.diag_shift,
          final_time=args.final_time, reference_origin=args.reference_origin,
          solver=args.solver, netket=nk.__version__, jax=jax.__version__, device=str(jax.devices()[0]))
     if resumed is None:
-        state = ps_to_peps(args.lx, args.ly, theta=np.pi / 4)
-        fit = PepsOptimizer(state, [], chi=args.d, mode="sweep", optimizer="als",
-            boundary_chi=(args.norm_chi, args.overlap_chi), normalize_chi=args.norm_chi,
-            evaluation_chi=(args.norm_chi, args.overlap_chi), boundary_convergence=False,
-            contraction_opt="greedy", sweep_kwargs={"local_contraction_opt": "greedy", "cutoff": 0.},
-            normalize_kwargs={"cutoff": 0.}, infidelity_kwargs={"cutoff": 0.},
-            sweep_optimize_kwargs={"n_round_trips": 1})
-        operator = trotter_pepo(args.lx, args.ly, args.startup_dt, j=args.j, h=args.h)
-        for step in range(args.startup_steps):
-            fit.run_pepo(operator, unitary=True, cutoff=0.)
-            record = fit.get_step_records()[0]
-            emit("startup_step", step=step + 1, D=fit.state.max_bond(),
-                 infidelity=record["final_infidelity"], reason=record["reason"])
-        state = fit.state
+        if args.basis == "x":
+            # The original all-+x product state is the Z2 vacuum in the X
+            # eigenbasis. Starting with only neutral virtual bonds gives that
+            # product state exactly; symmetric Trotter gates grow the bonds.
+            state = SymPEPS.for_model(
+                "tfim", args.lx, args.ly, bond_dim={0: 1},
+                phys_dim={0: 1, 1: 1}, flat=False, dtype="complex128",
+                seed=args.seed, site_charge=site_charge_uniform(0),
+            )
+            symmetric_hamiltonian = SymHamiltonian.from_edges(
+                "tfim", "Z2", state.edges, jx=-args.j, hz=-args.h, flat=False,
+            )
+            for step in range(args.startup_steps):
+                gates = symmetric_hamiltonian.trotter_gates(
+                    args.startup_dt, order=2,
+                )
+                state.apply_gates(
+                    gates, method="gate", max_bond=args.d, cutoff=0., normalize=False,
+                )
+                emit("startup_step", step=step + 1,
+                     D=state.peps.max_bond(), reason="symmetric-trotter")
+        else:
+            state = ps_to_peps(args.lx, args.ly, theta=np.pi / 4)
+            fit = PepsOptimizer(state, [], chi=args.d, mode="sweep", optimizer="als",
+                boundary_chi=(args.norm_chi, args.overlap_chi), normalize_chi=args.norm_chi,
+                evaluation_chi=(args.norm_chi, args.overlap_chi), boundary_convergence=False,
+                contraction_opt="greedy", sweep_kwargs={"local_contraction_opt": "greedy", "cutoff": 0.},
+                normalize_kwargs={"cutoff": 0.}, infidelity_kwargs={"cutoff": 0.},
+                sweep_optimize_kwargs={"n_round_trips": 1})
+            operator = trotter_pepo(args.lx, args.ly, args.startup_dt, j=args.j, h=args.h)
+            for step in range(args.startup_steps):
+                fit.run_pepo(operator, unitary=True, cutoff=0.)
+                record = fit.get_step_records()[0]
+                emit("startup_step", step=step + 1, D=fit.state.max_bond(),
+                     infidelity=record["final_infidelity"], reason=record["reason"])
+            state = fit.state
     else:
         state = resumed[2]
         emit("resumed", path=str(args.resume), time=initial_time, step=initial_step,
@@ -208,6 +264,7 @@ def main():
     # NetKet Ising uses +J ZZ-h X with Pauli operators. The PEPO uses
     # -j ZZ-h X, so negate J exactly once at this integration boundary.
     setup = build_ising_vmc(state, Lx=args.lx, Ly=args.ly, h=args.h, J=-args.j,
+        basis=args.basis,
         contraction="boundary", chi=args.chi, cutoff=0., parameter_mode="real-imag",
         n_samples=args.samples, n_chains=args.chains, n_discard_per_chain=args.discard,
         chunk_size=args.chunk_size, seed=args.seed, sampler_seed=args.seed + 1, use_sr=False)
@@ -227,7 +284,11 @@ def main():
             handoff_vector = resumed[1]["handoff_vector"]
             initial_energy = resumed[0]["initial_energy"]
         elif args.reference_origin == "initial":
-            reference = np.full(reference.size, 1 / np.sqrt(reference.size), dtype=complex)
+            if args.basis == "x":
+                reference = np.zeros(reference.size, dtype=complex)
+                reference[0] = 1.
+            else:
+                reference = np.full(reference.size, 1 / np.sqrt(reference.size), dtype=complex)
             initial_energy = float(np.vdot(reference, hamiltonian @ reference).real)
             reference = expm_multiply(-1j * startup_time * hamiltonian, reference)
         else:
@@ -237,7 +298,8 @@ def main():
              handoff_energy=float(np.vdot(handoff_vector, hamiltonian @ handoff_vector).real),
              startup_infidelity=(float(1 - abs(np.vdot(reference, handoff_vector))**2)
                                  if resumed is None else None),
-             observables=dense_spin_observables(handoff_vector, configurations, edges))
+             observables=dense_spin_observables(
+                 handoff_vector, configurations, edges, basis=args.basis))
     solver = args.solver
     solver_kwargs = None
     if args.solver == "pinv_smooth":
@@ -318,8 +380,10 @@ def main():
                            "dense_energy": energy, "energy_drift": energy - initial_energy,
                            "raw_squared_norm": squared_norm if np.isfinite(squared_norm) else None,
                            "raw_log_squared_norm": log_squared_norm,
-                           "observables": dense_spin_observables(vector, configurations, edges),
-                           "exact_observables": dense_spin_observables(reference, configurations, edges)}
+                           "observables": dense_spin_observables(
+                               vector, configurations, edges, basis=args.basis),
+                           "exact_observables": dense_spin_observables(
+                               reference, configurations, edges, basis=args.basis)}
             if not all(np.isfinite(x) for x in (log_squared_norm, energy)):
                 raise RuntimeError("The dense state has a non-finite scale or energy")
             # Norm is a gauge-dependent scale in TDVP; observables use the

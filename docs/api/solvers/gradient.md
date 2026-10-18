@@ -82,6 +82,14 @@ non-`None` `bounds`, `lower_bounds`, `upper_bounds`, `max_step`, and
 `max_step_norm`, and reject `angle_wrap=True`; these controls are unsupported.
 For JAX parameters with bounds, choose SciPy L-BFGS-B or NLopt.
 
+`jax-adam` runs up to 50 Optax updates per JIT-compiled `lax.scan` call by
+default, then reports the completed chunk to Python. This avoids synchronizing
+the device after every update while preserving each Adam update and the full
+per-step loss history. Set `options={"scan_steps": 1}` for per-step reporting,
+or choose another positive integer to tune the chunk size. Other native JAX
+Optax solvers retain one update per call by default; they also accept
+`scan_steps` when a multi-step scan is useful.
+
 The host solver transfers a packed iterate to the device and reads back the
 scalar loss and flat gradient per evaluation. `n_steps` limits SciPy iterations
 (TNC: objective calls) or NLopt objective evaluations; the budgets have

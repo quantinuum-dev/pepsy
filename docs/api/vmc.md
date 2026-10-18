@@ -248,6 +248,33 @@ and `imag` parameter leaves and is rebuilt inside the contraction. This retains
 the original tensor values, topology and native storage. The real coordinate
 mode registers the existing truncation-safe JAX SVD pullback for approximate
 contraction. An explicit `param_dtype` in this mode must be real.
+
+`build_ising_vmc(..., basis="x")` is the symmetry-adapted TFIM route. Supply a
+bosonic, flat-Z2 `SymPEPS` in the total charge-zero sector. Its physical basis
+is the original spin X eigenbasis, where the Hamiltonian is
+`J sum XX - h sum Z` and the all-`+x` state is the all-neutral product state.
+The builder uses NetKet Pauli strings and a pair-flip Metropolis rule; the
+initial and proposed configurations remain in the even global-X sector. The
+pair flips are ergodic within that sector. This mode is distinct from the
+default dense computational-basis route. The current TFIM example can create
+the symmetry-adapted product state and grow its bonds with symmetry-preserving
+Trotter gates using `--basis x`; its dense NPZ restart format is not yet
+available for flat-Z2 tensors.
+
+```python
+from pepsy.tensors import SymPEPS, site_charge_uniform
+from pepsy.vmc import build_ising_vmc
+
+peps = SymPEPS.for_model(
+    "tfim", 4, 4, symmetry="Z2", bond_dim={0: 1},
+    phys_dim={0: 1, 1: 1}, flat=True, site_charge=site_charge_uniform(0),
+)
+setup = build_ising_vmc(
+    peps, Lx=4, Ly=4, J=-1.0, h=1.0, basis="x",
+    contraction="boundary", chi=16, parameter_mode="real-imag",
+    n_samples=2048, n_chains=16, use_sr=False,
+)
+```
 `setup.to_peps()` reconstructs the updated complex tensors from either chart.
 
 The TDVP adapter requires real parameter leaves unless `holomorphic=True` is

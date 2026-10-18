@@ -1922,6 +1922,17 @@ def _run_jax_solver(
     ):
         options.pop(key, None)
 
+    default_scan_steps = 50 if solver_name == "jax-adam" else 1
+    raw_scan_steps = options.pop("scan_steps", default_scan_steps)
+    if isinstance(raw_scan_steps, (bool, np.bool_)):
+        raise ValueError("scan_steps must be a positive integer")
+    try:
+        scan_steps = int(raw_scan_steps)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("scan_steps must be a positive integer") from exc
+    if scan_steps < 1 or scan_steps != raw_scan_steps:
+        raise ValueError("scan_steps must be a positive integer")
+
     controls = _pop_common_controls(
         options,
         default_steps=n_steps,
@@ -1982,57 +1993,219 @@ def _run_jax_solver(
     convergence_reason = "maxiter"
     bad_consecutive = 0
     last_improve_step = 0
+    if scan_steps > 1:
+        # Keep optimizer state, best-state tracking, and early-stop decisions
+        # on device for several updates. Returning scalar diagnostics once per
+        # chunk avoids a host/device synchronization at every Adam step.
+        step_shapes = jax.eval_shape(_step, params, opt_state)
+        zero_loss = jnp.zeros((), dtype=step_shapes[2].dtype)
+        zero_imag = jnp.zeros((), dtype=step_shapes[3].dtype)
+        zero_gnorm = jnp.zeros((), dtype=step_shapes[4].dtype)
 
-    step_iter = _iter_steps(controls["max_steps"], progress=progress, opt_desc=opt_desc)
+        @jax.jit
+        def _scan_chunk(carry, total_steps):
+            def scan_step(carry, _):
+                scan_step_number, scan_stop = carry[-2:]
 
-    for step in step_iter:
-        evaluated_params = params
-        updated_params, updated_opt_state, loss, imag, gnorm = _step(params, opt_state)
-        _validate_loss_imaginary(imag)
-        loss_value = float(loss)
-        gnorm_value = float(gnorm)
-        step_num = step + 1
+                def perform_step(state):
+                    (current_params, current_opt_state, current_best_params,
+                     current_best_loss, current_last_improve, current_bad,
+                     current_step_number, _current_stop) = state
+                    (updated_params, updated_opt_state, loss, imag,
+                     grad_norm) = _step(current_params, current_opt_state)
+                    step_number = current_step_number + jnp.asarray(1, dtype=jnp.int32)
+                    imag_ok = jnp.isfinite(imag) & (jnp.abs(imag) <= 1e-10)
+                    loss_ok = jnp.isfinite(loss)
+                    grad_ok = jnp.isfinite(grad_norm)
+                    valid = imag_ok & loss_ok & grad_ok
+                    loss_bad = imag_ok & ~loss_ok
+                    grad_bad = imag_ok & loss_ok & ~grad_ok
+                    bad_count = jnp.where(loss_bad,
+                                          current_bad + jnp.asarray(1, dtype=jnp.int32),
+                                          jnp.where(valid, jnp.asarray(0, dtype=jnp.int32),
+                                                    current_bad))
 
-        if not np.isfinite(loss_value):
-            bad_consecutive += 1
-            history.append(controls["penalty_on_bad"])
+                    eligible = ((not controls["assume_nonnegative"])
+                                | (loss >= -controls["best_neg_tol"]))
+                    improve = valid & eligible & (
+                        loss + controls["min_improve"] < current_best_loss
+                    )
+                    best_params_next = jax.tree_util.tree_map(
+                        lambda old_best, evaluated: jnp.where(
+                            improve, evaluated, old_best,
+                        ),
+                        current_best_params, current_params,
+                    )
+                    best_loss_next = jnp.where(improve, loss, current_best_loss)
+                    last_improve_next = jnp.where(
+                        improve, step_number, current_last_improve,
+                    )
+                    params_next = jax.tree_util.tree_map(
+                        lambda new, old: jnp.where(valid, new, old),
+                        updated_params, current_params,
+                    )
+                    opt_state_next = jax.tree_util.tree_map(
+                        lambda new, old: jnp.where(valid, new, old),
+                        updated_opt_state, current_opt_state,
+                    )
+                    bad_stop = (loss_bad & (bad_count >= controls["bad_max"])
+                                & (step_number >= controls["min_steps"]))
+                    patience_stop = jnp.asarray(False)
+                    if controls["patience"] is not None:
+                        patience_stop = (
+                            valid & (step_number >= controls["min_steps"])
+                            & ((step_number - last_improve_next) >= controls["patience"])
+                        )
+                    stop = jnp.where(
+                        ~imag_ok, jnp.asarray(3, dtype=jnp.int32),
+                        jnp.where(
+                            grad_bad, jnp.asarray(4, dtype=jnp.int32),
+                            jnp.where(
+                                bad_stop, jnp.asarray(1, dtype=jnp.int32),
+                                jnp.where(patience_stop, jnp.asarray(2, dtype=jnp.int32),
+                                          jnp.asarray(0, dtype=jnp.int32)),
+                            ),
+                        ),
+                    )
+                    next_state = (
+                        params_next, opt_state_next, best_params_next,
+                        best_loss_next, last_improve_next, bad_count,
+                        step_number, stop,
+                    )
+                    metrics = (jnp.asarray(True), loss, imag, grad_norm, stop)
+                    return next_state, metrics
+
+                def skip_step(state):
+                    return state, (jnp.asarray(False), zero_loss, zero_imag,
+                                   zero_gnorm, state[-1])
+
+                active = ((scan_stop == 0) & (scan_step_number < total_steps))
+                next_carry, metrics = jax.lax.cond(active, perform_step,
+                                                    skip_step, carry)
+                return next_carry, metrics
+
+            return jax.lax.scan(scan_step, carry, None, length=scan_steps)
+
+        scan_state = (
+            params, opt_state, best_params, jnp.asarray(jnp.inf, dtype=step_shapes[2].dtype),
+            jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32),
+        )
+        step_iter = _iter_steps(controls["max_steps"], progress=progress,
+                                opt_desc=opt_desc)
+        steps_completed = 0
+        for _ in range((controls["max_steps"] + scan_steps - 1) // scan_steps):
+            scan_state, metrics = _scan_chunk(
+                scan_state, jnp.asarray(controls["max_steps"], dtype=jnp.int32),
+            )
+            active_steps, losses, imags, grad_norms, stop_codes = jax.device_get(metrics)
+            completed_this_chunk = 0
+            for active, loss, imag, grad_norm, stop_code in zip(
+                    active_steps, losses, imags, grad_norms, stop_codes):
+                if not active:
+                    break
+                completed_this_chunk += 1
+                step_num = steps_completed + completed_this_chunk
+                _validate_loss_imaginary(imag)
+                loss_value = float(loss)
+                grad_norm_value = float(grad_norm)
+                if np.isfinite(loss_value):
+                    if not np.isfinite(grad_norm_value):
+                        raise FloatingPointError("loss_fn produced a non-finite gradient")
+                    history.append(loss_value)
+                    if (_accept_as_best(loss_value, controls)
+                            and loss_value + controls["min_improve"] < best_loss):
+                        best_loss = loss_value
+                    bad_consecutive = 0
+                    if progress_callback is not None and step_num % log_every == 0:
+                        progress_callback(step_num, loss_value)
+                else:
+                    history.append(controls["penalty_on_bad"])
+                    bad_consecutive += 1
+                    if progress_callback is not None and step_num % log_every == 0:
+                        progress_callback(step_num, controls["penalty_on_bad"])
+                if int(stop_code) == 1:
+                    convergence_reason = "bad_max"
+                elif int(stop_code) == 2:
+                    convergence_reason = "patience"
+            steps_completed += completed_this_chunk
+            if progress and completed_this_chunk:
+                step_iter.update(completed_this_chunk)
+                step_iter.set_postfix(_format_pbar_postfix(
+                    step=steps_completed, evals=steps_completed, ev_per_step=1,
+                    gnorm=grad_norms[completed_this_chunk - 1],
+                    loss=(history[-1] if history else np.nan), best=best_loss,
+                ))
+            stop_code = int(jax.device_get(scan_state[-1]))
+            if stop_code == 3:
+                bad_imag = next(float(imag) for active, imag, code in
+                                zip(active_steps, imags, stop_codes)
+                                if active and int(code) == 3)
+                _validate_loss_imaginary(bad_imag)
+            if stop_code == 4:
+                raise FloatingPointError("loss_fn produced a non-finite gradient")
+            if stop_code != 0 or steps_completed >= controls["max_steps"]:
+                break
+        if progress:
+            step_iter.close()
+        (params, opt_state, best_params, device_best_loss, _, _,
+         _, final_stop_code) = scan_state
+        best_loss = float(jax.device_get(device_best_loss))
+        if int(jax.device_get(final_stop_code)) == 1:
+            convergence_reason = "bad_max"
+        elif int(jax.device_get(final_stop_code)) == 2:
+            convergence_reason = "patience"
+    else:
+        step_iter = _iter_steps(controls["max_steps"], progress=progress, opt_desc=opt_desc)
+
+        for step in step_iter:
+            evaluated_params = params
+            updated_params, updated_opt_state, loss, imag, gnorm = _step(params, opt_state)
+            _validate_loss_imaginary(imag)
+            loss_value = float(loss)
+            gnorm_value = float(gnorm)
+            step_num = step + 1
+
+            if not np.isfinite(loss_value):
+                bad_consecutive += 1
+                history.append(controls["penalty_on_bad"])
+                if progress:
+                    step_iter.set_postfix(_format_pbar_postfix(
+                        step=step_num, evals=step_num, ev_per_step=1,
+                        gnorm="nan", loss="nan", best=best_loss,
+                    ))
+                if progress_callback is not None and (step_num % log_every == 0):
+                    progress_callback(step_num, controls["penalty_on_bad"])
+                if (bad_consecutive >= controls["bad_max"]) and (step_num >= controls["min_steps"]):
+                    convergence_reason = "bad_max"
+                    break
+                continue
+
+            bad_consecutive = 0
+            if not np.isfinite(gnorm_value):
+                raise FloatingPointError("loss_fn produced a non-finite gradient")
+            params, opt_state = updated_params, updated_opt_state
+            history.append(loss_value)
+            if (
+                _accept_as_best(loss_value, controls)
+                and (loss_value + controls["min_improve"] < best_loss)
+            ):
+                best_loss = loss_value
+                # _step returns the loss at its input, before the Optax update.
+                best_params = evaluated_params
+                last_improve_step = step_num
+
             if progress:
                 step_iter.set_postfix(_format_pbar_postfix(
                     step=step_num, evals=step_num, ev_per_step=1,
-                    gnorm="nan", loss="nan", best=best_loss,
+                    gnorm=gnorm_value, loss=loss_value, best=best_loss,
                 ))
             if progress_callback is not None and (step_num % log_every == 0):
-                progress_callback(step_num, controls["penalty_on_bad"])
-            if (bad_consecutive >= controls["bad_max"]) and (step_num >= controls["min_steps"]):
-                convergence_reason = "bad_max"
-                break
-            continue
-
-        bad_consecutive = 0
-        if not np.isfinite(gnorm_value):
-            raise FloatingPointError("loss_fn produced a non-finite gradient")
-        params, opt_state = updated_params, updated_opt_state
-        history.append(loss_value)
-        if (
-            _accept_as_best(loss_value, controls)
-            and (loss_value + controls["min_improve"] < best_loss)
-        ):
-            best_loss = loss_value
-            # _step returns the loss at its input, before the Optax update.
-            best_params = evaluated_params
-            last_improve_step = step_num
-
-        if progress:
-            step_iter.set_postfix(_format_pbar_postfix(
-                step=step_num, evals=step_num, ev_per_step=1,
-                gnorm=gnorm_value, loss=loss_value, best=best_loss,
-            ))
-        if progress_callback is not None and (step_num % log_every == 0):
-            progress_callback(step_num, loss_value)
-        if controls["patience"] is not None and step_num >= controls["min_steps"]:
-            if (step_num - last_improve_step) >= controls["patience"]:
-                convergence_reason = "patience"
-                break
+                progress_callback(step_num, loss_value)
+            if controls["patience"] is not None and step_num >= controls["min_steps"]:
+                if (step_num - last_improve_step) >= controls["patience"]:
+                    convergence_reason = "patience"
+                    break
 
     # The last update has not been evaluated by the next step. Score it once
     # so final_loss matches the returned state and a one-step solve can improve.

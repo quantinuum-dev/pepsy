@@ -2361,6 +2361,44 @@ def _resolve_sampler_sweep_size(sampling, sampler_sweep_size=None):
     return _check_positive_int("sampler_sweep_size", sampler_sweep_size)
 
 
+def _make_z2_even_pair_flip_rule(nk):
+    """Build an ergodic Metropolis rule for the even global-X sector.
+
+    The PEPS physical basis is the original TFIM X eigenbasis. In this basis
+    ``+1`` is the neutral Z2 charge and ``-1`` carries odd charge, so valid
+    configurations have an even number of ``-1`` values. Pair flips connect
+    every configuration in that sector and have symmetric proposal weights.
+    """
+    jax, jnp = _require_jax()
+
+    @nk.utils.struct.dataclass
+    class Z2EvenPairFlipRule(nk.sampler.rules.MetropolisRule):
+        def random_state(self, sampler, machine, params, sampler_state, key):
+            # The X-basis TFIM starts from the all-+x product state. Random
+            # even-sector configurations can have exactly zero PEPS amplitude
+            # after a short Trotter startup, which makes log derivatives
+            # undefined before Metropolis can reject those configurations.
+            return jnp.ones(
+                (sampler.n_batches, sampler.hilbert.size), dtype=sampler.dtype
+            )
+
+        def transition(self, sampler, machine, params, sampler_state, key, sigma):
+            n_sites = sampler.hilbert.size
+            if n_sites < 2:
+                raise ValueError("The even-parity pair-flip sampler needs at least two sites.")
+            key_i, key_j = jax.random.split(key)
+            n_chains = sigma.shape[0]
+            i = jax.random.randint(key_i, (n_chains,), 0, n_sites)
+            offset = jax.random.randint(key_j, (n_chains,), 0, n_sites - 1)
+            j = offset + (offset >= i)
+            rows = jnp.arange(n_chains)[:, None]
+            indices = jnp.stack((i, j), axis=-1)
+            proposed = sigma.at[rows, indices].set(-sigma[rows, indices])
+            return proposed, None
+
+    return Z2EvenPairFlipRule()
+
+
 def _coerce_config_map(config_map):
     if config_map is None:
         return NetKetLocalConfigMap.spin_half()
@@ -2416,6 +2454,9 @@ def _z2_flat_padded(data, sr):
     truncation, so the blocks need zero-padding to their flattened index sizes
     before they can share one dense JAX array.  Padding is exact: the newly
     added entries are outside the original charge-block support.
+
+    Bosonic arrays use ``Z2ArrayFlat``; fermionic arrays also carry phase and
+    dummy-mode metadata and use ``Z2FermionicArrayFlat``.
     """
     flat_indices = tuple(index.to_flat() for index in data.indices)
     target_shape = tuple(index.charge_size for index in flat_indices)
@@ -2437,23 +2478,30 @@ def _z2_flat_padded(data, sr):
             padded[tuple(slice(0, size) for size in array.shape)] = array
             array = padded
         padded_blocks[sector] = array
-    return sr.Z2FermionicArrayFlat.from_blocks(
+    if hasattr(data, "phases"):
+        return sr.Z2FermionicArrayFlat.from_blocks(
+            padded_blocks,
+            flat_indices,
+            phases=data.phases,
+            label=data.label,
+            dummy_modes=data.dummy_modes,
+            symmetry=data.symmetry,
+        )
+    return sr.Z2ArrayFlat.from_blocks(
         padded_blocks,
         flat_indices,
-        phases=data.phases,
-        label=data.label,
-        dummy_modes=data.dummy_modes,
         symmetry=data.symmetry,
+        label=data.label,
     )
 
 
 def prepare_fermionic_peps_for_netket(peps, *, device=None):
-    """Prepare an evolved fermionic PEPS for NetKet's jitted JAX model.
+    """Prepare a Z2 Symmray PEPS for NetKet's jitted JAX model.
 
     The returned copy uses the natural ``qtn.pack`` representation consumed by
     :func:`pack_fermionic_peps_ansatz`.  Z2 block-sparse tensors are flattened
-    here, including the zero-padding required after unequal simple-update SVD
-    blocks, and then moved to JAX.  ``device=None`` follows JAX's default
+    here, including the zero-padding required after unequal SVD blocks, and
+    then moved to JAX. This also supports bosonic Z2 PEPS. ``device=None`` follows JAX's default
     device; ``PEPSY_FH_JAX_DEVICE`` can be used for a notebook-level override.
 
     Non-Z2 Symmray tensors are left block-sparse so the jitted NetKet model can
@@ -2495,6 +2543,14 @@ def prepare_fermionic_peps_for_netket(peps, *, device=None):
     if device is None:
         device = os.environ.get("PEPSY_FH_JAX_DEVICE")
     work.apply_to_arrays(backend_jax(device=device, dtype=None))
+    # Flat Symmray charge tables describe static tensor structure. Keeping
+    # them as NumPy metadata avoids carrying an Auto-mesh sharding into
+    # NetKet's Manual-mesh sampler kernels; only trainable block data belongs
+    # on the JAX device.
+    for tensor in tn:
+        data = tensor.data
+        if hasattr(data, "_sectors"):
+            data._sectors = np.asarray(ar.to_numpy(data._sectors))
     return work
 
 
@@ -3668,7 +3724,24 @@ def _unpack_amplitude_peps(params, ansatz, contraction, method_opts):
         # MPS canonicalization can underflow before boundary exponents are
         # accumulated. Full tensor norms are nonzero for a valid PEPS and
         # shared across configurations; physical zero slices remain intact.
-        tn.equalize_norms_(value=1.0)
+        if _uses_flat_symmray_arrays(tn):
+            # Quimb's Tensor.norm reshapes Symmray arrays, which fuses their
+            # charge axes and can conflict with the active JAX mesh. A flat
+            # array stores every symmetry block in one padded leading batch;
+            # its direct Frobenius norm includes the same entries (padding is
+            # zero) without changing charge metadata.
+            import jax.numpy as jnp
+
+            for tensor in tn:
+                data = tensor.data
+                if not _is_symmray_array(data) or "Flat" not in type(data).__name__:
+                    tn.strip_exponent(tensor, value=1.0)
+                    continue
+                scale = jnp.linalg.norm(data.blocks)
+                tensor.modify(data=data / scale)
+                tn.exponent = tn.exponent + jnp.log10(scale)
+        else:
+            tn.equalize_norms_(value=1.0)
     return tn
 
 
@@ -4522,8 +4595,16 @@ def build_ising_vmc(
     sr_solver_restart=False,
     param_dtype=None,
     parameter_mode="complex",
+    basis="z",
 ):
-    """Create NetKet VMC objects for a spin-1/2 transverse-field Ising PEPS."""
+    """Create NetKet VMC objects for a spin-1/2 transverse-field Ising PEPS.
+
+    ``basis="z"`` uses the usual computational-basis Ising operator and local
+    spin flips. ``basis="x"`` uses the original TFIM X eigenbasis, the rotated
+    operator ``J sum XX - h sum Z``, and an ergodic pair-flip sampler restricted
+    to the even global-X sector. The latter requires an even-sector, flat-Z2
+    Symmray PEPS, such as ``SymPEPS.for_model("tfim", ..., flat=True)``.
+    """
     (
         n_samples,
         n_chains,
@@ -4541,20 +4622,60 @@ def build_ising_vmc(
         sampler_seed=sampler_seed,
     )
     nk = _require_netket()
+    basis = str(basis).strip().lower()
+    if basis not in {"z", "x"}:
+        raise ValueError("basis must be 'z' or 'x'.")
     n_sites = int(Lx) * int(Ly)
+    if basis == "x":
+        if n_sites < 2:
+            raise ValueError("The even-parity pair-flip sampler needs at least two sites.")
+        tn = getattr(peps, "tn", peps)
+        if getattr(peps, "symmetry", None) != "Z2" or getattr(peps, "fermionic", False):
+            raise ValueError(
+                "basis='x' requires a bosonic SymPEPS in the even Z2 sector."
+            )
+        if _symmray_symmetry_name(tn) != "Z2":
+            raise ValueError("basis='x' requires a Symmray Z2 PEPS.")
+        site_charge = getattr(peps, "site_charge", None)
+        if not callable(site_charge):
+            raise ValueError(
+                "basis='x' needs SymPEPS site-charge metadata to verify the global sector."
+            )
+        total_charge = sum(int(site_charge(site)) for site in tn.sites) % 2
+        if total_charge != 0:
+            raise ValueError("basis='x' requires total Z2 charge zero.")
+        if _uses_flat_symmray_arrays(tn) is not True:
+            peps = prepare_fermionic_peps_for_netket(peps)
     hilbert = nk.hilbert.Spin(s=1 / 2, N=n_sites)
     if graph is None:
         if edges is None:
             edges = square_lattice_edges(Lx, Ly, pbc=pbc)
         graph = nk.graph.Graph(edges=tuple(edges), n_nodes=n_sites)
 
-    hamiltonian = nk.operator.Ising(
-        hilbert,
-        graph=graph,
-        h=h,
-        J=J,
-        dtype=float,
-    )
+    if basis == "x":
+        pauli_strings = []
+        weights = []
+        for i, j in graph.edges():
+            term = ["I"] * n_sites
+            term[int(i)] = term[int(j)] = "X"
+            pauli_strings.append("".join(term))
+            weights.append(J)
+        for site in range(n_sites):
+            term = ["I"] * n_sites
+            term[site] = "Z"
+            pauli_strings.append("".join(term))
+            weights.append(-h)
+        hamiltonian = nk.operator.PauliStrings(
+            hilbert, operators=pauli_strings, weights=weights, dtype=float
+        )
+    else:
+        hamiltonian = nk.operator.Ising(
+            hilbert,
+            graph=graph,
+            h=h,
+            J=J,
+            dtype=float,
+        )
     sampler_kwargs = {"n_chains": n_chains}
     sweep_size = _resolve_sampler_sweep_size(sampling, sampler_sweep_size)
     if sweep_size is not None:
@@ -4564,7 +4685,14 @@ def build_ising_vmc(
             "sampler_chunk_size",
             sampler_chunk_size,
         )
-    sampler = nk.sampler.MetropolisLocal(hilbert, **sampler_kwargs)
+    if basis == "x":
+        sampler = nk.sampler.MetropolisSampler(
+            hilbert,
+            rule=_make_z2_even_pair_flip_rule(nk),
+            **sampler_kwargs,
+        )
+    else:
+        sampler = nk.sampler.MetropolisLocal(hilbert, **sampler_kwargs)
     return _build_netket_peps_vmc(
         peps,
         Lx=Lx,

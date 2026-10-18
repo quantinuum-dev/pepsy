@@ -51,6 +51,11 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Added
 
+- `build_ising_vmc(..., basis="x")` runs bosonic flat-Z2 PEPS in the TFIM X
+  eigenbasis, with the rotated Pauli Hamiltonian and an ergodic even-parity
+  pair-flip Metropolis sampler. The TFIM TDVP example adds symmetry-preserving
+  Z2 product-state startup and gate evolution via `--basis x`.
+
 - NetKet TDVP can check every stage solve with
   `solver_max_relative_residual`. The TFIM example enables this check and adds
   atomic, self-contained checkpoints with `--resume` for physical-state
@@ -95,6 +100,10 @@ releases remain backwards-compatible. From 1.0 onward:
   single-layer contraction cap.
 
 ### Changed
+
+- Native JAX/Optax Adam batches 50 updates per JIT-compiled scan by default,
+  reducing per-step host/device synchronization. `options["scan_steps"]` tunes
+  the chunk size; other Optax solvers retain single-step calls unless requested.
 
 - PEPS TDVP diagnostics distinguish the squared normal-equation residual from
   the sampled complex tangent residual, exposing projection error even when
