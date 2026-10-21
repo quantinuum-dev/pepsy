@@ -75,6 +75,13 @@ value = pepsy.contract_flat(
 )
 ```
 
+For periodic boundaries, `compression_mode="direct"` passes Quimb's public
+direct compressor through its callable dispatch. The direct canonicalization
+sweep carries long-range bonds before SVD compression, retaining the requested
+bond cap and cutoff. This requires callable 1D and arbitrary-geometry dispatch
+support; unavailable capabilities raise explicitly. Dense NumPy/Torch/JAX and
+native bosonic/fermionic symmetry paths have separate regression coverage.
+
 `boundary_direction="middle-out-x"` and `"middle-out-y"` are different:
 they absorb the two opposing outer boundaries inward towards a selected middle
 row or column. Thus `"middle-out-y"` builds compressed left and right boundary

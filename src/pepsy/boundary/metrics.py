@@ -13,6 +13,7 @@ import autoray as ar
 
 from .._internal.quimb import quimb_2d_options, quimb_compression_options
 from .._internal.quimb import (
+    quimb_periodic_direct_compressor,
     require_quimb_1d_callable_compression,
     require_quimb_ctmrg_mode,
     require_quimb_ctmrg_projector_canonize,
@@ -1283,7 +1284,14 @@ def _contract_quimb_double_layer(  # pylint: disable=R0912,R0913,R0914,R0915
             kwargs["around"] = around
             kwargs["final_contract"] = False
         if mode_ is not None:
-            kwargs["mode"] = mode_
+            if (mode_ == "direct" and _infer_lattice_ndim(norm) == 2
+                    and any(getattr(norm, f"is_cyclic_{axis}")() for axis in ("x", "y"))):
+                # Quimb's ring dispatcher lacks the 'direct' name. Its public
+                # callable route executes the same direct canonicalize/SVD
+                # compressor, which carries long-range bonds along the sweep.
+                kwargs["mode"] = quimb_periodic_direct_compressor()
+            else:
+                kwargs["mode"] = mode_
         if layer_tags is not None:
             kwargs["layer_tags"] = list(layer_tags)
         contracted = _call_with_accepted_kwargs(contract_fn, **kwargs)

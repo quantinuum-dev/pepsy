@@ -16,6 +16,16 @@ def registration():
     reset_linalg_registrations('jax')
 
 
+@pytest.fixture(params=['cpu', 'gpu'])
+def qr_device(request):
+    try:
+        device = jax.devices(request.param)[0]
+    except RuntimeError:
+        pytest.skip(f'JAX {request.param} unavailable')
+    with jax.default_device(device):
+        yield device
+
+
 @pytest.mark.parametrize('shape', [(5, 3), (3, 5), (3, 3)])
 @pytest.mark.parametrize('complex_input', [False, True])
 def test_qr_resolved_gradients_and_reconstruction(shape, complex_input):
@@ -48,6 +58,54 @@ def test_qr_singular_and_batched_composed_gradient():
     value, gradient = jax.jit(jax.value_and_grad(loss))(a)
     assert float(value) == pytest.approx(5.)
     np.testing.assert_allclose(gradient, 2*jnp.conj(a), atol=2e-8)
+
+
+@pytest.mark.parametrize('shape', [(3, 2), (2, 3), (2, 2)])
+@pytest.mark.parametrize('pivot', [1e-8, 1e-16])
+@pytest.mark.parametrize('complex_input', [False, True])
+def test_small_nonzero_pivot_preserves_composed_linear_derivative(shape, pivot, complex_input, qr_device):
+    """QR reconstructs a linear map even below the regularization scale."""
+    qr = ar.get_lib_fn('jax', 'linalg.qr')
+    matrix = np.eye(*shape)
+    matrix[1, 1] = pivot
+    rng = np.random.default_rng(832)
+    weights = rng.normal(size=shape)
+    if complex_input:
+        matrix = matrix.astype(complex) * (1+.3j)
+        weights = weights + 1j*rng.normal(size=shape)
+    matrix, weights = jnp.asarray(matrix), jnp.asarray(weights)
+
+    def loss(a):
+        q, r = qr(a)
+        return jnp.real(jnp.sum((q @ r) * weights))
+
+    value, gradient = jax.jit(jax.value_and_grad(loss))(matrix)
+    assert gradient.device == qr_device
+    np.testing.assert_allclose(value, jnp.real(jnp.sum(matrix*weights)), atol=1e-13)
+    np.testing.assert_allclose(gradient, weights, atol=2e-12)
+
+
+@pytest.mark.parametrize('shape', [(2, 2), (2, 3)])
+@pytest.mark.parametrize('complex_input', [False, True])
+def test_zero_pivot_preserves_direct_r_cotangent(shape, complex_input, qr_device):
+    """A complete Q basis retains the linear derivative through q @ r."""
+    qr = ar.get_lib_fn('jax', 'linalg.qr')
+    matrix = np.zeros(shape)
+    matrix[0, 0] = 1.
+    weights = np.arange(np.prod(shape)).reshape(shape)*.1+.2
+    if complex_input:
+        matrix = matrix.astype(complex)*(1+.3j)
+        weights = weights + .2j*weights[::-1]
+    matrix, weights = jnp.asarray(matrix), jnp.asarray(weights)
+
+    def loss(a):
+        q, r = qr(a)
+        return jnp.real(jnp.sum((q @ r)*weights))
+
+    value, gradient = jax.jit(jax.value_and_grad(loss))(matrix)
+    assert gradient.device == qr_device
+    np.testing.assert_allclose(value, jnp.real(jnp.sum(matrix*weights)), atol=1e-13)
+    np.testing.assert_allclose(gradient, weights, atol=2e-12)
 
 
 def test_reset_restores_qr():

@@ -408,6 +408,20 @@ def quimb_1d_callable_compression_available():
     return code is not None and "callable" in code.co_names
 
 
+def quimb_periodic_direct_compressor():
+    """Select the same direct compressor through Quimb's ring dispatcher."""
+    compressor = quimb_1d_compression_function("direct")
+    dispatcher = getattr(qtn, "tensor_network_ag_compress", None)
+    code = getattr(inspect.unwrap(dispatcher), "__code__", None) if callable(dispatcher) else None
+    if (callable(compressor) and quimb_1d_callable_compression_available()
+            and code is not None and "callable" in code.co_names):
+        return compressor
+    raise NotImplementedError(
+        "Direct compression of periodic boundaries requires Quimb's callable "
+        "1D and arbitrary-geometry compression dispatchers."
+    )
+
+
 def require_quimb_1d_callable_compression():
     """Require callable 1D compression dispatch at execution time."""
     if quimb_1d_callable_compression_available():

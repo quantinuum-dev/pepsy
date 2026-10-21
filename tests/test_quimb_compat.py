@@ -21,6 +21,15 @@ from pepsy._internal.quimb import (
 from pepsy._internal.random import backend_random_array
 
 
+def test_periodic_direct_requires_callable_dispatch(monkeypatch):
+    from pepsy._internal import quimb as compat
+
+    assert compat.quimb_periodic_direct_compressor() is compat.quimb_1d_compression_function('direct')
+    monkeypatch.delattr(qtn, 'tensor_network_ag_compress')
+    with pytest.raises(NotImplementedError, match='periodic boundaries requires'):
+        compat.quimb_periodic_direct_compressor()
+
+
 @pytest.mark.parametrize("native_seed", (False, True))
 def test_randomized_compression_seed_support_preserves_reproducibility(monkeypatch, native_seed):
     """Legacy RNG seeding never becomes a contraction keyword."""

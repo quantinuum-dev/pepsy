@@ -14,6 +14,14 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Compression differentiation
 
+- Adaptive JAX QR preserves native derivatives at small nonzero pivots;
+  its primal-selected regularized extension now applies only at exactly zero
+  pivots. This repairs composed rank-one MPS replay gradients while retaining
+  pullback linearity for implicit solvers. The zero-pivot extension preserves
+  the direct `Q dR` contribution outside its regularized solve.
+- Periodic `method="mps", compression_mode="direct"` boundaries dispatch
+  Quimb's actual direct compressor through its public callable API, retaining
+  the requested cap/cutoff and native backend arrays.
 - NetKet `dmrg`/`dmrg2` route through `pepsy.fitting.compress_jax_fit`.
   Dense boundaries use checked implicit fixed-point gradients by default;
   `differentiation="unrolled"` retains finite-sweep differentiation. Native

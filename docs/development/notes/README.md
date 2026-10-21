@@ -7,6 +7,9 @@ and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
+- [JAX QR and periodic direct boundary fixes](2026-10-21-qr-periodic-boundary-fixes.md)
+  — Small/zero-pivot pullbacks, callable Quimb dispatch, and CPU/GPU regressions.
+
 - [Readability and API review](readability_api_2026_09.md) — Package-wide
   structural inventory, ranked follow-ups, and corrected vector-sampler contracts.
 

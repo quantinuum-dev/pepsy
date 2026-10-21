@@ -123,8 +123,14 @@ and delegates non-unitary gate replay to this optimizer.
 For JAX direct replay under `jit`, use `cutoff=0` and a fixed `chi`, and pass
 the packed MPS arrays as runtime arguments. `register_jax_linalg(stabilized=True,
 qr_rank_policy="adaptive")` installs truncation-safe SVD and adaptive QR
-derivatives. The default QR policy remains native. Adaptive QR preserves finite
-native VJPs and supplies a relative-regularized extension at singular charts;
+derivatives. The default QR policy remains native. Adaptive JAX QR uses native
+VJPs at every nonzero primal pivot, including pivots below the regularization
+scale. Only exactly zero pivots select its relative-regularized extension.
+Selecting from primal factors keeps the pullback linear and transposable;
+small nonzero pivots must retain cancellations in composed replay gradients.
+At zero pivots the extension retains the direct `Q dR` contribution and
+regularizes only the remaining solve.
+Adaptive Torch QR preserves finite native VJPs and extends singular charts;
 it does not remove singular-value degeneracies or rank-crossing limitations.
 `reset_linalg_registrations("jax")` restores both native registrations.
 

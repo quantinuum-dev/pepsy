@@ -43,7 +43,7 @@ def _qr_bwd(residual, tangents):
     """Reduced QR VJP, with a finite extension at singular QR charts.
 
     Match Pepsy's Torch policy: preserve the exact QR forward and native
-    derivative at resolved pivots; only singular blocks use a relative
+    derivative at nonzero pivots; only singular blocks use a relative
     Tikhonov right inverse. JAX complex cotangents use the conjugate of the
     convention used in the corresponding Torch rule.
     """
@@ -51,7 +51,10 @@ def _qr_bwd(residual, tangents):
     dq, dr = (jnp.conj(t) for t in tangents)
     scale = jnp.max(jnp.abs(a))
     eps = max(1e-6, jnp.finfo(a.real.dtype).eps**.5)
-    singular = jnp.any(jnp.abs(jnp.diag(r)) <= eps * scale)
+    # A small nonzero pivot still has a defined QR derivative. Regularizing
+    # it by relative magnitude destroys cancellations in composed MPS costs.
+    # Use primal pivots (not cotangents) so the pullback remains linear.
+    singular = jnp.any(jnp.diag(r) == 0)
 
     def native(_):
         # vmap lowers cond into masked branches with stop_gradient on the
@@ -75,7 +78,12 @@ def _qr_bwd(residual, tangents):
             upper = jnp.triu(gradient)
             projected = upper + h(upper)
             projected = projected - jnp.diag(jnp.real(jnp.diag(upper)))
-            gradient = solve(q @ projected + dq, r)
+            # Keep the directly known R cotangent outside the regularized
+            # solve. With an exact inverse this is the same QR formula, but
+            # regularizing it too erases composed derivatives at zero pivots
+            # (even a linear loss of q @ r when q spans the full space).
+            base = q @ dr
+            gradient = base + solve(q @ projected + dq - base @ h(r), r)
         else:
             skew = jnp.tril(h(gradient) - gradient)
             if jnp.iscomplexobj(a):
