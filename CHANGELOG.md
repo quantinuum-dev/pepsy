@@ -12,6 +12,12 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+### State construction
+
+- Ordinary `ps_to_mps` constructs product tensors directly, preserving dtype
+  and independent site arrays without seeding Quimb's shared random generator.
+  This removes a race during parallel stabilizer-trajectory initialization.
+
 ### Compression differentiation
 
 - NetKet boundary input normalization preserves the flat Symmray block

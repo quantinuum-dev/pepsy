@@ -58,6 +58,19 @@ substitution, copied upstream implementation, or process-global patch is used.
 
 ## Regression design
 
+A later trajectory test exposed an independent race in ordinary `ps_to_mps`:
+each thread called `MPS_rand_state(seed=666)` only to overwrite every entry
+with its product vector. Quimb's shared generator list could be cleared by
+another thread before `randn` indexed it. **Adopt:** public
+`MPS_product_state(arrays, cyclic=False, **mps_opts)`, inspected in the same
+installed Quimb version, with independent per-site vector copies. The dense
+state, real/complex dtype, physical indices, and open/periodic geometry remain
+unchanged; ordinary product construction no longer seeds or consumes random
+numbers. The Fermion-aware branch retains its existing sector construction.
+Sixteen deterministic regressions forbid the random constructor and compare
+independent dense Kronecker products. All 134 trajectory tests and 365 direct
+stabilizer-state consumer tests pass after this change.
+
 The full run also reproduced a pre-existing NetKet eager-normalization bug
 against untouched `2aacd87`. Flat NumPy Symmray blocks were divided by a JAX
 norm scalar, converting their numeric blocks while retaining NumPy sector

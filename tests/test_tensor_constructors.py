@@ -8,6 +8,30 @@ from pepsy.tensors.constructors import haar_random_state as constructors_haar_ra
 from pepsy.tensors import hrs_to_mps, hrs_to_peps, hrs_to_ttn, random_haar_qubit
 
 
+@pytest.mark.parametrize('length,cyclic', [(1, False), (1, True), (4, False), (4, True)])
+@pytest.mark.parametrize('dtype', ['float32', 'float64', 'complex64', 'complex128'])
+def test_product_mps_needs_no_random_scaffold(length, cyclic, dtype, monkeypatch):
+    import quimb.tensor as qtn
+    from pepsy.tensors import ps_to_mps
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('product-state initialization must not use a random MPS')
+
+    monkeypatch.setattr(qtn, 'MPS_rand_state', forbidden)
+    state = ps_to_mps(length, theta=.31, dtype=dtype, cyclic=cyclic, seed=17)
+    expected = np.array([1.])
+    for _ in range(length):
+        expected = np.kron(expected, [np.cos(.31), np.sin(.31)])
+    actual = np.asarray(state.to_dense()).reshape(-1)
+    np.testing.assert_allclose(actual, expected, atol=2e-7)
+    assert actual.dtype == np.dtype(dtype)
+    assert state.cyclic == cyclic
+    for i in range(length):
+        assert state.site_ind(i) == f'k{i}'
+        for j in range(i):
+            assert not np.shares_memory(state[i].data, state[j].data)
+
+
 @pytest.mark.parametrize("constructor,shape", [
     (hrs_to_mps, (4,)), (hrs_to_peps, (2, 2)), (hrs_to_ttn, (4,)),
 ])

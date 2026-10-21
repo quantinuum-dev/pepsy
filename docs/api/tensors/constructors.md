@@ -22,6 +22,11 @@ real_product = ps_to_peps(2, 3, dtype="float64", theta=0.31)
 sample the complex Haar ensemble. Older real-dtype `hrs_to_*` calls that
 discarded phases now raise `TypeError` with this alternative.
 
+Ordinary `ps_to_mps` builds its bond-one tensors directly, without seeding or
+consuming a random generator. This also avoids shared-generator races during
+parallel trajectory initialization. Its `seed` argument still controls the
+separate Fermion-aware construction.
+
 ## Lazy operator alignment
 
 `tns_align(state, operator)` joins labelled tensor networks without flattening

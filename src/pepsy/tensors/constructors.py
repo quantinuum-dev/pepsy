@@ -790,7 +790,8 @@ def ps_to_mps(
         Advanced override for the per-site charge pattern. By default this is
         derived from ``occupations``.
     seed : int, optional
-        Seed for the Fermion-aware construction and the ordinary constructor.
+        Seed for the Fermion-aware construction. Ordinary product states are
+        deterministic and do not seed or consume a random generator.
     to_backend : callable, optional
         Backend mapper applied to Fermion-aware Symmray blocks.
 
@@ -839,29 +840,12 @@ def ps_to_mps(
     if to_backend is not None:
         raise ValueError("to_backend requires fermion=...")
 
-    mps = qtn.MPS_rand_state(
-        L=L,
-        bond_dim=1,
-        phys_dim=2,
-        cyclic=cyclic,
-        seed=seed,
-        dtype=dtype,
-    )
     local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
-
-    for i in range(L):
-        tensor = mps[i]
-        phys_ind = mps.site_ind(i)
-        phys_axis = tensor.inds.index(phys_ind)
-        data = np.zeros_like(tensor.data, dtype=dtype)
-
-        slicer = [0] * data.ndim
-        slicer[phys_axis] = slice(None)
-        data[tuple(slicer)] = local_vec
-        tensor.modify(data=data)
-
-    mps.astype_(dtype)
-    return mps
+    # Random scaffold generation needlessly resets Quimb's global RNG and
+    # races when independent trajectory workers initialize product states.
+    return qtn.MPS_product_state(
+        [local_vec.copy() for _ in range(L)], cyclic=cyclic,
+    )
 
 
 def ps_to_ttn(
