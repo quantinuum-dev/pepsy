@@ -22,9 +22,11 @@ Its older “working-tree” and “unpublished” statements retain their origi
 ## Publication and validation
 
 The [October 21 numerical follow-up](../../history/2026-10-21-qr-periodic-boundary-fixes.md)
-repairs JAX derivatives at small nonzero QR pivots and periodic direct boundary
-dispatch. Its validation and local publication state are separate from the
-earlier promotion below.
+repairs JAX QR derivatives, periodic direct boundary dispatch, backend-native
+VMC normalization, and deterministic product-state initialization. It records
+the full collection and focused revalidation, hardware exclusions, and local
+commit state separately from the earlier promotion below. Downstream Gaugy
+compressed-trace failures remain unresolved.
 
 The [promotion handoff](../../history/2026-10-12-develop-main-promotion.md)
 records integration into `main`. These commits are later development work,
