@@ -78,3 +78,11 @@ are retained alongside it.
 
 No push or release is authorized or performed. Singular-chart and rank-crossing
 limitations remain explicit; original downstream tolerances are unchanged.
+
+## Subsequent publication
+
+After this report, the user explicitly requested commit and push. All four
+local commits through `472715d` were pushed successfully to `origin/develop`.
+The separate solver working-tree changes remain uncommitted and untouched.
+The subsequent compressed-trace repair is confined to sibling Gaugy; this
+publication note adds no Pepsy numerical changes or new validation claims.
