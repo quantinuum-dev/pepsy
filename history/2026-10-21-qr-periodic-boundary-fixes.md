@@ -1,8 +1,8 @@
-# 2026-10-21 — JAX QR and periodic direct boundary fixes
+# 2026-10-21 — JAX QR, periodic boundaries and VMC normalization
 
 - Scope: fix the dependency causes found by the requested Gaugy GPU review.
 - Branch / baseline: `develop` / `2aacd87`.
-- Commit status: this record accompanies the local implementation commit;
+- Commit status: this record accompanies the local implementation and follow-up commits;
   final full-suite validation is in progress. Nothing is pushed.
 - Existing solver changes and their documentation/tests belong to another
   task and are preserved separately.
@@ -27,7 +27,17 @@ The full run found an additional failure in
 NumPy `take` dispatch reaches a JAX array with unsupported `mode='raise'`.
 The same file fails identically against untouched Pepsy `2aacd87` (14 passed,
 one failed). This predates the QR and periodic-boundary changes and remains
-visible in the validation report.
+visible in the initial validation report. The follow-up fixes normalization
+with native Autoray norm/log dispatch, avoiding a JAX scalar that converted
+NumPy blocks while leaving their sector metadata unchanged. The unchanged
+15-case flat-Z2 suite and the corresponding bosonic small-norm TDVP regression
+pass; full VMC reruns are in progress.
+
+The full boundary-input suite also caught ten compatibility failures in the
+new cyclic probe: existing contraction wrappers need not expose cyclic-axis
+methods. The probe now checks for those methods before calling them and
+preserves the original dispatch otherwise. Existing tests are unchanged;
+the complete boundary-input and periodic numerical suites pass all 190 cases.
 
 No push or release is authorized or performed. Singular-chart and rank-crossing
 limitations remain explicit; original downstream tolerances are unchanged.

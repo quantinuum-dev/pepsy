@@ -131,6 +131,10 @@ Dense JAX checks cover `zipup`, seeded `src`, `sdc`, `dm`, and variational
 fitting. Flat Z2 checks cover the deterministic methods; randomized native
 Symmray compression depends on upstream RNG capabilities.
 
+Boundary input normalization retains each flat Symmray array's numerical
+backend. Eager NumPy-backed packed inputs and JAX parameter replacements both
+keep their sector metadata consistent, including very small global scales.
+
 ```python
 compression = pvmc.ContractionConfig(
     method="boundary", chi=16, cutoff=0.0,

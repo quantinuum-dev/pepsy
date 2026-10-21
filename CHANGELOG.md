@@ -14,6 +14,9 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ### Compression differentiation
 
+- NetKet boundary input normalization preserves the flat Symmray block
+  backend, fixing eager NumPy inputs whose scaling previously produced JAX
+  blocks with incompatible NumPy metadata.
 - Adaptive JAX QR preserves native derivatives at small nonzero pivots;
   its primal-selected regularized extension now applies only at exactly zero
   pivots. This repairs composed rank-one MPS replay gradients while retaining

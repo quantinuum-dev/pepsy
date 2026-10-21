@@ -1285,7 +1285,10 @@ def _contract_quimb_double_layer(  # pylint: disable=R0912,R0913,R0914,R0915
             kwargs["final_contract"] = False
         if mode_ is not None:
             if (mode_ == "direct" and _infer_lattice_ndim(norm) == 2
-                    and any(getattr(norm, f"is_cyclic_{axis}")() for axis in ("x", "y"))):
+                    and any(callable(check) and check() for check in (
+                        getattr(norm, "is_cyclic_x", None),
+                        getattr(norm, "is_cyclic_y", None),
+                    ))):
                 # Quimb's ring dispatcher lacks the 'direct' name. Its public
                 # callable route executes the same direct canonicalize/SVD
                 # compressor, which carries long-range bonds along the sweep.

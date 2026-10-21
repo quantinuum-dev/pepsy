@@ -58,6 +58,16 @@ substitution, copied upstream implementation, or process-global patch is used.
 
 ## Regression design
 
+The full run also reproduced a pre-existing NetKet eager-normalization bug
+against untouched `2aacd87`. Flat NumPy Symmray blocks were divided by a JAX
+norm scalar, converting their numeric blocks while retaining NumPy sector
+metadata. Physical selection then incorrectly dispatched NumPy `take` on JAX
+blocks. **Adopt:** compute the block norm and logarithmic scale with Autoray's
+native dispatch. Both NumPy inputs and JAX replacements retain their backend;
+JIT/autodiff, physical selection and fermionic signs remain on their existing
+paths. The original flat-Z2 test passes unchanged after this correction; the
+same cause affects the bosonic small-norm TDVP case. No Symmray code is patched.
+
 - QR reconstruction and analytic composed derivatives: real/complex, tall,
   wide and square matrices, nonzero pivots `1e-8` and `1e-16` on CPU/GPU,
   plus exactly zero pivots with complete square Q bases; retain existing

@@ -3730,16 +3730,17 @@ def _unpack_amplitude_peps(params, ansatz, contraction, method_opts):
             # array stores every symmetry block in one padded leading batch;
             # its direct Frobenius norm includes the same entries (padding is
             # zero) without changing charge metadata.
-            import jax.numpy as jnp
-
             for tensor in tn:
                 data = tensor.data
                 if not _is_symmray_array(data) or "Flat" not in type(data).__name__:
                     tn.strip_exponent(tensor, value=1.0)
                     continue
-                scale = jnp.linalg.norm(data.blocks)
+                # Eager inputs can still be NumPy-backed. A JAX scalar here
+                # would convert their blocks without converting Symmray's
+                # sector/backend metadata, breaking physical-index selection.
+                scale = ar.do("linalg.norm", data.blocks)
                 tensor.modify(data=data / scale)
-                tn.exponent = tn.exponent + jnp.log10(scale)
+                tn.exponent = tn.exponent + ar.do("log10", scale)
         else:
             tn.equalize_norms_(value=1.0)
     return tn
