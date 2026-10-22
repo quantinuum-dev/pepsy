@@ -1505,6 +1505,9 @@ def _run_nlopt_lbfgs(
     # gradient is near zero.  ftol_rel only fires after a completed iteration;
     # ftol_abs fires before the line search starts, allowing a clean stop.
     ftol_abs = _as_nonnegative_float(options.pop("ftol_abs", 1e-9), key="ftol_abs")
+    gradient_tol = options.pop("gradient_tol", None)
+    if gradient_tol is not None:
+        gradient_tol = _as_nonnegative_float(gradient_tol, key="gradient_tol")
     lower = options.pop("lower_bounds", None)
     upper = options.pop("upper_bounds", None)
     max_step = options.pop("max_step", None)
@@ -1610,6 +1613,7 @@ def _run_nlopt_lbfgs(
         "bad_consecutive": 0,
         "valid_evals": 0,
         "stopped_reason": "maxeval",
+        "gradient_stop_x": None,
         "step": 0,
     }
     pbar = None
@@ -1676,6 +1680,10 @@ def _run_nlopt_lbfgs(
             eval_state["valid_evals"] += 1
             eval_state["bad_consecutive"] = 0
             grad_norm = float(np.linalg.norm(grad_value))
+            gradient_max = (
+                float(np.max(np.abs(grad_value), initial=0.))
+                if gradient_tol is not None else float("inf")
+            )
             eval_state["last_gnorm"] = grad_norm
             if grad_clip_norm is not None:
                 clip = float(grad_clip_norm)
@@ -1727,6 +1735,16 @@ def _run_nlopt_lbfgs(
             ))
         if progress_callback is not None and ((step_num % log_every == 0) or (step_num == maxeval)):
             progress_callback(step_num, float(loss_value))
+        # NLopt's xtol/gtol alias measures parameter steps. This separate,
+        # opt-in criterion checks the unmodified derivative of a valid trial.
+        if (gradient_tol is not None and eval_state["bad_consecutive"] == 0
+                and eval_state["evals"] >= controls["min_steps"]
+                and gradient_max <= gradient_tol):
+            eval_state["stopped_reason"] = "gradient_tol"
+            # ForcedStop prevents optimize() from returning its final point.
+            # Preserve this trial for callers that disable best restoration.
+            eval_state["gradient_stop_x"] = np.array(x_vec, copy=True)
+            opt.force_stop()
         return float(loss_value)
 
     opt.set_min_objective(objective)
@@ -1744,12 +1762,14 @@ def _run_nlopt_lbfgs(
             raise
         if eval_state["stopped_reason"] == "maxeval":
             eval_state["stopped_reason"] = f"nlopt_error:{type(exc).__name__}"
-        warnings.warn(
-            f"NLopt terminated with {type(exc).__name__}: {exc}. "
-            f"Recovering parameters after {eval_state['evals']} evaluations.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        if not (eval_state["stopped_reason"] == "gradient_tol"
+                and isinstance(exc, nlopt.ForcedStop)):
+            warnings.warn(
+                f"NLopt terminated with {type(exc).__name__}: {exc}. "
+                f"Recovering parameters after {eval_state['evals']} evaluations.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     finally:
         if pbar is not None:
             pbar.close()
@@ -1760,6 +1780,8 @@ def _run_nlopt_lbfgs(
         best_x = eval_state["best_x_true"]
     elif controls["restore_best"] and eval_state["best_x_sel"] is not None:
         best_x = eval_state["best_x_sel"]
+    elif eval_state["gradient_stop_x"] is not None:
+        best_x = eval_state["gradient_stop_x"]
     elif x_opt is not None:
         best_x = np.asarray(x_opt, dtype=np.float64)
     else:

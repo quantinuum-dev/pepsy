@@ -82,6 +82,19 @@ non-`None` `bounds`, `lower_bounds`, `upper_bounds`, `max_step`, and
 `max_step_norm`, and reject `angle_wrap=True`; these controls are unsupported.
 For JAX parameters with bounds, choose SciPy L-BFGS-B or NLopt.
 
+For autodiff NLopt solvers (`nlopt` and `LD_*`), `gtol` remains a compatibility
+alias for the parameter-step tolerance `xtol_rel`.
+Set `options={"gradient_tol": 1e-10}` to add a separate
+maximum absolute derivative stopping threshold, measured over packed real
+coordinates before gradient clipping. Its result label is `"gradient_tol"`.
+The threshold must be finite and nonnegative; omitted or `None` disables it.
+Only finite objective/gradient trials qualify, after `min_steps` evaluations
+(`min_evals` is an alias). NLopt's budget counts objective evaluations,
+including line-search trials. With `restore_best=False`, the returned point
+is the trial that met the threshold; the default best-state restoration can
+return an earlier point with a lower eligible loss. This is a raw derivative
+criterion, not a projected-gradient criterion for constrained optima.
+
 `jax-adam` runs up to 50 Optax updates per JIT-compiled `lax.scan` call by
 default, then reports the completed chunk to Python. This avoids synchronizing
 the device after every update while preserving each Adam update and the full

@@ -79,6 +79,86 @@ def test_nlopt_reports_convergence_before_budget(solver):
     assert result.convergence_reason in {"success", "ftol", "xtol"}
 
 
+def test_nlopt_explicit_gradient_threshold_is_independent_of_step_tolerance():
+    pytest.importorskip("nlopt")
+    result = GradientOptimizer(
+        solver="LD_VAR2", n_steps=50,
+        options={"gradient_tol": 1e-3, "ftol_rel": 0., "ftol_abs": 0., "xtol_rel": 0.},
+    ).run(params_init={"x": torch.tensor(1e-4, dtype=torch.float64)},
+          loss_fn=lambda p: p["x"] ** 2)
+    assert result.convergence_reason == "gradient_tol"
+    assert result.n_evals == 1
+    assert 2 * abs(result.params["x"].item()) <= 1e-3
+    assert result.final_loss == pytest.approx(result.params["x"].item() ** 2)
+
+
+@pytest.mark.parametrize("restore", [False, True])
+def test_nlopt_gradient_stop_returns_converged_trial(restore):
+    pytest.importorskip("nlopt")
+    initial = torch.tensor(2., dtype=torch.float64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        result = GradientOptimizer(
+            solver="LD_VAR2", n_steps=50,
+            options={"gradient_tol": 1e-8, "restore_best": restore,
+                     "ftol_rel": 0., "ftol_abs": 0., "xtol_rel": 0.},
+        ).run(params_init={"x": initial}, loss_fn=lambda p: p["x"] ** 2)
+    assert result.convergence_reason == "gradient_tol"
+    assert 2 * abs(result.params["x"].item()) <= 1e-8
+    assert result.final_loss == pytest.approx(result.params["x"].item() ** 2)
+    assert result.n_evals == len(result.history) + (not restore)
+    assert initial.item() == 2.
+
+
+@pytest.mark.parametrize("threshold", [-1., float("nan"), float("inf")])
+def test_nlopt_rejects_invalid_gradient_threshold(threshold):
+    pytest.importorskip("nlopt")
+    def loss(p):
+        pytest.fail("invalid threshold must be rejected before evaluating the loss")
+    with pytest.raises(ValueError, match="gradient_tol"):
+        GradientOptimizer(solver="LD_VAR2", options={"gradient_tol": threshold}).run(
+            params_init={"x": torch.tensor(1., dtype=torch.float64)}, loss_fn=loss,
+        )
+
+
+@pytest.mark.parametrize("options", [
+    {"gradient_tol": None},
+    {"gradient_tol": 1e-3, "grad_clip_norm": 1e-8},
+    {"gradient_tol": 10., "min_steps": 2},
+])
+def test_nlopt_gradient_stop_honors_raw_gradient_and_controls(options):
+    pytest.importorskip("nlopt")
+    result = GradientOptimizer(
+        solver="LD_VAR2", n_steps=1,
+        options={"ftol_rel": 0., "ftol_abs": 0., "xtol_rel": 0., **options},
+    ).run(params_init={"x": torch.tensor(1., dtype=torch.float64)},
+          loss_fn=lambda p: p["x"] ** 2)
+    assert result.convergence_reason != "gradient_tol"
+
+
+def test_nlopt_gradient_threshold_uses_maximum_coordinate():
+    pytest.importorskip("nlopt")
+    initial = torch.tensor([4e-4, 4e-4], dtype=torch.float64)
+    result = GradientOptimizer(
+        solver="LD_VAR2", n_steps=50, options={"gradient_tol": 1e-3},
+    ).run(params_init={"x": initial}, loss_fn=lambda p: p["x"].square().sum())
+    assert result.convergence_reason == "gradient_tol"
+    assert result.n_evals == 1
+    torch.testing.assert_close(result.params["x"], initial)
+
+
+@pytest.mark.parametrize("invalid", ["loss", "gradient"])
+def test_nlopt_gradient_threshold_never_accepts_invalid_evaluation(invalid):
+    pytest.importorskip("nlopt")
+    def loss(p):
+        return p["x"] * float("nan") if invalid == "loss" else p["x"].sqrt()
+    with pytest.warns(RuntimeWarning, match="invalid objective"):
+        result = GradientOptimizer(
+            solver="LD_VAR2", n_steps=1, options={"gradient_tol": 1e-3},
+        ).run(params_init={"x": torch.tensor(0., dtype=torch.float64)}, loss_fn=loss)
+    assert result.convergence_reason == "invalid_objective"
+
+
 @pytest.mark.parametrize("solver", ["nlopt", "fd-nlopt"])
 def test_nlopt_failed_trial_reports_returned_state_loss(solver):
     pytest.importorskip("nlopt")

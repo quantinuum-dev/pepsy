@@ -17,9 +17,14 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Repeated cluster evaluation | Experimental compact channels; supported frontier/automaton MPO and symbolic/algebraic PEPO preparation retain separate capability and budget checks | [Compact channels](../api/operators/cluster_channels.md) |
 | Sum-target FIT | Separate cached overlap environments contribute to one shared local update, including supported layered and native targets | [FIT sums](../api/fitting/local.md#fitting-a-sum-of-target-networks) |
 | Dense direct MPO derivatives | Opt-in `mpo_factorization="projector"` with fixed numerical rank and resolved-chart checks; QR remains the default | [MPO replay](../api/optimizers/mpo.md), [paired derivatives](../api/boundary/metrics.md) |
-| Host gradient solvers | Native Torch/JAX parameters with SciPy/NLopt host control and explicit budget/result validation | [Gradient solvers](../api/solvers/gradient.md) |
+| Host gradient solvers | Native Torch/JAX parameters with SciPy/NLopt host control and explicit budget/result validation; NLopt supports an opt-in maximum derivative threshold separate from step tolerance | [Gradient solvers](../api/solvers/gradient.md) |
 
 ## Publication and validation
+
+The [October 21 NLopt review](../../history/2026-10-21-nlopt-gradient-tolerance.md#review-and-local-commit)
+adds explicit derivative stopping and preserves the stopping trial when best-state
+restoration is disabled. Its focused CPU validation and local commit status are
+separate from earlier published work.
 
 The [October 21 numerical follow-up](../../history/2026-10-21-qr-periodic-boundary-fixes.md)
 repairs JAX QR derivatives, periodic direct boundary dispatch, backend-native

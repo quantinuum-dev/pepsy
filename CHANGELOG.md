@@ -12,6 +12,10 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+- NLopt gradient solvers accept an opt-in `gradient_tol` maximum absolute
+  derivative threshold, separate from the historical `gtol`/`xtol_rel` step
+  tolerance alias. Stops report `gradient_tol` and preserve the best valid state.
+
 ### State construction
 
 - Ordinary `ps_to_mps` constructs product tensors directly, preserving dtype

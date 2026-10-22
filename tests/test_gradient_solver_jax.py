@@ -167,6 +167,35 @@ def test_jax_host_solver_works_without_torch_and_honors_bounds(solver, monkeypat
     np.testing.assert_allclose(result.params["x"], [.25], atol=1e-8)
 
 
+def test_jax_nlopt_explicit_gradient_threshold():
+    pytest.importorskip("nlopt")
+    initial = jax.device_put(jnp.array([1e-4]), jax.devices("cpu")[0])
+    result = GradientOptimizer(
+        solver="LD_VAR2", n_steps=50,
+        options={"gradient_tol": 1e-3, "ftol_rel": 0., "ftol_abs": 0., "xtol_rel": 0.},
+    ).run(params_init={"x": initial}, loss_fn=lambda p: (p["x"] ** 2).sum())
+    assert result.convergence_reason == "gradient_tol"
+    assert result.n_evals == 1
+    assert float(jnp.max(jnp.abs(2 * result.params["x"]))) <= 1e-3
+    np.testing.assert_array_equal(initial, result.params["x"])
+
+
+@pytest.mark.parametrize("restore", [False, True])
+def test_jax_nlopt_gradient_stop_returns_converged_trial(restore):
+    pytest.importorskip("nlopt")
+    initial = jax.device_put(jnp.array([2.]), jax.devices("cpu")[0])
+    result = GradientOptimizer(
+        solver="LD_VAR2", n_steps=50,
+        options={"gradient_tol": 1e-8, "restore_best": restore,
+                 "ftol_rel": 0., "ftol_abs": 0., "xtol_rel": 0.},
+    ).run(params_init={"x": initial}, loss_fn=lambda p: (p["x"] ** 2).sum())
+    assert result.convergence_reason == "gradient_tol"
+    assert float(jnp.max(jnp.abs(2 * result.params["x"]))) <= 1e-8
+    assert result.final_loss == pytest.approx(float((result.params["x"] ** 2).sum()))
+    assert result.n_evals == len(result.history) + (not restore)
+    np.testing.assert_array_equal(initial, [2.])
+
+
 def test_function_entrypoint_returns_jax_without_torch(monkeypatch):
     pytest.importorskip("scipy")
     monkeypatch.setattr(gradient, "torch", None)
