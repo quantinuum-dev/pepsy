@@ -14,7 +14,7 @@ when comparing with earlier runs; changed defaults can change trajectories.
   and one-site refinement requirements.
 - Review the [PEPS optimizer guide](../api/optimizers/peps.md) for sweep,
   full-update, boundary initialization, and cap-growth defaults.
-- Review the [complete 0.6.0 changelog](../../CHANGELOG.md#060---2026-10-23)
+- Review the [0.6.0 release highlights](../../CHANGELOG.md#060---2026-10-23)
   for sampling defaults, dtype-aware gate cutoffs, compression gradients,
   TDVP additions, and solver fixes. Optional backend and singular-gradient
   limitations remain part of the individual API contracts.
