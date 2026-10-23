@@ -1,72 +1,49 @@
 # PePsY
 
-<img src="assets/pepsy-icon.svg" alt="PePsY icon" width="220" />
+<p align="center">
+  <img src="assets/pepsy-icon.svg" alt="PePsY icon" width="180" />
+</p>
 
-PePsY (“PEPS in Python”) is a tensor-network library for circuit simulation,
-contraction, optimization, sampling, and variational Monte Carlo.
-The Python package is named `pepsy`.
+**Quantum circuits. Tensor networks.**
 
-Pepsy is independent of downstream packages such as Gaugy. Graph planning,
-tensor-network construction, contraction, compression and general solvers
-live here; downstream packages call these public APIs for their own domain
-algorithms. See [package ownership](docs/development/package_layout.md#pepsy-and-downstream-packages).
+PePsY (“PEPS in Python”) simulates quantum circuits with MPS, PEPS, tree,
+and stabilizer tensor networks, with tools for optimization and sampling.
+
+$$
+\underbrace{{\color{purple}|\psi_{\mathrm{TN}}\rangle}}_{\text{tensor-network output}}
+\;\approx\;
+\underbrace{{\color{blue}U_m\cdots U_2 U_1}}_{\text{quantum circuit}}
+\underbrace{{\color{teal}|\psi_0\rangle}}_{\text{initial state}}
+$$
+
+For unitary circuits, $U_1$ acts first; tensor-network compression controls
+the approximation.
 
 Version **0.5.0** · Python **3.12+** · [Changelog](CHANGELOG.md)
 
-## Install from GitHub
+## Install
 
-Pepsy is distributed through this GitHub repository. From a checkout, run:
+From a checkout:
 
 ```bash
 python -m pip install .
 ```
 
-Use your existing Python environment, or follow the
-[installation guide](docs/installation.md) to create one. Add extras only when
-needed, for example `python -m pip install ".[symmetry]"`.
+See [installation](docs/installation.md) for setup and optional dependencies.
 
-## First contraction
+## Circuit simulation
 
-```python
-import quimb.tensor as qtn
-from pepsy.boundary import BdyMPS, build_bra_ket, contract_boundary
-
-ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=1, dtype="complex128")
-ket_tagged, norm = build_bra_ket(ket=ket)
-
-bdy = BdyMPS(
-    tn_flat=ket_tagged,  # single-layer shape/backend reference
-    tn_double=norm,     # double-layer contraction target
-    chi=32,
-    single_layer=False,
-)
-res = contract_boundary(norm=norm, bdy=bdy, direction="y", n_iter=2)
-print(res.cost)
-```
-
-The [getting-started guide](docs/getting_started.md) explains each step and
-shows how to collect fidelity diagnostics.
-
-## Find what you need
+Start with the **[MPS simulation notebook](examples/MpsMagnetization/mps_simulator.ipynb)**,
+or choose a guide:
 
 | Task | Guide |
 | --- | --- |
-| Choose a workflow | [API starting points](docs/api/start_here.md) |
-| Learn through examples | [Tutorials](docs/tutorials/index.md) and [runnable examples](docs/examples.md) |
-| Find classes, functions, and imports | [API reference](docs/api/index.md) and [package map](docs/api/package.md) |
-| Use symmetric or fermionic states | [Symmetric tensors](docs/api/tensors/symmetric.md) |
-| Build or trace cluster operators | [MPO construction](docs/api/operators/mpo_cluster.md) and [PEPO trace contract](docs/api/operators/cluster_expansion.md#trace-of-the-constructed-pepo) |
-| Reuse repeated cluster evaluations | [Experimental compact channels and their limits](docs/api/operators/cluster_channels.md) |
-| Upgrade from 0.4.1 | [Migration guide](docs/development/api-migration.md) |
-| Check compatibility guarantees | [API stability](docs/stability.md) |
-| Contribute or run tests | [Contributing](CONTRIBUTING.md) |
-| Track cluster PEPO / downstream optimization | [Development status](docs/development/cluster_optimization_status.md) |
-| Find implementation notes | [Development documentation](docs/development/README.md) |
-| Plan work or write mathematical Markdown | [Plan index](docs/development/plans/README.md) and [writing policy](docs/development/markdown_policy.md) |
+| **MPS** · matrix product states | [Circuit replay and compression](docs/api/optimizers/mps.md) |
+| **PEPS** · projected entangled pair states | [Gates and operator steps](docs/api/optimizers/peps.md) |
+| **Tree** tensor networks | [Tree circuit replay](docs/api/optimizers/tree_replay.md) |
+| **Stabilizer** tensor networks | [MPS](docs/api/optimizers/stabilizer_tn.md) and [trees](docs/api/optimizers/tree_stabilizer.md) |
+| **Noise & measurements** | [Quantum trajectories](docs/api/optimizers/noise.md) |
+| **Guppy** circuits | [Circuit adapter](docs/api/interop.md) |
 
-Prefer imports from the owning namespace, such as `pepsy.tensors` or
-`pepsy.optimizers`. The top-level `pepsy` aliases remain available for
-compatibility.
-
-Documentation lives in [docs/](docs/index.md) as linked Markdown pages;
-reading it requires no documentation builder or extra packages.
+[Documentation](docs/index.md) · [API reference](docs/api/index.md) ·
+[Examples](docs/examples.md) · [Contributing](CONTRIBUTING.md)
