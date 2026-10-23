@@ -32,7 +32,8 @@ they do not establish current implementation or test coverage.
 
 ## Release distribution
 
-Pepsy is distributed through GitHub; `0.5.0` is the tagged release.
+Pepsy is distributed through GitHub. The current source version is `0.6.0`;
+`v0.5.0` remains the latest release tag.
 The release workflow validates GitHub Actions artifacts and has no registry
 publishing or GitHub Release-creation jobs. PyPI/TestPyPI publication remains
 cancelled. Later commits are development changes until a new version is tagged;

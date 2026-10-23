@@ -9,9 +9,9 @@ PEPS norm contraction and DMRG fitting). It is the "what/when" companion to the
 conceptual notes in `../notes/` (the "why/how"), the session journal in
 `history/` (the "what happened"), and the published documentation in `docs/`.
 
-This snapshot was written for version `0.4.1`. The package has since reached
-`0.5.0`; use the [changelog](https://github.com/quantinuum-dev/pepsy/blob/develop/CHANGELOG.md) and
-[migration guide](../api-migration.md) for released changes, and
+This snapshot was written for version `0.4.1`. Use the
+[changelog](https://github.com/quantinuum-dev/pepsy/blob/develop/CHANGELOG.md) and
+[migration guide](../api-migration.md) for versioned changes, and
 `pyproject.toml` for current version and dependency requirements. Completed
 work, prototypes, and deferred proposals below retain their dated context.
 

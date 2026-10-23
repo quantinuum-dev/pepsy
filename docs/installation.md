@@ -5,10 +5,10 @@ Install it from the GitHub repository; it is not published on PyPI.
 
 ## Install from a checkout
 
-Clone the tagged release if you do not already have a checkout:
+Clone the current stable branch if you do not already have a checkout:
 
 ```bash
-git clone --branch v0.5.0 https://github.com/quantinuum-dev/pepsy.git
+git clone --branch main https://github.com/quantinuum-dev/pepsy.git
 cd pepsy
 ```
 

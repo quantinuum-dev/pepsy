@@ -3,6 +3,25 @@
 Use the owning namespaces and canonical imports below. This does not imply
 that every optimizer mode, default, or supported Python version is unchanged.
 
+## Upgrading from 0.5.0 to 0.6.0
+
+Version 0.6.0 collects the post-0.5.0 changes under the
+[pre-1.0 stability policy](../stability.md). Pin numerical controls explicitly
+when comparing with earlier runs; changed defaults can change trajectories.
+
+- Review the [MPS replay guide](../api/optimizers/mps.md) and
+  [tree replay guide](../api/optimizers/tree_replay.md) for DMRG schedules
+  and one-site refinement requirements.
+- Review the [PEPS optimizer guide](../api/optimizers/peps.md) for sweep,
+  full-update, boundary initialization, and cap-growth defaults.
+- Review the [complete 0.6.0 changelog](../../CHANGELOG.md#060---2026-10-23)
+  for sampling defaults, dtype-aware gate cutoffs, compression gradients,
+  TDVP additions, and solver fixes. Optional backend and singular-gradient
+  limitations remain part of the individual API contracts.
+
+Install the updated checkout using the [installation guide](../installation.md)
+so distribution metadata and `pepsy.__version__` match the source version.
+
 ## Upgrading from 0.4.1 to 0.5.0
 
 Version 0.5.0 includes incompatible changes under the

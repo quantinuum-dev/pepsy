@@ -12,6 +12,13 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-23
+
+This version collects the changes since 0.5.0, including new PEPS/TDVP and
+compression-differentiation APIs, optimizer and sampling defaults, and
+numerical fixes. Review the [migration guide](docs/development/api-migration.md#upgrading-from-050-to-060)
+before reproducing earlier calculations.
+
 - Dense PEPS full updates accept `full_update_kwargs={"gauge": True,
   "gauge_qr": "qr:auto"}` for optional adaptive Cholesky QR of environment
   gauges. Ordinary QR remains the default; reduction and solver policies

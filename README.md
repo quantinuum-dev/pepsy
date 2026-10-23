@@ -19,7 +19,7 @@ $$
 For unitary circuits, $U_1$ acts first; tensor-network compression controls
 the approximation.
 
-Version **0.5.0** · Python **3.12+** · [Changelog](CHANGELOG.md)
+Version **0.6.0** · Python **3.12+** · [Changelog](CHANGELOG.md)
 
 ## Install
 
