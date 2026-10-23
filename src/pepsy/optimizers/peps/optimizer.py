@@ -383,6 +383,9 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         Dense Torch/CuPy nearest-neighbor two-site fitting controls for
         ``mode="full-update"``: ``max_iterations=50``, ``rtol="auto"``,
         dtype-dependent ``rcond=None``, ``gauge=False``, and ``solver="auto"``.
+        With ``gauge=True``, ``gauge_qr="qr:auto"`` opts into Quimb's adaptive
+        Cholesky QR for the two environment gauges; ``gauge_qr="qr"`` keeps
+        the existing QR path. This does not alter reduction or ALS QR policies.
         ``skip_exact=True`` accepts the local SVD warm start directly when its
         numerical rank fits within ``chi``, reporting local fidelity one and
         skipping the FU environment and solver. Requested normalization still

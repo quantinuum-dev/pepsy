@@ -12,6 +12,12 @@ releases remain backwards-compatible. From 1.0 onward:
 
 ## [Unreleased]
 
+- Dense PEPS full updates accept `full_update_kwargs={"gauge": True,
+  "gauge_qr": "qr:auto"}` for optional adaptive Cholesky QR of environment
+  gauges. Ordinary QR remains the default; reduction and solver policies
+  are unchanged. Gauge-conditioning checks also retain Torch CUDA arrays
+  on their device instead of entering Quimb's NumPy values-only SVD path.
+
 - NLopt gradient solvers accept an opt-in `gradient_tol` maximum absolute
   derivative threshold, separate from the historical `gtol`/`xtol_rel` step
   tolerance alias. Stops report `gradient_tol` and preserve the best valid state.

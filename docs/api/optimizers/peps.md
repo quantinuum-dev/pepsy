@@ -590,6 +590,27 @@ default (`gauge=False`). The existing explicit `gauge=True` option remains
 available; it uses independent gauges from the same square root when invertible.
 Reduction and positive-environment projection do not require this conditioning.
 
+For non-differentiable dense Torch/CuPy full updates, opt into Quimb's adaptive
+QR for these two environment gauges:
+
+```python
+full_update_kwargs = {"gauge": True, "gauge_qr": "qr:auto"}
+```
+
+The default `gauge_qr="qr"` retains the existing QR path. `"qr:auto"` requires
+`gauge=True` and a Quimb build exposing `quimb.tensor.decomp.qr_auto`.
+It tries two-pass Cholesky QR for sufficiently large, tall unfoldings and uses
+ordinary QR for smaller shapes or if the Cholesky/orthogonality checks fail.
+Only the triangular factors are requested. The existing singular-value check
+still decides whether to apply the gauges. Pair reports record the requested
+`gauge_qr` (`None` when gauges are disabled), not which internal Quimb branch
+ran. Exact-SVD shortcuts do not compute gauges.
+
+This option does not change state reduction, ALS, boundary compression, or
+global Torch/JAX derivative registrations. Full-tensor mode still requires
+`gauge=False`. Performance depends on matrix shape, backend, and dtype; a QR
+microbenchmark does not establish an end-to-end full-update speedup.
+
 Reduction, PSD projection, and ALS reuse `pepsy.bp.reduced_update`; this path
 does not run BP or use a BP environment. `solver="auto"` delegates to Quimb's
 public ALS fitter, with the existing weighted-QR fallback. `solver="quimb"`

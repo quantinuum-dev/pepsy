@@ -26,6 +26,7 @@ from ...bp.reduced_update import (
 
 def options(values=None):
     result = {'max_iterations': 50, 'rtol': 'auto', 'rcond': None, 'gauge': False,
+              'gauge_qr': 'qr',
               'tensor_mode': 'reduced', 'skip_exact': True,
               'solver': 'auto', 'refine_sweeps': 0, 'refine_rtol': 'auto',
               'refine_scope': 'strip', 'refine_solver': 'quimb',
@@ -48,6 +49,11 @@ def options(values=None):
         raise ValueError('refine_max_matrix_size must be a positive integer or None')
     if not isinstance(result['gauge'], bool):
         raise TypeError('full update gauge must be a bool')
+    if result['gauge_qr'] not in ('qr', 'qr:auto'):
+        raise ValueError("full update gauge_qr must be 'qr' or 'qr:auto'")
+    if result['gauge_qr'] == 'qr:auto':
+        if not result['gauge']:
+            raise ValueError("gauge_qr='qr:auto' requires gauge=True")
     if not isinstance(result['skip_exact'], bool):
         raise TypeError('full update skip_exact must be a bool')
     if not isinstance(result['accumulate_local_infidelity'], bool):
@@ -83,7 +89,19 @@ def options(values=None):
         result[name] = float(value)
     if result['rcond'] is not None and result['rcond'] >= 1:
         raise ValueError('full update rcond must be smaller than one')
+    if result['gauge_qr'] == 'qr:auto' and not callable(getattr(qtn.decomp, 'qr_auto', None)):
+        raise NotImplementedError("gauge_qr='qr:auto' requires Quimb's qr_auto")
     return result
+
+
+def _environment_gauge_r(matrix, method):
+    """Factor an environment unfolding without changing global QR policies."""
+    if method == 'qr':
+        return ar.do('linalg.qr', matrix)[1]
+    # ReducedPair already rejects differentiable and native-symmetry inputs.
+    # Only R is consumed; Quimb chooses CholeskyQR2 or its ordinary fallback
+    # and preserves dtype/device without installing a new derivative rule.
+    return qtn.decomp.qr_auto(matrix, absorb='rfactor')[2]
 
 
 def boundary_strip(network, *, axis, coordinate, boundary, chi, contraction_opt, boundary_kwargs):
@@ -287,6 +305,7 @@ class ReducedPair:
             'norm_min_eigenvalue': float(values.min()),
             'norm_negative_weight': float((-ar.do('clip', values, None, 0)).sum() / positive.sum()),
             'rcond': rcond, 'environment_gauge_applied': False,
+            'gauge_qr': controls['gauge_qr'] if controls['gauge'] else None,
             'norm_clipped_eigenvalues': clipped,
         }
         theta = self.theta
@@ -299,10 +318,13 @@ class ReducedPair:
             # Independent leg unfoldings of the same square root (Fig. 11).
             # We store N = root.H @ root; the paper uses X @ X.H, so its
             # QR/LQ pair appears as two QR factorizations in this convention.
-            _, ga = ar.do('linalg.qr', transpose(x, (0, 2, 1)).reshape(-1, self.na))
-            _, gb = ar.do('linalg.qr', x.reshape(-1, self.nb))
-            sa = qtn.Tensor(ga, inds=(0, 1)).split(method='svd', get='values', left_inds=(0,))
-            sb = qtn.Tensor(gb, inds=(0, 1)).split(method='svd', get='values', left_inds=(0,))
+            ga = _environment_gauge_r(
+                transpose(x, (0, 2, 1)).reshape(-1, self.na), controls['gauge_qr'])
+            gb = _environment_gauge_r(x.reshape(-1, self.nb), controls['gauge_qr'])
+            # Quimb's values-only driver can select NumPy for Torch arrays.
+            # Keep this small gauge-conditioning check on the input device.
+            sa = ar.do('linalg.svd', ga)[1]
+            sb = ar.do('linalg.svd', gb)[1]
             if bool((sa[-1] > rcond * sa[0]) & (sb[-1] > rcond * sb[0])):
                 inv_a, inv_b = ar.do('linalg.inv', ga), ar.do('linalg.inv', gb)
                 theta = einsum('ac,bd,cpdq->apbq', ga, gb, theta)
