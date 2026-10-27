@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Integral
 from typing import TYPE_CHECKING
 
 import autoray as ar
@@ -132,6 +133,14 @@ class CompiledPEPOClusterProduct:
         return self.expansion.trace_exp(
             step, parameters, coefficients=coefficients, normalized=normalized,
             state_budget=state_budget, **build_opts,
+        )
+
+    def residual_exp(self, step, parameters=None, *, coefficients=None,
+                     chi=None, cutoff=1e-12, **compress_opts):
+        """Build the ordered product minus identity as a square PEPO."""
+        return self.expansion.residual_exp(
+            step, parameters, coefficients=coefficients, chi=chi,
+            cutoff=cutoff, **compress_opts,
         )
 
     def partition_trace_exp(self, *args, **kwargs):
@@ -318,6 +327,46 @@ class PEPOClusterProductExpansion:
                         materialize=materialize, compression=compression,
                         compress=compress, **compress_opts)
         return trace_pepo(pepo, normalized=normalized, **trace_options)
+
+    def residual_exp(self, step, parameters=None, *, coefficients=None,
+                     chi=None, cutoff=1e-12, **compress_opts):
+        """Build ``exp(A) @ exp(B) @ ... - I`` with an optional PEPO bond cap.
+
+        The complete ordered product is assembled at this expansion's cluster
+        cutoff before identity subtraction. ``chi`` caps the resulting operator
+        by Quimb SVD compression; it is independent of the cluster cutoff and
+        of any later boundary-contraction bond dimension.
+        """
+        import quimb.tensor as qtn
+
+        if chi is not None and (isinstance(chi, bool) or not isinstance(chi, Integral) or chi < 1):
+            raise ValueError("chi must be a positive integer or None")
+        if compress_opts and chi is None:
+            raise ValueError("compression options require chi")
+        pepo = self.exp(step, parameters, coefficients=coefficients,
+                        materialize=True)
+        if not isinstance(pepo, qtn.PEPO):
+            raise NotImplementedError("residual_exp requires a square PEPO layout")
+
+        arrays = []
+        for i in range(self.lx):
+            row = []
+            for j in range(self.ly):
+                source = pepo[pepo.site_tag(i, j)].data
+                eye = ar.do("eye", source.shape[-1], like=source,
+                            dtype=source.dtype)
+                row.append(ar.do("reshape", eye,
+                                 (1,) * (source.ndim - 2) + eye.shape))
+            arrays.append(row)
+        identity = qtn.PEPO(arrays, shape="urdlbk", cyclic=self.cyclic)
+        # Small periodic lattices have parallel edges. Quimb's exact PEPO sum
+        # needs one virtual index per site pair, so fuse both operands first.
+        pepo.fuse_multibonds_()
+        identity.fuse_multibonds_()
+        residual = pepo - identity
+        if chi is not None and residual.max_bond() > chi:
+            residual.compress_all_(max_bond=chi, cutoff=cutoff, **compress_opts)
+        return residual
 
     def partition_trace_exp(self, step, parameters=None, *, coefficients=None,
                   normalized=False, state_budget=100000):

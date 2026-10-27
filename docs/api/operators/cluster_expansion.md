@@ -577,6 +577,7 @@ product = PEPOClusterProductExpansion.from_bases(
 )
 compiled = product.compile_exp()
 U = compiled.exp(0.01, compress=True, max_bond=64)
+R = compiled.residual_exp(0.01, chi=64)
 ```
 
 For every connected cluster `S`, the local target is formed jointly as
@@ -589,6 +590,41 @@ backend-native for Torch/JAX autodiff. This product path is intentionally
 separate from `exp(A + B + C)`, which is a different operator unless the
 factors commute. Contract the returned PEPO with the network contraction
 workflow appropriate for the observable you need.
+
+`residual_exp` returns a materialized square PEPO for the **ordered product
+minus identity**:
+
+$$
+{\color{blue}R}=e^{A}e^{B}e^{C}-I.
+$$
+
+For a gauged time-slice defect, supply the factors in algebraic order as
+`(G_left, V, G_right_dagger, A_dagger)`; the returned PEPO represents
+`G_left @ V @ G_right_dagger @ A_dagger - I`. Pepsy restricts **all four factor
+groups together** to each connected cluster, forms the complete ordered local
+product there, and assembles one approximate product PEPO. Subtracting the
+global identity removes that PEPO's vacuum contribution before compression;
+it does not build and multiply four full-lattice factor PEPOs. The chosen
+connected spatial cluster cutoff therefore applies to the entire defect.
+Subtracting $I_C$ from each local target before passing it through the
+ordinary connected-product assembler would require different vacuum
+bookkeeping. Even for disconnected sites 1 and 2,
+
+$$
+{\color{blue}P_1\otimes P_2-I\otimes I}
+=(P_1-I)\otimes I+I\otimes(P_2-I)+(P_1-I)\otimes(P_2-I).
+$$
+
+Multiplying only the two singleton defects loses the first two terms.
+`residual_exp` retains Pepsy's established product assembly and removes its
+global identity contribution exactly.
+
+Optional `chi` applies an SVD bond cap **after** identity subtraction; it is
+independent of the cluster size and of a later
+boundary-MPS trace bond dimension. `chi=None` leaves the residual uncompressed.
+Both open and periodic square PEPOs are supported, including the parallel
+bonds of a two-site periodic axis. `residual_exp` requires a square PEPO layout;
+generic graph materializations use their own operator representation.
 
 Pass `materialize=False` to `product.exp(...)` or `compiled.exp(...)` to
 receive `ActivePEPOBlocks` before allocating dense Quimb site tensors. This is
