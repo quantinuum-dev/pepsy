@@ -1123,6 +1123,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._mix_dmrg_disabled_reason = None
         self._mix_dmrg_failed_sweep = None
         self._last_dmrg_fit_diagnostics = None
+        self._last_nonunitary_diagnostics = None
         self.measurements = []
         self._control_operator_cache = None
         self._rng = np.random.default_rng()
@@ -2074,6 +2075,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             state=new_p,
         )
         self.p = new_p
+        self._last_nonunitary_diagnostics = None
         self._invalidate_replay_metadata()
         self._initial_p = self.p.copy()
         self._initial_mps_length = int(getattr(self.p, "L", 0))
@@ -3846,6 +3848,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # A resolved budget also suppresses DMRG2's legacy pair shortcut.
             fit_single_pair_n_iter = n_iter
         non_unitary = bool(non_unitary)
+        self._last_nonunitary_diagnostics = None
         if non_unitary or has_control:
             # Non-unitary and control-event runs can change the represented
             # norm without a unitary compression, so the next unitary stream
@@ -4291,7 +4294,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``fit_overlap_fidelity`` and ``fit_overlap_infidelity`` fields are
         populated only when ``run(fit_overlap_diagnostics=True)`` requests a
         direct contraction of the fitted MPS with the disposable exact FIT
-        target. Those fields are target-overlap diagnostics and are
+        target. Non-unitary replay reuses its automatic canonical-window
+        diagnostic instead of repeating that contraction. These fields are
+        target-overlap diagnostics and are
         intentionally separate from norm-survival fields such as
         ``cumulative_fidelity``. If the optional contraction is unavailable
         for a backend, both values are ``None`` and ``fit_overlap_error``
@@ -4668,6 +4673,32 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     _unitary_norm_overshoot_tolerance = _norm._unitary_norm_overshoot_tolerance
 
     _record_norm_event = _norm._record_norm_event
+
+    _nonunitary_window = _norm._nonunitary_window
+
+    _record_nonunitary_overlap = _norm._record_nonunitary_overlap
+
+    def get_nonunitary_diagnostics(self):
+        """Return the latest non-unitary direct/DMRG compression overlap.
+
+        This automatic local diagnostic excludes the gate's physical norm
+        change. Dense paths cancel the canonical exterior; native arrays use
+        a conservative full-network fallback. It is not a global fidelity or
+        an accumulated error bound. No contractions are performed here.
+        """
+        record = self._last_nonunitary_diagnostics
+        if record is None:
+            return None
+        result = dict(record)
+        for key in ("fidelity_raw", "local_fidelity", "local_infidelity"):
+            if result[key] is not None:
+                value = self._real_float(result[key])
+                if not math.isfinite(value):
+                    result.update(local_fidelity=None, local_infidelity=None,
+                                  fidelity_raw=None, error="non-finite target overlap")
+                    break
+                result[key] = value
+        return result
 
     _compact_norm_summary = _norm._compact_norm_summary
 
@@ -7484,11 +7515,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     center_site=fit_center,
                     restore=stabilize_unitary,
                 )
-            fit_overlap = (
-                {}
-                if self.mode == "mix" or not fit_overlap_diagnostics
-                else self._fit_overlap_diagnostics(p_g, fit.p)
-            )
+            if non_unitary:
+                self._timed_call(
+                    "infidelity.target_norm", self._record_nonunitary_overlap,
+                    p_g, p, (xmin, xmax), fit_norm=fit_norm,
+                )
+            fit_overlap = {}
+            if self.mode != "mix" and fit_overlap_diagnostics:
+                if non_unitary:
+                    diagnostic = self.get_nonunitary_diagnostics()
+                    fit_overlap = {
+                        "fit_overlap_fidelity": diagnostic["local_fidelity"],
+                        "fit_overlap_infidelity": diagnostic["local_infidelity"],
+                        "fit_overlap_error": diagnostic["error"],
+                    }
+                else:
+                    fit_overlap = self._fit_overlap_diagnostics(p_g, fit.p)
             self._last_dmrg_fit_diagnostics.update(
                 {
                     "backend": "fit",
@@ -7810,11 +7852,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     center_site=fit_center,
                     restore=stabilize_unitary,
                 )
-            fit_overlap = (
-                {}
-                if self.mode == "mix" or not fit_overlap_diagnostics
-                else self._fit_overlap_diagnostics(p_g, fit.p)
-            )
+            if non_unitary:
+                self._timed_call(
+                    "infidelity.target_norm", self._record_nonunitary_overlap,
+                    p_g, p, (xmin, xmax), fit_norm=fit_norm,
+                )
+            fit_overlap = {}
+            if self.mode != "mix" and fit_overlap_diagnostics:
+                if non_unitary:
+                    diagnostic = self.get_nonunitary_diagnostics()
+                    fit_overlap = {
+                        "fit_overlap_fidelity": diagnostic["local_fidelity"],
+                        "fit_overlap_infidelity": diagnostic["local_infidelity"],
+                        "fit_overlap_error": diagnostic["error"],
+                    }
+                else:
+                    fit_overlap = self._fit_overlap_diagnostics(p_g, fit.p)
             self._last_dmrg_fit_diagnostics.update(
                 {
                     "backend": "fit",
@@ -8208,6 +8261,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             where = where_seq[idx]
             gate = G_seq[idx]
             event_type = event_seq[idx]
+            diagnostic_target = None
+            if non_unitary and mpo_method == "direct" and len(where) > 1:
+                self.canonize_mps(p, (min(where), max(where)))
+                if event_type == "submpo":
+                    diagnostic_target = self._timed_call(
+                        "infidelity.target", self._build_lazy_submpo_target,
+                        p, gate, where,
+                    )
+                else:
+                    diagnostic_target = self._timed_call(
+                        "infidelity.target", self._build_norm_target,
+                        p, gate, where, 0.0, target_strategy="auto",
+                    )
             if event_type == "submpo":
                 # The payload is already an exact operator representation.
                 # Apply it through ``gate_with_submpo_`` so the selected
@@ -8332,6 +8398,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         center_site=approx_center,
                         restore=stabilize_unitary,
                     )
+
+            if diagnostic_target is not None:
+                self._timed_call(
+                    "infidelity.overlap", self._record_nonunitary_overlap,
+                    diagnostic_target, p, (min(where), max(where)),
+                )
 
             event = self._maybe_normalize_after_step(
                 p,

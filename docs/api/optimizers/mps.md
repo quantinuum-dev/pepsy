@@ -1172,6 +1172,26 @@ diagnostics. They are specific to DMRG and must not be substituted for the
 norm ledger used by the other modes. If a backend cannot perform that optional
 contraction, the values are `None` and `fit_overlap_error` explains why; the
 FIT update itself is not rejected.
+
+For `non_unitary=True`, `direct` and DMRG modes automatically measure local
+compression fidelity against the post-gate target. Read
+`opt.get_nonunitary_diagnostics()` for `local_fidelity`, `local_infidelity`,
+`fidelity_raw`, `where`, `method`, `scope`, and `error`. This latest-compression
+record is separate from the unitary norm-survival ledger and resets on a new
+run or `set_p`. Exact one-site gates add no compression record. Unsupported
+modes or runs without compression return `None`.
+
+Dense paths cancel the canonical exterior of the active interval. DMRG uses
+its existing terminal FIT projection norm and one target-norm contraction;
+direct uses a target-norm and cross-overlap contraction, plus the retained
+center norm. Common represented exponents cancel before forming the ratio.
+The diagnostic does not alter truncation, normalization, or the unitary path.
+Native arrays retain a full-network fallback for graded contractions. Failures
+leave unavailable values and an `error` message. No new contractions occur on
+readout. These diagnostics cost extra work during non-unitary evolution.
+For non-unitary FIT, `fit_overlap_diagnostics=True` reuses this record instead
+of repeating the full-network contraction.
+
 Measurement, reset, and state-dependent Kraus events are also recorded,
 including `branch_probability`, `physical_boundary`, and `renormalized`. Their
 expected norm includes the Born probability, so a normal physical branch has

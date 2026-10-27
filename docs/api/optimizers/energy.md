@@ -1,5 +1,72 @@
 # `pepsy.optimizers.energy`
 
+## Batched MPS and tree readout
+
+`MpsEnergyOptimizer.measure()` and `TreeEnergyOptimizer.measure()` evaluate
+total energy and named local sums together:
+
+```python
+from pepsy.optimizers.energy import MpsEnergyOptimizer
+from pepsy.tensors import build_optimizer
+
+reader = MpsEnergyOptimizer(
+    mps, terms=hamiltonian_terms, route="canonical",
+    contraction_opt=build_optimizer(progbar=False, parallel=False),
+)
+result = reader.measure(
+    {"magnetization": {(0,): Z, (1,): Z}, "correlation": {(0, 1): ZZ}},
+    route="envs", torch_batch="vmap", chunk_size=16,
+)
+energy = result["energy"]                 # total, not per-site
+magnetization = result["observables"]["magnetization"]
+actual_route = result["metadata"]["route"]
+```
+
+Operators are arrays; supports use ordered site numbers. Names map to sums
+of local terms, so divide a magnetization sum by the site count when a mean
+is wanted. Energy follows the class's `real` setting; observables retain their
+complex values. `normalized` follows the class setting. `measure` requires a
+local-term Hamiltonian; the existing MPS `energy()` API continues to support MPOs.
+
+MPS `route` is available on the constructor, `energy`, `loss`, and `measure`:
+
+| Route | Readout |
+| --- | --- |
+| `canonical` | One disposable MPS, moving its canonical center across supports |
+| `envs` | Shared exact block environments built in one sweep across requested intervals |
+| `exact` | Full-network local contractions; the existing MPS energy default |
+
+Dense combined readout builds one reduced density matrix per unique ordered
+support. Different operators on that support reuse it. `info` on `measure`
+can supply trusted canonical-center metadata; readout copies it and preserves
+the live state. Canonical readout requires open boundaries; `envs` and `exact`
+also support cyclic MPSs. Native Symmray arrays retain exact graded local
+expectations, reported by `metadata["route"] == "exact"`, regardless of the
+requested route. They are not converted to dense arrays for batching.
+Older Quimb builds without `compute_partial_traces` use exact readout with a
+compatibility warning and report the effective route in the metadata.
+
+Tree `measure` uses one canonical tree copy and one RDM per support for dense
+arrays. Native trees use their established graded readout, sharing contraction
+paths and their state-versioned norm cache. Tree readout has no MPS `route`
+argument; its effective route is reported as `canonical` or `native_exact`.
+
+`torch_batch=False` is the default. `True` or `"einsum"` groups compatible
+dense Torch RDM/operator pairs by shape, dtype and device and evaluates batched
+traces. `"vmap"` vectorizes the same pure tensor contraction. The default chunk
+size is 32. These options batch the **final operator contractions**, not the
+environment sweep, QR operations, or mutable tensor-network objects. Non-Torch
+and native arrays use the ordinary loop, reported in `metadata["torch_batch"]`.
+Both state and operator gradients are preserved; batching makes no truncation
+or normalization approximation. No CPU/GPU speedup is assumed.
+
+Only operators and contraction paths may persist across state updates.
+Numerical RDMs and MPS environments are rebuilt on every measurement call.
+The automatic path optimizer for combined MPS readout is created lazily and
+reused; an explicit optimizer object controls the search policy. Large global
+exponents cancel before normalized readout. Unnormalized readout restores
+their squared scale consistently across routes.
+
 PEPS boundary energies adapt to Quimb's installed `method`/`mode` API and use
 exact operator-inserted contractions on single-row or single-column states.
 This path preserves the selected Boolean normalization and backend gradients.

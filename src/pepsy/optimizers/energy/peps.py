@@ -24,6 +24,7 @@ from ...backends import (
 from ...backends import reg_rel_svd_jax
 from ...tensors import build_optimizer
 from ..global_opt import GlobalOptimizer
+from ._local import measure_mps_groups, validate_batch
 
 __all__ = ["EnergyEstimate", "MpsEnergyOptimizer", "PepsEnergyOptimizer"]
 
@@ -1241,7 +1242,11 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
 
     The objective is the normalized local expectation value
     ``<psi|H|psi>/<psi|psi>``. Local-term Hamiltonians are evaluated with
-    ``MPS.compute_local_expectation_exact(...)``. Bosonic MPO Hamiltonians are
+    ``MPS.compute_local_expectation_exact(...)`` by default. Explicit
+    ``route='canonical'`` and ``route='envs'`` use local canonical readout or
+    shared block environments. :meth:`measure` evaluates energy and named
+    observables together, reusing dense support RDMs and optionally batching
+    their final Torch contractions. Bosonic MPO Hamiltonians are
     evaluated directly as ``(<psi| & H_mpo & |psi>).contract(all,
     optimize=...)``, using ``contraction_opt`` for the full network
     contraction. Native fermionic MPOs are applied sitewise as a factorized
@@ -1272,6 +1277,9 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         "progbar",
         "allow_encoding_conversion",
         "native_mpo_compression",
+        "route",
+        "torch_batch",
+        "chunk_size",
     })
 
     def __init__(
@@ -1289,6 +1297,9 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         loss_kwargs: Mapping[str, Any] | None = None,
         allow_encoding_conversion: bool = False,
         native_mpo_compression: Mapping[str, Any] | None = None,
+        route: str = "exact",
+        torch_batch: bool | str = False,
+        chunk_size: int | None = 32,
         torch_linalg_config: TorchLinalgConfig | None = None,
     ):
         if hamiltonian is not None and terms is not None:
@@ -1321,6 +1332,8 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             ),
         }
         self._native_mpo_path_optimizer = None
+        self._local_path_optimizer = None
+        self.loss_kwargs.update(route=route, torch_batch=torch_batch, chunk_size=chunk_size)
         if loss_kwargs is not None:
             self.set_loss_kwargs(**loss_kwargs)
 
@@ -1358,6 +1371,56 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             "state must be an MPS-like object with "
             "compute_local_expectation_exact()."
         )
+
+    def _prepare_local_options(self, options):
+        """Reuse path searches while rebuilding state-dependent environments."""
+        options = dict(options)
+        optimize = options.get("contraction_opt")
+        if optimize is None or (isinstance(optimize, str) and optimize in {"auto", "auto-hq"}):
+            if self._local_path_optimizer is None:
+                self._local_path_optimizer = build_optimizer(progbar=False, parallel=False)
+            options["contraction_opt"] = self._local_path_optimizer
+        return options
+
+    def measure(self, observables=None, *, state=None, route=None,
+                torch_batch=None, chunk_size=None, info=None):
+        """Measure total energy and named local sums on the same state.
+
+        ``observables`` maps names to ``{support: operator}`` dictionaries.
+        Returns ``energy``, ``observables`` and readout ``metadata``. Dense
+        MPS routes share one reduced density matrix per unique ordered support.
+        Native arrays retain exact graded readout. Optional ``torch_batch``
+        (True/'einsum' or 'vmap') batches only compatible final contractions.
+        Numerical environments are rebuilt on every call; paths are reusable.
+        """
+        state = self.state if state is None else self._as_mps_state(state)
+        terms = self.terms
+        if self._is_fermionic_sym_hamiltonian(terms):
+            if not self._can_use_native_local_terms(terms, state):
+                raise ValueError("measure requires local terms indexed by MPS sites.")
+            terms = terms.terms
+        if self._is_mpo_hamiltonian(terms):
+            raise ValueError("measure requires local terms; use energy() for an MPO Hamiltonian.")
+        options = self._prepare_local_options(self.loss_kwargs)
+        groups = {"energy": terms}
+        if observables is not None:
+            if not isinstance(observables, Mapping):
+                raise TypeError("observables must map names to local-term mappings.")
+            groups.update({("observable", name): value for name, value in observables.items()})
+        for value in groups.values():
+            self._check_local_terms_state_compatible(state, value)
+        values, metadata = measure_mps_groups(
+            state, groups, route=options["route"] if route is None else route,
+            optimize=options["contraction_opt"], normalized=bool(options["normalized"]),
+            info=info, torch_batch=options["torch_batch"] if torch_batch is None else torch_batch,
+            chunk_size=options["chunk_size"] if chunk_size is None else chunk_size,
+        )
+        energy = values.pop("energy")
+        if options["real"]:
+            energy = self._maybe_real(energy)
+        return {"energy": energy,
+                "observables": {key[1]: value for key, value in values.items()},
+                "metadata": metadata}
 
     def _prepare_native_mpo_options(self, state, terms, options):
         """Reuse one cotengra optimizer for repeated native MPO losses."""
@@ -1943,7 +2006,13 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         progbar=False,
         allow_encoding_conversion=False,
         native_mpo_compression=None,
+        route="exact",
+        torch_batch=False,
+        chunk_size=32,
     ):
+        validate_batch(torch_batch, chunk_size)
+        if route not in {"exact", "canonical", "envs"}:
+            raise ValueError("route must be 'canonical', 'envs', or 'exact'.")
         state = cls._as_mps_state(state)
         terms = cls._terms_from_hamiltonian(terms)
         if cls._is_fermionic_sym_hamiltonian(terms):
@@ -1967,6 +2036,20 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             return value
 
         cls._check_local_terms_state_compatible(state, terms)
+        if route != "exact" or torch_batch:
+            options = dict(compute_kwargs or {})
+            info = options.pop("info", None)
+            if options:
+                raise ValueError("canonical/envs readout only accepts 'info' in compute_kwargs.")
+            values, _ = measure_mps_groups(
+                state, {"energy": terms}, route=route, optimize=contraction_opt,
+                normalized=bool(normalized), info=info,
+                torch_batch=torch_batch, chunk_size=chunk_size,
+            )
+            value = values["energy"]
+            if energy_per_site:
+                value = value / cls._num_sites(state)
+            return cls._maybe_real(value) if real else value
         terms = cls._terms_for_state_backend(terms, state)
         if contraction_opt is None:
             contraction_opt = build_optimizer(progbar=False)
@@ -2000,6 +2083,8 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             terms_use = self._terms_from_hamiltonian(terms)
         opts = self._merge_opts(self.loss_kwargs, self._pick_loss_kwargs(kwargs))
         opts = self._prepare_native_mpo_options(state, terms_use, opts)
+        if opts["route"] != "exact" or opts["torch_batch"]:
+            opts = self._prepare_local_options(opts)
         return self._loss_state(state, terms=terms_use, **opts)
 
     def energy(self, state=None, *, hamiltonian=None, terms=None, **kwargs):
@@ -2013,6 +2098,8 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
 
         opts = self._merge_opts(self.loss_kwargs, self._pick_loss_kwargs(kwargs))
         opts = self._prepare_native_mpo_options(state, terms_use, opts)
+        if opts["route"] != "exact" or opts["torch_batch"]:
+            opts = self._prepare_local_options(opts)
         opts_full = dict(opts)
         opts_full["energy_per_site"] = False
         energy = self._loss_state(state, terms=terms_use, **opts_full)
@@ -2035,6 +2122,8 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
                     if opts["native_mpo_compression"] is None
                     else dict(opts["native_mpo_compression"])
                 ),
+                "route": opts["route"],
+                "torch_batch": opts["torch_batch"],
             },
         )
 
@@ -2087,6 +2176,8 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             terms,
             merged_loss_kwargs,
         )
+        if merged_loss_kwargs["route"] != "exact" or merged_loss_kwargs["torch_batch"]:
+            merged_loss_kwargs = self._prepare_local_options(merged_loss_kwargs)
         if self._is_mpo_hamiltonian(terms):
             constants = {"terms": terms}
             constants.update(incoming_constants)

@@ -24,6 +24,126 @@ def _perm_mps_to_logical_dense(opt):
     return np.transpose(physical, logical_axes).reshape(-1)
 
 
+@pytest.mark.parametrize("mode", ["direct", "dmrg", "dmrg2", "dmrg3"])
+@pytest.mark.parametrize("where", [(2, 3), (1, 4)])
+def test_nonunitary_canonical_overlap_matches_dense(mode, where, monkeypatch):
+    """Truncated non-unitary updates compare to the exact post-gate state."""
+    p = qtn.MPS_rand_state(7, bond_dim=3, dtype="complex128", seed=314)
+    gate = np.diag([0.2, 0.7, 1.3, 1.8]).astype("complex128")
+    target = p.gate(gate, where, contract=False).to_dense().reshape(-1)
+    opt = py.MpsOptimizer(p, gates=[(gate, where)], chi=2, mode=mode,
+                          contraction_opt="greedy")
+    def fail_full_overlap(*args, **kwargs):
+        raise AssertionError("non-unitary diagnostics should reuse the canonical window")
+    monkeypatch.setattr(opt, "_fit_overlap_diagnostics", fail_full_overlap)
+    original_window = opt._nonunitary_window
+    windows = []
+    def inspect_window(network, support):
+        window, scope = original_window(network, support)
+        assert network.site_tag(0) not in window.tags
+        assert network.site_tag(6) not in window.tags
+        windows.append(window)
+        return window, scope
+    monkeypatch.setattr(opt, "_nonunitary_window", inspect_window)
+    opt.run(non_unitary=True, progbar=False, cutoff=0.0, n_iter=3,
+            fit_init_strategy="guess_direct", fit_overlap_diagnostics=True)
+    actual = opt.p.to_dense().reshape(-1)
+    fidelity = abs(np.vdot(target, actual)) ** 2 / (
+        np.vdot(target, target).real * np.vdot(actual, actual).real
+    )
+    diagnostic = opt.get_nonunitary_diagnostics()
+    assert diagnostic["error"] is None
+    assert diagnostic["scope"] == "canonical_window"
+    assert diagnostic["local_fidelity"] == pytest.approx(fidelity, abs=2e-10)
+    assert diagnostic["local_infidelity"] > 1e-7
+    assert diagnostic["method"] == ("target_overlap" if mode == "direct" else "fit_projection")
+    assert len(windows) == (2 if mode == "direct" else 1)
+    opt.set_p(p)
+    assert opt.get_nonunitary_diagnostics() is None
+
+
+@pytest.mark.parametrize("mode", ["direct", "dmrg"])
+@pytest.mark.parametrize("chi", [2, 16])
+def test_nonunitary_sequence_overlap_matches_dense_after_normalization(mode, chi):
+    """Moving centers and physical norm changes must not contaminate fidelity."""
+    p = qtn.MPS_rand_state(6, bond_dim=3, dtype="complex128", seed=73)
+    rng = np.random.default_rng(24)
+    gate = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    gates = [(0.1 * gate, (4, 1)), (np.diag([0.3, 1.4]), (0,)),
+             (0.2 * gate.T.conj(), (2, 5))]
+    opt = py.MpsOptimizer(p, [], chi=chi, mode=mode, contraction_opt="greedy")
+    losses = []
+    for gate, where in gates:
+        target = opt.p.copy()
+        target.exponent = 0.0
+        target = target.gate(gate, where, contract=False).to_dense().reshape(-1)
+        opt.set_gates([(gate, where)])
+        opt.run(non_unitary=True, normalize_every=True, progbar=False,
+                cutoff=0.0, n_iter=3, fit_init_strategy="guess_direct")
+        actual = opt.p.copy()
+        actual.exponent = 0.0
+        actual = actual.to_dense().reshape(-1)
+        fidelity = abs(np.vdot(target, actual)) ** 2 / (
+            np.vdot(target, target).real * np.vdot(actual, actual).real
+        )
+        record = opt.get_nonunitary_diagnostics()
+        if len(where) == 1:
+            assert record is None  # exact update, no compression this run
+            assert fidelity == pytest.approx(1., abs=2e-12)
+        else:
+            assert record["error"] is None
+            assert record["local_infidelity"] == pytest.approx(1. - fidelity, abs=2e-10)
+            losses.append(record["local_infidelity"])
+    if chi == 16:
+        assert losses == pytest.approx([0., 0.], abs=2e-10)
+    else:
+        assert min(losses) > 1e-5
+
+
+@pytest.mark.parametrize("mode", ["direct", "dmrg"])
+def test_nonunitary_overlap_cancels_exponent_and_keeps_torch_gradients(mode):
+    torch = pytest.importorskip("torch")
+    p = qtn.MPS_rand_state(5, bond_dim=2, dtype="float64", seed=82)
+    p.apply_to_arrays(lambda a: torch.tensor(a, dtype=torch.float64))
+    p.exponent = 400.0
+    strength = torch.tensor(0.2, dtype=torch.float64, requires_grad=True)
+    generator = torch.tensor(np.random.default_rng(12).normal(size=(4, 4)), dtype=torch.float64)
+    gate = torch.matrix_exp(strength * (generator + generator.T))
+    opt = py.MpsOptimizer(p, [(gate, (1, 3))], chi=2, mode=mode,
+                          contraction_opt="greedy")
+    opt.run(non_unitary=True, progbar=False, cutoff=0.0, n_iter=2,
+            fit_init_strategy="guess_direct", normalize_every=True)
+    diagnostic = opt.get_nonunitary_diagnostics()
+    assert diagnostic["error"] is None
+    assert 0.0 <= diagnostic["local_infidelity"] <= 1.0
+    assert not opt._last_nonunitary_diagnostics["local_infidelity"].requires_grad
+    normalized = opt.p.copy()
+    normalized.exponent = 0.0
+    vector = normalized.to_dense().reshape(-1)
+    weights = torch.linspace(-1., 1., vector.numel(), dtype=torch.float64)
+    loss = (weights * vector.square()).sum() / vector.square().sum()
+    loss.backward()
+    assert torch.isfinite(strength.grad)
+
+
+def test_nonunitary_dmrg_batched_target_overlap_matches_dense():
+    p = qtn.MPS_rand_state(6, bond_dim=2, dtype="complex128", seed=3)
+    gates = [(np.diag([0.2, 0.7, 1.3, 1.8]).astype("complex128"), (1, 3)),
+             (np.diag([1.2, 0.1, 0.3, 0.8]).astype("complex128"), (2, 4))]
+    target = p.copy()
+    for gate, where in gates:
+        target.gate_(gate, where, contract=False)
+    target = target.to_dense().reshape(-1)
+    opt = py.MpsOptimizer(p, gates, chi=2, mode="dmrg", contraction_opt="greedy")
+    opt.run(non_unitary=True, progbar=False, cutoff=0.0, n_iter=3,
+            fit_layer_size=2, fit_init_strategy="guess_direct")
+    actual = opt.p.to_dense().reshape(-1)
+    fidelity = abs(np.vdot(target, actual)) ** 2 / (
+        np.vdot(target, target).real * np.vdot(actual, actual).real
+    )
+    assert opt.get_nonunitary_diagnostics()["local_fidelity"] == pytest.approx(fidelity, abs=2e-10)
+
+
 def test_mps_optimizer_effective_length_is_gate_active_and_cap_reduced():
     """L_eff is a lightweight stream-support ledger, not a rank probe."""
     product = qtn.MPS_computational_state("000", dtype="complex128")
@@ -1956,6 +2076,7 @@ def test_mps_optimizer_mpo_mode_applies_submpo_stream_event():
     assert opt.where == [(1, 3)]
     assert np.allclose(vec, expected)
     assert out.max_bond() <= 8
+    assert opt.get_nonunitary_diagnostics()["local_infidelity"] == pytest.approx(0., abs=1e-12)
 
 
 def test_mps_optimizer_dmrg_mode_applies_submpo_as_layered_fit_target():

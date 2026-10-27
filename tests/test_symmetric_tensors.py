@@ -1782,6 +1782,24 @@ def test_fermion_hopping_gate_matches_native_hamiltonian_exponential():
     assert after < -1.0e-4
 
 
+@pytest.mark.parametrize("mode", ["direct", "dmrg"])
+@pytest.mark.parametrize("chi", [1, 4])
+def test_native_nonunitary_compression_overlap_uses_graded_fallback(mode, chi):
+    fermion = Fermion(spinful=False, symmetry="U1")
+    p = pepsy.ps_to_mps(3, fermion=fermion, occupations=(1, 1, 0),
+                       seed=123, dtype="complex128")
+    gate = fermion.hopping_gate(0.13, t=1.3, imaginary=True)
+    opt = pepsy.MpsOptimizer(p, [(gate, (0, 2))], chi=chi, mode=mode,
+                             contraction_opt="greedy")
+    opt.run(progbar=False, non_unitary=True, cutoff=0.0, n_iter=2,
+            fit_init_strategy="guess_direct")
+    diagnostic = opt.get_nonunitary_diagnostics()
+    assert diagnostic["scope"] == "full_native"
+    assert diagnostic["error"] is None
+    expected = np.sinh(0.13 * 1.3) ** 2 / np.cosh(2 * 0.13 * 1.3) if chi == 1 else 0.0
+    assert diagnostic["local_infidelity"] == pytest.approx(expected, abs=1e-10)
+
+
 def _native_mps_dense_amplitudes(state):
     """Read amplitudes from a dense fixed-charge native MPS contraction."""
     dense = state.to_dense()

@@ -41,6 +41,7 @@ from __future__ import annotations
 import heapq
 import re
 import time
+import math
 from collections.abc import Mapping
 
 import autoray as ar
@@ -1220,6 +1221,41 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         result = numerator / denominator
         if preserve_gauge:
             self._restore_readout_region(original_region)
+        return result
+
+    def _local_density_matrices(self, wheres, *, optimize="auto", normalized=True):
+        """Read dense support RDMs on one disposable canonical tree.
+
+        This is the energy layer's batched readout primitive. Native arrays
+        keep local_expectation's graded path rather than cancelling exterior
+        phases through an ordinary dense trace.
+        """
+        if self.fermionic or self.symmetry is not None:
+            raise NotImplementedError("native trees retain graded local expectations")
+        work = self.copy()
+        result = {}
+        for where in wheres:
+            nodes = [work.plan.node_of_qubit[site] for site in where]
+            work.shift_orthogonality_center(nodes[0])
+            span = work.steiner_nodes(nodes)
+            physical = tuple(work.site_ind(site) for site in where)
+            bra_physical = tuple(qtn.rand_uuid() for _ in where)
+            internal = {work.bond(node, other) for node in span
+                        for other in work.neighbors(node) if other in span}
+            ket = qtn.TensorNetwork([work.node_tensor(node).copy() for node in span])
+            bra = ket.H.reindex({**{ind: qtn.rand_uuid() for ind in internal},
+                                **dict(zip(physical, bra_physical))})
+            rho = (ket & bra).contract(
+                all, output_inds=physical + bra_physical, optimize=optimize,
+            ).data
+            dim = math.prod(work.node_tensor(node).ind_size(ind)
+                            for node, ind in zip(nodes, physical))
+            rho = ar.do("reshape", rho, (dim, dim))
+            if normalized:
+                rho = rho / ar.do("trace", rho)
+            else:
+                rho = rho * 10 ** (2 * getattr(self, "exponent", 0.0))
+            result[where] = rho
         return result
 
     def local_expectations(self, terms, *, optimize="auto", normalized=True):

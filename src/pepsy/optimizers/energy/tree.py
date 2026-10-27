@@ -24,6 +24,7 @@ import autoray as ar
 from ...backends import TorchLinalgConfig, infer_backend_converter_from_sample
 from ...tensors import build_optimizer
 from .peps import EnergyEstimate, PepsEnergyOptimizer
+from ._local import normalize_groups, trace_observables, validate_batch
 
 __all__ = ["TreeEnergyOptimizer"]
 
@@ -48,6 +49,10 @@ class TreeEnergyOptimizer(PepsEnergyOptimizer):
     plain string a reusable :func:`pepsy.build_optimizer` is built once so paths
     are cached across terms and across repeated calls; pass an explicit reusable
     optimiser object to control caching directory / parallelism.
+
+    :meth:`measure` evaluates energy and named observables together. Dense
+    trees reuse support density matrices on one canonical copy, with optional
+    Torch batching; native arrays keep their established graded readout.
     """
 
     _LOSS_KEYS = frozenset({
@@ -343,6 +348,54 @@ class TreeEnergyOptimizer(PepsEnergyOptimizer):
                 "contraction_opt": opts["contraction_opt"],
             },
         )
+
+    def measure(self, observables=None, *, state=None, torch_batch=False, chunk_size=32):
+        """Measure energy and named local sums with shared readout resources.
+
+        Dense trees share support RDMs on one canonical copy, with optional
+        Torch einsum/vmap batching. Native trees retain graded per-operator
+        contractions, sharing paths and their state-versioned norm cache.
+        """
+        state = self.state if state is None else self._as_tree_state(state)
+        method = validate_batch(torch_batch, chunk_size)
+        groups = {"energy": self.terms}
+        if observables is not None:
+            if not isinstance(observables, Mapping):
+                raise TypeError("observables must map names to local-term mappings.")
+            groups.update({("observable", name): value for name, value in observables.items()})
+        groups = normalize_groups(groups, state.plan.node_of_qubit)
+        supports = tuple(dict.fromkeys(where for terms in groups.values() for where in terms))
+        options = self.loss_kwargs
+        native = state.fermionic or state.symmetry is not None
+        if native:
+            values, cache = {}, {}
+            for name, terms in groups.items():
+                total = 0.0
+                for where, operator in terms.items():
+                    key = (where, id(operator))
+                    if key not in cache:
+                        cache[key] = state.local_expectation(
+                            operator, where, optimize=options["contraction_opt"],
+                            normalized=options["normalized"],
+                        )
+                    total = total + cache[key]
+                values[name] = total
+            used = "loop"
+        else:
+            rhos = state._local_density_matrices(
+                supports, optimize=options["contraction_opt"], normalized=options["normalized"],
+            )
+            values, used = trace_observables(
+                rhos, groups, torch_batch=torch_batch, chunk_size=chunk_size,
+            )
+        energy = values.pop("energy")
+        if options["real"]:
+            energy = self._maybe_real(energy)
+        return {"energy": energy,
+                "observables": {key[1]: value for key, value in values.items()},
+                "metadata": {"route": "native_exact" if native else "canonical",
+                             "torch_batch": used, "requested_batch": method,
+                             "num_supports": len(supports)}}
 
     def set_loss_kwargs(self, **kwargs):
         """Update the defaults used by :meth:`loss` and :meth:`optimize`."""

@@ -13,6 +13,67 @@ from ...backends import to_float as _backend_to_float
 from ...backends.convert import _array_namespace
 
 
+def _nonunitary_window(self, p, where):
+    """Cancel the canonical exterior for ordinary arrays; retain native signs.
+
+    The caller must canonicalize the input around ``where`` before making
+    its exact target. Compression must leave the exterior basis unchanged.
+    Both open virtual boundary indices then represent orthonormal bases.
+    """
+    local = not self._replay_has_symmray_data(p) and not p.isfermionic()
+    if local:
+        lo, hi = min(where), max(where)
+        result = p.select(tuple(p.site_tag(i) for i in range(lo, hi + 1)), which="any")
+    else:
+        result = p.copy()
+    # Both target and output have the same represented scale. Cancel it
+    # before contracting, including for exponents outside floating range.
+    result.exponent = 0.0
+    return result, "canonical_window" if local else "full_native"
+
+
+def _record_nonunitary_overlap(self, target, fitted, where, *, fit_norm=None):
+    """Measure a gate compression, reusing FIT's terminal projection norm."""
+    record = dict(where=tuple(where), local_fidelity=None, local_infidelity=None,
+                  fidelity_raw=None, method=None, scope=None, error=None)
+    try:
+        target, scope = self._nonunitary_window(target, where)
+        record["scope"] = scope
+        optimize = self.contraction_opt
+        if optimize is None or (isinstance(optimize, str) and optimize in {"auto", "auto-hq"}):
+            optimize = "greedy"
+        target_sq = ar.do("abs", (target.H & target).contract(
+            all, output_inds=(), optimize=optimize,
+        ))
+        if fit_norm is not None and scope == "canonical_window":
+            # The last FIT update is an orthogonal projection in the fixed
+            # canonical bases, so <target|fit> = ||fit||^2. No overlap or
+            # second retained-norm contraction is needed.
+            raw = ar.do("abs", fit_norm) ** 2 / target_sq
+            record["method"] = "fit_projection"
+        else:
+            approx, _ = self._nonunitary_window(fitted, where)
+            overlap = (target.H & approx).contract(all, output_inds=(), optimize=optimize)
+            if scope == "canonical_window":
+                norm, _ = self._retained_center_norm(fitted, where)
+                approx_sq = ar.do("abs", norm) ** 2
+            else:
+                approx_sq = ar.do("abs", (approx.H & approx).contract(
+                    all, output_inds=(), optimize=optimize,
+                ))
+            raw = ar.do("abs", overlap) ** 2 / (target_sq * approx_sq)
+            record["method"] = "target_overlap"
+        # Diagnostics never retain the evolution's autograd graph. Conversion
+        # to host scalars belongs to the explicit readout, not each GPU gate.
+        raw = ar.do("stop_gradient", raw)
+        fidelity = ar.do("clip", raw, 0.0, 1.0)
+        record.update(fidelity_raw=raw, local_fidelity=fidelity,
+                      local_infidelity=1.0 - fidelity)
+    except Exception as exc:
+        record["error"] = f"{type(exc).__name__}: {exc}"
+    self._last_nonunitary_diagnostics = record
+
+
 def normalize(self, eps=1e-15, insert=None):
     """Normalize current ``self.p`` in-place.
 

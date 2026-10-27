@@ -8,6 +8,29 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Local energy readout:** add canonical and shared-environment routes to
+  `MpsEnergyOptimizer`, plus joint energy/observable `measure()` calls for
+  MPS, tree, and Gibbs classes. Dense readout reuses support density matrices;
+  optional Torch einsum/vmap batches compatible final contractions with
+  bounded chunks. Native arrays retain graded fallbacks. Gibbs keeps canonical
+  readout by default; existing MPS energy objectives keep their exact default.
+
+- **Gibbs MPS:** add normalized local `energy()` readout without constructing
+  a density MPO, using a reusable Pepsy contraction optimizer; reject
+  nonfinite inverse temperature and step size early. Default to second-order
+  evolution with thermal increments `beta_step=0.05`, retaining explicit `dt`
+  in purification-time units. Add `evolve()` for one trajectory with
+  intermediate measurements, every N steps or at explicit beta targets;
+  default to `measure_every=5`, reuse equal gate batches and fuse between
+  measurement boundaries. Energy readout reuses the known canonical center
+  on a copy and caches its contraction optimizer and bound operators.
+  Explicit `n_steps` still takes precedence over the default step size.
+- **Non-unitary MPS diagnostics:** automatically measure local compression
+  overlap in direct/DMRG replay and expose it as Gibbs `local_infidelity`.
+  Dense paths cancel the canonical exterior and reuse FIT's terminal norm;
+  native arrays retain a graded full-network fallback. Keep unitary
+  norm-survival behavior unchanged.
+
 ## [0.6.0] - 2026-10-23
 
 - **PEPS:** full updates, strip ALS, full-PEPO fitting, adaptive boundary caps,
