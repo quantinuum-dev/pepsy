@@ -120,6 +120,41 @@ Native Symmray `BlockVector` gauges use the same rule, reducing over backend
 blocks and weighting every singular value equally even when sector sizes
 differ. Blocks remain native, and the scale is detached at the block backend.
 
+## Prepared dense simple update
+
+`pepsy.operators.PreparedSimpleUpdate` snapshots a dense complex Torch PEPO,
+its real SU weights, and an ordered schedule of `(sites, leg)` entries.
+Legs are `"upper"` or `"lower"`; gates have one leading axis for independent
+network copies. Qubit one-site and nearest-neighbor two-site gates are supported.
+Cutoff and cutoff mode default to the same dtype-aware `"auto"` policy as
+`gate_simple`, resolved once when the plan is constructed.
+
+```python
+from pepsy.operators import PreparedSimpleUpdate
+
+plan = PreparedSimpleUpdate(target, weights, schedule, max_bond=4,
+    cutoff=1e-12, cutoff_mode="rsum2", renorm_bonds=True)
+outputs = plan.apply(gates)  # list of (PEPO, external_weights), with autograd
+```
+
+The plan batches equal-shaped operations on disjoint sites and retains every
+site's supplied gate order. Independent networks are a second batching axis.
+Each fast update checks the requested truncation rank for every member. If
+any rank differs from the stored shape, the whole call replays the original
+adaptive `gate_simple` algorithm. It never chooses a batch-wide maximum rank.
+`plan.info` reports operation/batch counts and the last call's fallback status.
+Targets and weights are copied; returned weights remain external and the
+network exponent retains the removed scale. Empty schedules are unsupported.
+
+Use the desired `TorchLinalgConfig.activated()` scope around evaluation.
+The default `torch_backend=None` uses batched eager array kernels.
+`torch_backend="aot_eager"` captures each kernel's forward and registered
+stabilized backward together; boundary contraction is outside this plan.
+This optional capture uses Torch's internal AOT interface and is version-sensitive.
+Inductor is rejected: the tested complex backward failed reference checks.
+No CUDA graph replay or complete tensor-network compilation is claimed.
+Native Symmray and fermionic arrays retain their existing public paths.
+
 ## Native fermionic gates
 
 The gate-to-operator builders accept native Symmray fermionic gates directly;

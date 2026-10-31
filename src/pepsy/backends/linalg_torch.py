@@ -690,7 +690,7 @@ class QR_complex_safe(torch.autograd.Function):
             if ctx.rank_policy == "native":
                 return _native_qr_backward(A, dQ, dR)
             return _regularized_qr_backward(A, Q, R, dQ, dR, rank_deficient)
-        return _native_qr_backward(A, dQ, dR)
+        return _qr_backward_from_factors(Q, R, dQ, dR)
 
 
 def _simple_qr_backward(q, r, dq, dr):
@@ -753,6 +753,39 @@ def _qr_trilim_inv_adjoint_skew(x):
     if output.is_complex():
         output.diagonal(0, -2, -1).imag.mul_(0.5)
     return output
+
+
+def _qr_backward_from_factors(q, r, dq, dr):
+    """Native reduced-QR VJP from saved factors at a nonsingular QR chart.
+
+    Reusing Q/R avoids a second factorization and nested autograd invocation
+    for each tensor-network split. The adaptive caller still owns zero-pivot
+    detection and nonfinite-result fallback; this helper adds no regularizer.
+    """
+    if dq is None and dr is None:
+        return torch.zeros(*q.shape[:-1], r.shape[-1], dtype=q.dtype, device=q.device)
+    if dq is None:
+        gradient = dr @ r.mH
+    elif dr is None:
+        gradient = -q.mH @ dq
+    else:
+        gradient = dr @ r.mH - q.mH @ dq
+    m, n = q.shape[-2], r.shape[-1]
+    if m >= n:
+        gradient = q @ _qr_syminv_adjoint(gradient.triu())
+        if dq is not None:
+            gradient = gradient + dq
+        # Match native backward's materialized conjugation, including callers
+        # that export the returned gradient directly to NumPy.
+        return torch.linalg.solve_triangular(r, gradient.mH, upper=True).mH.resolve_conj()
+    gradient = q @ _qr_trilim_inv_adjoint_skew(-gradient)
+    gradient = torch.linalg.solve_triangular(
+        r.narrow(-1, 0, m), gradient.mH, upper=True,
+    ).mH
+    gradient = torch.cat((gradient, gradient.new_zeros(*gradient.shape[:-1], n - m)), dim=-1)
+    if dr is not None:
+        gradient = gradient + q @ dr
+    return gradient
 
 
 def _regularized_qr_backward(a, q, r, dq, dr, singular_pivot):
@@ -830,6 +863,13 @@ def _adaptive_qr_backward(a, q, r, dq, dr, singular_pivot):
     from torch.fx.experimental.proxy_tensor import get_proxy_mode
     if get_proxy_mode() is not None:
         return _captured_adaptive_qr_backward(a, q, r, dq, dr)
+    # SU commonly splits one small matrix at a time. Avoid scalar-mask gathers
+    # (and their CUDA nonzero synchronization) on the ordinary nonsingular
+    # chart. Zero pivots or nonfinite VJPs still take the same guarded path below.
+    if a.ndim == 2 and not bool((r.diagonal(0, -2, -1) == 0).any()):
+        result = _qr_backward_from_factors(q, r, dq, dr)
+        if bool(torch.isfinite(result).all()):
+            return result
     result = torch.zeros_like(a)
     active = torch.zeros(a.shape[:-2], dtype=torch.bool, device=a.device)
     for cotangent in (dq, dr):
@@ -840,8 +880,8 @@ def _adaptive_qr_backward(a, q, r, dq, dr, singular_pivot):
     zero_pivot = (r.diagonal(0, -2, -1) == 0).any(dim=-1)
     candidate = active & ~zero_pivot
     if bool(candidate.any()):
-        result[candidate] = _native_qr_backward(
-            a[candidate],
+        result[candidate] = _qr_backward_from_factors(
+            q[candidate], r[candidate],
             None if dq is None else dq[candidate],
             None if dr is None else dr[candidate],
         )

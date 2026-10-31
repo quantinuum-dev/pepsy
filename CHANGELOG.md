@@ -8,6 +8,15 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Prepared dense SU:** add `operators.PreparedSimpleUpdate` for reusable
+  Torch PEPO gate schedules, disjoint-site/network batching, and optional
+  AOT-eager forward/backward capture. Check per-member truncation decisions
+  and replay adaptively on rank changes; preserve SU weights and scale.
+
+- **Torch QR backward:** reuse saved forward factors on nonsingular stabilized
+  charts and avoid batch-mask gathers for single-matrix adaptive pullbacks.
+  Preserve rank-deficient fallbacks, FX capture, dtype, and truncation policy.
+
 - **Local energy readout:** add canonical and shared-environment routes to
   `MpsEnergyOptimizer`, plus joint energy/observable `measure()` calls for
   MPS, tree, and Gibbs classes. Dense readout reuses support density matrices;

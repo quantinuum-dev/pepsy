@@ -22,6 +22,23 @@ Its older “working-tree” and “unpublished” statements retain their origi
 
 ## Publication and validation
 
+The [October 30 prepared-SU follow-up](../../history/2026-10-30-prepared-simple-update.md)
+implements dense Torch batching with per-member rank checks
+and adaptive replay. AOT-eager is optional; Inductor failed complex-gradient
+checks and is excluded. This supersedes the earlier proposed-only SU status.
+
+The [October 30 QR performance follow-up](../../history/2026-10-30-pepo-qr-reuse.md)
+records a saved-factor backward optimization, focused
+CPU/CUDA derivative checks, and a matched finite-PBC Gaugy benchmark. It also
+records three downstream native-Z2 failures reproduced with unchanged QR.
+The separate CTMRG check preserves the finite torus and uses the public
+projector compatibility context. The newer prepared-SU entry above records
+the subsequent implementation and its limits.
+
+The [publication batch](../../history/2026-10-30-pepo-acceleration-publication.md)
+packages both changes and records fresh validation of the selected files.
+The earlier records retain their original uncommitted baseline status.
+
 The [October 21 NLopt review](../../history/2026-10-21-nlopt-gradient-tolerance.md#review-and-local-commit)
 adds explicit derivative stopping and preserves the stopping trial when best-state
 restoration is disabled. Its focused CPU validation and local commit status are

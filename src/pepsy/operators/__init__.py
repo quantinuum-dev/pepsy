@@ -54,6 +54,7 @@ _GATE_EXPORTS = [
     "fsimg",
 ]
 _SYMBOL_MODULES = {name: ".gates" for name in _GATE_EXPORTS}
+_SYMBOL_MODULES['PreparedSimpleUpdate'] = '.simple_update'
 _SYMBOL_MODULES["GraphPEPOClusterProductExpansion"] = ".graph_pepo_product"
 _SYMBOL_MODULES["SquarePEPOClusterProductExpansion"] = ".square_pepo_product"
 _SYMBOL_MODULES["ClusterCompressionPlan"] = ".cluster_compression"
@@ -179,6 +180,7 @@ _SUBMODULES = (
 
 __all__ = [
     *_GATE_EXPORTS,
+    'PreparedSimpleUpdate',
     "build_cluster_expansion_pepo",
     "build_model_cluster_expansion_pepo",
     "build_itf_cluster_expansion_pepo",

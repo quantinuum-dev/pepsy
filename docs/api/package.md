@@ -85,6 +85,15 @@ Use `pepsy.backends.TorchLinalgConfig` to configure Torch SVD/QR policy.
 See the [MPS](optimizers/mps.md) and [PEPS](optimizers/peps.md) guides for
 optimizer-specific usage.
 
+Stabilized Torch QR reuses the saved forward factors for its first-order
+pullback on nonsingular charts. The adaptive eager path avoids a second QR
+factorization and, for single matrices, the batch-mask indexing overhead.
+Zero pivots and nonfinite derivatives retain the existing regularized fallback;
+FX capture retains its separate fixed-shape implementation. This does not
+change precision, truncation, rank policy, or the native default. See the
+[validation record](../../history/2026-10-30-pepo-qr-reuse.md) for scope and
+downstream checks.
+
 `pepsy.backends.backend_cupy(...)` uses upstream Autoray namespace handling
 when it supports unhashable device objects. On affected older versions,
 Pepsy bypasses the failing namespace cache while keeping the original device

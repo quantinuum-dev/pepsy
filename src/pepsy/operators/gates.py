@@ -2824,6 +2824,13 @@ def renorm_gauge(tn, gauges, where, smudge=1e-12):
 def _renorm_gauge_index(tn, gauges, ix, smudge):
     """Extract one gauge's scalar without densifying blocks or detaching data."""
     s = gauges[ix]
+    if not hasattr(s, 'blocks'):
+        from ._gauge_scale import dense_gauge_scale
+        scale = dense_gauge_scale(s, smudge).reshape(())
+        if hasattr(tn, 'exponent'):
+            tn.exponent = tn.exponent + ar.do('log10', scale)
+        gauges[ix] = s / scale
+        return
     # SU singular values can be Symmray BlockVectors. Reduce their backend
     # blocks directly: Symmray has no mean, and detaching its wrapper does not
     # necessarily detach the Torch blocks it contains.
