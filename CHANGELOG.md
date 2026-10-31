@@ -12,6 +12,8 @@ patch versions remain compatible.
   Torch PEPO gate schedules, disjoint-site/network batching, and optional
   AOT-eager forward/backward capture. Check per-member truncation decisions
   and replay adaptively on rank changes; preserve SU weights and scale.
+  `apply_many` batches compatible ready updates across independent schedules
+  without padding them with identity gates or changing per-plan cutoffs.
 
 - **Torch QR backward:** reuse saved forward factors on nonsingular stabilized
   charts and avoid batch-mask gathers for single-matrix adaptive pullbacks.

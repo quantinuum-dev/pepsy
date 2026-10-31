@@ -11,7 +11,7 @@ def test_prepared_matches_sequential_matrix_and_gradient(cap, cutoff, smudge, ba
 
 
 def _check_prepared(cap, cutoff, smudge, backend, *, renorm_bonds=True,
-                    svd_driver=None, zero_external=False):
+                    svd_driver=None, zero_external=False, shared=False):
     torch = pytest.importorskip('torch')
     import quimb.tensor as qtn
     from pepsy.backends import TorchLinalgConfig
@@ -32,6 +32,14 @@ def _check_prepared(cap, cutoff, smudge, backend, *, renorm_bonds=True,
                 ((((0, 1), (1, 1))), 'upper')]
     prepared = PreparedSimpleUpdate(network, gauges, schedule, max_bond=cap,
         cutoff=cutoff, smudge=smudge, torch_backend=backend, renorm_bonds=renorm_bonds)
+    plans = [prepared]
+    if shared:
+        # Independent shorter schedules share compatible ready updates. The
+        # final plan uses another rank cap and must retain its own fallback.
+        for stop, rank in ((3, cap), (1, 1)):
+            plans.append(PreparedSimpleUpdate(network, gauges, schedule[:stop],
+                max_bond=rank, cutoff=cutoff, smudge=smudge,
+                torch_backend=backend, renorm_bonds=renorm_bonds))
     angles = torch.tensor([[.17, -.12, .2, .08, -.11], [.22, .06, -.1, .12, .15]],
                           dtype=torch.float64, requires_grad=True)
     x = torch.tensor([[0, 1], [1, 0]], dtype=torch.complex128)
@@ -50,8 +58,12 @@ def _check_prepared(cap, cutoff, smudge, backend, *, renorm_bonds=True,
 
     with TorchLinalgConfig(mode='complex', stabilized=True, qr_rank_policy='adaptive',
                            svd_driver=svd_driver).activated():
-        actual = torch.stack([dense(p) for p in prepared.apply(gates)])
-        expected = torch.stack([dense(p) for p in prepared._adaptive(gates)])
+        batches = [gates[:len(plan.schedule)] for plan in plans]
+        results = (PreparedSimpleUpdate.apply_many(plans, batches) if shared else
+                   [prepared.apply(gates)])
+        actual = torch.stack([dense(p) for pairs in results for p in pairs])
+        expected = torch.stack([dense(p) for plan, batch in zip(plans, batches)
+                                for p in plan._adaptive(batch)])
         torch.testing.assert_close(actual, expected, atol=2e-11, rtol=2e-10)
         probe = torch.randn(actual.shape, dtype=actual.dtype, device='cpu',
                             generator=torch.Generator().manual_seed(29)).to(actual.device)
@@ -60,6 +72,10 @@ def _check_prepared(cap, cutoff, smudge, backend, *, renorm_bonds=True,
         torch.testing.assert_close(ga, ge, atol=2e-10, rtol=2e-9)
     if not zero_external:
         assert prepared.info['fallback'] == (cap == 1 or cutoff == .4)
+    if shared:
+        assert all(plan.info['shared_batches'] > 0 for plan in plans[:2])
+        assert plans[-1].info['shared_batches'] == 0
+        assert plans[-1].info['fallback']
     assert network.exponent == -.7
     assert all(torch.equal(w, original_gauges[k]) for k, w in gauges.items())
 
@@ -71,6 +87,25 @@ def test_prepared_without_scale_extraction(backend):
 
 def test_prepared_zero_external_support():
     _check_prepared(2, 1e-12, 0., None, zero_external=True)
+
+
+@pytest.mark.parametrize('backend', [None, 'aot_eager'])
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+@pytest.mark.parametrize('renorm_bonds', [False, True])
+def test_shared_ready_updates_preserve_heterogeneous_schedules(backend, device, renorm_bonds):
+    torch = pytest.importorskip('torch')
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    with torch.device(device):
+        _check_prepared(2, 1e-12, 1e-12, backend, shared=True,
+            renorm_bonds=renorm_bonds, svd_driver='gesvdj' if device == 'cuda' else None)
+
+
+def test_shared_updates_validate_batch_count():
+    from pepsy.operators import PreparedSimpleUpdate
+    assert PreparedSimpleUpdate.apply_many([], []) == []
+    with pytest.raises(ValueError, match='one gate list'):
+        PreparedSimpleUpdate.apply_many([], [[]])
 
 
 @pytest.mark.parametrize('backend', [None, 'aot_eager'])

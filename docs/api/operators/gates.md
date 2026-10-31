@@ -146,6 +146,15 @@ adaptive `gate_simple` algorithm. It never chooses a batch-wide maximum rank.
 Targets and weights are copied; returned weights remain external and the
 network exponent retains the removed scale. Empty schedules are unsupported.
 
+`PreparedSimpleUpdate.apply_many(plans, gate_batches)` also batches compatible
+ready updates across independent plans, including different schedule lengths.
+Each gate list follows `apply`'s contract; the result is one output list per
+plan in input order. Every plan retains its own cutoffs, site order and fallback.
+Only matching array shapes, numerical options and execution backends share a
+kernel. Weight conditioning is performed on the combined independent vectors.
+`plan.info["shared_batches"]` counts that plan's updates shared with other plans
+in the last call. Use `apply` for a single plan.
+
 Use the desired `TorchLinalgConfig.activated()` scope around evaluation.
 The default `torch_backend=None` uses batched eager array kernels.
 `torch_backend="aot_eager"` captures each kernel's forward and registered

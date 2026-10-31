@@ -26,5 +26,8 @@ or read the [MPS](docs/api/optimizers/mps.md),
 [PEPS](docs/api/optimizers/peps.md), [tree](docs/api/optimizers/tree_replay.md),
 or [stabilizer](docs/api/optimizers/stabilizer_tn.md) guide.
 
+Reuse and batch independent PEPO gate schedules with
+[prepared simple update](docs/api/operators/gates.md#prepared-dense-simple-update).
+
 [Documentation](docs/index.md) · [Examples](docs/examples.md) ·
 [Contributing](CONTRIBUTING.md)

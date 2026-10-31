@@ -153,7 +153,63 @@ class PreparedSimpleUpdate:
 
     def apply(self, gates):
         """Return independent ``(PEPO, gauges)`` pairs, preserving autograd."""
+        steps = self._steps(gates)
+        try:
+            inputs = next(steps)
+            while True:
+                inputs = steps.send(self._kernel(inputs)(*inputs))
+        except StopIteration as completed:
+            return completed.value
+
+    @staticmethod
+    def apply_many(plans, gate_batches):
+        """Replay independent schedules, batching compatible ready updates.
+
+        Each gate list has the same contract as :meth:`apply`. Results retain
+        plan order and each plan's network-batch order. Only independent
+        networks share kernels; every schedule keeps its own update order,
+        truncation policy and adaptive fallback.
+        """
         import torch
+        plans, gate_batches = tuple(plans), tuple(gate_batches)
+        if len(plans) != len(gate_batches):
+            raise ValueError('one gate list is required per prepared plan')
+        outputs = [None] * len(plans)
+        steps = [plan._steps(gates) for plan, gates in zip(plans, gate_batches)]
+        ready = []
+        for i, iterator in enumerate(steps):
+            try:
+                ready.append((i, next(iterator)))
+            except StopIteration as completed:
+                outputs[i] = completed.value
+        while ready:
+            compatible = defaultdict(list)
+            for i, inputs in ready:
+                plan = plans[i]
+                key = (tuple(plan.options.items()), plan.torch_backend, tuple(
+                    (tuple(x.shape[1:]), x.dtype, x.device) for x in inputs))
+                compatible[key].append((i, inputs))
+            ready = []
+            for members in compatible.values():
+                plan = plans[members[0][0]]
+                sizes = [inputs[0].shape[0] for _, inputs in members]
+                inputs = (members[0][1] if len(members) == 1 else
+                          tuple(torch.cat(parts) for parts in zip(*(x for _, x in members))))
+                updated = plan._kernel(inputs)(*inputs)
+                pieces = tuple(x.split(sizes) for x in updated)
+                for n, (i, _) in enumerate(members):
+                    plans[i].info['compiled'] = plan.info['compiled']
+                    plans[i].info['shared_batches'] += len(members) > 1
+                    try:
+                        ready.append((i, steps[i].send(tuple(x[n] for x in pieces))))
+                    except StopIteration as completed:
+                        outputs[i] = completed.value
+        return outputs
+
+    def _steps(self, gates):
+        """Yield ready numeric updates while retaining per-network state."""
+        import torch
+        self.info['shared_batches'] = 0
         if len(gates) != len(self.operations) or not gates:
             raise ValueError('one batched matrix is required for every scheduled gate')
         batch = gates[0].shape[0]
@@ -183,7 +239,8 @@ class PreparedSimpleUpdate:
                     if len(ids) == 2:
                         (la if j == 0 else lb).append(layout)
                 if bond is not None:
-                    ws.append(gauges.get(bond, arrays[ids[0]].real.new_ones((batch, layouts[0][2][-2]))))
+                    ws.append(gauges[bond] if bond in gauges else
+                              arrays[ids[0]].real.new_ones((batch, layouts[0][2][-2])))
             g = torch.cat(gg)
             if len(ids) == 1:
                 updated = (torch.einsum('nou,nxu->nxo', g, torch.cat(aa)),)
@@ -191,9 +248,12 @@ class PreparedSimpleUpdate:
                 inputs = (torch.cat(aa).contiguous(), torch.cat(bb).contiguous(),
                           self._outer_many(la, conditioned, batch, aa[0]),
                           self._outer_many(lb, conditioned, batch, bb[0]), torch.cat(ws), g)
-                updated = self._kernel(inputs)(*inputs)
+                updated = yield inputs
                 valid.append(updated[4])
                 exponent = exponent + updated[3].reshape(len(group), batch).sum(0)
+                # Condition all independent weight vectors together before
+                # distributing views, avoiding one reduction/dispatch per gate.
+                conditioned_update = condition(updated[2])
             for n, k in enumerate(group):
                 ids, _, bond, layouts, _ = self.operations[k]
                 for j, (i, layout) in enumerate(zip(ids, layouts)):
@@ -202,7 +262,7 @@ class PreparedSimpleUpdate:
                         (0,)+tuple(x+1 for x in inverse))
                 if bond is not None:
                     gauges[bond] = updated[2][n*batch:(n+1)*batch]
-                    conditioned[bond] = condition(gauges[bond])
+                    conditioned[bond] = conditioned_update[n*batch:(n+1)*batch]
         if valid and not bool(torch.cat(valid).all()):
             self.info['fallback'] = True
             return self._adaptive(gates)

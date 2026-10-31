@@ -22,6 +22,10 @@ Its older “working-tree” and “unpublished” statements retain their origi
 
 ## Publication and validation
 
+The [Torch scheduling follow-up](../../history/2026-10-30-prepared-su-scheduling.md)
+batches compatible ready updates across independent schedules. The compiler
+investigation isolates a backward-lowering failure; Inductor remains excluded.
+
 The [October 30 prepared-SU follow-up](../../history/2026-10-30-prepared-simple-update.md)
 implements dense Torch batching with per-member rank checks
 and adaptive replay. AOT-eager is optional; Inductor failed complex-gradient
