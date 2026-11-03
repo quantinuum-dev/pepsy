@@ -64,6 +64,10 @@ class TorchLinalgConfig:
     svd_fallback : {"auto", "none", "scipy_gesdd", "scipy_gesvd"}, default="auto"
         Backend used after a Torch SVD failure. ``"auto"`` means no fallback
         for native SVD and ``"scipy_gesvd"`` for stabilized SVD.
+    svd_gap_rtol : float, default=1e-6
+        Relative gap threshold for the stabilized SVD derivative. Smaller
+        values reduce damping but can amplify roundoff near degeneracy; check
+        complete objective derivatives independently.
     allow_approximate : bool, default=False
         Safety acknowledgement required for CUDA's approximate ``gesvda``.
     qr_rank_policy : {"warn", "native", "adaptive", "error"}, default="warn"
@@ -98,6 +102,7 @@ class TorchLinalgConfig:
     qr_rank_policy: str = "warn"
     qr_rank_tol_factor: float = 1.0
     quimb_split_drivers: bool = False
+    svd_gap_rtol: float = 1.0e-6
 
     def __post_init__(self):
         mode = str(self.mode).strip().lower()
@@ -144,6 +149,13 @@ class TorchLinalgConfig:
         if not np.isfinite(qr_factor) or qr_factor <= 0.0:
             raise ValueError("qr_rank_tol_factor must be a positive finite number")
         object.__setattr__(self, "qr_rank_tol_factor", qr_factor)
+        try:
+            svd_gap_rtol = float(self.svd_gap_rtol)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("svd_gap_rtol must be a positive finite number") from exc
+        if not np.isfinite(svd_gap_rtol) or svd_gap_rtol <= 0:
+            raise ValueError("svd_gap_rtol must be a positive finite number")
+        object.__setattr__(self, "svd_gap_rtol", svd_gap_rtol)
         return self
 
     @property
@@ -677,6 +689,7 @@ def register_torch_linalg(
     svd_driver="gesvd",
     cpu_svd="torch",
     svd_fallback="auto",
+    svd_gap_rtol=1.0e-6,
     allow_approximate=False,
     qr_rank_policy="warn",
     qr_rank_tol_factor=1.0,
@@ -705,6 +718,9 @@ def register_torch_linalg(
     svd_fallback : {"auto", "none", "scipy_gesdd", "scipy_gesvd"}, default="auto"
         SVD failure fallback. ``"auto"`` means ``"none"`` for native SVD and
         ``"scipy_gesvd"`` for stabilized SVD.
+    svd_gap_rtol : float, default=1e-6
+        Relative gap threshold for stabilized SVD derivatives. Smaller values
+        reduce damping but can amplify numerical noise near degeneracy.
     allow_approximate : bool, default=False
         Explicitly acknowledge the accuracy tradeoff of ``svd_driver="gesvda"``.
     qr_rank_policy : {"warn", "native", "adaptive", "error"}, default="warn"
@@ -727,6 +743,7 @@ def register_torch_linalg(
         svd_driver=svd_driver,
         cpu_svd=cpu_svd,
         svd_fallback=svd_fallback,
+        svd_gap_rtol=svd_gap_rtol,
         allow_approximate=allow_approximate,
         qr_rank_policy=qr_rank_policy,
         qr_rank_tol_factor=qr_rank_tol_factor,

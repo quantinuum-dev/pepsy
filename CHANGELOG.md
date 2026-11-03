@@ -8,6 +8,11 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Torch SVD backward:** allow `TorchLinalgConfig.svd_gap_rtol` to select
+  the relative stabilized gap threshold while preserving the `1e-6` default.
+  The direct JAX `svd_jax` call likewise accepts `gap_rtol`. Narrower
+  thresholds require independent gradient checks near degeneracies.
+
 - **Prepared dense SU:** add `operators.PreparedSimpleUpdate` for reusable
   Torch PEPO gate schedules, disjoint-site/network batching, and optional
   AOT-eager forward/backward capture. Check per-member truncation decisions

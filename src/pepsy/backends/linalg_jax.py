@@ -1,6 +1,7 @@
 """JAX-side linalg registrations with truncation-safe VJP rules."""
 
 import autoray as ar
+import math
 import jax
 import jax.numpy as jnp
 from jax import custom_vjp
@@ -152,7 +153,7 @@ def jaxsvd_fwd(A):
     return outputs, (A, outputs)
 
 
-def jaxsvd_bwd(residual, tangents):
+def jaxsvd_bwd(residual, tangents, gap_rtol=1e-6):
     """Full-spectrum pullback, exact outside unresolved spectral gaps.
 
     Retaining discarded vectors avoids the zero-discarded-spectrum
@@ -172,7 +173,7 @@ def jaxsvd_bwd(residual, tangents):
         return (jnp.zeros_like(A),)
     scale = jnp.max(S, axis=-1, keepdims=True)
     # Use the same compact stabilizer as Torch, with no squared spectrum.
-    def reciprocal(x, spectral_scale, rtol=1e-6):
+    def reciprocal(x, spectral_scale, rtol=gap_rtol):
         threshold = jnp.maximum(spectral_scale * rtol, jnp.finfo(S.dtype).tiny)
         resolved = jnp.abs(x) >= threshold
         safe = jnp.where(resolved, x, jnp.ones_like(x))
@@ -208,7 +209,25 @@ def jaxsvd_bwd(residual, tangents):
 _svd_jax.defvjp(jaxsvd_fwd, jaxsvd_bwd)
 
 
-def svd_jax(A, full_matrices=False, compute_uv=True, hermitian=False):
+@custom_vjp
+def _svd_jax_with_gap(A, gap_rtol):
+    return jnp.linalg.svd(A, full_matrices=False)
+
+
+def _svd_gap_fwd(A, gap_rtol):
+    outputs, residual = jaxsvd_fwd(A)
+    return outputs, (residual, gap_rtol)
+
+
+def _svd_gap_bwd(residual, tangents):
+    decomposition, gap_rtol = residual
+    return jaxsvd_bwd(decomposition, tangents, gap_rtol)[0], None
+
+
+_svd_jax_with_gap.defvjp(_svd_gap_fwd, _svd_gap_bwd)
+
+
+def svd_jax(A, full_matrices=False, compute_uv=True, hermitian=False, *, gap_rtol=None):
     """Truncation-safe, relative-regularized thin SVD.
 
     Options outside the thin, general-matrix rule use JAX's native SVD.
@@ -216,13 +235,20 @@ def svd_jax(A, full_matrices=False, compute_uv=True, hermitian=False):
     The forward decomposition is unchanged. Reverse derivatives are exact at
     resolved spectra; unresolved gaps use a bounded surrogate.
     A degeneracy across the retained/discarded boundary remains nonsmooth.
+    ``gap_rtol`` optionally selects a positive finite static relative gap
+    threshold; smaller values can amplify noise and require validation.
     """
     if full_matrices or not compute_uv or hermitian:
         return jnp.linalg.svd(
             A, full_matrices=full_matrices, compute_uv=compute_uv,
             hermitian=hermitian,
         )
-    return _svd_jax(A)
+    if gap_rtol is None:
+        return _svd_jax(A)
+    gap_rtol = float(gap_rtol)
+    if not math.isfinite(gap_rtol) or gap_rtol <= 0:
+        raise ValueError("gap_rtol must be a positive finite number")
+    return _svd_jax_with_gap(A, gap_rtol)
 
 
 def _native_svd_jax(A, *args, **kwargs):

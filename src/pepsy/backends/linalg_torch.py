@@ -344,6 +344,9 @@ class SVD(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
+        from .config import get_torch_linalg_config
+        config = get_torch_linalg_config()
+        ctx.gap_rtol = config.svd_gap_rtol if config is not None else _SVD_EPS_REL
         options = _SVD_FORWARD_OPTIONS.get()
         if options is None:
             options = ("auto", "torch", "scipy_gesvd")
@@ -401,11 +404,11 @@ class SVD(torch.autograd.Function):
         # Townsend's F+/F- terms, written as 1/(s_j - s_i) and
         # 1/(s_i + s_j), stabilized only near unresolved denominators.
         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)
-        F = _svd_reciprocal(F, pair_scale)
+        F = _svd_reciprocal(F, pair_scale, rtol=ctx.gap_rtol)
         F.diagonal(0, -2, -1).fill_(0)
 
         G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)
-        G = _svd_reciprocal(G, pair_scale)
+        G = _svd_reciprocal(G, pair_scale, rtol=ctx.gap_rtol)
         G.diagonal(0, -2, -1).fill_(0)
 
         uh = u.conj().transpose(-2, -1)
@@ -467,6 +470,9 @@ class SVD_real(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
+        from .config import get_torch_linalg_config
+        config = get_torch_linalg_config()
+        ctx.gap_rtol = config.svd_gap_rtol if config is not None else _SVD_EPS_REL
         if A.is_complex():
             raise TypeError("SVD_real requires a real Torch tensor.")
         options = _SVD_FORWARD_OPTIONS.get()
@@ -522,11 +528,11 @@ class SVD_real(torch.autograd.Function):
         # Townsend's F+/F- terms, written as 1/(s_j - s_i) and
         # 1/(s_i + s_j), stabilized only near unresolved denominators.
         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)
-        F = _svd_reciprocal(F, pair_scale)
+        F = _svd_reciprocal(F, pair_scale, rtol=ctx.gap_rtol)
         F.diagonal(0, -2, -1).fill_(0)
 
         G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)
-        G = _svd_reciprocal(G, pair_scale)
+        G = _svd_reciprocal(G, pair_scale, rtol=ctx.gap_rtol)
         G.diagonal(0, -2, -1).fill_(0)
 
         ut = u.transpose(-2, -1)

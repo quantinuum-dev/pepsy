@@ -97,3 +97,41 @@ def test_svd_reciprocal_has_compact_finite_stabilization(scale):
     if scale == 1.:
         slope = torch.autograd.grad(actual.sum(), x)[0]
         torch.testing.assert_close(slope[[1, 5]], -1 / x[[1, 5]]**2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.complex128])
+def test_configured_gap_tolerance_is_captured_for_backward(dtype):
+    """A resolved narrow truncation gap must retain its native derivative."""
+    import autoray as ar
+    from pepsy.backends import TorchLinalgConfig
+
+    generator = torch.Generator().manual_seed(142)
+    seed = torch.randn((4, 4), dtype=dtype, generator=generator)
+    left, _, right = torch.linalg.svd(seed, full_matrices=False)
+    spectrum = torch.tensor([1., 1. - 2.e-7, .4, .1], dtype=torch.float64)
+    matrix = ((left * spectrum) @ right).detach().requires_grad_()
+    weight = torch.randn((4, 4), dtype=dtype, generator=generator)
+
+    def loss(svd):
+        u, s, vh = svd(matrix)
+        return (weight.conj() * ((u[:, :1] * s[:1]) @ vh[:1])).real.sum()
+
+    expected = torch.autograd.grad(loss(lambda a: torch.linalg.svd(a, full_matrices=False)), matrix)[0]
+    mode = "complex" if matrix.is_complex() else "real"
+    with TorchLinalgConfig(mode=mode, stabilized=True).activated():
+        default_value = loss(lambda a: ar.do("linalg.svd", a))
+    default_gradient = torch.autograd.grad(default_value, matrix)[0]
+    assert torch.linalg.vector_norm(default_gradient - expected) > .1 * torch.linalg.vector_norm(expected)
+    with TorchLinalgConfig(mode=mode, stabilized=True, svd_gap_rtol=1.e-8).activated():
+        value = loss(lambda a: ar.do("linalg.svd", a))
+    # Backward runs after the scoped registration has been restored.
+    actual = torch.autograd.grad(value, matrix)[0]
+    torch.testing.assert_close(actual, expected, atol=1.e-3, rtol=2.e-8)
+
+
+@pytest.mark.parametrize("tolerance", [0., -1., float("nan"), float("inf")])
+def test_invalid_svd_gap_tolerance_rejected(tolerance):
+    from pepsy.backends import TorchLinalgConfig
+
+    with pytest.raises(ValueError, match="svd_gap_rtol"):
+        TorchLinalgConfig(svd_gap_rtol=tolerance)

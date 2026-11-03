@@ -47,14 +47,19 @@ selected during forward even after the configuration context exits. Existing
 Adaptive QR is a finite first-order extension at singular charts, not proof
 that a factorization is differentiable there. Stabilized SVD uses exact
 reciprocals for singular sums and gaps of magnitude at least
-`1e-6 * max(singular_values)` per matrix/block. The inverse singular values
+`svd_gap_rtol * max(singular_values)` per matrix/block. The default
+`svd_gap_rtol=1e-6` preserves the existing stabilization. For example,
+`TorchLinalgConfig(stabilized=True, svd_gap_rtol=1e-8)` uses a narrower
+surrogate region; its choice is captured for backward at the forward call.
+Smaller thresholds can amplify roundoff and do not resolve degeneracies.
+The inverse singular values
 in the rectangular and complex-phase terms use a numerical-rank threshold
 `max(m, n) * finfo(dtype).eps * max(singular_values)` instead: a small but
 resolved singular value must not be treated as a degenerate gap.
 Below each threshold it uses a bounded cubic extension, with matching value
 and slope at the boundary and value zero at zero. Unlike the previous
 Lorentzian rule, it does not damp resolved spectral derivatives. The gap
-threshold is unchanged; derivatives inside either stabilization region
+threshold is configurable; derivatives inside either stabilization region
 remain surrogate derivatives.
 Check directional derivatives of the complete
 truncated calculation; rank changes and ties across a retained/discarded
@@ -72,6 +77,10 @@ or scale and therefore retains the explicit zero-VJP convention.
 Use `register_jax_linalg()` for the same native-versus-stabilized choice on
 JAX. The lower-level Torch/JAX helpers remain available directly from `pepsy`
 for advanced compatibility workflows.
+The explicit `pepsy.backends.linalg_jax.svd_jax(..., gap_rtol=...)` call
+accepts a positive finite static gap threshold for its stabilized VJP;
+omitting it retains `1e-6`. As for Torch, narrower thresholds require
+independent derivative checks near degenerate spectra.
 Registration helpers are idempotent: repeated calls do not re-register the
 same Autoray implementation, while switching Torch between native/stabilized
 or real/complex modes, and JAX between native/stabilized modes, intentionally

@@ -68,3 +68,30 @@ def test_svd_gradient_surrogate_remains_finite_across_global_scales(scale):
     # derivative. Check finiteness of the extension without claiming one.
     gradient = jax.jit(jax.grad(lambda a: jnp.real(svd_jax(a)[0][0, 0])))(matrix)
     assert np.isfinite(np.asarray(gradient)).all()
+
+
+@pytest.mark.parametrize('complex_input', [False, True])
+def test_narrow_gap_threshold_recovers_resolved_jit_gradient(complex_input):
+    rng = np.random.default_rng(512)
+    raw = rng.normal(size=(4, 4))
+    if complex_input:
+        raw = raw + 1j * rng.normal(size=(4, 4))
+    u, _, vh = np.linalg.svd(raw, full_matrices=False)
+    matrix = jnp.asarray((u * np.array([1., 1. - 2e-7, .4, .1])) @ vh)
+    weights = jnp.asarray(rng.normal(size=(4, 4)))
+
+    def loss(a, svd):
+        left, s, right = svd(a)
+        return jnp.real(jnp.sum(weights * ((left[:, :1] * s[:1]) @ right[:1])))
+
+    expected = jax.grad(lambda a: loss(a, lambda x: jnp.linalg.svd(x, full_matrices=False)))(matrix)
+    default = jax.jit(jax.grad(lambda a: loss(a, svd_jax)))(matrix)
+    actual = jax.jit(jax.grad(lambda a: loss(a, lambda x: svd_jax(x, gap_rtol=1e-8))))(matrix)
+    assert np.linalg.norm(np.asarray(default - expected)) > .1 * np.linalg.norm(np.asarray(expected))
+    np.testing.assert_allclose(actual, expected, rtol=2e-8, atol=1e-3)
+
+
+@pytest.mark.parametrize('threshold', [0., -1., float('nan'), float('inf')])
+def test_narrow_gap_threshold_requires_positive_finite_value(threshold):
+    with pytest.raises(ValueError, match='gap_rtol'):
+        svd_jax(jnp.eye(2), gap_rtol=threshold)
