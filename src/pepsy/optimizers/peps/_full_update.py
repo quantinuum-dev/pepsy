@@ -133,11 +133,19 @@ def boundary_strip(network, *, axis, coordinate, boundary, chi, contraction_opt,
     comp = CompBdy(network, boundary.mps_b, contraction_opt=contraction_opt,
                   fit_max_bond=kwargs.get('fit_max_bond') or chi, **comp_opts)
     strip = network.select(f'{axis.upper()}{coordinate}')
+    traversal = []
     for side, count in (('left', coordinate), ('right', size - 1 - coordinate)):
         for step in range(count):
+            cache = getattr(boundary.mps_b, 'environment_cache', None)
+            hits = cache.hits if cache is not None else 0
             comp.move_step_bdy(pos=step, direction=f'{axis}_{side}', n_iter=n_iter)
+            traversal.append(dict(direction=f'{axis}_{side}', step=step,
+                                  coordinate=step if side == 'left' else size-1-step,
+                                  cut=f'{axis.upper()}{step}_{side[0]}',
+                                  action='reuse' if cache is not None and cache.hits > hits else 'build'))
         if count:
             strip = strip | boundary.mps_b[f'{axis.upper()}{count - 1}_{side[0]}']
+    boundary._pepsy_full_update_traversal = traversal
     return strip, boundary
 
 

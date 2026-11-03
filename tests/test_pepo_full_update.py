@@ -346,8 +346,7 @@ def test_smart_pepo_order_and_single_site_fusion_match_dense_stream(which):
         contraction_opt='greedy')
     output = opt.run(normalize_final=False)
     np.testing.assert_allclose(dense(output), expected, rtol=2e-11, atol=2e-11)
-    assert opt.last_gate_order['original_step_groups'] == (
-        [[1, 2], [3], [4], [5]] if which is None else [[1], [2], [3], [4], [5]])
+    assert opt.last_gate_order['original_step_groups'] == [[1, 2], [3], [4], [5]]
     assert len(opt.gates) == len(gates)
 
 
@@ -440,8 +439,9 @@ def test_accelerator_pepo_als_keeps_arrays_on_device(
 @pytest.mark.parametrize('kind', ['pauli', 'projector'])
 @pytest.mark.parametrize('which', ['upper', 'lower'])
 @pytest.mark.parametrize('normalize_output', [False, True])
+@pytest.mark.parametrize('warmstart_method', ['compress', 'simple-update'])
 def test_arbitrary_operator_norms_are_measured_and_scale_is_preserved(
-    monkeypatch, fit_mode, kind, which, normalize_output,
+    monkeypatch, fit_mode, kind, which, normalize_output, warmstart_method,
 ):
     import torch
     from pepsy.tensors import id_to_pepo
@@ -488,6 +488,7 @@ def test_arbitrary_operator_norms_are_measured_and_scale_is_preserved(
         full_update_kwargs={'solver': 'qr', 'max_iterations': 4, 'skip_exact': False})
     assert opt.normalize_initial is False
     output = opt.run(measure_infidelity=True, measure_final_infidelity=True,
+                     warmstart_method=warmstart_method,
                      **({'normalize_final': True} if normalize_output else {}))
     assert measured_norms
     np.testing.assert_allclose(measured_norms, expected_norm, rtol=2e-10, atol=2e-10)

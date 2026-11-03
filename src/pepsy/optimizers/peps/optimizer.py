@@ -866,6 +866,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         """Replace the current state and reset initial-normalization status."""
         self.state = state if self.inplace else (state.copy() if hasattr(state, "copy") else state)
         self._initial_normalized = False
+        self._full_update_su = None
         if normalize_initial is not None:
             self._normalize_initial_auto = False
             self.normalize_initial = bool(normalize_initial)
@@ -2506,10 +2507,13 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         which = self.which if which is None else which
         source, guess = self.state, None
         if warmstart_method == 'simple-update':
-            source, guess = simple_update_guess(
-                source, [(gate_payload, where, which)], chi=self.chi,
-                cutoff=cutoff, cutoff_mode=cutoff_mode, return_source=True,
-            )
+            from ._su_warmstart import SimpleUpdateWarmStart
+            cache = getattr(self, '_full_update_su', None)
+            if cache is None:
+                cache = self._full_update_su = SimpleUpdateWarmStart()
+            source, guess = cache.prepare(
+                source, gate_payload, where, which=(which or 'upper') if _is_operator_tensor_network(source) else None,
+                chi=self.chi, cutoff=cutoff, cutoff_mode=cutoff_mode)
         if self.full_update_kwargs['tensor_mode'] == 'full':
             pair = FullPair(source, gate_payload, where, self.chi, which=which)
         else:
@@ -2598,6 +2602,9 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             from tqdm.auto import tqdm
             entries = tqdm(entries, total=len(self.gates), desc='PEPS full-update')
         for step, (gate_payload, where, which) in entries:
+            su_cache = getattr(self, '_full_update_su', None)
+            if warmstart_method == 'simple-update' and su_cache is not None and not su_cache.matches(self.state):
+                self._full_update_su = None
             sample = resolve_backend_sample_data_from_tn(self.state)
             if ar.infer_backend(sample) in {'torch', 'cupy'}:
                 # Pair reduction and exact strip targets must consume the same
@@ -2621,6 +2628,8 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                         self._normalize_without_rescaling_sites(
                             refine_target, getattr(old_norm, 'cost', old_norm),
                         )
+                if warmstart_method == 'simple-update' and getattr(self, '_full_update_su', None) is not None:
+                    self._full_update_su.commit(self.state)
                 continue
             before = self._phase_timer.snapshot() if self._phase_timer else None
             evaluation_start = len(self.evaluation_records)
@@ -2681,6 +2690,8 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                 summary['fidelity_convention'] += '; normalized Frobenius operator overlap'
             cache = getattr(getattr(boundary, 'mps_b', None), 'environment_cache', None)
             summary['environment_reuse'] = cache.report() if cache is not None else None
+            summary['boundary_mps_steps'] = (deepcopy(getattr(boundary, '_pepsy_full_update_traversal', []))
+                                              if not exact_svd else [])
             strip_cache = getattr(self, '_full_update_strip_cache', None)
             summary['strip_environment_reuse'] = strip_cache.report() if strip_cache is not None else None
             pre = post = None
@@ -2796,6 +2807,12 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                         else:
                             loss = None
                     refine_target, refine_bonds = None, set()
+            if warmstart_method == 'simple-update':
+                if refinement is not None and refinement['accepted']:
+                    self._full_update_su = None
+                else:
+                    self.state = self._full_update_su.finish(self.state, pair.where)
+                    summary['su_gauge_reuse'] = self._full_update_su.report()
             fidelity, geometric = self._record_fidelity_progress(loss)
             record = {
                 'step': step, 'start_step': step, 'where': where,
@@ -2833,6 +2850,8 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         if normalize_final and self.gates and self._site_count(self.gates[-1][1], self.state) == 1:
             self._normalize_state(self.state, normalize_chi=normalize_chi,
                                   normalize_kwargs={**(normalize_kwargs or {}), 'chi': normalize_chi})
+            if warmstart_method == 'simple-update' and getattr(self, '_full_update_su', None) is not None:
+                self._full_update_su.commit(self.state)
         return self.state
 
     @profile_run
@@ -2935,10 +2954,11 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             to a private simple-update gauge state and absorb its gauges once.
             Simple update changes only the guess; the target stays exact.
             Two-site full update supports both PEPS and PEPO SU guesses.
-            It reconditions a private source with SU gauges, preserving the
-            represented state, then uses its QR/LQ bases for the SU-initialized
-            fit. This can change exterior tensor gauges without changing
-            their physical operator; stale boundary caches are invalidated.
+            A first private gauging pass seeds persistent SU weights. Later
+            pairs compensate those weights on the active sites only, and
+            refresh the active bond after fitting, preserving exterior arrays.
+            Replacement/external mutation or accepted strip/layer refinement
+            reinitializes the SU representation; traces reset independently.
         target_representation : {"auto", "layered", "peps"}, default="auto"
             Strip ALS uses exact, separately tagged split-gate factors by
             default. Global fitting defaults to an enlarged PEPS and accepts

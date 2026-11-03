@@ -8,6 +8,12 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **PEPO scheduling and SU reuse:** reorder explicit upper/lower qubit gates
+  with row/column/smart traversal and preserve same-leg dependencies and
+  fusion order. Retain SU weights across full-update gates/runs, refreshing
+  only the active bond. Report boundary-MPS absorption and cache reuse steps;
+  direct boundaries retain separate BRA/KET compression.
+
 - **Native PEPO full update:** support upper/lower-leg gate streams with
   shared QR/LQ reductions, ALS and pair L-BFGS, retaining both operator legs.
   Preserve PEPO amplitudes by default and measure target Frobenius norms;

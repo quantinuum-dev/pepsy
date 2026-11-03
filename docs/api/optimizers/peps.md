@@ -749,6 +749,13 @@ boundary cuts remain cached across strip changes, while the prefix/suffix
 cache holds only the active strip. Legal commuting reorderings preserve the
 exact circuit, but can change finite-bond truncation results.
 
+Each pair's `optimizer_result['boundary_mps_steps']` lists the directional
+absorption steps: `direction`, spatial `coordinate`, cut key, and `action`
+(`"build"` or `"reuse"`). Direct boundary mode keeps BRA/KET layers separate
+by default and compresses each onto the preceding MPS in spatial order.
+Valid cuts retain their MPS objects. The trace is empty for exact-SVD updates
+that need no boundary environment.
+
 For reduced tensors, `rcond=None` selects 1e-12 for complex128 and 1e-6 for complex64. Diagnostics
 include the raw environment's anti-Hermitian residual, minimum eigenvalue,
 negative spectral weight, gauge status, accepted ALS loss history, and cache
@@ -918,8 +925,16 @@ gates. Pauli commutation uses the parity of different nonidentity axes on
 shared sites: XX and YY commute on the same bond but generally do not on
 bonds sharing only one site. There is no near-commuting numerical tolerance.
 Unknown dense gates retain their overlapping dependencies; trainable gates,
-unsupported arrays, selectors, and non-neighbor gates remain global barriers.
+unsupported arrays, PEPS selectors, and non-neighbor gates remain global barriers.
 Smart scheduling requires dense NumPy, Torch, or CuPy state arrays.
+
+Native PEPO upper/lower selectors participate in `row`, `column` and `smart`
+scheduling. Dependencies include the physical leg: upper and lower actions
+commute even on the same sites, while same-leg dependencies retain the usual
+commutation checks. Single-site fusion combines only actions on the same
+site **and** leg, in their original multiplication order. Selected physical
+dimensions must be two for this qubit scheduler; other dimensions remain
+barriers. Constructor `which` and per-entry overrides follow the same rules.
 
 Among legal next pair updates, the scheduler prefers the active strip and
 unused bonds within its current refinement block. It pulls in required
@@ -1026,8 +1041,15 @@ with upper/lower selection, reduced ALS or L-BFGS, and full-tensor L-BFGS.
 SU runs on a private copy, preserving scale (`renorm=False`), and changes
 only the disposable guess. Its pre-gate gauged source represents the same
 operator and supplies the frozen QR/LQ bases; the target remains untruncated.
-SU can recondition exterior tensor gauges. Boundary cache validation handles
-those changes; this option includes a fresh simple-gauging pass per pair.
+One private gauging pass seeds persistent SU weights. Later pairs remove and
+restore half-weights only on their active sites, and refresh the active bond
+after ALS/L-BFGS with an untruncated local gauge step. Exterior arrays are
+preserved, allowing valid boundary and strip caches to survive. Weights are
+initialization hints, not a claim of a converged global SU environment.
+They persist across gates and repeated `run()` calls, independently of trace
+resets. `set_state`, external tensor mutation, or an accepted strip/layer
+refinement reinitializes the SU representation. Pair reports expose
+`su_gauge_reuse` with initialization, reuse and local-refresh counts.
 It is separate from `fit_init_strategy`, which initializes boundary MPS fits.
 
 For unitary `G`, this applies ${\color{blue}O\mapsto GOG^\dagger}$ on the

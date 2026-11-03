@@ -219,3 +219,78 @@ and strip-batching restrictions are unchanged; support for native PEPO FU
 does not imply that every PEPS driver mode accepts a PEPO. Production-scale
 SU-initialized performance was not measured. Changes remain local and
 uncommitted on `develop`; no production optimization job was changed.
+
+## Follow-up: leg-aware traversal and persistent SU weights
+
+Baseline for this follow-up is published commit `41fa9cd` on `develop`.
+The user requested the remaining PEPO ordering/SU work and explicit checks
+that direct boundaries absorb layers and advance through MPS cuts stepwise.
+The user has now authorized committing and pushing this follow-up to
+`origin/develop`. Git history and remote refs carry the publication record;
+the earlier status sections describe the preceding implementation.
+
+Implemented:
+
+- Native PEPO `row`, `column` and `smart` scheduling now accepts explicit
+  upper/lower selectors and constructor defaults. Dependency supports include
+  the physical leg. Opposite-leg actions commute; unknown overlapping
+  same-leg gates retain their ordering dependencies. Same-site fusion checks
+  the leg and preserves multiplication order. Smart traversal groups
+  commuting opposite-leg single-site actions to expose same-leg fusion.
+  Selected physical dimensions other than two remain scheduler barriers.
+- New private `SimpleUpdateWarmStart` seeds SU weights with one private global
+  gauge pass, then retains them across pairs and repeated runs. Compensated
+  half-weight removal/insertion and an untruncated active-bond gauge refresh
+  after fitting preserve the represented operator and exterior array objects.
+  Only weights touching the active pair are conditioned, using backend-native
+  scalar arrays without per-bond host transfers. Weights are initialization
+  hints, not a claim of globally converged SU closure.
+- Source/version stamps detect external mutation. `set_state`, detected
+  external changes and accepted strip/layer refinement reinitialize SU.
+  Trace resets do not discard valid weights. Pair summaries report cumulative
+  `su_gauge_reuse` initialization/reuse/local-refresh counts.
+- The existing direct boundary compressor already absorbs BRA and KET
+  separately and extends each spatial cut from its preceding MPS. No new
+  boundary kernel was needed. Pair `boundary_mps_steps` now records each
+  direction, source coordinate, cut and build/reuse action. Valid cached cuts
+  retain their MPS objects; exact-SVD shortcuts record no boundary steps.
+
+Reused the upstream/version audit for the unchanged environment. Inspected
+the installed public `tensor_gauge_simple_bond` signature and exact gauge
+absorption/writeback behavior; classification **adopt**. Torch linear-algebra
+policies and production optimization jobs are unchanged. API docs and
+changelog describe the new behavior and diagnostics. Traversal remains a
+cache-aware heuristic, without a global optimality guarantee.
+
+Validation (overlapping selections; counts must not be added as unique cases):
+
+- Initial native/order/full-update/refinement selection: **318 passed**,
+  `/tmp/pepo-persistent-regressions.log`.
+- Final SU implementation against native PEPO tests: **167 passed**,
+  `/tmp/pepo-persistent-native-final.log`, including direct/DMRG comparisons,
+  CPU dense references and actual Torch CUDA/CuPy cases.
+- Final leg-aware ordering, persistent SU and ordered-environment checks:
+  **70 passed**, `/tmp/pepo-persistent-order-final.log`. The new module has
+  **25 cases**. They independently check exact operator actions and fusion,
+  same-leg dependencies, one global gauge pass per optimizer across repeated
+  runs, physical operator preservation and unchanged exterior array identity
+  after local refresh, cached/fresh-boundary agreement, mutation/reset
+  invalidation, and GPU norm/overlap fidelity against dense targets.
+- Direct mode is explicitly prevented from invoking variational boundary
+  FIT. Each built spatial cut is checked to absorb BRA then KET separately;
+  reused cuts retain their MPS objects, and trace build counts agree with
+  actual compressor calls.
+- General optimizer, pair/gauge/CuPy/whole-PEPO-step/strip-batch selection:
+  **294 passed**, `/tmp/pepo-persistent-integration.log`.
+- Scaled Pauli/projector checks now also select SU initialization: **32
+  passed**, `/tmp/pepo-persistent-scaled-operators.log`, covering both legs,
+  direct/DMRG boundaries and explicit output normalization or preservation.
+  Results match independently optimal operator-Schmidt truncations and
+  measured arbitrary target norms.
+- Default smoke: **112 passed**, `/tmp/pepo-persistent-smoke.log`.
+- `ruff check src tests`, local Markdown file-target checks and
+  `git diff --check` pass. Existing upstream/custom-format warnings remain.
+
+The complete extended suite is not re-certified: its earlier native Symmray shape failure,
+including reproduction with the pre-change solver, remains documented above.
+No native symmetry or JAX capability was added.
