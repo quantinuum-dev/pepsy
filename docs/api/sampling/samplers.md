@@ -743,6 +743,16 @@ state; changing the plotting code cannot repair them. The CDF is rebuilt per
 draw chunk without a persistent cache. CuPy accumulates directly into float64,
 avoiding a separate promoted copy of its probability vector.
 
+For a large **contiguous Torch CPU complex64** dense tensor with physical
+indices `k0,...,k(N-1)`, `VecSampler.sample_batch_bounded_z` draws Z-basis
+shots without a full probability vector, normalized vector, or CDF. It first
+sums Born mass in bounded chunks, then builds a float64 CDF only in chunks
+selected by the shots. The source tensor is unchanged, and the returned
+`MpsBatchSampleResult` uses physical site order even if tensor axes were
+permuted. This explicit Z-only path rejects gradients, other backends,
+dtypes, devices, and noncontiguous data. Its seeded sequence differs from
+`VecSampler.sample_batch` because the draw algorithm differs.
+
 | Method | Result | Default array location |
 | --- | --- | --- |
 | `sample_batch(n_samples, ...)` | Batch record: `configs` `(n_samples, L)`, `probs` and `weights` `(n_samples,)` | State backend/device |

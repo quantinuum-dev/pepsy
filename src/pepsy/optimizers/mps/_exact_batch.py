@@ -74,9 +74,23 @@ class ExactBatch:
     inds: tuple
     diagonal: bool
     locations: tuple
+    bounded_cpu: bool = False
 
     def apply(self, tensor):
-        """Replace the output array without writing through any shared input."""
+        """Apply the batch, updating owned data only in bounded CPU mode."""
+        if self.bounded_cpu:
+            if len(self.inds) != 1 or self.diagonal:
+                raise ValueError("bounded Torch CPU exact batch has no two-qubit kernel")
+            from ._exact_structured import apply_single_qubit_inplace
+
+            data = apply_single_qubit_inplace(
+                tensor.data,
+                1 << (len(tensor.inds) - 1 - tensor.inds.index(self.inds[0])),
+                ar.to_numpy(ar.do("reshape", self.operator, (2, 2))),
+            )
+            if data is not None:
+                return
+            raise ValueError("bounded Torch CPU exact batch has no one-qubit kernel")
         if self.diagonal:
             factor = _broadcast_diagonal(self.operator, self.inds, tensor.inds)
             tensor.modify(data=tensor.data * factor, left_inds=None)
@@ -95,6 +109,7 @@ class ExactStructuredBatch:
     diagonal: bool
     locations: tuple
     fallback: tuple
+    bounded_cpu: bool = False
 
     def apply(self, tensor):
         from ._exact_structured import (
@@ -154,6 +169,8 @@ class ExactStructuredBatch:
             result = apply_parity(tensor.data, mask0, mask1, self.operator)
 
         if result is None:
+            if self.bounded_cpu:
+                raise ValueError("bounded Torch CPU exact batch has no structured kernel")
             for batch in _iter_basic_batches(self.fallback):
                 batch.apply(tensor)
         else:
@@ -180,8 +197,12 @@ def _fuse(entries, inds, diagonal):
     return ExactBatch(operator, inds, diagonal, tuple(entry[3] for entry in entries))
 
 
-def _iter_basic_batches(gate_entries, matrices=None):
+def _iter_basic_batches(gate_entries, matrices=None, *, single_gate=False):
     """Existing bounded dense/diagonal fusion for formatted gate entries."""
+    if single_gate:
+        for gate, where, location in gate_entries:
+            yield ExactBatch(gate, where, False, (location,), bounded_cpu=True)
+        return
     entries = []
     inds = ()
     diagonal = False
@@ -261,7 +282,8 @@ def _parity_matrix(matrix):
     )
 
 
-def _structured_batch(kind, entries, matrices, *, phase_operator=None):
+def _structured_batch(kind, entries, matrices, *, phase_operator=None,
+                      bounded_torch_cpu=False):
     fallback = tuple(entries)
     locations = tuple(entry[2] for entry in entries)
     if kind == "phase":
@@ -283,7 +305,8 @@ def _structured_batch(kind, entries, matrices, *, phase_operator=None):
             dtype=dtype,
         )
         diagonal = False
-    return ExactStructuredBatch(kind, operator, inds, diagonal, locations, fallback)
+    return ExactStructuredBatch(kind, operator, inds, diagonal, locations,
+                                fallback, bounded_cpu=bounded_torch_cpu)
 
 
 def _two_class_worthwhile(entries, backend, state_size):
@@ -304,7 +327,8 @@ def _two_class_worthwhile(entries, backend, state_size):
     return state_size >= 1 << 18 and (passes >= 3 or state_size >= 1 << 21)
 
 
-def iter_exact_batches(gates, locations, format_ind, *, backend=None, state_size=0):
+def iter_exact_batches(gates, locations, format_ind, *, backend=None,
+                       state_size=0, bounded_torch_cpu=False):
     """Fuse ordered gates, selecting structural kernels when worthwhile.
 
     Gate values and classifications are rebuilt on replay so mutable payloads
@@ -316,7 +340,9 @@ def iter_exact_batches(gates, locations, format_ind, *, backend=None, state_size
             raise ValueError("Each gate location must have one or two sites.")
         entries.append((gate, tuple(format_ind(site) for site in location), location))
 
-    structured = backend == "cupy" or (backend == "numpy" and find_spec("numba"))
+    structured = (backend == "cupy" or
+                  (backend in {"numpy", "torch"} and find_spec("numba")))
+    structured = structured and (backend != "torch" or bounded_torch_cpu)
     if not structured or state_size < 1 << 16:
         yield from _iter_basic_batches(entries)
         return
@@ -354,11 +380,13 @@ def iter_exact_batches(gates, locations, format_ind, *, backend=None, state_size
                 and np.all(np.isfinite(compacted[2]))
             ):
                 yield from _iter_basic_batches(
-                    entries[basic_start:i], matrices[basic_start:i]
+                    entries[basic_start:i], matrices[basic_start:i],
+                    single_gate=bounded_torch_cpu,
                 )
                 yield _structured_batch(
                     "phase", entries[i:j], matrices[i:j],
                     phase_operator=compacted,
+                    bounded_torch_cpu=bounded_torch_cpu,
                 )
                 i = basic_start = j
                 continue
@@ -372,10 +400,19 @@ def iter_exact_batches(gates, locations, format_ind, *, backend=None, state_size
         ):
             j += 1
         if j - i >= 2 and (any(phase_values[i:j]) or j - i >= 3 or state_size >= 1 << 18):
-            yield from _iter_basic_batches(entries[basic_start:i], matrices[basic_start:i])
-            yield _structured_batch("parity", entries[i:j], matrices[i:j])
+            yield from _iter_basic_batches(
+                entries[basic_start:i], matrices[basic_start:i],
+                single_gate=bounded_torch_cpu,
+            )
+            yield _structured_batch(
+                "parity", entries[i:j], matrices[i:j],
+                bounded_torch_cpu=bounded_torch_cpu,
+            )
             i = basic_start = j
             continue
         i += 1
 
-    yield from _iter_basic_batches(entries[basic_start:], matrices[basic_start:])
+    yield from _iter_basic_batches(
+        entries[basic_start:], matrices[basic_start:],
+        single_gate=bounded_torch_cpu,
+    )

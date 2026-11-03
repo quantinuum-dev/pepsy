@@ -48,6 +48,69 @@ def test_exact_batch_repeated_replay_preserves_scale_backend_and_input(backend):
     assert set(batched.p.tags) == set(reference.p.tags)
 
 
+def test_exact_batch_bounded_torch_cpu_matches_fused_replay():
+    """In-place CPU kernels preserve a diagonal wall-style gate stream."""
+    torch = pytest.importorskip("torch")
+    convert = backend_torch(dtype=torch.complex64)
+    state = qtn.MPS_computational_state("0" * 16, dtype="complex64")
+    state.apply_to_arrays(convert)
+    gates = (
+        [(convert(rx(0.21)), (i,)) for i in range(16)]
+        + [(convert(rzz(-0.19)), (i, (i + 3) % 16)) for i in range(16)]
+        + [(convert(rx(-0.07)), (i,)) for i in range(16)]
+    )
+    baseline = MpsOptimizer(state, gates, chi=1, mode="exact-batch")
+    bounded = MpsOptimizer(
+        state, gates, chi=1, mode="exact-batch",
+        exact_batch_bounded_cpu=True,
+    )
+    previous = None
+    for _ in range(2):
+        baseline.run()
+        bounded.run()
+        torch.testing.assert_close(
+            bounded.to_dense().ravel(), baseline.to_dense().ravel(),
+            atol=2e-5, rtol=2e-5,
+        )
+        if previous is not None:
+            assert (
+                previous.tensors[0].data.data_ptr()
+                == bounded.p.tensors[0].data.data_ptr()
+            )
+        previous = bounded.p
+    expected_input = torch.zeros(2**16, dtype=torch.complex64)
+    expected_input[0] = 1
+    torch.testing.assert_close(state.to_dense().ravel(), expected_input)
+
+
+def test_exact_batch_bounded_torch_cpu_owns_dense_input():
+    torch = pytest.importorskip("torch")
+    convert = backend_torch(dtype=torch.complex64)
+    product = qtn.MPS_computational_state("0" * 16, dtype="complex64")
+    product.apply_to_arrays(convert)
+    dense = qtn.TensorNetwork([product.contract(all)])
+    initial = dense.tensors[0].data.clone()
+    optimizer = MpsOptimizer(
+        dense, [(convert(rx(0.2)), (0,))], chi=1,
+        mode="exact-batch", exact_batch_bounded_cpu=True,
+    )
+    optimizer.run()
+    torch.testing.assert_close(dense.tensors[0].data, initial)
+
+
+def test_exact_batch_bounded_torch_cpu_rejects_unstructured_pair():
+    torch = pytest.importorskip("torch")
+    convert = backend_torch(dtype=torch.complex64)
+    state = qtn.MPS_computational_state("0" * 16, dtype="complex64")
+    state.apply_to_arrays(convert)
+    optimizer = MpsOptimizer(
+        state, [(convert(rzz(0.2)), (0, 1))], chi=1,
+        mode="exact-batch", exact_batch_bounded_cpu=True,
+    )
+    with pytest.raises(ValueError, match="no two-qubit kernel"):
+        optimizer.run()
+
+
 def test_batch_exact_alias_uses_exact_batch_replay_and_mode_switch():
     state = qtn.MPS_computational_state("0000", dtype="complex128")
     gates = _stream(4)

@@ -2003,6 +2003,51 @@ def test_vec_sampler_torch_large_uniform_vector_has_unbiased_low_bits():
     assert torch.all(torch.abs(means - 0.5) < 0.03), means
 
 
+def test_vec_sampler_bounded_z_matches_probabilities_and_physical_order():
+    """Chunked draws retain Born weights despite permuted tensor indices."""
+    torch = pytest.importorskip("torch")
+    amplitudes = torch.tensor(
+        [1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.complex64,
+    ).reshape(2, 2, 2)
+    tensor = qtn.Tensor(amplitudes, inds=("k2", "k0", "k1"))
+    site_map = {i: (i, 0) for i in range(3)}
+    original = amplitudes.clone()
+    batch = sampler_mod.VecSampler.sample_batch_bounded_z(
+        tensor, site_map, 6000, seed=17, chunk_size=3,
+    )
+    repeat = sampler_mod.VecSampler.sample_batch_bounded_z(
+        tensor, site_map, 6000, seed=17, chunk_size=3,
+    )
+    torch.testing.assert_close(batch.configs, repeat.configs)
+    torch.testing.assert_close(batch.probs, repeat.probs)
+    torch.testing.assert_close(amplitudes, original)
+    assert batch.basis == ("Z",) * 3
+    actual = torch.bincount(
+        (batch.configs[:, 2].long() * 4
+         + batch.configs[:, 0].long() * 2
+         + batch.configs[:, 1].long()),
+        minlength=8,
+    ).double() / len(batch)
+    expected = amplitudes.reshape(-1).abs().square().double()
+    expected /= expected.sum()
+    torch.testing.assert_close(actual, expected, atol=0.025, rtol=0)
+    indices = (batch.configs[:, 2].long() * 4
+               + batch.configs[:, 0].long() * 2
+               + batch.configs[:, 1].long())
+    torch.testing.assert_close(batch.probs.double(), expected[indices])
+
+
+def test_vec_sampler_bounded_z_rejects_noncontiguous_state():
+    """The bounded route must never hide a state-sized flattening copy."""
+    torch = pytest.importorskip("torch")
+    data = torch.ones((2, 2, 2), dtype=torch.complex64).transpose(0, 1)
+    tensor = qtn.Tensor(data, inds=("k0", "k1", "k2"))
+    with pytest.raises(ValueError, match="contiguous"):
+        sampler_mod.VecSampler.sample_batch_bounded_z(
+            tensor, {i: (i, 0) for i in range(3)}, 4,
+        )
+
+
 def test_vec_sampler_cupy_cdf_resolves_small_probability_intervals(monkeypatch):
     """Exercise a deterministic interval lost by CuPy's float32 choice CDF."""
     cp = pytest.importorskip("cupy")

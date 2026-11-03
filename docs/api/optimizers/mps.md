@@ -417,6 +417,18 @@ is not contracted again on the next replay. This reduces passes and avoidable
 copies; it does **not** eliminate output allocation or internal contraction
 packing, nor change the exponential statevector memory requirement.
 
+For a large Torch CPU complex64 state with a supported one-qubit/diagonal
+gate stream, `exact_batch_bounded_cpu=True` selects an explicit low-memory
+replay policy. It materializes one contiguous dense layout, then applies
+one-qubit and structured phase/parity gates in place through optional Numba
+kernels. It rejects an unsupported block instead of silently allocating a
+full-state fallback. The live dense array is reused across `run()` calls, so
+previous references to `opt.p` reflect later evolution. The constructor still
+protects its input when `inplace=False`. The policy does not support gradients,
+other devices or dtypes, and is off by default. It changes floating-point
+operation order and can trade some speed for bounded peak memory; compare against ordinary
+`exact-batch` at a smaller matched size before a large run.
+
 Fusion is enabled for ordinary qubit arrays on NumPy, Torch, and CuPy, preserving
 backend, dtype rules, and device. Other backends, native Symmray/fermionic states,
 and qudits use the existing `exact` kernel without densifying or coercing them.

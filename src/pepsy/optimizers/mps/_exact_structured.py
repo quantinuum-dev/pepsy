@@ -64,12 +64,21 @@ def _cpu_kernels():
                 disagreements1 += popcount(bits)
             out[i] = inp[i] * (table0[disagreements0] * table1[disagreements1])
 
-    return parity, grouped_phase, grouped_phase_two
+    @njit(nogil=True)
+    def single_qubit_inplace(data, mask, matrix, start, stop):
+        low = mask - 1
+        for i in range(start, stop):
+            base = (i & low) | ((i & ~low) << 1)
+            v0, v1 = data[base], data[base | mask]
+            data[base] = matrix[0, 0] * v0 + matrix[0, 1] * v1
+            data[base | mask] = matrix[1, 0] * v0 + matrix[1, 1] * v1
+
+    return parity, grouped_phase, grouped_phase_two, single_qubit_inplace
 
 
-def _run_cpu(kernel, total, *args):
-    """Use four independent chunks without changing Numba's global thread count."""
-    workers = min(4, max(1, total // (1 << 16)))
+def _run_cpu(kernel, total, *args, workers=4):
+    """Use independent chunks without changing Numba's global thread count."""
+    workers = min(workers, max(1, total // (1 << 16)))
     if workers == 1:
         kernel(*args, 0, total)
         return
@@ -170,8 +179,56 @@ def _supported(data, coeff_dtype):
     )
 
 
+def _torch_cpu_view(data, coeff_dtype):
+    """Return a writable NumPy view only for safe, untracked Torch CPU data."""
+    if type(data).__module__.split(".", 1)[0] != "torch":
+        return None
+    import torch
+
+    if (
+        data.device.type != "cpu"
+        or data.dtype != torch.complex64
+        or data.requires_grad
+        or data.is_conj()
+        or data.is_neg()
+        or not data.is_contiguous()
+        or coeff_dtype != np.dtype("complex64")
+    ):
+        return None
+    return data.numpy().reshape(-1)
+
+
+def _torch_cpu_workers():
+    import torch
+
+    return min(16, torch.get_num_threads())
+
+
+def apply_single_qubit_inplace(data, mask, matrix):
+    """Apply one dense qubit gate in place on a Torch CPU complex64 vector."""
+    matrix = np.asarray(matrix)
+    view = _torch_cpu_view(data, matrix.dtype)
+    if view is None or matrix.shape != (2, 2):
+        return None
+    kernels = _cpu_kernels()
+    if kernels is None:
+        return None
+    _run_cpu(kernels[3], view.size // 2, view, mask, matrix,
+             workers=_torch_cpu_workers())
+    return data
+
+
 def apply_parity(data, mask0, mask1, coeff):
     """Apply two parity-sector 2x2 matrices, or return None."""
+    view = _torch_cpu_view(data, coeff.dtype)
+    if view is not None:
+        kernels = _cpu_kernels()
+        if kernels is None:
+            return None
+        low, high = sorted((mask0.bit_length() - 1, mask1.bit_length() - 1))
+        _run_cpu(kernels[0], view.size // 4, view, view, low, high,
+                 mask0, mask1, coeff, workers=_torch_cpu_workers())
+        return data
     if not _supported(data, coeff.dtype):
         return None
     low, high = sorted((mask0.bit_length() - 1, mask1.bit_length() - 1))
@@ -197,6 +254,14 @@ def apply_parity(data, mask0, mask1, coeff):
 
 def apply_grouped_phase(data, offsets, masks, table):
     """Apply an equal-value ZZ layer using grouped XOR population counts."""
+    view = _torch_cpu_view(data, table.dtype)
+    if view is not None:
+        kernels = _cpu_kernels()
+        if kernels is None:
+            return None
+        _run_cpu(kernels[1], view.size, view, view, offsets, masks, table,
+                 workers=_torch_cpu_workers())
+        return data
     if not _supported(data, table.dtype):
         return None
     if isinstance(data, np.ndarray):
@@ -223,6 +288,14 @@ def apply_grouped_phase(data, offsets, masks, table):
 
 def apply_grouped_phase_two(data, offsets, masks, table0, table1, split):
     """Apply two ZZ value classes in one output pass, or return None."""
+    view = _torch_cpu_view(data, table0.dtype)
+    if view is not None and table1.dtype == table0.dtype:
+        kernels = _cpu_kernels()
+        if kernels is None:
+            return None
+        _run_cpu(kernels[2], view.size, view, view, offsets, masks,
+                 table0, table1, split, workers=_torch_cpu_workers())
+        return data
     if not _supported(data, table0.dtype) or table1.dtype != table0.dtype:
         return None
     if isinstance(data, np.ndarray):

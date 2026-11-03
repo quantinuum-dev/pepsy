@@ -302,6 +302,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         tracks MPS canonical metadata.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
+    exact_batch_bounded_cpu : bool, default=False
+        Use in-place Numba kernels for compatible Torch CPU complex64 exact-batch
+        gate streams, avoiding state-sized gate temporaries. Requires contiguous
+        dense state data without gradients and supported one-qubit/phase gates.
+        The live dense array is reused across runs; references to earlier
+        ``p`` states therefore change on later replay.
     fit_differentiation : {"unrolled", "implicit"}, default="unrolled"
         Derivative policy for dense Torch DMRG replay. ``"implicit"``
         converges each local one-site FIT fixed point and uses a custom VJP
@@ -1023,6 +1029,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         to_backend=None,
         qubit_roles=None,
         fit_differentiation="unrolled",
+        exact_batch_bounded_cpu=False,
     ):
         if chi is None:
             if isinstance(gates, Integral):
@@ -1037,7 +1044,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError("chi must be a positive integer.")
 
         self.inplace = bool(inplace)
-        self.p = self._install_represented_norm(p if self.inplace else p.copy())
+        self.exact_batch_bounded_cpu = bool(exact_batch_bounded_cpu)
+        dense_bounded_input = self.exact_batch_bounded_cpu and p.num_tensors == 1
+        self.p = self._install_represented_norm(
+            p if self.inplace else p.copy(deep=dense_bounded_input)
+        )
         self._qubit_roles = _normalize_site_roles(
             qubit_roles, range(int(getattr(self.p, "L", 0)))
         )
@@ -1056,7 +1067,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._effective_length_history = [0]
         self._effective_site_history = [()]
         self._effective_event_history = []
-        self._initial_p = self.p.copy() if _capture_initial else None
+        self._initial_p = (
+            self.p.copy(deep=dense_bounded_input) if _capture_initial else None
+        )
         if to_backend is not None and not callable(to_backend):
             raise TypeError("to_backend must be callable or None.")
         self._symbolic_gate_to_backend = to_backend
@@ -8804,15 +8817,37 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 G_seq, where_seq, progbar=progbar,
                 cutoff=cutoff, cutoff_mode=cutoff_mode,
             )
-        # A single-tensor network is already contracted. Copy its metadata,
-        # not its exponentially large array; each batch produces a new array.
+        # A single-tensor network is already contracted. The bounded CPU path
+        # updates its owned dense array in place across replays. Callers opting
+        # in must treat previous ``self.p`` snapshots as mutable.
         if self.p.num_tensors == 1:
-            self.p = self._install_represented_norm(self.p.copy())
+            self.p = self._install_represented_norm(
+                self.p.copy()
+            )
         else:
             tensor = self.p.contract(all, optimize=self.contraction_opt)
             self.p = self._install_represented_norm(qtn.TensorNetwork([tensor]))
         self.info_c = {}
         tensor = self.p.tensors[0]
+        bounded_cpu = (
+            self.exact_batch_bounded_cpu
+            and int(np.prod(tensor.data.shape)) >= 1 << 16
+        )
+        if (bounded_cpu and ar.infer_backend(tensor.data) == "torch"
+                and not tensor.data.is_contiguous()):
+            # One materialization establishes a stable physical-axis layout;
+            # every supported gate thereafter updates the same allocation.
+            tensor.modify(data=tensor.data.contiguous())
+        if bounded_cpu and (
+            ar.infer_backend(tensor.data) != "torch"
+            or tensor.data.device.type != "cpu"
+            or str(tensor.data.dtype) != "torch.complex64"
+            or tensor.data.requires_grad
+        ):
+            raise ValueError(
+                "bounded exact-batch requires contiguous Torch CPU complex64 "
+                "state data without gradients"
+            )
         pbar = None
         if progbar:
             pbar = _make_progress_bar(
@@ -8825,7 +8860,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 G_seq, where_seq, self._format_ind,
                 backend=ar.infer_backend(tensor.data),
                 state_size=int(np.prod(tensor.data.shape)),
+                bounded_torch_cpu=bounded_cpu,
             ):
+                if bounded_cpu and not batch.bounded_cpu:
+                    raise ValueError("bounded exact-batch has an unsupported gate block")
                 batch.apply(tensor)
                 for where in batch.locations:
                     self._record_effective_event(where, event_type="gate")

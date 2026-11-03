@@ -328,6 +328,87 @@ class VecSampler:
         return int(size.bit_length() - 1)
 
     @staticmethod
+    def sample_batch_bounded_z(
+        state, one_d_to_two_d, n_samples, *, seed=None, chunk_size=1 << 20,
+    ):
+        """Sample Z shots from a contiguous Torch CPU tensor with bounded scratch.
+
+        The first pass stores one float64 mass per chunk. A second pass builds
+        a float64 CDF only for chunks selected by the seeded shots. The state
+        is read without transposing or normalizing a state-sized copy.
+        """
+        import torch  # pylint: disable=import-outside-toplevel
+
+        n_samples = _validate_sample_count(n_samples)
+        if n_samples < 1:
+            raise ValueError("n_samples must be positive")
+        chunk_size = _validate_sample_chunk_size(chunk_size)
+        if not hasattr(state, "inds") or not hasattr(state, "data"):
+            raise TypeError("bounded Z sampling requires a single dense tensor")
+        data = state.data
+        n_sites = _validate_one_d_to_two_d(one_d_to_two_d)
+        inds = tuple(state.inds)
+        if (not isinstance(data, torch.Tensor) or data.device.type != "cpu"
+                or data.dtype != torch.complex64 or data.requires_grad
+                or not data.is_contiguous()
+                or tuple(data.shape) != (2,) * n_sites
+                or set(inds) != {f"k{i}" for i in range(n_sites)}):
+            raise ValueError(
+                "bounded Z sampling requires contiguous Torch CPU complex64 "
+                "qubit data with physical indices k0,...,k(N-1) and no gradients"
+            )
+        vector = data.view(-1)
+        size = vector.numel()
+        with torch.no_grad():
+            masses = []
+            for start in range(0, size, chunk_size):
+                stop = min(start + chunk_size, size)
+                probabilities = vector[start:stop].abs().square()
+                masses.append(probabilities.sum(dtype=torch.float64).item())
+            block_masses = torch.tensor(masses, dtype=torch.float64)
+            boundaries = block_masses.cumsum(0)
+            total = boundaries[-1]
+            if not torch.isfinite(total) or total <= 0:
+                raise ValueError("state must have a finite nonzero norm")
+            generator = torch.Generator(device="cpu")
+            if seed is not None:
+                generator.manual_seed(int(seed))
+            draws = torch.rand(n_samples, dtype=torch.float64,
+                               generator=generator) * total
+            blocks = torch.searchsorted(boundaries, draws, right=True)
+            selected = torch.empty(n_samples, dtype=torch.int64)
+            for block in torch.unique(blocks).tolist():
+                positions = torch.nonzero(blocks == block).view(-1)
+                lower = 0.0 if block == 0 else boundaries[block - 1]
+                start = block * chunk_size
+                stop = min(start + chunk_size, size)
+                probabilities = vector[start:stop].abs().square()
+                local_cdf = probabilities.cumsum(0, dtype=torch.float64)
+                within = torch.searchsorted(
+                    local_cdf, draws[positions] - lower, right=True,
+                ).clamp_max(stop - start - 1)
+                selected[positions] = start + within
+            probabilities = vector[selected].abs().square() / total
+            shifts = [n_sites - 1 - inds.index(f"k{i}")
+                      for i in range(n_sites)]
+            configs = torch.stack(
+                [((selected >> shift) & 1).to(torch.int8) for shift in shifts],
+                dim=1,
+            )
+        mapping = dict(one_d_to_two_d)
+        return MpsBatchSampleResult(
+            configs=configs,
+            probs=probabilities,
+            Lx=max(x for x, _ in mapping.values()) + 1,
+            Ly=max(y for _, y in mapping.values()) + 1,
+            one_d_to_two_d=mapping,
+            backend="torch",
+            basis=("Z",) * n_sites,
+            basis_probability=1.0,
+            weights=probabilities,
+        )
+
+    @staticmethod
     def _to_vector(state, L, ind_id):
         """Convert state to a flat vector with sites in 0..L-1 order."""
         import quimb.tensor as qtn  # noqa: F811

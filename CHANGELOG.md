@@ -24,6 +24,12 @@ patch versions remain compatible.
   charts and avoid batch-mask gathers for single-matrix adaptive pullbacks.
   Preserve rank-deficient fallbacks, FX capture, dtype, and truncation policy.
 
+- **Bounded dense CPU runs:** add opt-in Torch complex64 exact-batch gate
+  replay with in-place one-qubit/structured kernels, and chunked final Z
+  sampling. These avoid state-sized gate and CDF temporaries for supported
+  streams while preserving physical site order. Earlier references to the
+  optimizer's dense state reflect later in-place replay.
+
 - **Local energy readout:** add canonical and shared-environment routes to
   `MpsEnergyOptimizer`, plus joint energy/observable `measure()` calls for
   MPS, tree, and Gibbs classes. Dense readout reuses support density matrices;
