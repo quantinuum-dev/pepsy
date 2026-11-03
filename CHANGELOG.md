@@ -8,6 +8,10 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Full Haar vectors:** allow an explicit `L_max>20` with a positive
+  `max_dense_bytes` preallocation budget. The historical default size guard
+  and seeded complex Haar distribution remain unchanged.
+
 - **Torch SVD backward:** allow `TorchLinalgConfig.svd_gap_rtol` to select
   the relative stabilized gap threshold while preserving the `1e-6` default.
   The direct JAX `svd_jax` call likewise accepts `gap_rtol`. Narrower

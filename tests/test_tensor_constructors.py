@@ -104,3 +104,21 @@ def test_haar_random_state_rejects_real_dtype():
 def test_haar_random_state_constructor_facade_resolves():
     """Constructor facade should expose the dense Haar helper."""
     assert constructors_haar_random_state is haar_random_state
+
+
+def test_haar_random_state_explicit_budget_allows_larger_dense_state():
+    state = haar_random_state(21, seed=5, L_max=21, max_dense_bytes=256*1024**2)
+    assert state.shape == (2**21,)
+    assert state.dtype == np.complex128
+    assert np.vdot(state, state).real == pytest.approx(1., abs=2e-14)
+
+
+def test_haar_random_state_budget_rejects_before_rng_allocation(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail('insufficient Haar budget allocated a random vector')
+    monkeypatch.setattr(np.random, 'default_rng', forbidden)
+    with pytest.raises(MemoryError, match='dense Haar preparation'):
+        haar_random_state(23, L_max=23, max_dense_bytes=1024)
+    for invalid in (True, 0, -1, 1.5):
+        with pytest.raises(ValueError, match='positive integer'):
+            haar_random_state(2, max_dense_bytes=invalid)

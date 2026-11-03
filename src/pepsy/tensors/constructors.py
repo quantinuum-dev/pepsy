@@ -1404,6 +1404,8 @@ def haar_random_state(
     seed=None,
     L_max: int = 20,
     as_tensor: bool = False,
+    *,
+    max_dense_bytes: int | None = None,
 ):
     """Create a dense Haar-random ``L``-qubit state.
 
@@ -1420,11 +1422,16 @@ def haar_random_state(
     seed : int | None, optional
         Seed for deterministic samples.
     L_max : int, optional
-        Maximum allowed number of qubits. Values above 20 are capped to 20
-        with a warning because this helper constructs a dense state.
+        Maximum allowed number of qubits. Without ``max_dense_bytes``, values
+        above 20 are capped to 20 with a warning. A positive explicit budget
+        permits a larger requested limit.
     as_tensor : bool, optional
         If True, return the amplitudes reshaped as a dense tensor with shape
         ``(2,) * L``. Otherwise return a dense vector with shape ``(2**L,)``.
+    max_dense_bytes : int | None, optional
+        Explicit allocation budget for a larger requested ``L_max``. Without
+        a budget the historical 20-qubit cap remains. The estimate covers six
+        dense vectors, not a hard process-memory bound.
 
     Returns
     -------
@@ -1435,7 +1442,12 @@ def haar_random_state(
         raise ValueError("L must be a non-negative integer.")
     if not isinstance(L_max, Integral) or L_max < 0:
         raise ValueError("L_max must be a non-negative integer.")
-    if L_max > 20:
+    if max_dense_bytes is not None and (
+        isinstance(max_dense_bytes, bool) or not isinstance(max_dense_bytes, Integral)
+        or max_dense_bytes < 1
+    ):
+        raise ValueError("max_dense_bytes must be a positive integer")
+    if L_max > 20 and max_dense_bytes is None:
         warnings.warn(
             "haar_random_state constructs dense entangled states and is "
             "intended for L <= 20; capping L_max to 20.",
@@ -1451,6 +1463,13 @@ def haar_random_state(
 
     dtype = np.dtype(dtype)
     _require_complex_haar_dtype(dtype)
+    if max_dense_bytes is not None:
+        estimate = 6 * dtype.itemsize * (1 << int(L))
+        if estimate > max_dense_bytes:
+            raise MemoryError(
+                f"dense Haar preparation estimated {estimate} bytes exceeds "
+                f"max_dense_bytes={max_dense_bytes}"
+            )
 
     real_dtype = np.float32 if dtype == np.dtype("complex64") else np.float64
     rng = np.random.default_rng(seed)

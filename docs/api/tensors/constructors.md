@@ -2,6 +2,21 @@
 
 ## Haar states and real product states
 
+`haar_random_state(L, ...)` draws one normalized, fully entangled complex
+Haar vector of dimension `2**L`. Its default `L_max=20` guard is unchanged.
+Larger explicit limits require a positive `max_dense_bytes` budget:
+
+```python
+from pepsy.tensors import haar_random_state
+
+state = haar_random_state(23, L_max=23, max_dense_bytes=2**30, seed=7)
+```
+
+The preallocation estimate is six dense complex vectors. This guards this
+constructor only; later MPS decompositions, exponential actions and replay
+have separate workspace costs. A budget does not change the distribution,
+dtype, seed or requested system size.
+
 `hrs_to_mps`, `hrs_to_peps`, and `hrs_to_ttn` create ordinary products of
 single-qubit Haar states when `fermion` is omitted. Like `haar_random_state`,
 they require a complex dtype: a real cast would discard relative phases and
