@@ -525,7 +525,8 @@ complex64/complex128 PEPS and [PEPO](#native-pepo-full-update), with Pepsy
 boundary MPS (direct or DMRG fitting).
 It does not support differentiation through the update or native symmetry
 arrays. `k_2q_batch="auto"` means one two-site gate in this mode; integers
-greater than one are rejected. For row/column fitting, `k_2q_batch=1` explicitly
+greater than one are rejected. PEPO opposite-leg actions on one bond can
+share that update with `fuse_pepo_legs=True`. For row/column fitting, `k_2q_batch=1` explicitly
 selects gate-by-gate fitting; `"auto"` retains automatic batching.
 
 Boundary `fit_mode` can be `"direct"`, `"dmrg"` (the default, also `"eff"`),
@@ -1091,6 +1092,44 @@ the norm and overlap networks.
 PSD projection applies to the local norm environment $N$, not the operator.
 Pair fidelity remains a local environment estimate. This evolves a PEPO itself;
 `run_pepo(U)` above uses a separate full-step fitting path.
+
+#### Joint upper/lower action on one bond
+
+Use `fit.run(fuse_pepo_legs=True)` to fit adjacent opposite-leg gates on
+the same bond together. The default is `False`. For upper gate $U$ and
+lower gate $L$, the exact target is ${\color{blue}T=U O L^T}$, followed by
+one reduced pair fit. Each gate contracts into its own physical leg; no
+product superoperator or intermediate target truncation is introduced.
+
+```python
+fit = PepsOptimizer(
+    operator,
+    [(U, ((0, 0), (0, 1)), "upper"),
+     (U.conj(), ((0, 0), (0, 1)), "lower")],
+    chi=D, mode="full-update", fit_mode="direct",
+)
+operator = fit.run(fuse_pepo_legs=True)
+```
+
+The two gates share QR/LQ reduction, the boundary environment and the fit.
+Reversed site order is aligned automatically. Input traversal pairs only
+adjacent entries; `gate_order="smart"` can bring compatible same-bond
+opposite-leg actions together while retaining same-leg dependencies. Same-leg
+gates and intervening barriers are not fused by this option.
+
+Both SVD and persistent SU initialization, reduced ALS, reduced/full pair
+L-BFGS and strip/layer refinement support joint updates. The SU guess keeps
+the first action untruncated and truncates only after the second action.
+Layer refinement never ends its exact target between the paired actions,
+even if its target-bond budget is crossed there. Direct and DMRG boundaries
+are supported and remain cached between joint fits. Each combined record has
+`joint_pepo_legs=True`, `operator_gate_count=2`, and both original positions
+in `original_steps`; local fidelity describes the combined compression.
+
+Joint fitting can preserve amplitudes lost by two separate truncations.
+For example, a unitary sandwich of the identity remains the identity at
+bond dimension one; separate upper/lower truncations can shrink its scale
+even when their final normalized operator fidelity equals one.
 
 ## Local solver defaults
 

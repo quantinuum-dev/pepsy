@@ -8,6 +8,11 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Joint PEPO leg updates:** opt into `run(fuse_pepo_legs=True)` to apply
+  upper/lower gates on the same bond to one exact target and fit it once.
+  Align reversed sites and retain both original gate positions. Reuse SVD/SU
+  starts, reduced/full pair solvers, cached boundaries and strip/layer refinement.
+
 - **PEPO scheduling and SU reuse:** reorder explicit upper/lower qubit gates
   with row/column/smart traversal and preserve same-leg dependencies and
   fusion order. Retain SU weights across full-update gates/runs, refreshing

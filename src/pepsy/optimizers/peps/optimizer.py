@@ -1087,6 +1087,12 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         return opts
 
     def _apply_gate_entry(self, state, gate_payload, where, which, *, opts, inplace=False):
+        if which == 'both':
+            state = state if inplace else state.copy()
+            for side, payload in zip(('upper', 'lower'), gate_payload):
+                state = self._apply_gate_entry(state, payload, where, side,
+                                               opts=dict(opts), inplace=True)
+            return state
         which_local = self.which if which is None else which
         if (getattr(self, '_active_full_update', False) and _is_operator_tensor_network(state)
                 and not _is_explicit_index_where(where)):
@@ -2502,7 +2508,8 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
 
     @timed_phase('target')
     def _full_update_pair(self, gate_payload, where, which=None, *,
-                          warmstart_method='compress', cutoff=0., cutoff_mode='rsum2'):
+                          warmstart_method='compress', cutoff=0., cutoff_mode='rsum2',
+                          build_target=True):
         from ._full_update import FullPair, ReducedPair
         which = self.which if which is None else which
         source, guess = self.state, None
@@ -2518,7 +2525,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             pair = FullPair(source, gate_payload, where, self.chi, which=which)
         else:
             pair = ReducedPair(source, gate_payload, where, self.chi, which=which)
-        return pair, *pair.initial_states(guess)
+        return pair, *pair.initial_states(guess, build_target=build_target)
 
     @timed_phase('full_update_environment')
     def _full_update_environment(self, pair, guess, boundary, chi):
@@ -2590,18 +2597,23 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
     def _run_full_update(self, *, normalize_target, normalize_final, normalize_chi, evaluation_chi,
                          normalize_kwargs, measure_infidelity, measure_final_infidelity,
                          accept_if_improved, improvement_tol, metric_kwargs,
-                         cutoff, cutoff_mode, warmstart_method, gate_kwargs, step_callback, progress):
+                         cutoff, cutoff_mode, warmstart_method, gate_kwargs, step_callback, progress,
+                         fuse_pepo_legs=False):
         """Sequential nearest-neighbor updates sharing the checked boundary cache."""
         from ._strip_update import strip_key, local_matrix_size
         refine_target, refine_bonds, refine_start = None, set(), None
         refine_enabled = self.full_update_kwargs['refine_sweeps'] > 0
+        build_target = bool(normalize_target or measure_infidelity or measure_final_infidelity
+                            or refine_enabled or self.boundary_convergence is not None)
         layer_refine = refine_enabled and self.full_update_kwargs['refine_scope'] == 'layer'
         layer_end, layer_stop, layer_limit = None, None, None
-        entries = enumerate(self.gates, 1)
+        from ._full_update import full_update_entries
+        entries = full_update_entries(self.gates, self.state, self.which,
+                                      fuse_pepo_legs=fuse_pepo_legs)
         if progress:
             from tqdm.auto import tqdm
-            entries = tqdm(entries, total=len(self.gates), desc='PEPS full-update')
-        for step, (gate_payload, where, which) in entries:
+            entries = tqdm(entries, total=None if fuse_pepo_legs else len(self.gates), desc='PEPS full-update')
+        for step, (gate_payload, where, which), source_steps in entries:
             su_cache = getattr(self, '_full_update_su', None)
             if warmstart_method == 'simple-update' and su_cache is not None and not su_cache.matches(self.state):
                 self._full_update_su = None
@@ -2609,7 +2621,9 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             if ar.infer_backend(sample) in {'torch', 'cupy'}:
                 # Pair reduction and exact strip targets must consume the same
                 # native gate, including when refinement is enabled.
-                gate_payload = infer_backend_converter_from_sample(sample)(gate_payload)
+                convert = infer_backend_converter_from_sample(sample)
+                gate_payload = (tuple(convert(g) for g in gate_payload) if which == 'both'
+                                else convert(gate_payload))
             if self._site_count(where, self.state) == 1:
                 opts = self._target_gate_options(cutoff=cutoff, cutoff_mode=cutoff_mode,
                                                  gate_kwargs=gate_kwargs)
@@ -2636,6 +2650,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             pair, guess, target = self._full_update_pair(
                 gate_payload, where, which, warmstart_method=warmstart_method,
                 cutoff=cutoff, cutoff_mode=cutoff_mode,
+                build_target=build_target,
             )
             if refine_enabled:
                 if layer_refine and refine_target is None:
@@ -2648,12 +2663,21 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                         layer_stop, layer_limit = 'matrix_size_limit', None
                     else:
                         _, _, layer_end, refine_target, layer_stop, layer_limit = self._collect_auto_batch_target(
-                            step - 1, cutoff=0., cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
+                            source_steps[0] - 1, cutoff=0., cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs,
                             gate_converter=infer_backend_converter_from_sample(sample), end_on_pair=True,
                         )
-                    refine_start = step
+                    refine_start = source_steps[0]
                 elif not layer_refine and refine_target is None:
-                    refine_target, refine_start = self.state.copy(), step
+                    refine_target, refine_start = self.state.copy(), source_steps[0]
+                if layer_refine and layer_end < step:
+                    # A target-budget stop can fall between the two actions.
+                    # Keep a fused pair atomic without truncating its target.
+                    for payload, sites, side in self.gates[layer_end:step]:
+                        payload = infer_backend_converter_from_sample(sample)(payload)
+                        refine_target = self._build_target(
+                            refine_target, payload, sites, side, cutoff=0.,
+                            cutoff_mode=cutoff_mode, gate_kwargs=gate_kwargs)
+                    layer_end = step
                 if not layer_refine:
                     refine_target = self._build_target(
                         refine_target, gate_payload, where, which, cutoff=0.,
@@ -2815,14 +2839,19 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                     summary['su_gauge_reuse'] = self._full_update_su.report()
             fidelity, geometric = self._record_fidelity_progress(loss)
             record = {
-                'step': step, 'start_step': step, 'where': where,
+                'step': step, 'start_step': source_steps[0], 'where': where,
                 'which': pair.which if pair.operator else which,
-                'original_steps': list(self.last_gate_order['original_step_groups'][step - 1]),
+                'original_steps': [original for position in source_steps
+                    for original in self.last_gate_order['original_step_groups'][position-1]],
+                'operator_gate_count': len(source_steps), 'joint_pepo_legs': which == 'both',
                 'gate_order': self.last_gate_order['policy'], 'update_style': 'two-site',
                 'warmstart_method': warmstart_method,
                 'batch_size': 1, 'two_site_batch': 1, 'k_2q_batch': 1,
                 'batch_stop_reason': 'gate_count', 'batch_target_bond_limit': None,
-                'target_max_bond': self._max_bond(target), 'state_max_bond': self._max_bond(self.state),
+                'target_max_bond': (self._max_bond(target) if target is not None else
+                                    max(self._max_bond(pair.state), pair.target_bond_dimension)),
+                'target_network_built': target is not None,
+                'state_max_bond': self._max_bond(self.state),
                 'normalize_chi': normalize_chi, 'evaluation_chi': evaluation_chi,
                 'norm_environment_chi': norm_environment_chi,
                 'effective_evaluation_chi': step_evaluation_chi,
@@ -2895,6 +2924,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         timing=False,
         timing_sync_device=False,
         step_callback=None,
+        fuse_pepo_legs=False,
     ):
         """Run the queued gate stream and return the compressed state.
 
@@ -2965,6 +2995,13 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             explicit layered targets with strip/all/integer gate batches.
             With a layered target, the compress guess applies/truncates gates
             sequentially. Automatic bond-growth batching requires PEPS targets.
+        fuse_pepo_legs : bool, default=False
+            In native PEPO full update, combine adjacent upper/lower actions
+            on the same bond into one exact target and pair solve. Smart
+            traversal can bring commuting partners together. SVD/SU starts,
+            reduced/full solvers and strip/layer refinement remain supported.
+            Combined records retain both original gate positions. General
+            multi-bond batching still uses the existing gate-by-gate policy.
         non_unitary : bool, default=False
             If ``True``, target states produced by gates are explicitly
             normalized before fidelity estimates and optimization.
@@ -3057,6 +3094,10 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         cutoff_mode = _resolve_gate_cutoff_mode(cutoff_mode)
         infidelity_tol = self._resolve_infidelity_tol(infidelity_tol)
         run_mode = self.mode if mode is None else self._normalize_mode(mode)
+        if not isinstance(fuse_pepo_legs, bool):
+            raise TypeError('fuse_pepo_legs must be a bool')
+        if fuse_pepo_legs and run_mode != 'full-update':
+            raise ValueError('fuse_pepo_legs requires full-update mode')
         style = self.update_style if update_style is None else self._normalize_update_style(update_style)
         if run_mode == 'global' and style != 'row-column':
             raise ValueError('update_style applies to sweep mode, not global mode')
@@ -3228,6 +3269,8 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                 or gate_kwargs):
             raise ValueError('simple-update guesses require physical PEPS gates without custom gate options')
         if run_mode == 'full-update':
+            if fuse_pepo_legs and not _is_operator_tensor_network(self.state):
+                raise ValueError('fuse_pepo_legs requires a native PEPO')
             if k_2q_batch not in ('auto', 1):
                 raise ValueError('full-update is gate-by-gate; use k_2q_batch=1 or auto')
             operator = _is_operator_tensor_network(self.state)
@@ -3268,6 +3311,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                 metric_kwargs=metric_kwargs, cutoff=cutoff, cutoff_mode=cutoff_mode,
                 warmstart_method=warmstart_method,
                 gate_kwargs=gate_kwargs, step_callback=step_callback, progress=show_progress,
+                fuse_pepo_legs=fuse_pepo_legs,
             )
 
         pbar = None

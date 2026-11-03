@@ -149,6 +149,35 @@ def boundary_strip(network, *, axis, coordinate, boundary, chi, contraction_opt,
     return strip, boundary
 
 
+def full_update_entries(gates, state, which=None, *, fuse_pepo_legs=False):
+    """Fuse adjacent opposite-leg actions on one bond; never move a gate."""
+    def sites(where):
+        if (isinstance(where, (tuple, list)) and len(where) == 2
+                and all(isinstance(s, (tuple, list)) and len(s) == 2 for s in where)):
+            return tuple(map(tuple, where))
+        return None
+
+    index = 0
+    while index < len(gates):
+        gate, where, side = gates[index]
+        first = sites(where)
+        side = _normalize_gate_which(side if side is not None else which) or 'upper'
+        if fuse_pepo_legs and first is not None and index+1 < len(gates):
+            other, other_where, other_side = gates[index+1]
+            second = sites(other_where)
+            other_side = _normalize_gate_which(other_side if other_side is not None else which) or 'upper'
+            if second is not None and set(first) == set(second) and side != other_side:
+                if first != second:
+                    dims = [state.ind_size(getattr(state, f'{other_side}_ind')(*s)) for s in second]
+                    other = ar.do('transpose', ar.do('reshape', other, (*dims, *dims)), (1, 0, 3, 2))
+                pair = (gate, other) if side == 'upper' else (other, gate)
+                yield index+2, (pair, first, 'both'), (index+1, index+2)
+                index += 2
+                continue
+        yield index+1, gates[index], (index+1,)
+        index += 1
+
+
 class ReducedPair:
     """Keep all tensors outside the gated pair fixed, including QR/LQ factors."""
 
@@ -173,14 +202,15 @@ class ReducedPair:
         if ar.get_dtype_name(sample) not in ('complex64', 'complex128'):
             raise TypeError('full-update requires complex64 or complex128')
         self.operator = _is_operator_tensor_network(state)
-        which = _normalize_gate_which(which)
+        both = which == 'both'
+        which = 'both' if both else _normalize_gate_which(which)
         if which is not None and not self.operator:
             raise ValueError('full-update which selects upper/lower PEPO legs, not PEPS legs')
         self.which = (which or 'upper') if self.operator else None
         physical = tuple(_site_physical_inds(state, site) for site in self.where)
         self.physical = physical
         self.phys = tuple(index for group in physical for index in group)
-        self.gate_phys = (tuple(getattr(state, f'{self.which}_ind')(*site) for site in self.where)
+        self.gate_phys = (tuple(getattr(state, f'{"upper" if both else self.which}_ind')(*site) for site in self.where)
                           if self.operator else self.phys)
         bonds = tuple(self.tensors[0].bonds(self.tensors[1]))
         if len(bonds) != 1:
@@ -193,31 +223,40 @@ class ReducedPair:
         physical_dims = tuple(tuple(t.ind_size(i) for i in group)
                               for t, group in zip(self.tensors, physical))
         self.dims = tuple(math.prod(group) for group in physical_dims)
-        gate_dims = tuple(t.ind_size(p) for t, p in zip(self.tensors, self.gate_phys))
         # Reuse Pepsy's existing QR/LQ reduction without requesting BP messages.
         self.reduced = prepare_reduced_bond_pair(state, where=self.where,
                                                  input_mode='physical', run_bp=False)
         self.na, _, _, self.nb = self.reduced.theta_shape
         self.qa = self.reduced.q_left.transpose(*self.external[0], self.reduced.reduced_left_ind).data.reshape(-1, self.na)
         self.qb = self.reduced.q_right.transpose(self.reduced.reduced_right_ind, *self.external[1]).data.reshape(self.nb, -1)
-        gate = infer_backend_converter_from_sample(sample)(gate)
-        if getattr(gate, 'requires_grad', False) or math.prod(gate.shape) != math.prod(gate_dims) ** 2:
-            raise ValueError('full-update requires a fixed two-site gate of matching size')
-        if not all_finite(gate):
-            raise ValueError('full-update gate contains nonfinite values')
-        gate = gate.reshape(*gate_dims, *gate_dims)
-        self.gate = gate
+        if both and (not isinstance(gate, (tuple, list)) or len(gate) != 2):
+            raise ValueError('paired PEPO update requires upper and lower gates')
+        actions = list(zip(('upper', 'lower'), gate)) if both else [(self.which, gate)]
+        validated = []
+        for side, payload in actions:
+            inds = (tuple(getattr(state, f'{side}_ind')(*site) for site in self.where)
+                    if self.operator else self.phys)
+            dims = tuple(t.ind_size(p) for t, p in zip(self.tensors, inds))
+            payload = infer_backend_converter_from_sample(sample)(payload)
+            if getattr(payload, 'requires_grad', False) or math.prod(payload.shape) != math.prod(dims)**2:
+                raise ValueError('full-update requires a fixed two-site gate of matching size')
+            if not all_finite(payload):
+                raise ValueError('full-update gate contains nonfinite values')
+            validated.append((side, payload.reshape(*dims, *dims)))
+        self.gate = tuple(g for _, g in validated) if both else validated[0][1]
         theta = self.reduced.theta_array()
         if self.operator:
             # Keep the spectator operator legs as batch axes. Do not form
             # G tensor-product I on the enlarged local physical dimension.
             theta = theta.reshape(self.na, *physical_dims[0], *physical_dims[1], self.nb)
-            expression = ('PQpq,axpyqb->axPbyQ' if self.which == 'upper'
-                          else 'PQpq,apxqyb->aPxbQy')
-            theta = einsum(expression, gate, theta)
+            for side, payload in validated:
+                expression = ('PQpq,axpyqb->axPyQb' if side == 'upper'
+                              else 'XYxy,axpyqb->aXpYqb')
+                theta = einsum(expression, payload, theta)
+            theta = transpose(theta, (0, 1, 2, 5, 3, 4))
             self.theta = theta.reshape(self.na, self.dims[0], self.nb, self.dims[1])
         else:
-            self.theta = einsum('PQpq,apqb->aPbQ', gate, theta)
+            self.theta = einsum('PQpq,apqb->aPbQ', self.gate, theta)
         self.chi = int(chi)
         self.initial_factors = None
 
@@ -228,7 +267,7 @@ class ReducedPair:
     def state_from(self, left, right):
         return self.reduced.reconstruct_tn(left, transpose(right, (0, 2, 1)))
 
-    def initial_states(self, guess=None):
+    def initial_states(self, guess=None, *, build_target=True):
         # One local SVD supplies the warm start and exact target. Determine
         # numerical support using machine precision, never the fit tolerance:
         # a small but genuinely discarded component must still trigger FU.
@@ -263,7 +302,8 @@ class ReducedPair:
             right = einsum('kpb,bx->kxp', b.reshape(size, self.dims[1], -1), self.qb.conj().T)
             self.initial_factors = left, right
             guess = self.state_from(left, right)
-        target = self.state_from(*factors(len(s)))
+        self.target_bond_dimension = int(s.shape[0])
+        target = self.state_from(*factors(len(s))) if build_target else None
         return guess, target
 
     def exact_report(self):
@@ -502,10 +542,13 @@ class FullPair(ReducedPair):
         env, boundary = self.strip_environment(state, **kwargs)
         tags = tuple(state.site_tag(*site) for site in self.where)
         # Keep the gate lazy, separate from the frozen pre-gate site tensors.
-        target = qtn.tensor_network_gate_inds(
-            self.state.select_any(tags), self.gate * self.target_phase,
-            self.gate_phys, contract=False,
-        )
+        target = self.state.select_any(tags)
+        actions = list(zip(('upper', 'lower'), self.gate)) if self.which == 'both' else [(self.which, self.gate)]
+        for i, (leg, payload) in enumerate(actions):
+            inds = (tuple(getattr(self.state, f'{leg}_ind')(*site) for site in self.where)
+                    if self.operator else self.phys)
+            target = qtn.tensor_network_gate_inds(
+                target, payload * (self.target_phase if i == 0 else 1.), inds, contract=False)
         objective = PairObjective(env, tuple(state[site] for site in self.where), target,
                                   physical_inds=self.phys, optimize=self.contraction_opt)
         return objective, boundary

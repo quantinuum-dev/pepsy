@@ -294,3 +294,65 @@ Validation (overlapping selections; counts must not be added as unique cases):
 The complete extended suite is not re-certified: its earlier native Symmray shape failure,
 including reproduction with the pre-change solver, remains documented above.
 No native symmetry or JAX capability was added.
+
+## Joint opposite-leg update on one bond
+
+Baseline: published `25bdac2` on `develop`. The user requested upper/lower
+actions on the same bond to share one ALS fit. Concurrent implementation
+edits were initially observed and preserved; the user then clarified that
+this session should own the PEPO optimizer work. Unified the implementation
+around one opt-in `run(fuse_pepo_legs=True)` API. The user has authorized
+committing and pushing this joint-update change set to `origin/develop`;
+Git history and remote refs carry the publication record.
+
+The traversal pairs adjacent opposite-leg actions on the same unordered
+bond. Smart scheduling can bring ready commuting partners together, and its
+cost counts a paired update once. Same-leg ordering dependencies and opaque
+barriers remain intact. Reversed operand sites are aligned before applying
+the second leg. Both gates act on the same reduced target before any output
+truncation; no product superoperator is formed. One QR/LQ reduction, norm
+environment and solver serve the joint action. Record `operator_gate_count`
+is two, `joint_pepo_legs` is true, and `original_steps` retains both original
+positions. The default flag is false.
+
+Completed compatibility with persistent SU, reduced QR/Quimb ALS and pair
+L-BFGS, full-tensor L-BFGS, strip/layer refinement, target normalization and
+direct/DMRG boundary caches. The SU initializer applies its first action
+untruncated and truncates after the second. Full-tensor objectives retain
+two lazy gates. Refinement starts at the first original action and cannot
+stop its exact target between paired actions, including when the target
+bond budget is crossed there. Global/sweep modes and PEPS reject the flag.
+
+The reduced driver also skips reconstructing an unused exact diagnostic
+target network when normalization, fidelity readout, refinement and boundary
+calibration are disabled. The required exact local reduced target is retained.
+`target_network_built` records that choice. Explicit diagnostics still build
+the target. Reused the unchanged-environment upstream audit; public Quimb gate
+attachment and the existing QR/LQ/ALS primitives were adopted, with no new
+backend, decomposition policy or dependency.
+
+Validation (selections overlap):
+
+- **404 passed** in the broad PEPO, PEPS full-update/pair/refinement and
+  ordered-cache selection, `/tmp/pepo-joint-final-regressions.log`.
+- **95 passed** in the final paired-update and gate-order selection,
+  `/tmp/pepo-joint-paths-final.log`, including actual Torch CUDA/CuPy runs
+  across complex64/128 and direct/DMRG boundaries.
+- Independent dense actions verify both operand orders, reversed sites,
+  unequal physical dimensions, complex source/gate scale and network exponent,
+  solver fidelity, normalization, provenance, smart partner selection,
+  refinement targets and persistent SU/boundary reuse across runs. Quimb ALS
+  is guarded against expanding the full physical identity metric. Default
+  runs are checked not to reconstruct unused diagnostic targets.
+- A scaled identity sandwich $U I U^\dagger$ is preserved at bond dimension
+  one by the joint update, with SVD and SU starts. Separate truncations lose
+  amplitude in this example even though normalized final fidelity is one;
+  this test compares the actual operator arrays and scale.
+- **112 smoke passed**, `/tmp/pepo-joint-final-smoke.log`. Ruff, local
+  Markdown file-target checks and `git diff --check` pass. The initial identity
+  regression incorrectly expected normalized fidelity to expose amplitude
+  loss; its assertion was corrected to test the actual operator difference.
+
+The complete extended suite was not rerun; the previously reproduced native
+Symmray shape failure remains documented above. No native-symmetry/JAX support
+or production-scale performance claim was added. No production job was changed.

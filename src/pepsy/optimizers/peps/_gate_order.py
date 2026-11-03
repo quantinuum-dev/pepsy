@@ -132,7 +132,7 @@ def _strip(sites):
     return ('column', a[1]) if a[1] == b[1] else ('row', a[0])
 
 
-def _schedule(entries, descriptors, preferred):
+def _schedule(entries, descriptors, preferred, *, pair_opposite_legs=False):
     """Greedy topological traversal, pulling in required single-site gates."""
     predecessors = [set() for _ in entries]
     followers = [set() for _ in entries]
@@ -184,7 +184,16 @@ def _schedule(entries, descriptors, preferred):
                     strip[0] != preferred, strip[1], inner if strip[1] % 2 == 0 else -inner, i)
 
         chosen = min(ready, key=priority)
-        pending, required = list(predecessors[chosen]), set()
+        selected = [chosen]
+        if pair_opposite_legs and len(descriptors[chosen]) > 2:
+            support, _, leg = descriptors[chosen]
+            partner = next((i for i in sorted(ready) if i != chosen
+                            and set(descriptors[i][0]) == set(support)
+                            and descriptors[i][2] != leg), None)
+            if partner is not None:
+                selected.append(partner)
+        pending = [i for j in selected for i in predecessors[j]]
+        required = set()
         while pending:
             ancestor = pending.pop()
             if ancestor not in required:
@@ -194,12 +203,12 @@ def _schedule(entries, descriptors, preferred):
         # Different sites commute; preserve original order within each site.
         for i in sorted(required, key=single_order):
             emit(i)
-        emit(chosen)
-        pairs.remove(chosen)
-        ready.remove(chosen)
-        # A chosen pair now acts like a released single-site node: visit each
-        # outgoing dependency once, recursively unlocking local rotations.
-        unlock([chosen])
+        for item in selected:
+            emit(item)
+            pairs.remove(item)
+            ready.remove(item)
+            # Release each emitted pair's dependencies exactly once.
+            unlock([item])
         sites = descriptors[chosen][0]
         strip = _strip(sites)
         if strip != active:
@@ -213,27 +222,37 @@ def _schedule(entries, descriptors, preferred):
     return ordered
 
 
-def _smart_order(optimizer, entries):
+def _smart_order(optimizer, entries, *, pair_opposite_legs=False):
     ordered, block, descriptors = [], [], []
     signatures, constants = {}, {}
     def flush():
         if block:
             # Compare refinement-block counts, then strip changes. This is a
             # bounded heuristic, not a search over all circuit permutations.
-            candidates = [_schedule(block, descriptors, preferred) for preferred in ('column', 'row')]
+            candidates = [_schedule(block, descriptors, preferred,
+                                    pair_opposite_legs=pair_opposite_legs)
+                          for preferred in ('column', 'row')]
             def cost(candidate):
                 blocks, changes, active, used = 0, 0, None, set()
+                pending = None
                 for _, entry in candidate:
                     sites = fixed_gate_sites(optimizer, entry)
                     if len(sites) == 1:
+                        pending = None
                         continue
                     strip, bond = _strip(sites), frozenset(sites)
+                    leg = _gate_leg(optimizer, entry)
+                    if (pair_opposite_legs and pending is not None
+                            and pending[0] == bond and pending[1] != leg):
+                        pending = None
+                        continue
                     if strip != active or bond in used:
                         blocks += 1
                         used.clear()
                     changes += active is not None and strip != active
                     active = strip
                     used.add(bond)
+                    pending = bond, leg
                 return blocks, changes
             ordered.extend(min(candidates, key=cost))
             block.clear()
@@ -280,7 +299,7 @@ def _fuse_singles(optimizer, ordered, gate_kwargs=None):
     return result, groups
 
 
-def order_gates(optimizer, policy):
+def order_gates(optimizer, policy, *, pair_opposite_legs=False):
     """Traverse legal gate orders with the selected strip scheduling policy.
 
     Row/column policies reorder contiguous commuting two-qubit blocks.
@@ -291,7 +310,7 @@ def order_gates(optimizer, policy):
     if policy == 'input':
         return entries
     if policy == 'smart':
-        return _smart_order(optimizer, entries)
+        return _smart_order(optimizer, entries, pair_opposite_legs=pair_opposite_legs)
     major = 1 if policy == 'column' else 0
 
     def sortable(entry):
@@ -366,7 +385,8 @@ def ordered_gate_run(method):
             if policy == 'smart' and any(ar.infer_backend(t.data) not in {'numpy', 'torch', 'cupy'}
                                          for t in getattr(self.state, 'tensors', ())):
                 raise TypeError("gate_order='smart' requires dense NumPy, Torch, or CuPy state arrays")
-            ordered = order_gates(self, policy)
+            ordered = order_gates(self, policy,
+                                  pair_opposite_legs=bool(kwargs.get('fuse_pepo_legs', False)))
             if policy == 'smart':
                 ordered, groups = _fuse_singles(self, ordered, gate_kwargs=kwargs.get('gate_kwargs'))
             else:

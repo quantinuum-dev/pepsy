@@ -66,8 +66,12 @@ class SimpleUpdateWarmStart:
             core = state.copy()
             self._half_weights(core, where, inverse=True)
             self.reuses += 1
-        gate_simple(core, gate, where, which=which, gauges=self.gauges,
-                    max_bond=chi, cutoff=cutoff, cutoff_mode=cutoff_mode, renorm=False)
+        actions = list(zip(('upper', 'lower'), gate)) if which == 'both' else [(which, gate)]
+        for i, (leg, payload) in enumerate(actions):
+            final = i+1 == len(actions)
+            gate_simple(core, payload, where, which=leg, gauges=self.gauges,
+                        max_bond=chi if final else None, cutoff=cutoff if final else 0.,
+                        cutoff_mode=cutoff_mode, renorm=False)
         self._half_weights(core, where)
         guess = source.copy()
         for site in where:
