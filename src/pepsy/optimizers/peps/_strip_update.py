@@ -9,6 +9,7 @@ from ..._internal.cutoff import resolve_fit_rtol
 from ...boundary._reuse import layer_sources
 from ...boundary.metrics import build_bra_ket, _as_scaled_scalar
 from ...bp._backend import all_finite, dag
+from ...bp.reduced_update import _site_physical_inds
 from ._boundary_convergence import chi_pair
 from ._full_update import boundary_strip
 from ._strip_cursor import StripSweepCursor
@@ -17,7 +18,7 @@ from ._strip_solve import solve_positive
 
 def local_matrix_size(state, site):
     tensor = state[site]
-    return tensor.size // tensor.ind_size(state.site_ind(*site))
+    return tensor.size // math.prod(tensor.ind_size(i) for i in _site_physical_inds(state, site))
 
 
 def strip_key(where):

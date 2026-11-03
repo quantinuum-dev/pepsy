@@ -20,8 +20,9 @@ from ..._internal.cutoff import resolve_fit_rtol
 from ...bp._backend import all_finite, dag, einsum, transpose
 from ...bp.reduced_update import (
     ReducedEnvironmentUpdateProblem, prepare_reduced_bond_pair, solve_reduced_als,
-    _psd_project_metric, _svd_initial_factors,
+    _psd_project_metric, _svd_initial_factors, _site_physical_inds,
 )
+from ...operators.gates import _is_operator_tensor_network, _normalize_gate_which
 
 
 def options(values=None):
@@ -145,7 +146,7 @@ class ReducedPair:
 
     tensor_mode = 'reduced'
 
-    def __init__(self, state, gate, where, chi):
+    def __init__(self, state, gate, where, chi, *, which=None):
         self.state = state
         self.where = tuple(tuple(site) for site in where)
         if len(self.where) != 2 or any(len(site) != 2 for site in self.where):
@@ -159,20 +160,32 @@ class ReducedPair:
         if (signature[0] not in {'torch', 'cupy'}
                 or any(infer_backend_signature(t.data) != signature
                        or getattr(t.data, 'requires_grad', False) for t in state)):
-            raise TypeError('full-update requires non-differentiable dense Torch or CuPy PEPS '
+            raise TypeError('full-update requires non-differentiable dense Torch or CuPy PEPS/PEPO '
                             'with matching backend, dtype and device')
         if ar.get_dtype_name(sample) not in ('complex64', 'complex128'):
             raise TypeError('full-update requires complex64 or complex128')
-        self.phys = tuple(state.site_ind(*site) for site in self.where)
+        self.operator = _is_operator_tensor_network(state)
+        which = _normalize_gate_which(which)
+        if which is not None and not self.operator:
+            raise ValueError('full-update which selects upper/lower PEPO legs, not PEPS legs')
+        self.which = (which or 'upper') if self.operator else None
+        physical = tuple(_site_physical_inds(state, site) for site in self.where)
+        self.physical = physical
+        self.phys = tuple(index for group in physical for index in group)
+        self.gate_phys = (tuple(getattr(state, f'{self.which}_ind')(*site) for site in self.where)
+                          if self.operator else self.phys)
         bonds = tuple(self.tensors[0].bonds(self.tensors[1]))
         if len(bonds) != 1:
             raise ValueError('full-update requires exactly one bond between the pair')
         self.bond = bonds[0]
-        self.external = tuple(tuple(i for i in t.inds if i not in (p, self.bond))
-                              for t, p in zip(self.tensors, self.phys))
+        self.external = tuple(tuple(i for i in t.inds if i not in (*group, self.bond))
+                              for t, group in zip(self.tensors, physical))
         self.shapes = tuple(tuple(t.ind_size(i) for i in ext)
                             for t, ext in zip(self.tensors, self.external))
-        self.dims = tuple(t.ind_size(p) for t, p in zip(self.tensors, self.phys))
+        physical_dims = tuple(tuple(t.ind_size(i) for i in group)
+                              for t, group in zip(self.tensors, physical))
+        self.dims = tuple(math.prod(group) for group in physical_dims)
+        gate_dims = tuple(t.ind_size(p) for t, p in zip(self.tensors, self.gate_phys))
         # Reuse Pepsy's existing QR/LQ reduction without requesting BP messages.
         self.reduced = prepare_reduced_bond_pair(state, where=self.where,
                                                  input_mode='physical', run_bp=False)
@@ -180,14 +193,25 @@ class ReducedPair:
         self.qa = self.reduced.q_left.transpose(*self.external[0], self.reduced.reduced_left_ind).data.reshape(-1, self.na)
         self.qb = self.reduced.q_right.transpose(self.reduced.reduced_right_ind, *self.external[1]).data.reshape(self.nb, -1)
         gate = infer_backend_converter_from_sample(sample)(gate)
-        if getattr(gate, 'requires_grad', False) or math.prod(gate.shape) != math.prod(self.dims) ** 2:
+        if getattr(gate, 'requires_grad', False) or math.prod(gate.shape) != math.prod(gate_dims) ** 2:
             raise ValueError('full-update requires a fixed two-site gate of matching size')
         if not all_finite(gate):
             raise ValueError('full-update gate contains nonfinite values')
-        gate = gate.reshape(*self.dims, *self.dims)
+        gate = gate.reshape(*gate_dims, *gate_dims)
         self.gate = gate
-        self.theta = einsum('PQpq,apqb->aPbQ', gate, self.reduced.theta_array())
+        theta = self.reduced.theta_array()
+        if self.operator:
+            # Keep the spectator operator legs as batch axes. Do not form
+            # G tensor-product I on the enlarged local physical dimension.
+            theta = theta.reshape(self.na, *physical_dims[0], *physical_dims[1], self.nb)
+            expression = ('PQpq,axpyqb->axPbyQ' if self.which == 'upper'
+                          else 'PQpq,apxqyb->aPxbQy')
+            theta = einsum(expression, gate, theta)
+            self.theta = theta.reshape(self.na, self.dims[0], self.nb, self.dims[1])
+        else:
+            self.theta = einsum('PQpq,apqb->aPbQ', gate, theta)
         self.chi = int(chi)
+        self.initial_factors = None
 
     def split(self, theta, chi):
         left, right = _svd_initial_factors(transpose(theta, (0, 1, 3, 2)), chi)
@@ -196,7 +220,7 @@ class ReducedPair:
     def state_from(self, left, right):
         return self.reduced.reconstruct_tn(left, transpose(right, (0, 2, 1)))
 
-    def initial_states(self):
+    def initial_states(self, guess=None):
         # One local SVD supplies the warm start and exact target. Determine
         # numerical support using machine precision, never the fit tolerance:
         # a small but genuinely discarded component must still trigger FU.
@@ -217,7 +241,20 @@ class ReducedPair:
             right = (roots[:, None] * vh[:count]).reshape(count, self.dims[1], self.nb)
             return left, transpose(right, (0, 2, 1))
 
-        guess = self.state_from(*factors(rank))
+        self.initial_factors = None
+        if guess is None or self.warmstart_exact:
+            guess = self.state_from(*factors(rank))
+        else:
+            # SU uses a different internal-bond gauge but the same exterior
+            # tensors. Project its active sites into the frozen QR/LQ bases.
+            ta, tb = (guess[site] for site in self.where)
+            size = ta.ind_size(self.bond)
+            a = ta.transpose(*self.external[0], *self.physical[0], self.bond).data
+            b = tb.transpose(self.bond, *self.physical[1], *self.external[1]).data
+            left = einsum('ax,apk->xpk', self.qa.conj(), a.reshape(-1, self.dims[0], size))
+            right = einsum('kpb,bx->kxp', b.reshape(size, self.dims[1], -1), self.qb.conj().T)
+            self.initial_factors = left, right
+            guess = self.state_from(left, right)
         target = self.state_from(*factors(len(s)))
         return guess, target
 
@@ -244,6 +281,9 @@ class ReducedPair:
             raise ValueError('Cannot normalize a zero or nonfinite full-update target')
         self.reduced.tn.exponent -= .5 * (math.log10(magnitude) + exponent)
         self.theta = self.theta * (complex(mantissa) / magnitude)**-.5
+        if self.initial_factors is not None:
+            left, right = self.initial_factors
+            self.initial_factors = left * (complex(mantissa) / magnitude)**-.5, right
 
     def strip_environment(self, state, *, boundary=None, chi, contraction_opt, boundary_kwargs,
                           strip_cache=None):
@@ -347,10 +387,16 @@ class ReducedPair:
             value = float(inner(delta, delta).real / target_norm)
             return max(0., value) if math.isfinite(value) else math.inf
 
-        left, right = self.split(theta, self.chi)
-        # Gauge-SVD is usually a better initial guess, but retain the ordinary
-        # rank-D split if it is better in this same positive environment.
-        baseline_left, baseline_right = self.split(self.theta, self.chi)
+        if self.initial_factors is None:
+            left, right = self.split(theta, self.chi)
+        else:
+            left, right = self.initial_factors
+            left = einsum('ac,cpk->apk', ga, left)
+            right = einsum('bd,kdq->kbq', gb, right)
+        # Compare gauge-SVD with the ordinary split in the same environment;
+        # an explicitly supplied SU start is retained in either gauge.
+        baseline_left, baseline_right = (self.split(self.theta, self.chi)
+                                         if self.initial_factors is None else self.initial_factors)
         baseline_left = einsum('ac,cpk->apk', ga, baseline_left)
         baseline_right = einsum('bd,kdq->kbq', gb, baseline_right)
         baseline_loss = loss(baseline_left, baseline_right)
@@ -420,6 +466,7 @@ class ReducedPair:
             problem, max_bond=self.chi, max_iterations=controls['max_iterations'],
             tol=tolerance, rcond=rcond, solver=controls['solver'],
             monitor_convergence=True,
+            initial_factors=(left, transpose(right, (0, 2, 1))),
             quimb_opts={'contract_optimize': policy, 'enforce_pos': True, 'progbar': False},
         )
 
@@ -433,8 +480,8 @@ class FullPair(ReducedPair):
 
     tensor_mode = 'full'
 
-    def __init__(self, state, gate, where, chi):
-        super().__init__(state, gate, where, chi)
+    def __init__(self, state, gate, where, chi, *, which=None):
+        super().__init__(state, gate, where, chi, which=which)
         self.target_phase = 1.
 
     def normalize_target(self, norm):
@@ -447,8 +494,9 @@ class FullPair(ReducedPair):
         env, boundary = self.strip_environment(state, **kwargs)
         tags = tuple(state.site_tag(*site) for site in self.where)
         # Keep the gate lazy, separate from the frozen pre-gate site tensors.
-        target = self.state.select_any(tags).gate(
-            self.gate * self.target_phase, self.where, contract=False,
+        target = qtn.tensor_network_gate_inds(
+            self.state.select_any(tags), self.gate * self.target_phase,
+            self.gate_phys, contract=False,
         )
         objective = PairObjective(env, tuple(state[site] for site in self.where), target,
                                   physical_inds=self.phys, optimize=self.contraction_opt)
@@ -457,7 +505,8 @@ class FullPair(ReducedPair):
     def optimize(self, objective, controls):
         controls = options(dict(controls, tensor_mode='full'))
         params, report = objective.optimize(controls)
-        state = self.reduced.tn.copy()
+        state = self.state.copy()
+        state.exponent = self.reduced.tn.exponent
         for site, data in zip(self.where, params):
             state[site].modify(data=data)
         return state, report

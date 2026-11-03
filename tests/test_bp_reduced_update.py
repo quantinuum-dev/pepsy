@@ -28,6 +28,57 @@ def _random_peps():
     return qtn.PEPS.rand(2, 2, bond_dim=2, seed=7, dtype="complex128")
 
 
+@pytest.mark.parametrize('solver', ['qr', 'quimb', 'normal'])
+@pytest.mark.parametrize('monitor', [False, True])
+def test_dense_als_uses_supplied_initial_factors_without_restarting_svd(monkeypatch, solver, monitor):
+    module = importlib.import_module('pepsy.bp.reduced_update')
+    state = _random_peps()
+    pair = prepare_reduced_bond_pair(state, where=((0, 0), (1, 0)),
+                                     input_mode='physical', run_bp=False)
+    problem = exact_reduced_update_problem(pair, np.eye(4), optimize='greedy')
+    a, p, q, b = problem.shape
+    rng = np.random.default_rng(27)
+    left = rng.normal(size=(a, p, 1))+1j*rng.normal(size=(a, p, 1))
+    right = rng.normal(size=(1, q, b))+1j*rng.normal(size=(1, q, b))
+    originals = left.copy(), right.copy()
+    expected = problem.cost(np.einsum('apk,kqb->apqb', left, right))
+    def unexpected(*args, **kwargs):
+        pytest.fail('ALS discarded the supplied factors and restarted from SVD')
+    monkeypatch.setattr(module, '_svd_initial_factors', unexpected)
+    result = solve_reduced_als(problem, initial_factors=(left, right), solver=solver,
+                               max_bond=2, max_iterations=2, monitor_convergence=monitor)
+    assert result.left.shape[-1] == result.right.shape[0] == 1
+    assert result.costs[0] == pytest.approx(expected)
+    assert result.costs[-1] <= expected+1e-9
+    np.testing.assert_array_equal(left, originals[0])
+    np.testing.assert_array_equal(right, originals[1])
+
+
+@pytest.mark.parametrize('invalid', ['length', 'shape', 'rank', 'dtype', 'nonfinite', 'autodiff'])
+def test_dense_als_rejects_invalid_initial_factors(invalid):
+    state = _random_peps()
+    pair = prepare_reduced_bond_pair(state, where=((0, 0), (1, 0)),
+                                     input_mode='physical', run_bp=False)
+    problem = exact_reduced_update_problem(pair, np.eye(4), optimize='greedy')
+    a, p, q, b = problem.shape
+    left, right = np.ones((a, p, 1), dtype=complex), np.ones((1, q, b), dtype=complex)
+    initial = (left, right)
+    if invalid == 'length':
+        initial = (left,)
+    elif invalid == 'shape':
+        initial = (left[:, :1], right)
+    elif invalid == 'rank':
+        initial = (np.ones((a, p, 2), dtype=complex), np.ones((2, q, b), dtype=complex))
+    elif invalid == 'dtype':
+        initial = (left.real, right.real)
+    elif invalid == 'nonfinite':
+        left[0, 0, 0] = np.nan
+    error = NotImplementedError if invalid == 'autodiff' else ValueError
+    with pytest.raises(error):
+        solve_reduced_als(problem, initial_factors=initial, max_bond=1,
+                          solver='autodiff' if invalid == 'autodiff' else 'qr')
+
+
 def test_metric_factor_falls_back_only_for_numerical_failures(monkeypatch):
     module = importlib.import_module("pepsy.bp.reduced_update")
     metric = np.diag([2.0, 0.0])

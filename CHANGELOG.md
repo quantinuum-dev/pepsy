@@ -8,6 +8,14 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Native PEPO full update:** support upper/lower-leg gate streams with
+  shared QR/LQ reductions, ALS and pair L-BFGS, retaining both operator legs.
+  Preserve PEPO amplitudes by default and measure target Frobenius norms;
+  PEPS normalization defaults remain unchanged. Validate direct and DMRG
+  boundaries against dense operator references. Add opt-in SU pair warm
+  starts for PEPS/PEPO and pass their factors through the shared dense ALS
+  solver. Independent norm/fidelity diagnostics remain off by default in FU.
+
 - **Full Haar vectors:** allow an explicit `L_max>20` with a positive
   `max_dense_bytes` preallocation budget. The historical default size guard
   and seeded complex Haar distribution remain unchanged.

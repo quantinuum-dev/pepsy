@@ -2588,6 +2588,7 @@ def _solve_reduced_als_quimb(
     rcond: float,
     quimb_opts: dict[str, Any] | None = None,
     monitor_convergence: bool = False,
+    initial_factors=None,
 ) -> ReducedALSSolution:
     """Solve the reduced ALS problem through Quimb's public TN ALS API."""
     import quimb.tensor as qtn
@@ -2610,7 +2611,8 @@ def _solve_reduced_als_quimb(
 
     pair = problem.pair
     left_dim, physical_left, physical_right, right_dim = problem.shape
-    left, right = _svd_initial_factors(problem.target, max_bond)
+    left, right = (_svd_initial_factors(problem.target, max_bond)
+                   if initial_factors is None else tuple(map(_copy_array, initial_factors)))
     initial_cost = problem.cost(_einsum("aps,sqb->apqb", left, right))
 
     ket_bond = qtn.rand_uuid()
@@ -3110,6 +3112,7 @@ def solve_reduced_als(
     quimb_opts: dict[str, Any] | None = None,
     autodiff_opts: dict[str, Any] | None = None,
     monitor_convergence: bool = False,
+    initial_factors: tuple[Any, Any] | None = None,
 ) -> ReducedALSSolution:
     """Solve a reduced two-site projection by alternating least squares.
 
@@ -3132,6 +3135,10 @@ def solve_reduced_als(
     uses cost/target_norm <= tol or the absolute complete-sweep cost change
     divided by target_norm <= tol; tol=0 requests the full iteration budget.
     The dense QR/normal routes use the same criterion when monitoring.
+    ``initial_factors=(left, right)`` supplies a dense ALS warm start instead
+    of the target SVD. Its shapes are ``(left_dim, physical_left, rank)`` and
+    ``(rank, physical_right, right_dim)``. The fit retains that rank, at most
+    ``max_bond``. Native symmetry and autodiff routes require the default SVD.
     """
     if not isinstance(max_iterations, int) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
@@ -3160,6 +3167,24 @@ def solve_reduced_als(
     if not isinstance(max_bond, int) or max_bond < 1:
         raise ValueError("max_bond must be a positive integer")
     max_bond = min(max_bond, left_dim * physical_left, physical_right * right_dim)
+
+    if initial_factors is not None:
+        if is_symmray_array(problem.target) or solver == 'autodiff':
+            raise NotImplementedError('initial_factors requires dense ALS')
+        if not isinstance(initial_factors, (tuple, list)) or len(initial_factors) != 2:
+            raise ValueError('initial_factors must contain left and right arrays')
+        left, right = initial_factors
+        rank = left.shape[-1] if getattr(left, 'ndim', 0) == 3 else 0
+        if (not 1 <= rank <= max_bond or left.shape != (left_dim, physical_left, rank)
+                or getattr(right, 'shape', None) != (rank, physical_right, right_dim)):
+            raise ValueError('initial_factors shapes or rank do not match the reduced problem')
+        from ..backends import infer_backend_signature
+        if any(infer_backend_signature(value) != infer_backend_signature(problem.target)
+               for value in initial_factors):
+            raise ValueError('initial_factors must match target backend, dtype and device')
+        if not all(_all_finite(value) for value in initial_factors):
+            raise ValueError('initial_factors must be finite')
+        max_bond = rank
 
     if monitor_convergence and (is_symmray_array(problem.target) or solver == 'autodiff'):
         raise ValueError('monitor_convergence is supported only for dense Quimb/QR/normal ALS')
@@ -3198,6 +3223,7 @@ def solve_reduced_als(
                 rcond=rcond,
                 quimb_opts=quimb_opts,
                 monitor_convergence=monitor_convergence,
+                initial_factors=initial_factors,
             )
         except ValueError:
             if requested_solver != "auto":
@@ -3213,7 +3239,8 @@ def solve_reduced_als(
             autodiff_opts=autodiff_opts,
         )
 
-    left, right = _svd_initial_factors(problem.target, max_bond)
+    left, right = (_svd_initial_factors(problem.target, max_bond)
+                   if initial_factors is None else tuple(map(_copy_array, initial_factors)))
     metric = _dense_problem_metric(problem)
     linear = _dense_problem_linear_term(problem, metric)
     metric_scale = _metric_scale(metric)

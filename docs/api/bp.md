@@ -207,6 +207,14 @@ sweep; QR/normal also retain their half-sweep measurements. The default
 unmonitored behavior is unchanged, with these status fields set to `None`.
 Monitoring is unavailable for autodiff and native Symmray's graded-SVD route.
 
+Dense ALS also accepts `initial_factors=(left, right)` instead of restarting
+from a target SVD. Shapes are `(left_dim, physical_left, rank)` and
+`(rank, physical_right, right_dim)`, with matching backend, dtype and device.
+The fit retains that rank, bounded by `max_bond`, and copies the supplied
+arrays. Quimb, QR and normal ALS support this; autodiff and native symmetry
+require the default initializer. Two-site PEPS/PEPO full update uses this
+to pass its chosen SVD, environment-gauged or SU warm start into ALS.
+
 For explicit dense diagnostics, use `problem.dense_metric()` and
 `problem.dense_linear_term()`. Direct problem builders also accept
 `materialize_metric=True`, but this is unnecessary for the native Quimb path.

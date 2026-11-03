@@ -220,7 +220,8 @@ the unrestricted split. Rank-deficient QR factors can still make derivatives
 unreliable; `canonize=False` is an explicit alternative, not a general cure.
 Check gradients and convergence with the boundary cap for the intended circuit.
 
-For normalized inputs and unitary gates, the known target squared norm is one.
+For normalized PEPS inputs and unitary gates, the known target squared norm
+is one.
 The driver normalizes the initial state and each compressed candidate, and
 reuses the known target norm. Set `normalize_initial=False` only for an already
 normalized input. Nonunitary gates require `non_unitary=True` or an explicit,
@@ -519,8 +520,9 @@ accepted as a two-site alias. For one-site ALS within row/column sweeps,
 keep `update_style="row-column"` and select `optimizer="als"` below.
 The two-site path follows the reduced-tensor scheme
 in [Lubasch, Cirac and Bañuls, Sec. III B](https://arxiv.org/pdf/1405.3259).
-Currently it supports nearest-neighbor coordinate pairs on dense Torch or CuPy
-complex64/complex128 PEPS, with Pepsy boundary MPS (direct or DMRG fitting).
+It supports nearest-neighbor coordinate pairs on dense Torch or CuPy
+complex64/complex128 PEPS and [PEPO](#native-pepo-full-update), with Pepsy
+boundary MPS (direct or DMRG fitting).
 It does not support differentiation through the update or native symmetry
 arrays. `k_2q_batch="auto"` means one two-site gate in this mode; integers
 greater than one are rejected. For row/column fitting, `k_2q_batch=1` explicitly
@@ -999,6 +1001,75 @@ for profiling. Inner slice timers remain unsynchronized host wall times and
 are explicitly marked as such. Timing off adds no accelerator barriers and
 does not enable extra contractions or alter optimization settings.
 
+### Native PEPO full update
+
+Pass a native PEPO as `state`. Its two physical legs, operator class, backend,
+dtype and device are retained. The default leg is `"upper"`; each gate's
+third field overrides the constructor's `which`.
+The existing coordinate-adjacency requirement remains: periodic wrap-around
+bonds are not accepted by this gate-stream full-update path.
+
+```python
+fit = PepsOptimizer(
+    operator,
+    [(G, ((0, 0), (0, 1)), "upper"),
+     (G.conj(), ((0, 0), (0, 1)), "lower")],
+    chi=D, mode="full-update",
+    full_update_kwargs={"solver": "auto"},
+)
+operator = fit.run()
+```
+
+Use `fit.run(warmstart_method="simple-update")` to initialize the pair solver
+from SU instead of the default reduced SVD. This works for PEPS and PEPO,
+with upper/lower selection, reduced ALS or L-BFGS, and full-tensor L-BFGS.
+SU runs on a private copy, preserving scale (`renorm=False`), and changes
+only the disposable guess. Its pre-gate gauged source represents the same
+operator and supplies the frozen QR/LQ bases; the target remains untruncated.
+SU can recondition exterior tensor gauges. Boundary cache validation handles
+those changes; this option includes a fresh simple-gauging pass per pair.
+It is separate from `fit_init_strategy`, which initializes boundary MPS fits.
+
+For unitary `G`, this applies ${\color{blue}O\mapsto GOG^\dagger}$ on the
+selected sites. The existing physical-leg convention applies gates as supplied:
+upper gives $GO$, lower gives $OG^T$. Supply `G.T` on the lower legs for $OG$.
+One-site gates, mixed streams and custom upper/lower index formats follow the
+same rules; input order is preserved across selector barriers.
+
+The shared QR/LQ reduction temporarily fuses the active lower/upper legs into
+physical dimension $d_{\rm in}d_{\rm out}$, then restores them on reconstruction.
+Gates contract into the selected reduced leg while the spectator leg stays
+explicit; no $G\otimes I$ array is formed. Positive-environment projection,
+ALS, optional gauges, exact-SVD shortcuts, boundary/strip caches and strip/layer
+refinement reuse the PEPS kernels. Reduced/full-tensor pair L-BFGS works too.
+
+The metric is normalized **Frobenius operator overlap**:
+
+$$
+{\color{purple}F(O,T)=
+\frac{|\operatorname{Tr}(O^\dagger T)|^2}
+{\operatorname{Tr}(O^\dagger O)\operatorname{Tr}(T^\dagger T)}}.
+$$
+
+PEPO initial and output normalization default to **off**; PEPS defaults remain
+unchanged. Independent norm and fidelity contractions are **off by default**
+for two-site full update. ALS still uses its local norm environment, residual
+and local fidelity estimate. Enable independent pre/post checks with
+`measure_infidelity=True, measure_final_infidelity=True`, or boundary
+calibration with `boundary_convergence`. Requested diagnostics measure the
+target norm, with no assumed value of one or $2^L$.
+For an unscaled $L$-qubit Pauli string, $\operatorname{Tr}(O^\dagger O)=2^L$;
+scaling it by $a$ gives $|a|^2 2^L$. General operators have their own norms.
+Explicit `normalize_initial=True` or `normalize_final=True` sets the Frobenius
+norm to one at the requested stage. `normalize_target` follows `non_unitary`;
+leave it false when nonunitary operator evolution must retain its amplitude.
+Both direct and DMRG boundary compression contract both physical legs in
+the norm and overlap networks.
+
+PSD projection applies to the local norm environment $N$, not the operator.
+Pair fidelity remains a local environment estimate. This evolves a PEPO itself;
+`run_pepo(U)` above uses a separate full-step fitting path.
+
 ## Local solver defaults
 
 ### One-site ALS inside each row or column
@@ -1124,12 +1195,16 @@ controls with `optimizer_options` or per-run
 With adaptive sweep checks, the target norm is measured during calibration
 and reused throughout that fit, overriding the unitary shortcut below.
 
-For global mode or `boundary_convergence=False`, default unitary evolution
-passes `norm_target=1` to every
+For PEPS in global mode or with `boundary_convergence=False`, default unitary
+evolution passes `norm_target=1` to every
 pre/post fidelity evaluation and to variational cleanup, avoiding the
 enlarged target's norm contraction. This assumes that the incoming retained
 PEPS is normalized and the gates are unitary. The compressed candidate's
 norm is still measured at `evaluation_chi`.
+
+PEPO targets always have their norm measured unless the caller explicitly
+supplies `norm_target`, even when output normalization is enabled. A unitary
+gate preserves an operator's Frobenius norm, which need not be one.
 
 Set `infidelity_kwargs={"norm_target": None}` to explicitly measure the
 target norm, or supply a known scalar/scaled norm. Constructor settings and
@@ -1260,7 +1335,10 @@ optimization restores the already normalized warm start. Thus the retained
 state has unit norm according to the selected finite-cap contraction, which
 does not guarantee an exactly unit dense norm at insufficient boundary chi.
 Increase `normalize_chi` to check convergence. `normalize_final=False` skips
-candidate/direct-output normalization; warm starts are always normalized.
+candidate/direct-output normalization; row/column and global warm starts
+are always normalized. Two-site full update preserves the target scale in
+its warm start. PEPO initial and output normalization are off by default;
+see [native PEPO full update](#native-pepo-full-update).
 `normalize_target=None` follows `non_unitary`; set `non_unitary=True` for
 nonunitary evolution or explicitly override `normalize_target=True/False`.
 Adaptive sweeps measure the unchanged target norm before fitting. Outside

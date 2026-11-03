@@ -36,6 +36,10 @@ from ...backends import (
 )
 from ...operators.gates import (
     _normalize_gate_entries,
+    _normalize_gate_which,
+    _normalize_where_arg_2d,
+    _is_operator_tensor_network,
+    _is_explicit_index_where,
     _resolve_gate_cutoff,
     _resolve_gate_cutoff_mode,
     gate as apply_gate,
@@ -200,7 +204,8 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
     - Unitary evolution is assumed by default: generated targets are not
       rescaled. ``non_unitary=True`` enables target normalization, and
       ``normalize_target`` explicitly overrides that policy. Retained outputs
-      are normalized using ``normalize_chi`` by default.
+      are normalized using ``normalize_chi`` by default for PEPS; PEPOs
+      preserve amplitudes unless normalization is explicitly requested.
       This does not implement the interval scheduling or norm-proxy machinery
       available in :class:`pepsy.optimizers.mps.MpsOptimizer`.
     - Step records and fidelity traces are per measured two-site gate batch.
@@ -236,13 +241,14 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         the evaluation chi defaults to ``boundary_chi`` for two-site full
         update, otherwise ``(2 * chi**2, 4 * chi**2)``. Measured state
         norms use the first entry; the overlap uses the second. A scalar sets
-        both. Unitary runs assume target norm one unless explicitly overridden.
+        both. Unitary PEPS runs assume target norm one unless explicitly
+        overridden; PEPO target norms are measured.
     evaluation_max_retries : int | None, default=None
         Retry a substantially negative finite-cap infidelity with equal norm
         and overlap caps twice the previous maximum, up to this many times.
         None selects zero for two-site full update and two for other modes.
         Each retry warns and is recorded. Zero keeps the requested caps strict.
-        Supplied norms (including the unitary run's target norm one) and exact
+        Supplied norms (including unitary PEPS target norm one) and exact
         contractions are never retried.
     evaluation_negative_tol : float, default=1e-3
         Approximate infidelities outside [0, 1] by at most this absolute tolerance
@@ -271,11 +277,14 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         variational backend. None builds Pepsy's reusable Cotengra optimizer.
     which : {"upper", "lower"} | None, optional
         Default physical-index family passed to :func:`pepsy.operators.gate`.
-        Per-entry ``which`` values override this.
+        Per-entry ``which`` values override this. PEPO full update defaults
+        to upper legs; lower-leg gates apply O @ G.T. PEPO operator amplitudes
+        are preserved by default.
     inplace : bool, default=False
         If ``False``, copy ``state`` before applying gates.
-    normalize_initial : bool, default=True
+    normalize_initial : bool | None, default=None
         Normalize the initial state once, on the first :meth:`run` call.
+        None normalizes PEPS inputs and preserves PEPO operator amplitudes.
     fit_* : optional
         The boundary FIT controls accepted by :class:`SweepOptimizer` may be
         supplied directly here (for example ``fit_mode="dmrg2"`` or
@@ -463,7 +472,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         contraction_opt=None,
         which=None,
         inplace=False,
-        normalize_initial=True,
+        normalize_initial=None,
         fit_mode=None,
         fit_layer_mode=None,
         fit_layer_order=None,
@@ -565,7 +574,9 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         self._require_torch_symmray_backend(self.state, role="state")
         self.gates = _normalize_gate_queue(gates)
 
-        self.normalize_initial = bool(normalize_initial)
+        self._normalize_initial_auto = normalize_initial is None
+        self.normalize_initial = (not _is_operator_tensor_network(state)
+                                  if self._normalize_initial_auto else bool(normalize_initial))
         direct_fit_kwargs = {
             key: value
             for key, value in {
@@ -856,7 +867,10 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         self.state = state if self.inplace else (state.copy() if hasattr(state, "copy") else state)
         self._initial_normalized = False
         if normalize_initial is not None:
+            self._normalize_initial_auto = False
             self.normalize_initial = bool(normalize_initial)
+        elif getattr(self, '_normalize_initial_auto', False):
+            self.normalize_initial = not _is_operator_tensor_network(state)
         return self
 
     def set_mode(self, mode):
@@ -1073,6 +1087,14 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
 
     def _apply_gate_entry(self, state, gate_payload, where, which, *, opts, inplace=False):
         which_local = self.which if which is None else which
+        if (getattr(self, '_active_full_update', False) and _is_operator_tensor_network(state)
+                and not _is_explicit_index_where(where)):
+            # Use live PEPO leg names, including for one-site gates and exact
+            # refinement targets. The generic gate helper's k/b defaults
+            # need not match a custom operator's upper/lower index formats.
+            selector = _normalize_gate_which(which_local) or 'upper'
+            sites = _normalize_where_arg_2d(where)
+            where = tuple(getattr(state, f'{selector}_ind')(*site) for site in sites)
         if isinstance(where, str) or (
             isinstance(where, (tuple, list)) and all(isinstance(site, str) for site in where)
         ):
@@ -1753,9 +1775,9 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                     raise
                 raise BoundaryAccuracyError('zero_norm_product', components=('norm',),
                                             stage='evaluation') from exc
-            self._last_target_norm = (
-                result.get("norm_target", 1.0) if isinstance(result, Mapping) else 1.0
-            )
+            default_norm = None if _is_operator_tensor_network(target) else 1.0
+            self._last_target_norm = (result.get("norm_target", default_norm)
+                                      if isinstance(result, Mapping) else default_norm)
             self._append_fit_diagnostics(result)
             raw = result.get("infidelity") if isinstance(result, Mapping) else result
             value = None if raw is None else _backend_to_float(raw)
@@ -2478,13 +2500,21 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         return postfix
 
     @timed_phase('target')
-    def _full_update_pair(self, gate_payload, where):
+    def _full_update_pair(self, gate_payload, where, which=None, *,
+                          warmstart_method='compress', cutoff=0., cutoff_mode='rsum2'):
         from ._full_update import FullPair, ReducedPair
+        which = self.which if which is None else which
+        source, guess = self.state, None
+        if warmstart_method == 'simple-update':
+            source, guess = simple_update_guess(
+                source, [(gate_payload, where, which)], chi=self.chi,
+                cutoff=cutoff, cutoff_mode=cutoff_mode, return_source=True,
+            )
         if self.full_update_kwargs['tensor_mode'] == 'full':
-            pair = FullPair(self.state, gate_payload, where, self.chi)
+            pair = FullPair(source, gate_payload, where, self.chi, which=which)
         else:
-            pair = ReducedPair(self.state, gate_payload, where, self.chi)
-        return pair, *pair.initial_states()
+            pair = ReducedPair(source, gate_payload, where, self.chi, which=which)
+        return pair, *pair.initial_states(guess)
 
     @timed_phase('full_update_environment')
     def _full_update_environment(self, pair, guess, boundary, chi):
@@ -2556,7 +2586,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
     def _run_full_update(self, *, normalize_target, normalize_final, normalize_chi, evaluation_chi,
                          normalize_kwargs, measure_infidelity, measure_final_infidelity,
                          accept_if_improved, improvement_tol, metric_kwargs,
-                         cutoff, cutoff_mode, gate_kwargs, step_callback, progress):
+                         cutoff, cutoff_mode, warmstart_method, gate_kwargs, step_callback, progress):
         """Sequential nearest-neighbor updates sharing the checked boundary cache."""
         from ._strip_update import strip_key, local_matrix_size
         refine_target, refine_bonds, refine_start = None, set(), None
@@ -2594,7 +2624,10 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                 continue
             before = self._phase_timer.snapshot() if self._phase_timer else None
             evaluation_start = len(self.evaluation_records)
-            pair, guess, target = self._full_update_pair(gate_payload, where)
+            pair, guess, target = self._full_update_pair(
+                gate_payload, where, which, warmstart_method=warmstart_method,
+                cutoff=cutoff, cutoff_mode=cutoff_mode,
+            )
             if refine_enabled:
                 if layer_refine and refine_target is None:
                     limit = self.full_update_kwargs['refine_max_matrix_size']
@@ -2643,6 +2676,9 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                 norm, boundary = self._full_update_environment(pair, guess, boundary, norm_environment_chi)
                 self._full_update_boundary = boundary
                 candidate, summary = self._full_update_optimize(pair, norm)
+            if pair.operator:
+                summary['which'] = pair.which
+                summary['fidelity_convention'] += '; normalized Frobenius operator overlap'
             cache = getattr(getattr(boundary, 'mps_b', None), 'environment_cache', None)
             summary['environment_reuse'] = cache.report() if cache is not None else None
             strip_cache = getattr(self, '_full_update_strip_cache', None)
@@ -2762,9 +2798,11 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                     refine_target, refine_bonds = None, set()
             fidelity, geometric = self._record_fidelity_progress(loss)
             record = {
-                'step': step, 'start_step': step, 'where': where, 'which': which,
+                'step': step, 'start_step': step, 'where': where,
+                'which': pair.which if pair.operator else which,
                 'original_steps': list(self.last_gate_order['original_step_groups'][step - 1]),
                 'gate_order': self.last_gate_order['policy'], 'update_style': 'two-site',
+                'warmstart_method': warmstart_method,
                 'batch_size': 1, 'two_site_batch': 1, 'k_2q_batch': 1,
                 'batch_stop_reason': 'gate_count', 'batch_target_bond_limit': None,
                 'target_max_bond': self._max_bond(target), 'state_max_bond': self._max_bond(self.state),
@@ -2819,7 +2857,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         normalize_initial=None,
         normalize_chi=None,
         evaluation_chi=None,
-        normalize_final=True,
+        normalize_final=None,
         infidelity_tol="auto",
         measure_infidelity=None,
         optimize=True,
@@ -2896,6 +2934,11 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             Compress the exact target, or apply the batch gates individually
             to a private simple-update gauge state and absorb its gauges once.
             Simple update changes only the guess; the target stays exact.
+            Two-site full update supports both PEPS and PEPO SU guesses.
+            It reconditions a private source with SU gauges, preserving the
+            represented state, then uses its QR/LQ bases for the SU-initialized
+            fit. This can change exterior tensor gauges without changing
+            their physical operator; stale boundary caches are invalidated.
         target_representation : {"auto", "layered", "peps"}, default="auto"
             Strip ALS uses exact, separately tagged split-gate factors by
             default. Global fitting defaults to an enlarged PEPS and accepts
@@ -2908,8 +2951,9 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         normalize_target : bool | None, default=None
             Follow ``non_unitary`` by default: unitary gate targets are not
             rescaled. True/False explicitly enables/disables target
-            normalization. Unitary runs assume target norm one by default;
-            use infidelity_kwargs={"norm_target": None} to measure it.
+            normalization. Unitary PEPS runs may assume target norm one;
+            Requested PEPO fidelity diagnostics measure target norms unless
+            explicitly supplied; default full update skips these diagnostics.
         normalize_initial : bool | None, optional
             Override the constructor's one-time initial normalization setting.
         normalize_chi : int | tuple[int, int] | None, optional
@@ -2920,10 +2964,12 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             Per-run boundary chi override for pre/post infidelity estimates.
             This is the recommended way to judge acceptance with a larger chi
             than the optimizer environment uses.
-        normalize_final : bool, default=True
+        normalize_final : bool | None, default=None
             Normalize optimized candidates before acceptance, retained targets
             that already fit chi, and output after standalone one-site gates.
-            Truncated warm starts are always normalized before optimization.
+            None enables this for PEPS and preserves amplitudes for PEPO.
+            Row/column and global fits normalize truncated warm starts before
+            optimization; two-site full update preserves their target scale.
             When disabled, target norms are measured unless explicitly supplied.
         infidelity_tol : float | {"auto"}, default="auto"
             Accept the chi-truncated warm start without optimization when its
@@ -3102,8 +3148,10 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             else bool(sweep_progress)
         )
         normalize_target = bool(non_unitary) if normalize_target is None else bool(normalize_target)
+        operator = _is_operator_tensor_network(self.state)
+        normalize_final = not operator if normalize_final is None else bool(normalize_final)
         metric_kwargs = dict(infidelity_kwargs or {})
-        default_target_norm = (1.0 if not non_unitary and normalize_final
+        default_target_norm = (1.0 if not operator and not non_unitary and normalize_final
                                and self._active_boundary_growth is None else None)
         metric_kwargs.setdefault(
             "norm_target", self.infidelity_kwargs.get(
@@ -3154,19 +3202,22 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                     strip_key(where)
                 if which is not None or self.which is not None:
                     raise ValueError('strip batching requires physical PEPS gates')
-        if warmstart_method == 'simple-update' and has_two_site and (
+        if warmstart_method == 'simple-update' and has_two_site and run_mode != 'full-update' and (
                 self.which is not None or any(entry[2] is not None for entry in self.gates)
                 or self.gate_kwargs or self.target_gate_kwargs or self.warmstart_gate_kwargs
-                or gate_kwargs or run_mode == 'full-update'):
+                or gate_kwargs):
             raise ValueError('simple-update guesses require physical PEPS gates without custom gate options')
         if run_mode == 'full-update':
             if k_2q_batch not in ('auto', 1):
                 raise ValueError('full-update is gate-by-gate; use k_2q_batch=1 or auto')
-            if (self.which is not None or any(entry[2] is not None for entry in self.gates)
-                    or self.gate_kwargs or self.target_gate_kwargs or self.warmstart_gate_kwargs
+            operator = _is_operator_tensor_network(self.state)
+            for selector in [self.which, *(entry[2] for entry in self.gates)]:
+                _normalize_gate_which(selector)
+                if selector is not None and not operator:
+                    raise ValueError('full-update which selects upper/lower PEPO legs, not PEPS legs')
+            if (self.gate_kwargs or self.target_gate_kwargs or self.warmstart_gate_kwargs
                     or gate_kwargs):
-                raise ValueError('full-update accepts physical PEPS gate tensors directly; '
-                                 'which and custom gate application options are unsupported')
+                raise ValueError('full-update custom gate application options are unsupported')
             if not optimize or self.boundary_engine == 'quimb-mps' or self.boundary_options:
                 raise ValueError('full-update requires optimize=True and Pepsy DMRG boundary environments')
             if (sweep_kwargs or sweep_optimize_kwargs or self.sweep_kwargs or self.sweep_optimize_kwargs
@@ -3195,6 +3246,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                 measure_infidelity=measure_infidelity, measure_final_infidelity=measure_final_infidelity,
                 accept_if_improved=accept_if_improved, improvement_tol=improvement_tol,
                 metric_kwargs=metric_kwargs, cutoff=cutoff, cutoff_mode=cutoff_mode,
+                warmstart_method=warmstart_method,
                 gate_kwargs=gate_kwargs, step_callback=step_callback, progress=show_progress,
             )
 
