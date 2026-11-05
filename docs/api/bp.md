@@ -375,10 +375,13 @@ The builder return types share the `ReducedUpdateProblem` type alias for
 annotations. `ReducedEnvironmentUpdateProblem(pair, environment, target)`
 also accepts an externally contracted reduced environment, such as the checked
 boundary-MPS environment used by `PepsOptimizer` two-site updates. It does not
-claim an exact environment or run BP. The shared `solve_reduced_als` result
-reports `solver="quimb"`, `"qr"`, or `"normal"` on those dense routes;
+claim an exact environment or run BP. Supply a labeled Quimb tensor or a
+native backend array ordered `(ket_left, ket_right, bra_left, bra_right)`.
+Raw Torch arrays retain their environment gradients; array `.data` is not
+used to unwrap them. The shared `solve_reduced_als` result
+reports `solver="quimb"`, `"torch"`, `"qr"`, or `"normal"` on those dense routes;
 other routes retain `None` when no route diagnostic is available.
-The full-system `max_cluster_size` cutoff is an exact small-system
+With `tree_reduction=False`, the full-system `max_cluster_size` cutoff is an exact small-system
 oracle (up to the requested Hermitian/PSD projection), so a practical
 convergence study compares a ladder of total cutoffs against
 `exact_reduced_update_problem(..., psd_project=False)` and reports the open

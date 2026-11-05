@@ -136,12 +136,12 @@ def solve(problem, *, max_bond, max_iterations, tol, rcond,
     import torch
     from .reduced_update import (
         ReducedALSSolution, _gauge_reduced_factors, _reduced_als_stop,
-        _svd_initial_factors,
+        _open_environment_data, _svd_initial_factors,
     )
 
     if not isinstance(problem.target, torch.Tensor):
         raise TypeError("solver='torch' requires a dense Torch target")
-    environment = problem.environment.data
+    environment = _open_environment_data(problem.environment)
     if not isinstance(environment, torch.Tensor):
         raise TypeError("solver='torch' requires a dense Torch environment")
     # QR creates transposed/conjugate views. Canonical layouts keep one

@@ -11,7 +11,7 @@ import quimb.tensor as qtn
 
 from pepsy import TorchLinalgConfig
 from pepsy.bp import (
-    LoopClusterUpdateTracker, exact_reduced_update_problem,
+    LoopClusterUpdateTracker, ReducedEnvironmentUpdateProblem, exact_reduced_update_problem,
     prepare_reduced_bond_pair, solve_reduced_als,
 )
 from pepsy.bp._reduced_torch import _guarded_solve
@@ -189,17 +189,51 @@ def test_torch_als_retains_gate_derivatives(backend, stabilized, device):
 
 
 @pytest.mark.parametrize('solver', ['quimb', 'qr', 'normal'])
-def test_optional_fidelity_on_numpy_solvers_matches_dense_state(solver):
+@pytest.mark.parametrize('raw_environment', [False, True])
+def test_optional_fidelity_on_numpy_solvers_matches_dense_state(solver, raw_environment):
     state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype='complex128', seed=114)
     pair = prepare_reduced_bond_pair(state, where=((0, 0), (0, 1)), run_bp=False)
     gate = np.diag(np.exp(.17j*np.array([1., -1., -1., 1.])))
     problem = exact_reduced_update_problem(pair, gate, optimize='greedy')
+    if raw_environment:
+        problem = ReducedEnvironmentUpdateProblem(pair, problem.environment.data, problem.target)
     solution = solve_reduced_als(problem, solver=solver, max_bond=1,
                                  max_iterations=3, measure_fidelity=True)
     a = np.asarray(pair.gate_target_tn(gate).to_dense()).ravel()
     b = np.asarray(pair.reconstruct_tn(solution.left, solution.right).to_dense()).ravel()
     expected = abs(np.vdot(a, b))**2/(np.vdot(a, a).real*np.vdot(b, b).real)
     assert solution.local_fidelity == pytest.approx(expected, abs=2e-12)
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+@pytest.mark.parametrize('backend', [None, 'aot_eager'])
+def test_raw_torch_environment_preserves_gradients(device, backend):
+    template = problem_on(device)
+    control = torch.tensor(.17, dtype=torch.float64, device=device, requires_grad=True)
+
+    def loss(value, raw):
+        dimension = template.environment.data.shape[0]
+        weights = torch.exp(value * torch.arange(dimension, dtype=torch.float64, device=device))
+        data = (template.environment.data * weights[:, None, None, None]
+                * weights[None, None, :, None])
+        environment = data if raw else qtn.Tensor(data, inds=template.environment.inds)
+        problem = ReducedEnvironmentUpdateProblem(template.pair, environment, template.target)
+        result = solve_reduced_als(problem, solver='torch', torch_backend=backend,
+                                   max_bond=1, max_iterations=2, tol=0., measure_fidelity=True)
+        assert result.fidelity_status == 'valid'
+        return result.theta().abs().square().sum()
+
+    raw = loss(control, True)
+    wrapped = loss(control, False)
+    actual = torch.autograd.grad(raw, control)[0]
+    reference = torch.autograd.grad(wrapped, control)[0]
+    torch.testing.assert_close(raw, wrapped)
+    torch.testing.assert_close(actual, reference)
+    step = 1e-5
+    finite_difference = (loss(control.detach()+step, True)
+                         - loss(control.detach()-step, True))/(2*step)
+    torch.testing.assert_close(actual, finite_difference, rtol=2e-4, atol=2e-5)
+    assert actual.abs().item() > 1e-3
 
 
 def test_tracker_totals_handle_tiny_and_zero_fidelities_without_retaining_records():

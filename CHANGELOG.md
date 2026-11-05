@@ -13,6 +13,10 @@ patch versions remain compatible.
   fallback. Optional `torch_backend="aot_eager"` captures array contractions
   and backward, with separate charts for autocast state/dtype; eager remains
   the default. Preserve QR/LQ and stopping policy.
+- **External reduced environments:** preserve gradients when a raw Torch
+  environment is supplied; unwrap labeled tensors without using array
+  `.data`. Raw NumPy/backend environments also retain their array types,
+  with labeled Quimb views constructed when needed by its ALS solver.
 - **Local cluster diagnostics:** optional normalized complex-overlap fidelity
   on reduced ALS results and `pepsy.bp.LoopClusterUpdateTracker` for scalar
   records across streams. Products of local fidelities are heuristic, not

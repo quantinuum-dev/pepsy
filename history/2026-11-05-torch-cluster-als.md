@@ -94,3 +94,36 @@ audit journals belong to this task's commit. The 240-test second-review
 selection above is the latest package numerical check; prior full-suite
 failure evidence remains scoped and unresolved. Push success is verified
 against the remote before the user handoff.
+
+## Post-publication recheck
+
+The feature commits `6478f6b` (Pepsy `develop`) and `a290a7c` (examples `main`)
+were pushed and verified against the remote. The user requested a further
+review and publication. Fresh checks on those revisions passed **492 package
+tests** and **104 benchmark tests**. Allocation-free preflight for the actual
+23-spin homogeneous D20 χ6 source confirmed guarded Torch ALS, eager capture
+policy, six-site loop-union geometry, local fidelity tracking, `gesvd` and MPS
+cap18. No running simulation or saved result changed.
+
+An additional low-level probe then reproduced a raw-environment gradient
+defect: unconditional `.data` access detached a Torch array, while the same
+environment inside a labeled Quimb tensor retained a nonzero derivative.
+The shared extraction helper now unwraps labeled tensors only, Torch ALS
+uses that helper, and Quimb ALS wraps raw backend arrays with canonical
+reduced indices. This also avoids NumPy `.data` memoryviews. The benchmark's
+labeled environment path is unchanged.
+
+New regressions compare eager/AOT raw versus labeled environment derivatives
+on CPU/CUDA against finite differences, and raw NumPy fidelity through
+Quimb/QR/normal. **55 Torch ALS tests passed**. Final expanded package checks
+passed **500 tests** in 70.19 s, including the native graded reduced-compression
+check, CPU/CUDA, derivatives, public API/layout and PEPS/PEPO full update.
+Downstream cluster/global-cost/FU-resolution/relocation checks passed **104
+tests** in 72.60 s. Ruff and whitespace checks pass. The full repository suite
+was not rerun; the previously reproduced native fermionic readout failure
+remains unresolved. Owning docs also now list the Torch solver in the shared
+result summary and explicitly disable tree reduction for the system-covering
+diagnostic oracle, consistent with the earlier optional-mode audit.
+The follow-up is committed and pushed under the user's publication request;
+the remote revision is checked before reporting completion. Unrelated example
+notebooks and exploratory logs remain outside the commits.

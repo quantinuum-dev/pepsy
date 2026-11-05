@@ -92,6 +92,14 @@ are under `/tmp/pepsy-cluster-speed-20261105/`; final GPU data is
 
 ## Upstream audit
 
+The post-publication review found that unconditionally reading an environment's
+`.data` silently detached raw Torch environments and exposed a memoryview for
+raw NumPy environments. Unwrap labeled tensors only, retain native arrays,
+and build a labeled view for Quimb ALS when needed. Eager/AOT CPU/CUDA checks
+now compare raw versus labeled environment derivatives and finite differences;
+raw NumPy fidelity checks cover Quimb, QR and normal solves. The existing
+benchmark supplies labeled environments and avoids the original detach case.
+
 Reused this active task's unchanged installed versions: Quimb
 `1.15.1.dev101+g1b64353d9`, Autoray `0.11.1.dev14+g014a3f69a`, Cotengra
 `0.8.3`, Symmray `0.4.1.dev25+gdc377f033`, Torch `2.14.1+cu126`.

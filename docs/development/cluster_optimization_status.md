@@ -28,6 +28,13 @@ Its older “working-tree” and “unpublished” statements retain their origi
 The [Torch ALS follow-up](../../history/2026-11-05-torch-cluster-als.md)
 implements guarded dense solves: three saved χ6 GPU pair
 updates improved by 1.64–1.87× with matched local errors and stopping.
+The implementation was published in Pepsy `6478f6b`; examples `a290a7c`
+select it in the existing 3×2 PEPO benchmark. A subsequent review also
+preserves gradients for raw Torch environments; its fresh checks are
+recorded in the linked handoff.
+The final follow-up selection passed **500 package tests** and **104 downstream
+benchmark tests**. This is scoped validation, separate from the earlier
+full-suite failure described below.
 It adds optional local fidelity tracking and per-pair stream RMS bookkeeping.
 Compilation is validated but did not consistently beat eager. This bounded
 replay does not establish whole-trajectory speed or convergence; see the

@@ -200,7 +200,9 @@ def _open_environment_data(environment):
     matrix rows and ket indices on columns. Keeping this convention explicit
     prevents accidental transposes when passing ``E`` to Quimb ALS.
     """
-    data = environment.data if hasattr(environment, "data") else environment
+    # Unwrap a labeled Quimb tensor only. Torch Tensor.data detaches autograd,
+    # and NumPy ndarray.data exposes a memoryview rather than the array.
+    data = environment.data if hasattr(environment, "inds") else environment
     return _native(data)
 
 
@@ -1236,7 +1238,8 @@ class ReducedEnvironmentUpdateProblem(_ReducedUpdateProblemMixin):
     consumers without running BP or rebuilding an exact exterior. Environment
     legs are ket-left, ket-right, bra-left, bra-right. ``target`` is ordered
     left-reduced, left-physical, right-physical, right-reduced. The caller owns
-    environment approximation and Hermitian/PSD projection. Physical identity
+    environment approximation and Hermitian/PSD projection. ``environment``
+    accepts a labeled Quimb tensor or a native backend array. Physical identity
     factors stay implicit when ``metric`` and ``linear_term`` are None.
     """
 
@@ -2657,7 +2660,9 @@ def _metric_to_quimb_environment(pair: ReducedBondPair, metric):
 def _quimb_environment_for_problem(problem):
     """Select the retained open environment or validate a custom metric."""
     if problem.metric is None or isinstance(problem.metric, _LazyReducedMetric):
-        return problem.environment.copy()
+        if hasattr(problem.environment, 'inds'):
+            return problem.environment.copy()
+        return _open_environment_tensor(problem.pair, _open_environment_data(problem.environment))
     return _metric_to_quimb_environment(problem.pair, _native(problem.metric))
 
 
