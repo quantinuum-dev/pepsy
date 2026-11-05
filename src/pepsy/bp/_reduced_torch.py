@@ -11,35 +11,37 @@ import math
 def _weighted_target(environment, target):
     import torch
 
-    return torch.einsum('abAB,apqb->ApqB', environment, target)
+    return torch.einsum('...abAB,...apqb->...ApqB', environment, target)
 
 
 def _left_equations(environment, weighted_target, right):
     import torch
 
     # Physical indices are multiple RHS columns, never identity-expanded.
-    gram = torch.einsum('abAB,kqb,KqB->AKak', environment, right, right.conj())
-    rhs = torch.einsum('KqB,ApqB->AKp', right.conj(), weighted_target)
-    size = rhs.shape[0] * rhs.shape[1]
-    return gram.reshape(size, size), rhs.reshape(size, -1)
+    gram = torch.einsum('...abAB,...kqb,...KqB->...AKak', environment, right, right.conj())
+    rhs = torch.einsum('...KqB,...ApqB->...AKp', right.conj(), weighted_target)
+    size = rhs.shape[-3] * rhs.shape[-2]
+    batch = rhs.shape[:-3]
+    return gram.reshape(*batch, size, size), rhs.reshape(*batch, size, -1)
 
 
 def _right_equations(environment, weighted_target, left):
     import torch
 
-    gram = torch.einsum('abAB,apk,ApK->KBkb', environment, left, left.conj())
-    rhs = torch.einsum('ApK,ApqB->KBq', left.conj(), weighted_target)
-    size = rhs.shape[0] * rhs.shape[1]
-    return gram.reshape(size, size), rhs.reshape(size, -1)
+    gram = torch.einsum('...abAB,...apk,...ApK->...KBkb', environment, left, left.conj())
+    rhs = torch.einsum('...ApK,...ApqB->...KBq', left.conj(), weighted_target)
+    size = rhs.shape[-3] * rhs.shape[-2]
+    batch = rhs.shape[:-3]
+    return gram.reshape(*batch, size, size), rhs.reshape(*batch, size, -1)
 
 
 def _objective(environment, target, left, right):
     import torch
 
-    theta = torch.einsum('apk,kqb->apqb', left, right)
+    theta = torch.einsum('...apk,...kqb->...apqb', left, right)
     delta = theta - target
-    weighted_delta = torch.einsum('abAB,apqb->ApqB', environment, delta)
-    cost = torch.sum(delta.conj() * weighted_delta).real
+    weighted_delta = torch.einsum('...abAB,...apqb->...ApqB', environment, delta)
+    cost = torch.sum(delta.conj() * weighted_delta, dim=(-4, -3, -2, -1)).real
     return cost, theta, weighted_delta
 
 

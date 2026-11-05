@@ -17,6 +17,7 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Local cluster updates | Centered six-site loop-union patch, direct SU/BP-closed reduced environment, native dense ALS and local diagonal-gauge extraction; dense PEPO upper/lower streams | [BP cluster updates](../api/bp.md#centered-six-site-gate-updates) |
 | Dense Torch cluster ALS | Opt-in certified Cholesky solves with spectral fallback, optional AOT capture, local fidelity records and per-pair stream scale bookkeeping | [Torch ALS and fidelity](../api/bp.md#dense-torch-als-and-local-fidelity) |
 | Prepared cluster replay | Dense Torch PEPO schedule/layout and Cotengra program reuse; fresh six-site contractions, rank-growth rebuilds and unchanged truncation order | [Prepared cluster replay](../api/bp.md#prepared-ordered-pepo-cluster-replay) |
+| Independent cluster batches (experimental) | `batch_size="auto"` discovers compatible ready patches with lattice/dependency/workspace limits; integer caps retain consecutive groups; per-pair stopping and ordered gauge/exponent commits | [Auto scheduling](notes/2026-11-05-auto-cluster-batches.md), [initial measurements](notes/2026-11-05-independent-cluster-batches.md) |
 | Ordered PEPO residuals | `residual_exp` constructs the connected-cluster ordered product minus identity on a square OBC/PBC lattice, with an optional post-subtraction SVD bond cap | [Ordered products](../api/operators/cluster_expansion.md#ordered-pepo-products) |
 | Native bosonic cluster MPOs | Exact Torch/JAX autodiff and sector-preserving NumPy/Torch compressed assembly within documented modes | [Native MPO scope](../api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos) |
 | Repeated cluster evaluation | Experimental compact channels; supported frontier/automaton MPO and symbolic/algebraic PEPO preparation retain separate capability and budget checks | [Compact channels](../api/operators/cluster_channels.md) |
@@ -25,6 +26,13 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Host gradient solvers | Native Torch/JAX parameters with SciPy/NLopt host control and explicit budget/result validation; NLopt supports an opt-in maximum derivative threshold separate from step tolerance | [Gradient solvers](../api/solvers/gradient.md) |
 
 ## Publication and validation
+
+The [batch commit review](../../history/2026-11-05-cluster-batch-precommit-review.md)
+adds experimental same-network cluster batching through
+`PreparedLoopClusterUpdate(batch_size="auto")` or integer consecutive caps.
+Sequential replay remains the default. The review validates read/write
+dependencies, ordered gauge merges and CPU/CUDA mixed-gate/cache-eviction
+cases; measured gains and limitations remain in the linked records above.
 
 The [prepared-replay follow-up](../../history/2026-11-05-prepared-cluster-replay.md)
 adds reusable six-site geometry and array contraction programs to the existing

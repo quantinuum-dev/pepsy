@@ -13,6 +13,9 @@ see the [BP API guide](../../api/bp.md).
 | `pne.py` | Partitioned network expansion |
 | `compression.py` | Selected-bond and loop-series compression |
 | `reduced_update.py` | Reduced local environments, ALS, and local gate/compression updates |
+| `prepared_update.py` | Prepared six-site PEPO replay, contraction programs and optional disjoint patch batches |
+| `_reduced_torch.py`, `_reduced_torch_batch.py` | Dense Torch ALS kernels and independent per-member batched solves |
+| `cluster_updates.py` | Scalar local-fidelity tracking across gate streams |
 | `gauges.py` | BP/simple-update gauge conversion |
 | `observables.py` | Boundary and path-cluster observables |
 | `_symmray.py` | Native array/charge/fermionic compatibility |

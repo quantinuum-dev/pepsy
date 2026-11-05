@@ -480,9 +480,62 @@ combined device verdict replaces separate synchronizations for each cut bond.
 Optional `torch_backend="aot_eager"` captures the shared ALS kernels. The
 prepared environment uses Cotengra's generated Torch contraction program;
 one separate AOT graph per lattice bond would churn the shared capture cache.
-The prepared route does not batch independent networks or reorder disjoint
-gates. Native symmetry, directed messages, other base clusters and added loop
+Prepared replay keeps update commits in input order and does not batch
+independent networks. Native symmetry, directed messages, other base clusters and added loop
 corrections retain the ordinary `gate_loop_cluster` route.
+
+For an experimental batch of independent updates in the same network, set
+`PreparedLoopClusterUpdate(..., batch_size="auto")` to discover ready groups,
+or choose an integer cap such as `batch_size=4`. The default `batch_size=1`
+retains sequential execution. An explicit integer groups consecutive gates
+only. Its batches require disjoint complete patches and matching environment
+programs/shapes.
+Gate endpoints alone are insufficient: another update must not change a
+spectator in the local metric. One-site gates, overlaps, incompatible shapes
+and each `apply(start=..., stop=...)` boundary end a consecutive batch.
+
+`"auto"` uses the actual lattice topology and gate read/write footprints to
+look ahead for compatible independent clusters. A later fit may cross an
+earlier action only when neither action writes a tensor read by the other.
+The selected clusters have disjoint complete patches. Independent one-site
+actions and incompatible shapes may be skipped; their dependencies still
+constrain all later candidates. Other ready groups can run while a previous
+lookahead result waits for its original commit position. Every `apply`
+boundary remains a barrier, and mutations/callbacks retain original order.
+
+Automatic width is bounded by the pair count, lattice size divided by the
+smallest scheduled patch, and a preparation cap of 16. Lookahead examines at
+most `max(64, 8 * number_of_site_tensors)` actions within the current call.
+Current operand shapes/ranks, the explicit contraction cost limits, and an
+estimated working-memory allowance reduce the width further. The estimate
+includes full-network preparation snapshots as well as local contractions
+and ALS buffers. On CUDA the allowance is at most 2 GiB and one quarter of
+currently free device memory; on CPU it is at most 512 MiB and one eighth of
+available host memory. Available memory is refreshed while groups remain
+pending. Auto falls back to individual updates when no batch fits. This is
+a bounded heuristic, not a globally optimal schedule or a memory guarantee.
+
+Eager Torch batches the environment contractions, initial SVD, ALS equations,
+guarded local solves and inter-sweep QR/LQ. Each pair keeps its own rank,
+spectral fallback and stopping decision. Pair preparation and final local SU
+gauge extraction remain sequential. Output mutations, exponent changes,
+tracker records and callbacks are committed in original order; unrelated
+gauges from earlier members survive the merge. Callbacks are observational:
+they must not modify tensors, gauges or later gates already prepared in a batch.
+Integer batching above one and `"auto"` currently require eager Torch.
+`info` reports `cluster_batches`, `batched_pair_updates`, `largest_batch`,
+`lookahead_pair_updates`, `batch_histogram` and the configured `batch_size`.
+Auto also reports `auto_batch_limit`, `auto_workspace_bytes` and the latest
+`auto_estimated_member_bytes`, so actual opportunities and chosen widths are
+inspectable. The [auto scheduling record](../development/notes/2026-11-05-auto-cluster-batches.md)
+contains correctness checks, real-stream opportunity counts and bounded timings.
+
+The contraction preflight includes the simultaneous batch workspace and total
+batch FLOPs. It estimates contraction intermediates, not total process memory;
+ALS buffers and retained results also consume memory. Larger batches can be
+slower or consume substantially more memory. The
+[bounded measurement](../development/notes/2026-11-05-independent-cluster-batches.md)
+uses synthetic disjoint patches and is separate from whole-trajectory speed.
 
 Torch reduced-state copies preserve the singular-value graph through SU
 gauges. This matters for derivatives of the returned physical operator over

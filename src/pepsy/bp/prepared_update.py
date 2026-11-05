@@ -28,6 +28,9 @@ class _EnvironmentProgram:
         tree, self.cost, _ = plans.plan_for(network, output_inds=output, optimize=optimize)
         enforce_cost_budget(ContractionCost(**self.cost), label='prepared loop-cluster region', **budget)
         tensors = network.tensors
+        labels = {}
+        inputs = tuple(tuple(labels.setdefault(ix, len(labels)) for ix in t.inds) for t in tensors)
+        self.structure = inputs, tuple(labels[ix] for ix in output)
         self.boundary = boundary
         self.plan_key = plans._topology_key(network, output, optimize)
         self.shapes = tuple(t.shape for t in tensors)
@@ -35,7 +38,7 @@ class _EnvironmentProgram:
             [t.inds for t in tensors], output, shapes=self.shapes,
             optimize=tree, cache=False), backend='torch')
 
-    def contract(self, pair, spectators):
+    def operands(self, pair, spectators):
         import torch
 
         ket = [pair.q_left.data, pair.q_right.data]
@@ -60,7 +63,10 @@ class _EnvironmentProgram:
         # Cotengra's generated program already binds the contraction order.
         # Keep optional AOT on the shared ALS kernels: capturing a separate
         # environment graph for every bond would churn its bounded chart cache.
-        return self.function(*arrays)
+        return arrays
+
+    def contract(self, pair, spectators):
+        return self.function(*self.operands(pair, spectators))
 
 
 class PreparedLoopClusterUpdate:
@@ -75,17 +81,25 @@ class PreparedLoopClusterUpdate:
     Each call reads current cores and gauges. Bond growth makes a new bounded
     contraction program; it never pads ranks or reuses an old environment.
     ALS, its conditioning checks and final gauge extraction use the existing
-    reduced-update routines. No gate fusion or reordering is performed.
+    reduced-update routines. Gate/truncation dependencies and commit order
+    are preserved, with no gate fusion.
 
     This first prepared path supports the direct six-site loop-union patch
     with SU boundary gauges, dense complex Torch qubit PEPOs and Torch ALS.
     Other cluster/message/backend routes retain ``gate_loop_cluster``.
+
+    ``batch_size>1`` opts into eager batches of consecutive shape-compatible,
+    disjoint patches. Environment contraction and ALS use batch kernels;
+    preparation and final local gauge extraction remain sequential. Individual
+    stopping decisions, original callback order and apply boundaries are kept.
+    ``batch_size='auto'`` discovers independent ready patches with bounded
+    lookahead and sizes their batches from topology, shapes and workspace.
     """
 
     def __init__(self, network, schedule, *, max_bond=6, max_iterations=10,
                  tol=1e-8, psd_project=False, torch_backend=None, optimize=None,
                  max_peak_memory_log2=None, max_flops_log10=None,
-                 max_programs=512):
+                 max_programs=512, batch_size=1):
         import torch
         import quimb.tensor as qtn
         from ._compression_utils import ContractionPlanCache, validate_cost_options
@@ -96,12 +110,18 @@ class PreparedLoopClusterUpdate:
                             ('max_programs', max_programs)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f'{name} must be a positive integer')
+        automatic = isinstance(batch_size, str) and batch_size == 'auto'
+        if not automatic and (isinstance(batch_size, bool)
+                              or not isinstance(batch_size, int) or batch_size < 1):
+            raise ValueError("batch_size must be a positive integer or 'auto'")
         if not math.isfinite(tol) or tol < 0:
             raise ValueError('tol must be finite and nonnegative')
         if not isinstance(psd_project, bool):
             raise TypeError('psd_project must be a bool')
         if torch_backend not in {None, 'aot_eager'}:
             raise ValueError('torch_backend must be None or aot_eager')
+        if batch_size != 1 and torch_backend is not None:
+            raise ValueError('independent cluster batches currently require eager Torch')
         prototype = network.tensors[0].data
         if (not hasattr(network, 'upper_ind') or not hasattr(network, 'lower_ind')
                 or not isinstance(prototype, torch.Tensor)
@@ -146,11 +166,27 @@ class PreparedLoopClusterUpdate:
         self.budget = dict(max_flops_log10=max_flops_log10,
                            max_peak_memory_log2=max_peak_memory_log2, on_budget=on_budget)
         self.max_programs = max_programs
+        self.batch_size = batch_size
         self.plan_cache = ContractionPlanCache()
         self._geometry = {}
+        self._batch_regions = {}
+        self._auto_batch_limit = None
+        self._auto_workspace_bytes = None
+        self._auto_member_bytes = None
+        self._batch_histogram = {}
+        if automatic:
+            sizes = [len(self._region_for(network, slot)) for slot in self.slots
+                     if len(slot.sites) == 2]
+            # Bound preparation copies as well as geometric parallelism. Actual
+            # widths are chosen later from ready gates, ranks and workspace.
+            self._auto_batch_limit = (min(16, len(sizes), len(network.tensor_map)//min(sizes))
+                                      if sizes else 1)
+            self._auto_lookahead = max(64, 8*len(network.tensor_map))
         self._programs = OrderedDict()
         self._counts = dict(applications=0, pair_updates=0, one_site_updates=0,
-                            program_hits=0, program_misses=0, program_evictions=0)
+                            program_hits=0, program_misses=0, program_evictions=0,
+                            cluster_batches=0, batched_pair_updates=0, largest_batch=0,
+                            lookahead_pair_updates=0)
 
     @staticmethod
     def _signature(network):
@@ -174,15 +210,90 @@ class PreparedLoopClusterUpdate:
     def info(self):
         """Scalar execution/cache counts; no tensor data or environments."""
         return dict(**self._counts, geometry_plans=len(self._geometry),
-                    contraction_programs=len(self._programs), ordering='input; no fusion or reordering')
+                    contraction_programs=len(self._programs), batch_size=self.batch_size,
+                    auto_batch_limit=self._auto_batch_limit,
+                    auto_workspace_bytes=self._auto_workspace_bytes,
+                    auto_estimated_member_bytes=self._auto_member_bytes,
+                    batch_histogram=dict(self._batch_histogram),
+                    ordering=('input commits; dependency-ready preparation' if self.batch_size == 'auto'
+                              else 'input; no fusion or reordering'))
 
-    def _problem(self, pair, gate, which):
-        from .reduced_update import (
-            LoopClusterReducedUpdateProblem, LoopClusterTerm, _LazyReducedMetric,
-            _hermitian_open_environment, _metric_views, _open_environment_tensor,
-            _psd_project_open_environment, _reduced_gate_target,
-        )
+    def _region_for(self, work, slot):
+        """Topology-only read footprint; one-site actions read/write one tensor."""
+        if len(slot.sites) == 1:
+            return frozenset(slot.tids)
+        if slot.sites not in self._batch_regions:
+            patch = work.select_local(
+                tuple(work.site_tag(s) for s in slot.sites), which='any',
+                max_distance=4, mode='loopunion', fillin=1, grow_from='all', virtual=True)
+            self._batch_regions[slot.sites] = frozenset(patch.tensor_map)
+        return self._batch_regions[slot.sites]
 
+    def _available_batch_memory(self):
+        """Reserve a conservative fraction of currently available host/device RAM."""
+        if self.device.type == 'cuda':
+            import torch
+
+            free, _ = torch.cuda.mem_get_info(self.device)
+            return min(2*1024**3, free//4)
+        import os
+
+        try:
+            available = os.sysconf('SC_AVPHYS_PAGES')*os.sysconf('SC_PAGE_SIZE')
+        except (AttributeError, OSError, ValueError):
+            available = 4*1024**3
+        return min(512*1024**2, available//8)
+
+    def _auto_capacity(self, program, pair):
+        """Shrink automatic groups to explicit costs and estimated ALS workspace."""
+        # Lookahead can leave earlier fits pending while another ready group
+        # runs. Refresh available memory instead of reusing the apply-start
+        # allowance after those pending snapshots have consumed workspace.
+        self._auto_workspace_bytes = min(self._auto_workspace_bytes, self._available_batch_memory())
+        a, p, q, b = pair.theta_shape
+        rank = min(self.max_bond, a*p, q*b)
+        # In addition to Cotengra intermediates, allow for environment/target
+        # stacks and both normal equations, factors and inverse certificates.
+        # Preparation currently gauge-inserts a PRIVATE FULL NETWORK, not just
+        # the patch. Its live arrays scale with lattice size; counting only the
+        # local contraction would badly underestimate large-lattice batches.
+        snapshot = sum(math.prod(t.shape) for t in pair.tn.tensors)
+        snapshot_factor = 6 if any(t.data.requires_grad for t in pair.tn.tensors) else 2
+        elements = (snapshot_factor*snapshot + 2**program.cost['peak_memory_log2'] + 4*(a*b)**2
+                    + 8*a*p*q*b + 6*((a*rank)**2+(b*rank)**2)
+                    + sum(math.prod(shape) for shape in program.shapes))
+        per_member = elements*pair.q_left.data.element_size()
+        self._auto_member_bytes = math.ceil(per_member)
+        for width in range(self._auto_batch_limit, 1, -1):
+            if width*per_member > self._auto_workspace_bytes:
+                continue
+            peak = self.budget['max_peak_memory_log2']
+            flops = self.budget['max_flops_log10']
+            if peak is not None and program.cost['peak_memory_log2']+math.log2(width) > peak:
+                continue
+            if flops is not None and program.cost['flops_log10']+math.log10(width) > flops:
+                continue
+            return width
+        return 1
+
+    def _has_ready_peer(self, work, index, end, automatic, excluded):
+        """Reject serial-only windows before building a numerical pair copy."""
+        first = self._region_for(work, self.slots[index])
+        reads, writes = set(), set()
+        for k in range(index+1, end):
+            slot = self.slots[k]
+            region = self._region_for(work, slot)
+            active = set(slot.tids)
+            if (k not in excluded and len(slot.sites) == 2 and not first & region
+                    and not reads & active and not writes & region):
+                return True
+            if not automatic:
+                return False
+            reads.update(region)
+            writes.update(active)
+        return False
+
+    def _program_for(self, pair):
         if pair.where not in self._geometry:
             spectators = pair._cluster_tids(4, mode='loopunion', fillin=True)
             self._geometry[pair.where] = spectators, pair.full_cluster_radius()
@@ -202,9 +313,20 @@ class PreparedLoopClusterUpdate:
         else:
             self._counts['program_hits'] += 1
             self._programs.move_to_end(key)
-        program = self._programs[key]
+        return self._programs[key], spectators, radius
+
+    def _problem(self, pair, gate, which, *, prepared=None, data=None):
+        from .reduced_update import (
+            LoopClusterReducedUpdateProblem, LoopClusterTerm, _LazyReducedMetric,
+            _hermitian_open_environment, _metric_views, _open_environment_tensor,
+            _psd_project_open_environment, _reduced_gate_target,
+        )
+
+        program, spectators, radius = self._program_for(pair) if prepared is None else prepared
+        if data is None:
+            data = program.contract(pair, spectators)
         raw = _hermitian_open_environment(pair, _open_environment_tensor(
-            pair, program.contract(pair, spectators)))
+            pair, data))
         environment, minimum, clipped = (
             _psd_project_open_environment(pair, raw, 0.) if self.psd_project else (raw, None, 0))
         target = _reduced_gate_target(pair, gate, which)
@@ -218,6 +340,84 @@ class PreparedLoopClusterUpdate:
             psd_projected=self.psd_project, raw_min_eigenvalue=minimum,
             clipped_eigenvalues=clipped, contraction_costs=(program.cost,),
             contraction_cost=program.cost, cluster_mode='loopunion', fillin=True, which=which)
+
+    def _batch(self, work, gates, gauges, index, stop, measure_fidelity, *, excluded=frozenset()):
+        """Fit independent patches; publish all mutations in original input order."""
+        import torch
+        from ._compression_utils import ContractionCost, enforce_cost_budget
+        from .reduced_update import prepare_reduced_bond_pair
+        from ._reduced_torch_batch import solve
+
+        automatic = self.batch_size == 'auto'
+        limit = self._auto_batch_limit if automatic else self.batch_size
+        if limit < 2:
+            return ()
+        end = min(stop, index+(self._auto_lookahead if automatic else limit))
+        if not self._has_ready_peer(work, index, end, automatic, excluded):
+            return ()
+        selected, occupied, signature = [], set(), None
+        skipped_reads, skipped_writes = set(), set()
+        for k in range(index, end):
+            slot = self.slots[k]
+            region = self._region_for(work, slot)
+            writes = set(slot.tids)
+            # Whole patches, including the active factors, must be disjoint.
+            # Disjoint gate endpoints alone do not make their metrics independent.
+            # A looked-ahead fit must also commute with EVERY skipped action:
+            # neither its writes nor its metric may cross a preceding dependency.
+            blocked = (k in excluded or len(slot.sites) != 2 or occupied & region
+                       or skipped_reads & writes or skipped_writes & region)
+            if blocked:
+                if not automatic:
+                    break
+                skipped_reads.update(region)
+                skipped_writes.update(writes)
+                continue
+            pair = prepare_reduced_bond_pair(work, gauges, where=slot.sites,
+                                             input_mode='su_core', run_bp=False)
+            prepared = self._program_for(pair)
+            program, tids, _ = prepared
+            key = program.structure, program.shapes, pair.theta_shape
+            if signature is not None and key != signature:
+                if not automatic:
+                    break
+                skipped_reads.update(region)
+                skipped_writes.update(writes)
+                continue
+            if not selected and automatic:
+                limit = self._auto_capacity(program, pair)
+                if limit < 2:
+                    return ()
+            signature = key
+            selected.append((k, pair, prepared))
+            occupied.update(region)
+            if len(selected) == limit:
+                break
+        if len(selected) < 2:
+            return ()
+        # The user budget also bounds the simultaneous environment workspace.
+        cost = selected[0][2][0].cost
+        enforce_cost_budget(ContractionCost(
+            flops_log10=cost['flops_log10']+math.log10(len(selected)),
+            peak_memory_log2=cost['peak_memory_log2']+math.log2(len(selected))),
+            label='independent cluster batch', **self.budget)
+        operands = [program.operands(pair, tids) for _, pair, (program, tids, _) in selected]
+        stacks = tuple(torch.stack(xs) for xs in zip(*operands))
+        data = torch.vmap(selected[0][2][0].function)(*stacks)
+        problems = [self._problem(pair, gates[k], self.slots[k].which,
+                                  prepared=prepared, data=data[n])
+                    for n, (k, pair, prepared) in enumerate(selected)]
+        solutions = solve(problems, max_bond=self.max_bond,
+                          max_iterations=self.max_iterations, tol=self.tol,
+                          measure_fidelity=measure_fidelity)
+        self._counts['cluster_batches'] += 1
+        self._counts['batched_pair_updates'] += len(selected)
+        self._counts['largest_batch'] = max(self._counts['largest_batch'], len(selected))
+        self._counts['lookahead_pair_updates'] += sum(k != index+n
+                                                     for n, (k, _, _) in enumerate(selected))
+        self._batch_histogram[len(selected)] = self._batch_histogram.get(len(selected), 0)+1
+        return tuple((k, pair, problem, solution)
+                     for (k, pair, _), problem, solution in zip(selected, problems, solutions))
 
     def apply(self, network, gates, *, gauges, start=0, stop=None, tracker=None,
               step_callback=None, inplace=True, return_results=False):
@@ -267,6 +467,9 @@ class PreparedLoopClusterUpdate:
         work = network if inplace else network.copy()
         results = []
         self._counts['applications'] += 1
+        if self.batch_size == 'auto':
+            self._auto_workspace_bytes = self._available_batch_memory()
+        pending = {}
         for index in range(start, stop):
             slot, gate = self.slots[index], gates[index]
             result = None
@@ -277,15 +480,24 @@ class PreparedLoopClusterUpdate:
                 tensor.modify(data=data.permute(slot.output_permutation))
                 self._counts['one_site_updates'] += 1
             else:
-                pair = prepare_reduced_bond_pair(work, gauges, where=slot.sites,
-                                                 input_mode='su_core', run_bp=False)
-                problem = self._problem(pair, gate, slot.which)
+                if self.batch_size != 1 and index not in pending:
+                    pending.update({k: (pair, problem, solution) for k, pair, problem, solution in
+                        self._batch(work, gates, gauges, index, stop, tracker is not None,
+                                    excluded=frozenset(pending))})
+                solution = None
+                if index in pending:
+                    pair, problem, solution = pending.pop(index)
+                else:
+                    pair = prepare_reduced_bond_pair(work, gauges, where=slot.sites,
+                                                     input_mode='su_core', run_bp=False)
+                    problem = self._problem(pair, gate, slot.which)
                 result = _finish_reduced_gate(
                     work, gauges, pair, problem, max_bond=self.max_bond,
                     als_opts=dict(solver='torch', max_iterations=self.max_iterations,
                                   tol=self.tol, monitor_convergence=True,
                                   measure_fidelity=tracker is not None, torch_backend=self.torch_backend),
-                    regauge_opts={}, inplace=True, result_type=ReducedLoopClusterGateResult)
+                    regauge_opts={}, inplace=True, result_type=ReducedLoopClusterGateResult,
+                    solution=solution)
                 renorm_gauge(work, gauges, slot.sites, smudge=0.)
                 if tracker is not None:
                     tracker.record(result)

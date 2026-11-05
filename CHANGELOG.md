@@ -8,6 +8,15 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Independent cluster batches (experimental):** opt into
+  `PreparedLoopClusterUpdate(..., batch_size="auto")` to discover compatible
+  disjoint ready clusters from gate/lattice dependencies and current workspace;
+  integer caps retain consecutive grouping. Batch patch contractions and Torch
+  ALS while preserving per-pair conditioning,
+  rank, stopping, gauges, exponent bookkeeping and source barriers; sequential
+  replay remains the default. Preparation and final gauge extraction remain
+  sequential, and AOT is unsupported with this option.
+
 - **Prepared cluster replay:** `pepsy.bp.PreparedLoopClusterUpdate` binds
   dense Torch PEPO gate layouts and six-site Cotengra contraction programs,
   with fresh tensor/gauge values, bounded caches and rank-growth rebuilds.

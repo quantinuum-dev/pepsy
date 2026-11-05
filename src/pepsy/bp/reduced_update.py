@@ -3579,6 +3579,7 @@ def _local_svd_reduced_state(
     solution,
     *,
     inplace,
+    output_gauges=None,
 ):
     """Extract the active SU gauge in its full exterior-weighted metric."""
     import quimb.tensor as qtn
@@ -3618,8 +3619,14 @@ def _local_svd_reduced_state(
     left = _reordered(q_left @ u, left.inds)
     right = _reordered(v @ q_right, right.inds)
     singular_values = s.data
+    # Independent fits may share a preparation snapshot. Merge against the
+    # current output gauges so a preceding commit's unrelated bond survives.
+    output_gauges = (gauges if output_gauges is None else {
+        ix: _cast_like(value, gauges[ix]) if ix in gauges else value
+        for ix, value in output_gauges.items()
+    })
     updated_gauges = {
-        index: _copy_array(gauges[index]) if index in gauges
+        index: _copy_array(output_gauges[index]) if index in output_gauges
         else _identity_bond_gauge(tn, index)
         for index in tn.inner_inds() if index != pair.bond_ind
     }
@@ -3682,12 +3689,16 @@ def _finish_reduced_gate(
     regauge_opts,
     inplace,
     result_type,
+    solution=None,
 ):
     """Solve and extract the active SU gauge without a global gauge sweep."""
     _validate_local_regauge_opts(regauge_opts)
-    solution = solve_reduced_als(problem, max_bond=max_bond, **als_opts)
+    precomputed = solution is not None
+    if solution is None:
+        solution = solve_reduced_als(problem, max_bond=max_bond, **als_opts)
     core, updated_gauges, physical_tn, su_info, reused = _local_svd_reduced_state(
         tn, pair, solution, inplace=inplace,
+        output_gauges=gauges if precomputed and pair.input_mode == 'su_core' else None,
     )
     if inplace and hasattr(gauges, "clear"):
         gauges.clear()
