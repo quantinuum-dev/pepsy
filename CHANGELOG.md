@@ -8,6 +8,18 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Dense Torch cluster ALS:** opt into `solver="torch"` for batched physical
+  RHS contractions and certified Cholesky solves with the reference spectral
+  fallback. Optional `torch_backend="aot_eager"` captures array contractions
+  and backward, with separate charts for autocast state/dtype; eager remains
+  the default. Preserve QR/LQ and stopping policy.
+- **Local cluster diagnostics:** optional normalized complex-overlap fidelity
+  on reduced ALS results and `pepsy.bp.LoopClusterUpdateTracker` for scalar
+  records across streams. Products of local fidelities are heuristic, not
+  global fidelity. `gate_loop_cluster(strip_exponent=True)` performs
+  amplitude-preserving per-pair RMS bookkeeping; unused full result snapshots
+  are no longer retained across the stream.
+
 - **Local SU gauge correction:** include full exterior SU weights in the
   endpoint QR/LQ and small-core SVD. Bare reduced-factor spectra preserved
   states but produced incorrect boundary gauges for later updates. Add

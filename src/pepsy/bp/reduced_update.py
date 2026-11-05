@@ -11,7 +11,8 @@ solve before constructing the local environment.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import math
 from typing import Any, TypeAlias
 import warnings
 
@@ -1393,6 +1394,10 @@ class ReducedALSSolution:
     iterations: int | None = None
     converged: bool | None = None
     termination_reason: str | None = None
+    local_fidelity: float | None = None
+    local_infidelity: float | None = None
+    fidelity_status: str = 'not_requested'
+    solver_report: dict[str, Any] = field(default_factory=dict)
 
     def theta(self):
         """Return the optimized joint reduced tensor."""
@@ -3180,6 +3185,43 @@ def _reduced_als_stop(previous, current, target_norm, tol):
     return None
 
 
+def _validated_local_fidelity(norm, target_norm, overlap_abs, eps):
+    """Validate the local metric without hiding indefinite/zero norms."""
+    if not all(math.isfinite(x) for x in (norm, target_norm, overlap_abs)):
+        return None, 'nonfinite_metric'
+    if norm <= 0 or target_norm <= 0:
+        return None, 'nonpositive_norm'
+    # Avoid overflow/underflow in norm*target_norm and abs(overlap)**2.
+    ratio = overlap_abs / math.sqrt(norm) / math.sqrt(target_norm)
+    fidelity = ratio * ratio
+    if not math.isfinite(fidelity) or fidelity > 1 + 256*eps:
+        return None, 'unphysical_metric'
+    return min(1., fidelity), 'valid'
+
+
+def _with_local_fidelity(problem, solution, enabled):
+    """Measure a phase-invariant fidelity in the same retained environment."""
+    if not enabled:
+        return solution
+    theta = solution.theta()
+    if problem.metric is None or isinstance(problem.metric, _LazyReducedMetric):
+        norm = _open_environment_quadratic(problem.pair, problem.environment, theta)
+        applied = _open_environment_apply(problem.pair, problem.environment, problem.target)
+        overlap = _einsum('ApqB,ApqB->', _conj(theta), applied)
+    else:
+        vector = _reshape(theta, (-1,))
+        metric = _native(problem.metric)
+        norm = _scalar_float(_real(_einsum('i,ij,j->', _conj(vector), metric, vector)))
+        overlap = _einsum('i,ij,j->', _conj(vector), metric, _reshape(problem.target, (-1,)))
+    eps = np.finfo(np.float32 if ar.get_dtype_name(theta) in {'float32', 'complex64'} else np.float64).eps
+    fidelity, status = _validated_local_fidelity(
+        norm, problem.target_norm, _scalar_float(_backend_abs(overlap)), eps,
+    )
+    return replace(solution, local_fidelity=fidelity,
+                   local_infidelity=None if fidelity is None else 1-fidelity,
+                   fidelity_status=status)
+
+
 def solve_reduced_als(
     problem: ReducedUpdateProblem,
     *,
@@ -3193,6 +3235,8 @@ def solve_reduced_als(
     autodiff_opts: dict[str, Any] | None = None,
     monitor_convergence: bool = False,
     initial_factors: tuple[Any, Any] | None = None,
+    measure_fidelity: bool = False,
+    torch_backend: str | None = None,
 ) -> ReducedALSSolution:
     """Solve a reduced two-site projection by alternating least squares.
 
@@ -3219,6 +3263,22 @@ def solve_reduced_als(
     of the target SVD. Its shapes are ``(left_dim, physical_left, rank)`` and
     ``(rank, physical_right, right_dim)``. The fit retains that rank, at most
     ``max_bond``. Native symmetry and autodiff routes require the default SVD.
+
+    ``solver="torch"`` opts into dense Torch contractions with physical
+    indices batched as RHS columns and guarded Cholesky local solves. An
+    uncertified matrix retains the reference relative spectral floor via
+    eigendecomposition. QR/LQ balancing and complete-sweep stopping remain.
+    ``torch_backend="aot_eager"`` optionally compiles the contraction kernels;
+    the default ``None`` is eager. Capture uses Torch's version-sensitive
+    AOT interface, as does prepared simple update.
+    Conditioning, rank decisions and stopping run outside the compiled graphs.
+    This path requires the retained open environment without dense overrides
+    and does not accept regularization or other solver-specific options.
+
+    ``measure_fidelity=True`` records normalized squared complex overlap in
+    the same local environment, plus its infidelity and validation status.
+    Nonfinite, nonpositive or unphysical metrics give ``None``. This is a
+    local approximation diagnostic, not global state/operator fidelity.
     """
     if not isinstance(max_iterations, int) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
@@ -3228,6 +3288,11 @@ def solve_reduced_als(
         raise ValueError("tol must be finite and nonnegative")
     if not isinstance(monitor_convergence, bool):
         raise TypeError('monitor_convergence must be a bool')
+    _require_bool('measure_fidelity', measure_fidelity)
+    if torch_backend not in {None, 'aot_eager'}:
+        raise ValueError('torch_backend must be None or aot_eager')
+    if torch_backend is not None and solver != 'torch':
+        raise ValueError("torch_backend requires solver='torch'")
     if not np.isfinite(regularization) or regularization < 0.0:
         raise ValueError("regularization must be finite and nonnegative")
     if not isinstance(solver, str) or solver not in {
@@ -3236,9 +3301,10 @@ def solve_reduced_als(
         "normal",
         "qr",
         "quimb",
+        "torch",
     }:
         raise ValueError(
-            "solver must be 'auto', 'autodiff', 'normal', 'qr', or 'quimb'"
+            "solver must be 'auto', 'autodiff', 'normal', 'qr', 'quimb', or 'torch'"
         )
 
     left_dim, physical_left, physical_right, right_dim = problem.shape
@@ -3267,7 +3333,7 @@ def solve_reduced_als(
         max_bond = rank
 
     if monitor_convergence and (is_symmray_array(problem.target) or solver == 'autodiff'):
-        raise ValueError('monitor_convergence is supported only for dense Quimb/QR/normal ALS')
+        raise ValueError('monitor_convergence is supported only for dense Quimb/Torch/QR/normal ALS')
 
     if is_symmray_array(problem.target):
         if regularization:
@@ -3275,11 +3341,25 @@ def solve_reduced_als(
                 "regularization is not yet available for native Symmray "
                 "reduced compression"
             )
-        return _solve_reduced_als_symmray(
+        solution = _solve_reduced_als_symmray(
             problem,
             max_bond=max_bond,
             solver=solver,
         )
+        return _with_local_fidelity(problem, solution, measure_fidelity)
+
+    if solver == 'torch':
+        if regularization or quimb_opts or autodiff_opts:
+            raise ValueError("solver='torch' does not accept regularization, quimb_opts or autodiff_opts")
+        if (problem.metric is not None and not isinstance(problem.metric, _LazyReducedMetric)
+                or problem.linear_term is not None and not isinstance(problem.linear_term, _LazyReducedVector)):
+            raise ValueError("solver='torch' requires the retained open environment without dense overrides")
+        from ._reduced_torch import solve
+
+        return solve(problem, max_bond=max_bond, max_iterations=max_iterations,
+                     tol=tol, rcond=rcond, monitor_convergence=monitor_convergence,
+                     initial_factors=initial_factors, torch_backend=torch_backend,
+                     measure_fidelity=measure_fidelity)
 
     # Native Quimb ALS is the stable default because it contracts the open
     # environment directly. Regularization, explicit autodiff, and indefinite
@@ -3295,7 +3375,7 @@ def solve_reduced_als(
                 "solver='qr' or solver='auto' with regularization=0"
             )
         try:
-            return _solve_reduced_als_quimb(
+            solution = _solve_reduced_als_quimb(
                 problem,
                 max_bond=max_bond,
                 max_iterations=max_iterations,
@@ -3305,19 +3385,21 @@ def solve_reduced_als(
                 monitor_convergence=monitor_convergence,
                 initial_factors=initial_factors,
             )
+            return _with_local_fidelity(problem, solution, measure_fidelity)
         except ValueError:
             if requested_solver != "auto":
                 raise
             solver = "qr"
 
     if solver == "autodiff":
-        return _solve_reduced_als_autodiff(
+        solution = _solve_reduced_als_autodiff(
             problem,
             max_bond=max_bond,
             max_iterations=max_iterations,
             tol=tol,
             autodiff_opts=autodiff_opts,
         )
+        return _with_local_fidelity(problem, solution, measure_fidelity)
 
     left, right = (_svd_initial_factors(problem.target, max_bond)
                    if initial_factors is None else tuple(map(_copy_array, initial_factors)))
@@ -3417,11 +3499,12 @@ def solve_reduced_als(
         elif abs(costs[-2] - current_cost) <= tol * max(1.0, costs[-2]):
             break
 
-    return ReducedALSSolution(left=left, right=right, costs=tuple(costs),
+    solution = ReducedALSSolution(left=left, right=right, costs=tuple(costs),
                               solver='qr' if use_qr else 'normal',
                               iterations=iteration if monitor_convergence else None,
                               converged=converged if monitor_convergence else None,
                               termination_reason=(reason or 'max_iterations') if monitor_convergence else None)
+    return _with_local_fidelity(problem, solution, measure_fidelity)
 
 
 def _identity_bond_gauge(tn, index):

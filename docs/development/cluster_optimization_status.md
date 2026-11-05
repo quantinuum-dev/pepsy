@@ -15,6 +15,7 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Interaction clusters | Shared graph inventories, ordered product adapters, structural reuse and explicit construction budgets | [Interaction clusters](../api/operators/interaction_clusters.md) |
 | Constructed PEPO traces | `trace_exp` traces the selected PEPO with its caps/compression; `partition_trace_exp` names the separate scalar shortcut | [Trace contract](../api/operators/cluster_expansion.md#trace-of-the-constructed-pepo) |
 | Local cluster updates | Centered six-site loop-union patch, direct SU/BP-closed reduced environment, native dense ALS and local diagonal-gauge extraction; dense PEPO upper/lower streams | [BP cluster updates](../api/bp.md#centered-six-site-gate-updates) |
+| Dense Torch cluster ALS | Opt-in certified Cholesky solves with spectral fallback, optional AOT capture, local fidelity records and per-pair stream scale bookkeeping | [Torch ALS and fidelity](../api/bp.md#dense-torch-als-and-local-fidelity) |
 | Ordered PEPO residuals | `residual_exp` constructs the connected-cluster ordered product minus identity on a square OBC/PBC lattice, with an optional post-subtraction SVD bond cap | [Ordered products](../api/operators/cluster_expansion.md#ordered-pepo-products) |
 | Native bosonic cluster MPOs | Exact Torch/JAX autodiff and sector-preserving NumPy/Torch compressed assembly within documented modes | [Native MPO scope](../api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos) |
 | Repeated cluster evaluation | Experimental compact channels; supported frontier/automaton MPO and symbolic/algebraic PEPO preparation retain separate capability and budget checks | [Compact channels](../api/operators/cluster_channels.md) |
@@ -23,6 +24,22 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Host gradient solvers | Native Torch/JAX parameters with SciPy/NLopt host control and explicit budget/result validation; NLopt supports an opt-in maximum derivative threshold separate from step tolerance | [Gradient solvers](../api/solvers/gradient.md) |
 
 ## Publication and validation
+
+The [Torch ALS follow-up](../../history/2026-11-05-torch-cluster-als.md)
+implements guarded dense solves: three saved χ6 GPU pair
+updates improved by 1.64–1.87× with matched local errors and stopping.
+It adds optional local fidelity tracking and per-pair stream RMS bookkeeping.
+Compilation is validated but did not consistently beat eager. This bounded
+replay does not establish whole-trajectory speed or convergence; see the
+[measurement record](notes/2026-11-05-torch-cluster-als.md).
+The affected BP, API/layout and PEPS/PEPO full-update selection passed
+**480 tests**, including CUDA. Full-suite fail-fast still stops at the
+previously reproduced native fermionic exact-readout failure; the handoff
+records that scope separately.
+The second review fixed an AOT cache omission for autocast state/dtype;
+**240 focused tests** then passed, including CUDA backward checks and
+rectangular real/complex layouts. This is a later scoped check, separate
+from the earlier 480-test integration selection.
 
 The [local-cluster implementation audit](../../history/2026-11-05-loop-cluster-audit.md)
 corrects half-weighted active-gauge extraction and order-insensitive tree

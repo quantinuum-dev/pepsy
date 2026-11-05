@@ -140,8 +140,8 @@ or clipping the environment spectrum; `raw_min_eigenvalue` is then `None`.
 Torch/CuPy local solves remain in their backend even above Quimb's
 automatic dense-solve threshold. No physical-identity-expanded metric is
 materialized by the default Quimb route.
-Long-running drivers should use public `pepsy.operators.renorm_gauge`
-after each pair update, as the SU driver does. It moves the positive gauge
+Long-running streams should set `strip_exponent=True` (or call public
+`pepsy.operators.renorm_gauge` manually after each pair). It moves the positive gauge
 RMS scale into `tn.exponent`, preserving the represented amplitude while
 preventing scalar gauge magnitudes from overflowing local contractions.
 Dense Torch gate streams retain their tensor/gauge devices. A November 5
@@ -260,7 +260,7 @@ The returned loop problem records the choice as
 objective separately if a Hessian-level justification is required.
 
 The solver options accept `solver="auto"` (the default), `solver="quimb"`,
-`solver="autodiff"`, `solver="qr"`, or `solver="normal"`, plus a relative
+`solver="torch"`, `solver="autodiff"`, `solver="qr"`, or `solver="normal"`, plus a relative
 `regularization` value. The autodiff route uses Quimb's public autodiff
 fitter after factorizing the reduced open environment, so it retains the same
 weighted objective without converting tensors to NumPy.
@@ -278,7 +278,73 @@ block-sparse through the graded SVD adapter; use `solver="auto"` or
 `solver="quimb"` there. Dense QR/autodiff refinement is intentionally not
 available for native arrays because it would flatten charge sectors.
 
-For dense Quimb, QR, and normal ALS, `monitor_convergence=True` opts into
+### Dense Torch ALS and local fidelity
+
+For dense Torch PEPS/PEPOs, opt into `als_opts={"solver": "torch"}`.
+This contracts the open environment directly, batches physical indices as
+multiple RHS columns, and avoids rebuilding tensor networks for each sweep.
+Local Cholesky solves run only with a conservative certificate that the
+reference relative eigenvalue floor is inactive and a small solve residual.
+Other matrices use the reference Hermitian eigensolve and relative clipping.
+QR/LQ balancing, rank, tolerance and complete-sweep stopping are retained.
+`solution.solver_report` counts Cholesky and spectral solves. This path requires
+the retained open environment; explicit dense metric/linear overrides,
+regularization and other solver-specific options are rejected.
+The default `solver="auto"` still selects Quimb.
+
+`torch_backend="aot_eager"` inside `als_opts` optionally captures contraction
+kernels and their backward, using the same version-sensitive Torch AOT
+interface as prepared simple update. Shapes/devices/gradient/autocast signatures have
+separate bounded cached charts. Rank selection, conditioning checks, QR/LQ,
+stopping and environment construction stay outside capture. Inductor is
+unsupported. Use `torch_backend=None` for eager execution; compilation has
+startup costs and does not guarantee a speedup for sequential cluster ALS.
+
+`measure_fidelity=True` adds these `ReducedALSSolution` fields:
+`local_fidelity`, `local_infidelity`, and `fidelity_status`. With the selected
+local environment $N$ and fitted/target reduced tensors $x,t$,
+
+$$
+{\color{blue} F_{\rm local}} =
+\frac{|\langle x|N|t\rangle|^2}
+{\langle x|N|x\rangle\langle t|N|t\rangle},
+\qquad I_{\rm local}=1-F_{\rm local}.
+$$
+
+This preserves complex overlap and removes overall phase and amplitude.
+Nonfinite/nonpositive norms or a fidelity outside its physical range return
+`None` with an explanatory status; only roundoff above one is clipped.
+Torch ALS reuses the weighted target and final weighted residual, adding
+scalar inner products and host scalar transfers. Other solvers evaluate the
+needed local contractions when requested. No global readout is performed.
+Fidelity is disabled by default.
+
+For scalar tracking across gate-stream chunks:
+
+```python
+from pepsy.bp import LoopClusterUpdateTracker
+from pepsy.operators import gate_loop_cluster
+
+tracker = LoopClusterUpdateTracker()  # keep_records=False for totals only
+core = gate_loop_cluster(
+    core, gates, gauges=gauges, max_bond=6,
+    cluster_mode="loopunion", base_radius=4, fillin=True, max_loop_size=0,
+    psd_project=False, strip_exponent=True, tracker=tracker,
+    als_opts={"solver": "torch", "max_iterations": 10, "tol": 1e-8,
+              "monitor_convergence": True, "torch_backend": None},
+)
+rows = tracker.records
+totals = tracker.summary()
+```
+
+A tracker enables fidelity measurement unless explicitly disabled in
+`als_opts`. It records one row per two-site fit, retains no tensor networks
+or device arrays, and can be reused across chunks; `reset()` starts a new
+trajectory. One-site gates have no truncation record. The accumulated product
+$\prod_j F_{{\rm local},j}$ is a heuristic diagnostic, **not global fidelity
+or an error bound**. Any unavailable local fidelity makes that product `None`.
+
+For dense Quimb, Torch, QR, and normal ALS, `monitor_convergence=True` opts into
 complete-sweep stopping and fills `ReducedALSSolution.iterations`, `converged`,
 and `termination_reason`. The stopping criterion is squared residual divided
 by target norm at most `tol`, or absolute complete-sweep cost change divided
@@ -293,7 +359,7 @@ Dense ALS also accepts `initial_factors=(left, right)` instead of restarting
 from a target SVD. Shapes are `(left_dim, physical_left, rank)` and
 `(rank, physical_right, right_dim)`, with matching backend, dtype and device.
 The fit retains that rank, bounded by `max_bond`, and copies the supplied
-arrays. Quimb, QR and normal ALS support this; autodiff and native symmetry
+arrays. Quimb, Torch, QR and normal ALS support this; autodiff and native symmetry
 require the default initializer. Two-site PEPS/PEPO full update uses this
 to pass its chosen SVD, environment-gauged or SU warm start into ALS.
 

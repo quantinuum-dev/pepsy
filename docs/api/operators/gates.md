@@ -130,6 +130,14 @@ PEPO upper/lower leg conventions and amplitude-preserving gauge handling.
 Keep the local patch size distinct from the PEPO bond cap and any later
 boundary-MPS scalar readout.
 
+Set `strip_exponent=True` for amplitude-preserving RMS bookkeeping after
+every pair in a long stream. Pass `tracker=LoopClusterUpdateTracker()` from
+`pepsy.bp` to retain scalar local fidelity records across calls. The
+[Torch ALS and fidelity recipe](../bp.md#dense-torch-als-and-local-fidelity)
+documents the optional dense Torch solver, AOT capture, measurement costs and
+the limits of accumulated local fidelities. Full pair-result snapshots are
+retained only with `return_results=True`.
+
 ## Prepared dense simple update
 
 `pepsy.operators.PreparedSimpleUpdate` snapshots a dense complex Torch PEPO,

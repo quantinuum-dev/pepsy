@@ -2257,6 +2257,8 @@ def gate_loop_cluster(
     smudge: float = 0.0,
     als_opts=None,
     regauge_opts=None,
+    tracker=None,
+    strip_exponent: bool = False,
     inplace=True,
     return_results: bool = False,
 ):
@@ -2292,12 +2294,33 @@ def gate_loop_cluster(
     including per-entry overrides; lower-leg action follows Quimb's O G^T
     convention. ``optimize`` accepts a Pepsy Cotengra optimizer, and
     ``plan_cache`` reuses contraction trees with current tensor values.
+
+    Pass a :class:`pepsy.bp.LoopClusterUpdateTracker` as ``tracker`` to retain
+    scalar fidelity records after each pair fit, across stream chunks. This
+    enables ``als_opts['measure_fidelity']`` unless explicitly disabled.
+    The product of local fidelities is a heuristic, not global fidelity.
+    ``strip_exponent=True`` moves each active gauge's positive RMS scale into
+    the network exponent after every pair, preserving amplitude and avoiding
+    gauge-scale overflow in long streams. It replaces manual per-pair
+    :func:`renorm_gauge` calls. Dense Torch callers may opt into
+    ``als_opts={'solver': 'torch'}``, with optional ``torch_backend='aot_eager'``
+    inside that dictionary. Existing automatic solver selection is unchanged.
     """
     if gauges is None and isinstance(where, dict):
         gauges = where
         where = None
     if gauges is None:
         gauges = {}
+    if not isinstance(strip_exponent, bool):
+        raise TypeError('strip_exponent must be a bool')
+    if tracker is not None:
+        from ..bp.cluster_updates import LoopClusterUpdateTracker
+
+        if not isinstance(tracker, LoopClusterUpdateTracker):
+            raise TypeError('tracker must be a LoopClusterUpdateTracker or None')
+    als_opts_use = {} if als_opts is None else dict(als_opts)
+    if tracker is not None:
+        als_opts_use.setdefault('measure_fidelity', True)
     tn_work = tn if inplace else (tn.copy() if hasattr(tn, "copy") else tn)
     entries = _normalize_gate_entries(
         G, where=where, allow_empty=True, allow_which=True
@@ -2434,45 +2457,51 @@ def gate_loop_cluster(
 
             from ..bp import apply_reduced_loop_cluster_gate
 
-            results.append(
-                apply_reduced_loop_cluster_gate(
-                    tn_work,
-                    gauges,
-                    gate_payload,
-                    where=where_norm,
-                    which=which_local if is_operator else None,
-                    boundary_messages=boundary_messages,
-                    input_mode=input_mode_use,
-                    run_bp=run_bp,
-                    bp_runner=bp_runner,
-                    bp_opts=bp_opts,
-                    message_psd_project=message_psd_project,
-                    message_psd_floor=message_psd_floor,
-                    bp_convergence=bp_convergence,
-                    max_bond=max_bond,
-                    max_loop_size=max_loop_size,
-                    max_cluster_size=max_cluster_size,
-                    base_radius=base_radius,
-                    cluster_mode=cluster_mode,
-                    fillin=fillin,
-                    include_full_system=include_full_system,
-                    autocomplete=autocomplete,
-                    tree_reduction=tree_reduction,
-                    psd_project=psd_project,
-                    psd_floor=psd_floor,
-                    optimize=optimize,
-                    loop_cache=loop_cache,
-                    plan_cache=plan_cache,
-                    cost_check=cost_check,
-                    max_flops_log10=max_flops_log10,
-                    max_peak_memory_log2=max_peak_memory_log2,
-                    on_budget=on_budget,
-                    smudge=smudge,
-                    als_opts=als_opts,
-                    regauge_opts=regauge_opts_use,
-                    inplace=True,
-                )
+            result = apply_reduced_loop_cluster_gate(
+                tn_work,
+                gauges,
+                gate_payload,
+                where=where_norm,
+                which=which_local if is_operator else None,
+                boundary_messages=boundary_messages,
+                input_mode=input_mode_use,
+                run_bp=run_bp,
+                bp_runner=bp_runner,
+                bp_opts=bp_opts,
+                message_psd_project=message_psd_project,
+                message_psd_floor=message_psd_floor,
+                bp_convergence=bp_convergence,
+                max_bond=max_bond,
+                max_loop_size=max_loop_size,
+                max_cluster_size=max_cluster_size,
+                base_radius=base_radius,
+                cluster_mode=cluster_mode,
+                fillin=fillin,
+                include_full_system=include_full_system,
+                autocomplete=autocomplete,
+                tree_reduction=tree_reduction,
+                psd_project=psd_project,
+                psd_floor=psd_floor,
+                optimize=optimize,
+                loop_cache=loop_cache,
+                plan_cache=plan_cache,
+                cost_check=cost_check,
+                max_flops_log10=max_flops_log10,
+                max_peak_memory_log2=max_peak_memory_log2,
+                on_budget=on_budget,
+                smudge=smudge,
+                als_opts=als_opts_use,
+                regauge_opts=regauge_opts_use,
+                inplace=True,
             )
+            if strip_exponent:
+                # Preserve amplitude while preventing gauge-scale growth
+                # between pairs in a long multigate call.
+                renorm_gauge(tn_work, gauges, where_norm, smudge=0.)
+            if tracker is not None:
+                tracker.record(result)
+            if return_results:
+                results.append(result)
             # Pair updates return an SU core plus explicit weights even when
             # the first input was physical. Subsequent gates must insert them.
             input_mode_use = "su_core"
