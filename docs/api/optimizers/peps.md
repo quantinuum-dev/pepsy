@@ -234,7 +234,22 @@ exact unit norm. Long-run fidelity improvements need separate benchmarks.
 
 Two-site full update defaults to reduced-tensor ALS, `gauge=False`, one
 `boundary_chi=2*D**2` shared by normalization and evaluation, and cached boundary
-MPS with `fit_mode="dmrg"`. Boundary/norm convergence probes and automatic
+MPS with `fit_mode="dmrg"`, `fit_init_strategy="reuse-direct"`, and
+`boundary_kwargs={"n_iter": 4}`. Cold cuts use direct compression; a previously
+fitted boundary is used only as a starting guess when a changed cut is refitted
+against its current target. Set `fit_init_strategy="guess-src"` to test seeded
+SRC for every guess, or `"reuse-src"` to use SRC only for cold cuts. Unsupported
+native SRC capabilities retain the existing warned direct fallback.
+One-site boundary reuse zero-pads and canonicalizes an undersized dense,
+non-differentiable seed, preserving its represented state while opening the
+requested bond space. An early low-rank cut therefore cannot prevent later
+growth. Differentiable/unsupported starts and reduced caps retain fresh seeding.
+
+Explicit initialization and `boundary_kwargs['n_iter']` override these defaults,
+including when switching into full-update mode at `run()`. To reproduce older
+FU runs select `fit_init_strategy="guess-direct", boundary_kwargs={"n_iter": 2}`
+when those were their recorded settings. Four iterations are a budget, not
+evidence of boundary convergence. Boundary/norm convergence probes and automatic
 evaluation cap retries are disabled. Set `boundary_convergence=True` or a
 mapping to opt into convergence checks.
 
@@ -621,7 +636,26 @@ requires that route, while `solver="qr"` requires weighted least squares.
 All new contractions receive Pepsy's Cotengra optimizer. The shared solver
 starts from the target's SVD in the selected basis. Its result is compared against
 the SVD guesses in the same positive metric, retaining the
-lowest cost. The final internal bond is balanced with SVD.
+lowest cost. Initial SVD factors are retained for the starting point and
+baseline comparison. With `gauge=False`, final balancing uses QR/LQ followed
+by a bond-sized SVD, without reconstructing and decomposing the larger pair.
+The explicit environment-gauge path retains its full final SVD. These are
+exact factor rearrangements at the existing rank cap, not approximate SVDs.
+
+Native Torch/CuPy local ALS uses dense backend solves even above Quimb's
+automatic size threshold, avoiding its incompatible SciPy LinearOperator
+route. Pair reports include `norm_matrix_dimension`, the size of the reduced
+environment eigendecomposition; it excludes physical identity expansion.
+
+For ordered source chunks, call `set_gates(chunk)` and `run()` on the same
+optimizer. Each call schedules only that chunk while source-validated boundary
+and strip caches survive between calls. `reset_traces=False` additionally
+retains diagnostic records and local fidelity products. Changed tensor arrays,
+versions and numerical boundary settings still invalidate dependent entries.
+At finite boundary caps, retained compression guesses and floating-point
+gauge changes can alter the approximate trajectory; validate full evolutions
+separately from small exact-environment reconstruction checks.
+
 External PEPS tensors remain unchanged by the pair fit.
 When explicitly enabled, environment gauges use two independent unfoldings of the same square root.
 Internally `N = root.H @ root`, so the paper's QR/LQ construction for

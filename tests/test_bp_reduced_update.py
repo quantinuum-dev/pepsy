@@ -28,6 +28,35 @@ def _random_peps():
     return qtn.PEPS.rand(2, 2, bond_dim=2, seed=7, dtype="complex128")
 
 
+@pytest.mark.parametrize("solver", ["quimb", "qr"])
+def test_zero_cluster_als_matches_independent_weighted_svd(solver):
+    core = qtn.PEPS.rand(3, 2, bond_dim=2, dtype="complex128", seed=88)
+    gauges = {ix: np.array([0.4, 1.3]) for ix in core.inner_inds()}
+    pair = prepare_reduced_bond_pair(core, gauges, where=((1, 0), (1, 1)), run_bp=False)
+    rng = np.random.default_rng(113)
+    gate = np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))[0]
+    problem = su_cluster_reduced_update_problem(
+        pair, gate, radius=0, psd_project=False, optimize="greedy",
+    )
+    target = qtn.Tensor(problem.target, inds=(
+        pair.reduced_left_ind, pair.physical_left_ind,
+        pair.physical_right_ind, pair.reduced_right_ind,
+    ))
+    full = pair.q_left @ target @ pair.q_right
+    for ix in full.inds:
+        if ix in gauges:
+            full.multiply_index_diagonal_(ix, gauges[ix] ** 0.5)
+    left = tuple(ix for ix in pair.left_original_inds if ix != pair.bond_ind)
+    right = tuple(ix for ix in pair.right_original_inds if ix != pair.bond_ind)
+    spectrum = np.linalg.svd(full.to_dense(left, right), compute_uv=False)
+    assert problem.target_norm == pytest.approx(np.sum(spectrum**2), rel=1e-12)
+    solution = solve_reduced_als(problem, max_bond=2, max_iterations=60,
+        tol=0, monitor_convergence=True, solver=solver)
+    assert solution.costs[-1] == pytest.approx(np.sum(spectrum[2:]**2), rel=1e-11)
+    assert all(b <= a + 1e-12 * problem.target_norm
+               for a, b in zip(solution.costs, solution.costs[1:]))
+
+
 @pytest.mark.parametrize('solver', ['qr', 'quimb', 'normal'])
 @pytest.mark.parametrize('monitor', [False, True])
 def test_dense_als_uses_supplied_initial_factors_without_restarting_svd(monkeypatch, solver, monitor):

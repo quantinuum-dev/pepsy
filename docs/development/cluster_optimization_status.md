@@ -13,6 +13,7 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Downstream MPS replay | Native mode discovery, named DMRG schedules and arbitrary-support sub-MPO fit windows; Gaugy preserves logical permutation indices and cached targets | [MPS guide](../api/optimizers/mps.md), [scoped alignment evidence](notes/2026-10-13-mps-mode-alignment.md) |
 | Interaction clusters | Shared graph inventories, ordered product adapters, structural reuse and explicit construction budgets | [Interaction clusters](../api/operators/interaction_clusters.md) |
 | Constructed PEPO traces | `trace_exp` traces the selected PEPO with its caps/compression; `partition_trace_exp` names the separate scalar shortcut | [Trace contract](../api/operators/cluster_expansion.md#trace-of-the-constructed-pepo) |
+| Local cluster updates | Centered six-site loop-union patch, direct SU/BP-closed reduced environment, native dense ALS and local diagonal-gauge extraction; dense PEPO upper/lower streams | [BP cluster updates](../api/bp.md#centered-six-site-gate-updates) |
 | Ordered PEPO residuals | `residual_exp` constructs the connected-cluster ordered product minus identity on a square OBC/PBC lattice, with an optional post-subtraction SVD bond cap | [Ordered products](../api/operators/cluster_expansion.md#ordered-pepo-products) |
 | Native bosonic cluster MPOs | Exact Torch/JAX autodiff and sector-preserving NumPy/Torch compressed assembly within documented modes | [Native MPO scope](../api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos) |
 | Repeated cluster evaluation | Experimental compact channels; supported frontier/automaton MPO and symbolic/algebraic PEPO preparation retain separate capability and budget checks | [Compact channels](../api/operators/cluster_channels.md) |
@@ -21,6 +22,47 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Host gradient solvers | Native Torch/JAX parameters with SciPy/NLopt host control and explicit budget/result validation; NLopt supports an opt-in maximum derivative threshold separate from step tolerance | [Gradient solvers](../api/solvers/gradient.md) |
 
 ## Publication and validation
+
+The [local-cluster implementation audit](../../history/2026-11-05-loop-cluster-audit.md)
+corrects half-weighted active-gauge extraction and order-insensitive tree
+cache keys. Earlier long-time cluster trials used the incorrect gauge
+spectra; preserve their numerical records without interpreting them as
+validation of the corrected method.
+The corrected 23-qubit homogeneous depth20 χ6 test gives exact scalar cost
+0.0516255383, versus 0.8648849089 before the fix and matched-target HRS
+0.0476403551. Public RMS-to-exponent bookkeeping keeps the operator amplitude
+while bounding gauge scales. This is one measured case; finite-χ/cluster/ALS
+convergence remains unverified.
+
+The [Hermitian-only follow-up](../../history/2026-11-05-loop-cluster-hermitian-environment.md)
+removes the diagnostic eigensolve when reduced builders receive
+`psd_project=False`; the raw minimum eigenvalue is then absent. The downstream
+six-site trial explicitly selects this mode. Public builder defaults retain
+their existing PSD policy; long-time χ6 stability remains unverified.
+
+The [CUDA-preservation audit](../../history/2026-11-05-loop-cluster-cuda-preservation.md)
+fixes a silent Torch-to-NumPy conversion in the public cluster gate stream.
+Earlier low-level CUDA checks remain valid, but the first downstream
+GPU-labeled gate-stream prefix was CPU execution. New regressions assert
+actual devices and the replacement trial uses a corrected snapshot.
+
+The [centered-cluster readiness record](../../history/2026-11-05-centered-cluster-updates.md)
+adds base-patch selection, one-sided dense PEPO gates and accelerator solves.
+The χ6 interior-patch CPU/CUDA pilot agrees and remains finite; long-time
+χ6 stability remains unmeasured. The earlier native reduced-shape failure
+is fixed; five unrelated fermionic readout failures reproduce on the baseline.
+
+The [November 5 local-gauge follow-up](../../history/2026-11-05-local-bond-svd-gauges.md)
+replaces global SU regauging in BP reduced gate/compression updates with
+local QR/LQ and SVD gauge extraction. Its CPU/CUDA checks are separate from
+the 10×10 boundary-MPS FU campaigns and do not establish χ6 stability.
+
+The [November 4 FU follow-up](../../history/2026-11-04-full-update-factor-reuse.md)
+records SVD-factor reuse, small-core final balancing and native dense
+local-solve dispatch, included with the local-cluster changes on `develop`.
+The [publication review](../../history/2026-11-05-publication-review.md)
+records fresh validation and baseline failures separately from the historical
+downstream CPU16 performance measurements.
 
 The [Torch scheduling follow-up](../../history/2026-10-30-prepared-su-scheduling.md)
 batches compatible ready updates across independent schedules. The compiler

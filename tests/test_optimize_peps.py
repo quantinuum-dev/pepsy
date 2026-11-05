@@ -174,7 +174,7 @@ def _install_fake_normalize(monkeypatch):
 @pytest.mark.parametrize("options,strategy,iterations", [
     ({}, "reuse-direct", 10),
     ({"mode": "global"}, "guess-direct", 10),
-    ({"mode": "full-update"}, "guess-direct", 10),
+    ({"mode": "full-update"}, "reuse-direct", 4),
     ({"mode": "global", "fit_init_strategy": "guess-src"}, "guess-src", 10),
     ({"mode": "global", "boundary_kwargs": {"fit_init_strategy": "guess-src"}},
      "guess-src", 10),

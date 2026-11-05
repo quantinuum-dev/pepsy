@@ -150,6 +150,8 @@ def test_full_update_defaults_use_one_fixed_chi_and_cached_dmrg(monkeypatch, sel
     assert not opt.accept_if_improved
     assert opt.evaluation_records == []
     assert opt.boundary_kwargs['fit_mode'] == 'dmrg'
+    assert opt.boundary_kwargs['fit_init_strategy'] == 'reuse-direct'
+    assert opt.boundary_kwargs['n_iter'] == 4
     assert opt.full_update_kwargs['tensor_mode'] == 'reduced'
     assert not opt.full_update_kwargs['gauge']
     records = opt.get_step_records()
@@ -170,6 +172,17 @@ def test_full_update_metric_defaults_follow_explicit_boundary_chi():
                         contraction_opt=policy)
     assert opt._boundary_chi_for_norm() == 13
     assert opt._boundary_chi_for_infidelity() == 13
+
+
+def test_full_update_keeps_explicit_boundary_initializer_and_iterations():
+    state, gate, policy = fixture()
+    opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=2,
+                        mode='full-update', contraction_opt=policy,
+                        fit_init_strategy='guess-src', boundary_kwargs={'n_iter': 3},
+                        full_update_kwargs={'max_iterations': 2})
+    opt.run(normalize_final=False)
+    assert opt.boundary_kwargs['fit_init_strategy'] == 'guess-src'
+    assert opt.boundary_kwargs['n_iter'] == 3
     opt.set_boundary_chi(17)
     assert opt._boundary_chi_for_norm() == 17
     assert opt._boundary_chi_for_infidelity() == 17

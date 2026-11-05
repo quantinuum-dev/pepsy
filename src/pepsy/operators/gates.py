@@ -2240,6 +2240,8 @@ def gate_loop_cluster(
     max_loop_size: int = 0,
     max_cluster_size: int | None = None,
     base_radius: int = 0,
+    cluster_mode: str = "graphdistance",
+    fillin: bool | int = False,
     include_full_system: bool | None = None,
     autocomplete: bool = True,
     tree_reduction: bool = True,
@@ -2262,8 +2264,10 @@ def gate_loop_cluster(
 
     This is the gate-stream bridge for
     :func:`pepsy.bp.apply_reduced_loop_cluster_gate`. Adjacent two-site gates
-    are updated by the open-leg loop-cluster metric and re-gauged into the
-    supplied SU ``gauges`` dictionary. ``input_mode="su_core"`` makes that
+    are updated by the open-leg loop-cluster metric, extracting only their
+    active diagonal SU gauge by local QR/LQ and SVD. Exterior gauges and
+    spectator core tensors stay fixed; missing initial gauges are identities.
+    ``input_mode="su_core"`` makes that
     representation explicit; ``input_mode="physical"`` treats gauges as
     boundary-only closures for an already gauged network. Alternatively, pass
     frozen directed D2BP ``boundary_messages`` keyed by
@@ -2281,6 +2285,13 @@ def gate_loop_cluster(
     ``loop_cache`` optionally reuses generalized-loop geometry for repeated
     updates of the same active bond. A cache is topology-only: contractions,
     tensor values, and boundary messages are always rebuilt.
+
+    Set ``cluster_mode='loopunion', base_radius=4, fillin=True`` for the
+    centered six-site square-lattice patch. ``max_loop_size=0`` contracts that
+    patch directly. Dense PEPOs require an explicit upper/lower selector,
+    including per-entry overrides; lower-leg action follows Quimb's O G^T
+    convention. ``optimize`` accepts a Pepsy Cotengra optimizer, and
+    ``plan_cache`` reuses contraction trees with current tensor values.
     """
     if gauges is None and isinstance(where, dict):
         gauges = where
@@ -2293,6 +2304,7 @@ def gate_loop_cluster(
     )
     which_default = _normalize_gate_which(which)
     results = []
+    input_mode_use = input_mode
     regauge_opts_use = {} if regauge_opts is None else dict(regauge_opts)
 
     native_symmray = any(
@@ -2311,42 +2323,24 @@ def gate_loop_cluster(
             "updates are not implemented."
         )
 
-    # A supplied message tree belongs to the current tensor network. Running
-    # SU gauging here would change the tensors while leaving those messages
-    # attached to the old representation, so only initialize gauges on the
-    # pure-SU route.
+    # Missing gauges are identities: initialize the representation without
+    # changing spectator tensors or performing a whole-network SU sweep.
     if (
         not native_symmray
         and boundary_messages is None
         and entries
         and any(index not in gauges for index in tn_work.inner_inds())
     ):
-        from ..bp import gauge_all_simple
+        from ..bp.reduced_update import _identity_bond_gauge
 
-        initial_gauge_opts = dict(regauge_opts_use)
-        initial_gauge_opts.setdefault("max_iterations", 20)
-        initial_gauge_opts.setdefault("tol", 0.0)
-        gauge_all_simple(
-            tn_work,
-            gauges=gauges,
-            inplace=True,
-            **initial_gauge_opts,
-        )
+        for index in tn_work.inner_inds():
+            if index not in gauges:
+                gauges[index] = _identity_bond_gauge(tn_work, index)
 
-    if not native_symmray and any(
-        hasattr(tensor.data, "to_dense") for tensor in tn_work.tensor_map.values()
-    ):
-        for tensor in tn_work.tensor_map.values():
-            if hasattr(tensor.data, "to_dense"):
-                tensor.modify(data=np.asarray(ar.to_numpy(tensor.data.to_dense())))
-        for index, gauge in tuple(gauges.items()):
-            if hasattr(gauge, "to_dense"):
-                gauges[index] = np.asarray(ar.to_numpy(gauge.to_dense()))
-
+    # Dense Torch tensors also expose to_dense(). Its presence is not evidence
+    # of a symmetry wrapper and must never trigger conversion to NumPy/CPU.
+    # Native symmetry capability checks above already select supported routes.
     for gate_payload, where_payload, which_payload in entries:
-        if not native_symmray and hasattr(gate_payload, "to_dense"):
-            gate_payload = np.asarray(ar.to_numpy(gate_payload.to_dense()))
-
         if _is_explicit_index_where(where_payload):
             raise ValueError(
                 "gate_loop_cluster() requires lattice site coordinates, not "
@@ -2368,11 +2362,19 @@ def gate_loop_cluster(
         else:
             raise ValueError("Could not infer gate dimensionality from where.")
 
+        is_operator = _is_operator_tensor_network(tn_work)
+        which_local = _normalize_gate_which(
+            which_payload if which_payload is not None else which_default
+        )
         ind_id_local = ind_id
-        if which_payload is not None:
-            ind_id_local = _ind_id_from_which(which_payload, arity)
-        elif which_default is not None:
-            ind_id_local = _ind_id_from_which(which_default, arity)
+        if is_operator:
+            if which_local is None and ind_id is not None:
+                which_local = _operator_which_from_ind_id(tn_work, ind_id)
+            if which_local is None:
+                raise ValueError("PEPO loop-cluster gates require which='upper' or 'lower'")
+            ind_id_local = None
+        elif which_local is not None:
+            ind_id_local = _ind_id_from_which(which_local, arity)
         if ind_id_local is not None:
             _validate_gate_target_inds_exist(tn_work, where_norm, ind_id_local)
 
@@ -2388,6 +2390,14 @@ def gate_loop_cluster(
 
         try:
             if len(where_norm) == 1:
+                if is_operator:
+                    # A one-site physical action commutes with all virtual SU
+                    # weights. Gate that one leg directly; PEPO gate_simple's
+                    # sandwich semantics are not the requested one-sided action.
+                    site = where_norm[0]
+                    physical_ind = getattr(tn_work, which_local + "_ind")(*site)
+                    tn_work.gate_inds_(gate_payload, (physical_ind,), contract=True)
+                    continue
                 if not gauges:
                     raise TypeError(
                         "gate_loop_cluster() one-site gates require SU gauges; "
@@ -2430,8 +2440,9 @@ def gate_loop_cluster(
                     gauges,
                     gate_payload,
                     where=where_norm,
+                    which=which_local if is_operator else None,
                     boundary_messages=boundary_messages,
-                    input_mode=input_mode,
+                    input_mode=input_mode_use,
                     run_bp=run_bp,
                     bp_runner=bp_runner,
                     bp_opts=bp_opts,
@@ -2442,6 +2453,8 @@ def gate_loop_cluster(
                     max_loop_size=max_loop_size,
                     max_cluster_size=max_cluster_size,
                     base_radius=base_radius,
+                    cluster_mode=cluster_mode,
+                    fillin=fillin,
                     include_full_system=include_full_system,
                     autocomplete=autocomplete,
                     tree_reduction=tree_reduction,
@@ -2460,6 +2473,9 @@ def gate_loop_cluster(
                     inplace=True,
                 )
             )
+            # Pair updates return an SU core plus explicit weights even when
+            # the first input was physical. Subsequent gates must insert them.
+            input_mode_use = "su_core"
         finally:
             if ind_id_local is not None and has_site_ind_id:
                 tn_work.site_ind_id = old_site_ind_id

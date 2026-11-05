@@ -8,6 +8,47 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Local SU gauge correction:** include full exterior SU weights in the
+  endpoint QR/LQ and small-core SVD. Bare reduced-factor spectra preserved
+  states but produced incorrect boundary gauges for later updates. Add
+  independent PEPS/PEPO Schmidt-spectrum and zero-cluster SU regressions.
+- **Contraction-plan cache:** retain tensor operand order in cache keys;
+  a tree reused after operand permutation could contract the wrong network.
+
+- **Hermitian-only reduced environments:** `psd_project=False` skips spectral
+  diagnostics as well as clipping; `raw_min_eigenvalue` is then `None`.
+  Hermitianization remains enabled for exact, SU-cluster and loop-cluster
+  problem builders.
+
+- **Loop-cluster GPU replay:** preserve dense Torch tensors, gates and SU
+  gauges in `gate_loop_cluster`. Torch exposes `to_dense()` even for dense
+  tensors; it must not trigger NumPy/CPU conversion. Add actual-device checks
+  for PEPS/PEPO one-/two-site gate streams.
+
+- **BP cluster evolution:** expose Quimb graph-distance/loop-union base-patch
+  selection and fill-in through reduced gate/compression APIs. Loop-union
+  cutoff four selects the centered six-site patch, with cached Cotengra
+  paths and fresh contractions. Add dense PEPO upper/lower gate streams,
+  preserve SU weights across physical-input streams, retain native charge
+  spaces, and keep Torch/CuPy local ALS solves in their array backend.
+
+- **BP reduced updates:** replace whole-network SU regauging with local
+  QR/LQ and small-core SVD extraction of the active bond gauge. Preserve
+  exterior gauges, spectator tensors and fitted amplitude. Loop-cluster gate
+  streams initialize missing gauges as identities. Legacy `regauge_opts`
+  sweep controls are deprecated.
+
+- **Reduced full-update work:** reuse the initial SVD factors and balance
+  ungauged ALS results with QR/LQ and a bond-sized SVD. Keep native Torch/CuPy
+  local ALS solves dense when Quimb's automatic threshold would choose a
+  SciPy LinearOperator. Source-barrier replay can retain checked environments
+  through the existing `set_gates()` and `run()` interface.
+
+- **FU boundary initialization:** default to `reuse-direct` and four boundary
+  DMRG iterations. Direct compression seeds cold cuts; existing fitted MPS
+  initialize later refits. Explicit initialization and iteration controls
+  retain precedence; seeded `guess-src`/`reuse-src` remain selectable.
+
 - **Joint PEPO leg updates:** opt into `run(fuse_pepo_legs=True)` to apply
   upper/lower gates on the same bond to one exact target and fit it once.
   Align reversed sites and retain both original gate positions. Reuse SVD/SU

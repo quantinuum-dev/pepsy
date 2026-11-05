@@ -49,6 +49,86 @@ def fidelity(a, b):
     return abs(np.vdot(a, b))**2 / (np.vdot(a, a).real*np.vdot(b, b).real)
 
 
+@pytest.mark.parametrize('dtype', ['complex64', 'complex128'])
+@pytest.mark.parametrize('which', ['upper', 'lower', 'both'])
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_cached_svd_start_and_small_core_balance_preserve_operator(monkeypatch, dtype, which, device):
+    import torch
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    state = fixture(dtype=dtype)
+    state.apply_to_arrays(lambda x: x.to(device))
+    state.exponent = .31
+    gate = torch.tensor(unitary(4), dtype=getattr(torch, dtype), device=device)*(1.2+.3j)
+    payload = (gate, gate.conj()) if which == 'both' else gate
+    pair = ReducedPair(state, payload, ((0, 0), (0, 1)), chi=2, which=which)
+    guess, target = pair.initial_states()
+    # A complex normalization phase must update the cached starting factors too.
+    pair.normalize_target(2.5+.1j)
+    expected = dense(target) / np.sqrt(2.5+.1j)
+    norm, _ = pair.environment(guess, chi=64, contraction_opt='greedy',
+                              boundary_kwargs={'fit_mode': 'direct', 'cutoff': 0.})
+    split, balance, cached = pair.split, pair.balance, pair._svd_guess_factors
+    pair._svd_guess_factors = None
+    pair.balance = lambda a, b: split(torch.einsum('apk,kbq->apbq', a, b), pair.chi)
+    reference, _ = pair.optimize(norm, {'solver': 'quimb', 'max_iterations': 3})
+    pair.balance, pair._svd_guess_factors = balance, cached
+    def forbid_split(*args, **kwargs):
+        pytest.fail('Ungauged FU repeated a full-pair SVD after initialization')
+    monkeypatch.setattr(pair, 'split', forbid_split)
+    output, report = pair.optimize(norm, {'solver': 'quimb', 'max_iterations': 3})
+    tol = 5e-5 if dtype == 'complex64' else 3e-10
+    assert report['fidelity'] == pytest.approx(fidelity(dense(output), expected), abs=tol)
+    np.testing.assert_allclose(dense(output), dense(reference), rtol=tol, atol=tol)
+    assert output.max_bond() <= 2
+    assert next(iter(output)).data.device.type == device
+
+
+@pytest.mark.parametrize('dtype', ['complex64', 'complex128'])
+def test_small_core_balance_preserves_product_and_symmetric_singular_values(dtype):
+    import torch
+    pair = ReducedPair(fixture(dtype=dtype), torch.tensor(unitary(4), dtype=getattr(torch, dtype)),
+                       ((0, 0), (0, 1)), chi=2, which='lower')
+    rng = np.random.default_rng(72)
+    def array(shape):
+        return torch.tensor(rng.normal(size=shape)+1j*rng.normal(size=shape), dtype=getattr(torch, dtype))
+    left, right = array((pair.na, pair.dims[0], 2)), array((2, pair.nb, pair.dims[1]))
+    left *= 1e3
+    right *= 1e-3*(1+.3j)
+    product = np.einsum('apk,kbq->apbq', left.numpy(), right.numpy())
+    a, b = pair.balance(left, right)
+    tol = 5e-5 if dtype == 'complex64' else 2e-12
+    np.testing.assert_allclose(np.einsum('apk,kbq->apbq', a.numpy(), b.numpy()), product, rtol=tol, atol=tol)
+    am, bm = a.reshape(-1, 2).numpy(), b.permute(0, 2, 1).reshape(2, -1).numpy()
+    singular = np.linalg.svd(product.transpose(0, 1, 3, 2).reshape(am.shape[0], bm.shape[1]), compute_uv=False)[:2]
+    np.testing.assert_allclose(am.conj().T@am, np.diag(singular), rtol=tol, atol=tol)
+    np.testing.assert_allclose(bm@bm.conj().T, np.diag(singular), rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_chi6_native_als_uses_dense_local_solver(monkeypatch, device):
+    import torch
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    state = qtn.PEPO.rand(2, 2, bond_dim=6, phys_dim=2, dtype='complex128', seed=82)
+    state.apply_to_arrays(lambda x: torch.tensor(x, device=device))
+    pair = ReducedPair(state, torch.tensor(unitary(4), device=device),
+                       ((0, 0), (0, 1)), chi=6, which='lower')
+    pair.initial_states(build_target=False)
+    fit = qtn.tensor_network_fit_als
+    calls = []
+    def checked(*args, **kwargs):
+        assert kwargs['dense_solve'] is True
+        calls.append(True)
+        return fit(*args, **kwargs)
+    monkeypatch.setattr(qtn, 'tensor_network_fit_als', checked)
+    norm = torch.eye(pair.na*pair.nb, dtype=torch.complex128, device=device)
+    output, report = pair.optimize(norm, {'solver': 'auto', 'max_iterations': 2})
+    assert calls and report['solver'] == 'quimb'
+    assert np.isfinite(dense(output)).all()
+    assert next(iter(output)).data.device.type == device
+
+
 def optimizer(state, gates, *, fit_mode='direct', **kwargs):
     return PepsOptimizer(state, gates, chi=2, mode='full-update',
         contraction_opt='greedy', normalize_initial=False, boundary_convergence=False,

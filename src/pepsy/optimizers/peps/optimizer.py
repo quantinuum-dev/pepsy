@@ -298,8 +298,9 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         estimates, and sweep environment updates. Defaults are
         ``n_iter=10``, ``direction="y"``, ``max_separation=1``,
         ``track_boundary_fidelity=False``, and ``strip_exponent=True``.
-        Sweep boundary FIT defaults to ``fit_init_strategy="reuse-direct"``;
-        other modes use ``"guess-direct"``. Cuts are refitted after changes;
+        Sweep and full-update boundary FIT default to ``fit_init_strategy="reuse-direct"``;
+        full update uses ``n_iter=4``. Other modes use ``"guess-direct"``.
+        Cuts are refitted after changes;
         explicit direct arguments or mapping entries override this policy.
         FIT controls such as ``fit_mode``, ``fit_layer_mode``, ``layer_tags``,
         the ``fit_*`` initialization/convergence options, and ``cutoff`` are
@@ -534,6 +535,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         self._evaluation_retries_auto = evaluation_max_retries is None
         self._boundary_fit_auto = fit_mode is None and 'fit_mode' not in (boundary_kwargs or {})
         self._boundary_init_auto = fit_init_strategy is None and 'fit_init_strategy' not in (boundary_kwargs or {})
+        self._boundary_iter_auto = 'n_iter' not in (boundary_kwargs or {})
         self.boundary_chi = self._validate_boundary_chi(
             (2 * self.chi**2 if self._active_full_update else (2 * self.chi**2, 4 * self.chi**2))
             if boundary_chi is None else boundary_chi
@@ -607,8 +609,10 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         )
         if self._boundary_fit_auto:
             self.boundary_kwargs['fit_mode'] = 'dmrg' if self._active_full_update else 'eff'
-        if self._boundary_init_auto and self.mode == 'sweep' and not self._active_full_update:
+        if self._boundary_init_auto and (self.mode == 'sweep' or self._active_full_update):
             self.boundary_kwargs['fit_init_strategy'] = 'reuse-direct'
+        if self._boundary_iter_auto and self._active_full_update:
+            self.boundary_kwargs['n_iter'] = 4
         self.boundary_engine = canonical_boundary_engine_selector(boundary_engine)
         self._boundary_layers_auto = self.boundary_kwargs.get('fit_layer_mode') is None
         self._validate_boundary_fit_policy()
@@ -3137,8 +3141,10 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             self.boundary_kwargs['fit_mode'] = 'dmrg' if self._active_full_update else 'eff'
         if self._boundary_init_auto:
             self.boundary_kwargs['fit_init_strategy'] = (
-                'reuse-direct' if run_mode == 'sweep' else _DEFAULT_BOUNDARY_KWARGS['fit_init_strategy']
+                'reuse-direct' if run_mode in {'sweep', 'full-update'} else _DEFAULT_BOUNDARY_KWARGS['fit_init_strategy']
             )
+        if self._boundary_iter_auto:
+            self.boundary_kwargs['n_iter'] = 4 if self._active_full_update else _DEFAULT_BOUNDARY_KWARGS['n_iter']
         normalize_chi = self._boundary_chi_for_norm(normalize_chi, options=normalize_kwargs)
         evaluation_chi = self._boundary_chi_for_infidelity(evaluation_chi, options=infidelity_kwargs)
         # Explicit None belongs to exact contractions or supplied boundary

@@ -259,6 +259,7 @@ class ReducedPair:
             self.theta = einsum('PQpq,apqb->aPbQ', self.gate, theta)
         self.chi = int(chi)
         self.initial_factors = None
+        self._svd_guess_factors = None
 
     def split(self, theta, chi):
         left, right = _svd_initial_factors(transpose(theta, (0, 1, 3, 2)), chi)
@@ -266,6 +267,22 @@ class ReducedPair:
 
     def state_from(self, left, right):
         return self.reduced.reconstruct_tn(left, transpose(right, (0, 2, 1)))
+
+    def balance(self, left, right):
+        """Balance a rank-chi result through QR/LQ and a chi-by-chi SVD.
+
+        ALS already supplies low-rank factors. Splitting their reconstructed
+        full pair repeats a much larger SVD without changing its rank cap.
+        The small core retains the symmetric singular-value bond gauge.
+        """
+        rank = left.shape[-1]
+        qa, ra = ar.do('linalg.qr', left.reshape(-1, rank))
+        qb, rb = ar.do('linalg.qr', dag(transpose(right, (0, 2, 1)).reshape(rank, -1)))
+        u, s, vh = ar.do('linalg.svd', ra @ dag(rb))
+        roots = ar.do('sqrt', s)
+        left = (qa @ (u[:, :len(s)] * roots)).reshape(self.na, self.dims[0], len(s))
+        right = ((roots[:, None] * vh[:len(s)]) @ dag(qb)).reshape(len(s), self.dims[1], self.nb)
+        return left, transpose(right, (0, 2, 1))
 
     def initial_states(self, guess=None, *, build_target=True):
         # One local SVD supplies the warm start and exact target. Determine
@@ -289,8 +306,10 @@ class ReducedPair:
             return left, transpose(right, (0, 2, 1))
 
         self.initial_factors = None
+        self._svd_guess_factors = None
         if guess is None or self.warmstart_exact:
-            guess = self.state_from(*factors(rank))
+            self._svd_guess_factors = factors(rank)
+            guess = self.state_from(*self._svd_guess_factors)
         else:
             # SU uses a different internal-bond gauge but the same exterior
             # tensors. Project its active sites into the frozen QR/LQ bases.
@@ -332,6 +351,9 @@ class ReducedPair:
         if self.initial_factors is not None:
             left, right = self.initial_factors
             self.initial_factors = left * (complex(mantissa) / magnitude)**-.5, right
+        if self._svd_guess_factors is not None:
+            left, right = self._svd_guess_factors
+            self._svd_guess_factors = left * (complex(mantissa) / magnitude)**-.5, right
 
     def strip_environment(self, state, *, boundary=None, chi, contraction_opt, boundary_kwargs,
                           strip_cache=None):
@@ -384,11 +406,11 @@ class ReducedPair:
         if float(scale) == 0:
             raise ValueError('full-update norm environment is zero')
         norm = norm / scale
-        _, _, clipped, values, vectors, positive = _psd_project_metric(norm, 0., return_spectrum=True)
+        projected, _, clipped, values, vectors, positive = _psd_project_metric(norm, 0., return_spectrum=True)
         if float(positive.max()) <= 0:
             raise ValueError('full-update norm environment has no positive support')
-        root = ar.do('sqrt', positive)[:, None] * dag(vectors)
         report = {
+            'norm_matrix_dimension': self.na * self.nb,
             'norm_antihermitian_relative': float(ar.do('linalg.norm', norm - dag(norm))),
             'norm_min_eigenvalue': float(values.min()),
             'norm_negative_weight': float((-ar.do('clip', values, None, 0)).sum() / positive.sum()),
@@ -402,6 +424,7 @@ class ReducedPair:
         inv_b = ar.do('diag', ar.do('ones_like', norm[:self.nb, 0]))
         ga, gb = inv_a, inv_b
         if controls['gauge']:
+            root = ar.do('sqrt', positive)[:, None] * dag(vectors)
             x = root.reshape(-1, self.na, self.nb)
             # Independent leg unfoldings of the same square root (Fig. 11).
             # We store N = root.H @ root; the paper uses X @ X.H, so its
@@ -420,7 +443,12 @@ class ReducedPair:
                 report['environment_gauge_applied'] = True
             else:
                 ga, gb = inv_a, inv_b
-        n = (dag(root) @ root).reshape(self.na, self.nb, self.na, self.nb)
+            n = dag(root) @ root
+        else:
+            # PSD projection already formed V diag(s+) V.H. Rebuilding the
+            # same matrix through its square root adds a dense product per fit.
+            n = projected
+        n = n.reshape(self.na, self.nb, self.na, self.nb)
         n = n / ar.do('linalg.norm', n.reshape(-1))
 
         def inner(a, b):
@@ -435,16 +463,22 @@ class ReducedPair:
             value = float(inner(delta, delta).real / target_norm)
             return max(0., value) if math.isfinite(value) else math.inf
 
-        if self.initial_factors is None:
-            left, right = self.split(theta, self.chi)
-        else:
+        baseline = self.initial_factors
+        if baseline is None:
+            baseline = self._svd_guess_factors
+        if baseline is None:
+            baseline = self.split(self.theta, self.chi)
+        baseline_left, baseline_right = baseline
+        if self.initial_factors is not None:
             left, right = self.initial_factors
             left = einsum('ac,cpk->apk', ga, left)
             right = einsum('bd,kdq->kbq', gb, right)
+        elif controls['gauge']:
+            left, right = self.split(theta, self.chi)
+        else:
+            left, right = baseline_left, baseline_right
         # Compare gauge-SVD with the ordinary split in the same environment;
         # an explicitly supplied SU start is retained in either gauge.
-        baseline_left, baseline_right = (self.split(self.theta, self.chi)
-                                         if self.initial_factors is None else self.initial_factors)
         baseline_left = einsum('ac,cpk->apk', ga, baseline_left)
         baseline_right = einsum('bd,kdq->kbq', gb, baseline_right)
         baseline_loss = loss(baseline_left, baseline_right)
@@ -469,7 +503,10 @@ class ReducedPair:
         # Undo the environment gauges, then balance the internal bond by SVD.
         left = einsum('ac,cpk->apk', inv_a, left)
         right = einsum('bd,kdq->kbq', inv_b, right)
-        left, right = self.split(einsum('apk,kbq->apbq', left, right), self.chi)
+        if controls['gauge']:
+            left, right = self.split(einsum('apk,kbq->apbq', left, right), self.chi)
+        else:
+            left, right = self.balance(left, right)
         residual_converged = tolerance > 0 and history[-1] <= tolerance
         reason = ('residual_tolerance' if residual_converged else
                   solution.termination_reason if accepted else 'solver_candidate_rejected')
@@ -515,7 +552,11 @@ class ReducedPair:
             tol=tolerance, rcond=rcond, solver=controls['solver'],
             monitor_convergence=True,
             initial_factors=(left, transpose(right, (0, 2, 1))),
-            quimb_opts={'contract_optimize': policy, 'enforce_pos': True, 'progbar': False},
+            # Quimb's automatic large-tensor route uses a SciPy LinearOperator,
+            # which cannot consume native Torch/CuPy dtypes. These reduced
+            # environments are already dense; keep their solves native too.
+            quimb_opts={'contract_optimize': policy, 'enforce_pos': True,
+                        'dense_solve': True, 'progbar': False},
         )
 
 

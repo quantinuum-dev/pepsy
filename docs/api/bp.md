@@ -88,6 +88,77 @@ correction = loop_cluster_expand(
 
 ## Reduced loop-cluster compression
 
+### Centered six-site gate updates
+
+Use Quimb's loop-union selector for the **3×2 patch** around a horizontal
+bond (and its rotation around a vertical bond). Cutoff four selects both
+plaquettes sharing that bond. At a lattice edge, only the available plaquette
+is retained. Graph radius one instead selects eight sites; enabling fill-in
+there gives twelve. These selection controls are separate from an expansion
+cutoff or retained bond dimension.
+
+```python
+from pepsy.bp import ContractionPlanCache
+from pepsy.operators import gate_loop_cluster
+from pepsy.tensors import build_optimizer
+
+optimizer = build_optimizer(parallel=False, progbar=False)
+plans = ContractionPlanCache()
+core, updates = gate_loop_cluster(
+    core, gates, gauges=gauges, input_mode="su_core",
+    max_bond=6,
+    cluster_mode="loopunion", base_radius=4, fillin=True,
+    max_loop_size=0,  # direct base-cluster contraction
+    psd_project=False,
+    optimize=optimizer, plan_cache=plans,
+    als_opts={"solver": "quimb", "max_iterations": 10,
+              "tol": 1e-8, "monitor_convergence": True},
+    inplace=False, return_results=True,
+)
+```
+
+Here `core` and `gauges` are an existing SU representation. The gate-stream
+wrapper updates the gauge dictionary to match its returned core; use a copied
+dictionary when retaining the old representation. For a dense PEPO, give
+`which="upper"` / `"lower"`, or entries `(gate, where, side)`. One-site gates
+use the native nontruncating route. PEPO operator legs remain separate in the
+returned core; their fusion is private to the reduced pair. Lower-leg gates
+implement $O G^T$, so pass $G^T$ once when the intended action is $O G$.
+One-sided native fermionic PEPO gate updates are explicitly unsupported here.
+
+Every pair update contracts current tensors and SU boundary weights into
+the reduced environment, runs ALS, and extracts only the active diagonal
+gauge locally. Gauge extraction restores the two full endpoint factors and
+includes full exterior SU weights before QR/LQ and the bond-sized SVD.
+Those weights are removed on their support afterward. An SVD of the bare
+reduced ALS factors preserves the state but gives incorrect SU boundary
+spectra; on an untruncated tree the corrected gauges reproduce the independent
+Schmidt spectrum. No whole-network gauging or pair-sized matrix is needed.
+Contraction-plan keys retain operand order because Cotengra trees label their
+leaves by position. `psd_project=False` keeps Hermitianization without computing
+or clipping the environment spectrum; `raw_min_eigenvalue` is then `None`.
+Torch/CuPy local solves remain in their backend even above Quimb's
+automatic dense-solve threshold. No physical-identity-expanded metric is
+materialized by the default Quimb route.
+Long-running drivers should use public `pepsy.operators.renorm_gauge`
+after each pair update, as the SU driver does. It moves the positive gauge
+RMS scale into `tn.exponent`, preserving the represented amplitude while
+preventing scalar gauge magnitudes from overflowing local contractions.
+Dense Torch gate streams retain their tensor/gauge devices. A November 5
+profiling audit found and removed an older `to_dense()` feature-detection
+branch that silently converted dense Torch inputs to NumPy; verify actual
+tensor devices when assessing historical GPU-labeled runs.
+
+`plan_cache` retains topology/shape-dependent contraction trees; it never
+retains environment values. Explicit BP boundary messages describe one state
+snapshot and must be refreshed as that state changes. The base-patch options
+also reach `compress_reduced_loop_cluster`,
+`su_cluster_reduced_update_problem`, and `loop_cluster_reduced_update_problem`.
+
+This is a direct finite-cluster approximation with SU/BP exterior closure.
+It is distinct from the explicit cut-edge $P+Q$ series below. Package readiness
+does not establish stability or convergence of a long χ6 trajectory.
+
 For the first-pass local full-update style compression, use
 `compress_reduced_loop_cluster`. It selects the active bond, fills a finite
 cluster by `max_distance`, closes its cut bonds with either SU vectors or
@@ -121,8 +192,10 @@ supplied SU gauge mapping means that `tn` is an SU core; set
 `input_mode="physical"` when `tn` already contains the gauge factors and the
 vectors should be used only as diagonal closures.
 
-Set `regauge=True` to refresh SU gauges after truncation; the default returns
-the compressed physical network without refreshing them. Set
+Set `regauge=True` to extract the active bond's diagonal gauge by local
+QR/LQ and SVD after truncation; the default returns the compressed physical
+network without extracting a gauge. Exterior SU gauges and spectator core
+tensors remain unchanged. Set
 `max_loop_size>0` to add the open-leg loop-cluster correction on top of the
 finite base cluster. For the paper's total-region convention, use
 `max_cluster_size=...`; it includes the active/base support and is mutually
@@ -220,7 +293,9 @@ For explicit dense diagnostics, use `problem.dense_metric()` and
 `materialize_metric=True`, but this is unnecessary for the native Quimb path.
 All reduced problem builders Hermitianize and PSD-project the smaller open
 environment by default. `problem.raw_min_eigenvalue` and
-`problem.clipped_eigenvalues` expose the projection diagnostics.
+`problem.clipped_eigenvalues` expose the projection diagnostics. With
+`psd_project=False`, only Hermitianization runs: no diagnostic eigensolve,
+`raw_min_eigenvalue=None`, and zero clipped eigenvalues.
 The builder return types share the `ReducedUpdateProblem` type alias for
 annotations. `ReducedEnvironmentUpdateProblem(pair, environment, target)`
 also accepts an externally contracted reduced environment, such as the checked
@@ -244,6 +319,26 @@ For compatibility with gate streams, `apply_reduced_loop_cluster_gate` and
 `gate_loop_cluster` accept the same closure semantics for adjacent two-site
 updates: `input_mode`, fresh-BP controls, PSD message handling, and contraction
 cost budgets are forwarded through the wrapper.
+
+After restoring endpoint factors $L,R$ with full exterior SU weights,
+the gate helpers compute
+
+$$
+L=Q_L A,\qquad R=B Q_R,\qquad
+AB=U\,{\color{blue}S}\,V^\dagger,
+\qquad {\color{purple}\Lambda_{\rm new}}=S.
+$$
+
+The new active gauge retains its full amplitude. The two core tensors are reconstructed from
+`Q_L U` and `V† Q_R`, removing the full exterior SU weights used in
+that split. Exterior gauges stay fixed; no
+`gauge_all_simple` sweep runs at initialization or after a gate. Missing
+initial gauges are identity vectors. Physical/BP inputs receive identity
+gauges on the other bonds; boundary-only gauge values are not absorbed into
+that output representation. Zero exterior weights use a support pseudoinverse.
+The local spectrum is an SU representation choice, not an exact Schmidt
+spectrum for a loopy network. Legacy `regauge_opts` entries `max_iterations`
+and `tol` are deprecated and ignored with a warning; other entries are rejected.
 
 Pass the same `ReducedLoopClusterCache` through repeated updates of one
 active bond with `loop_cache=cache` to reuse generalized-loop geometry. The
