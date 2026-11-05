@@ -430,6 +430,66 @@ contraction raises `CompressionBudgetError` before tensor values are
 contracted. `on_budget="warn"` additionally emits a warning, while
 `on_budget="ignore"` reports and continues.
 
+### Prepared ordered PEPO cluster replay
+
+`PreparedLoopClusterUpdate` prepares a fixed ordered schedule for dense
+complex64/complex128 Torch qubit PEPOs. It binds one-/two-site gate selectors,
+one-site axis permutations, six-site loop-union geometry and shape-specific
+Cotengra contraction programs. Programs receive **fresh** QR factors,
+spectator tensors and SU boundary weights on every pair update. No numerical
+environment, messages or fixed-point values are reused.
+
+```python
+from pepsy.bp import LoopClusterUpdateTracker, PreparedLoopClusterUpdate
+
+# schedule entries: (tuple_of_sites, "upper" or "lower")
+plan = PreparedLoopClusterUpdate(
+    core, schedule, max_bond=6, max_iterations=10, tol=1e-8,
+    psd_project=False, torch_backend=None, max_peak_memory_log2=28,
+)
+tracker = LoopClusterUpdateTracker(keep_records=False)
+core = plan.apply(core, gate_bank, gauges=gauges, start=0, stop=first_slice_end,
+                  tracker=tracker)
+core = plan.apply(core, gate_bank, gauges=gauges, start=first_slice_end,
+                  tracker=tracker)
+counts = plan.info
+```
+
+`gate_bank` covers the complete schedule; `[start:stop]` selects each source
+slice without reordering or fusing gates. Arrays and mutable SU gauge vectors
+must match the plan's Torch device and precision. Lower-leg gates retain the
+native $O G^T$ convention: transpose each intended right-applied matrix once
+before forming the bank. Source barriers, all pair truncations, ALS stopping,
+endpoint QR/LQ and final local SVD extraction remain the ordinary reduced
+algorithm. Every pair moves its gauge RMS into the network exponent.
+
+`step_callback(index, result)` receives the original zero-based gate index;
+one-site gates have `result=None`. `return_results=True` returns
+`(core, tuple_of_pair_results)`; otherwise full results are not accumulated.
+`inplace=False` copies the input core while updating the supplied gauge map,
+as in the ordinary gate-stream API. Trackers can span multiple slices.
+
+Bond growth generates a new contraction program. The default cache retains
+at most 512 programs and their trees; set `max_programs` to change that limit.
+`plan.info` reports program hits/misses/evictions, geometry plans and operation
+counts. The plan retains no evolving state or gauge arrays. Topology, index
+order, operator dimensions, dtype and device changes require a new plan.
+Boundary weights remain checked for finite, real, nonnegative values; one
+combined device verdict replaces separate synchronizations for each cut bond.
+
+Optional `torch_backend="aot_eager"` captures the shared ALS kernels. The
+prepared environment uses Cotengra's generated Torch contraction program;
+one separate AOT graph per lattice bond would churn the shared capture cache.
+The prepared route does not batch independent networks or reorder disjoint
+gates. Native symmetry, directed messages, other base clusters and added loop
+corrections retain the ordinary `gate_loop_cluster` route.
+
+Torch reduced-state copies preserve the singular-value graph through SU
+gauges. This matters for derivatives of the returned physical operator over
+multiple gates: a detached gauge copy can preserve values while dropping part
+of the derivative. Gate and gauge gradients are checked against finite
+differences with native/stabilized linear algebra on supported charts.
+
 ## Selected-bond PEPS/PEPO compression
 
 When there is no gate and one particular virtual bond should be reduced, use

@@ -137,6 +137,7 @@ _SYMBOL_MODULES = {
     'ContractionCost': '._compression_utils',
     'ContractionPlanCache': '._compression_utils',
     'LoopClusterUpdateTracker': '.cluster_updates',
+    'PreparedLoopClusterUpdate': '.prepared_update',
     'ExactReducedUpdateProblem': '.reduced_update',
     'ReducedEnvironmentUpdateProblem': '.reduced_update',
     'LoopClusterReducedUpdateProblem': '.reduced_update',
@@ -169,6 +170,7 @@ __all__ = [
     "ContractionCost",
     "ContractionPlanCache",
     "LoopClusterUpdateTracker",
+    "PreparedLoopClusterUpdate",
     "ExactReducedUpdateProblem",
     "ReducedEnvironmentUpdateProblem",
     "BPCandidateScore",
@@ -390,6 +392,7 @@ if TYPE_CHECKING:
         ContractionPlanCache,
     )
     from .cluster_updates import LoopClusterUpdateTracker  # noqa: F401 -- public alias
+    from .prepared_update import PreparedLoopClusterUpdate  # noqa: F401 -- public alias
     from .reduced_update import (  # noqa: F401 -- public aliases
         ExactReducedUpdateProblem,
         ReducedEnvironmentUpdateProblem,

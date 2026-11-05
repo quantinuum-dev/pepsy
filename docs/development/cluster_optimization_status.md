@@ -16,6 +16,7 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Constructed PEPO traces | `trace_exp` traces the selected PEPO with its caps/compression; `partition_trace_exp` names the separate scalar shortcut | [Trace contract](../api/operators/cluster_expansion.md#trace-of-the-constructed-pepo) |
 | Local cluster updates | Centered six-site loop-union patch, direct SU/BP-closed reduced environment, native dense ALS and local diagonal-gauge extraction; dense PEPO upper/lower streams | [BP cluster updates](../api/bp.md#centered-six-site-gate-updates) |
 | Dense Torch cluster ALS | Opt-in certified Cholesky solves with spectral fallback, optional AOT capture, local fidelity records and per-pair stream scale bookkeeping | [Torch ALS and fidelity](../api/bp.md#dense-torch-als-and-local-fidelity) |
+| Prepared cluster replay | Dense Torch PEPO schedule/layout and Cotengra program reuse; fresh six-site contractions, rank-growth rebuilds and unchanged truncation order | [Prepared cluster replay](../api/bp.md#prepared-ordered-pepo-cluster-replay) |
 | Ordered PEPO residuals | `residual_exp` constructs the connected-cluster ordered product minus identity on a square OBC/PBC lattice, with an optional post-subtraction SVD bond cap | [Ordered products](../api/operators/cluster_expansion.md#ordered-pepo-products) |
 | Native bosonic cluster MPOs | Exact Torch/JAX autodiff and sector-preserving NumPy/Torch compressed assembly within documented modes | [Native MPO scope](../api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos) |
 | Repeated cluster evaluation | Experimental compact channels; supported frontier/automaton MPO and symbolic/algebraic PEPO preparation retain separate capability and budget checks | [Compact channels](../api/operators/cluster_channels.md) |
@@ -24,6 +25,17 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Host gradient solvers | Native Torch/JAX parameters with SciPy/NLopt host control and explicit budget/result validation; NLopt supports an opt-in maximum derivative threshold separate from step tolerance | [Gradient solvers](../api/solvers/gradient.md) |
 
 ## Publication and validation
+
+The [prepared-replay follow-up](../../history/2026-11-05-prepared-cluster-replay.md)
+adds reusable six-site geometry and array contraction programs to the existing
+middle-out PEPO benchmark. A saved χ6 96-action CUDA diagnostic improved by
+**1.04694×**, with identical pair errors/iterations and cap18 MPS readout.
+It also fixes detached SU-gauge derivatives exposed by multi-gate finite
+differences. Gate order, source barriers and truncations remain unchanged;
+independent-network batching and whole-step CUDA capture remain deferred.
+The final affected selection passed **520 package tests** and **110 benchmark
+tests**. Fresh full-suite fail-fast still stops at the known native fermionic
+readout failure; the handoff records its separate scope.
 
 The [Torch ALS follow-up](../../history/2026-11-05-torch-cluster-als.md)
 implements guarded dense solves: three saved χ6 GPU pair

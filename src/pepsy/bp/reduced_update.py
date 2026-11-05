@@ -25,7 +25,7 @@ from ._backend import (
     array as _backend_array,
     cast_like as _cast_like,
     conj as _conj,
-    copy as _copy_array,
+    copy as _backend_copy,
     dag as _dag,
     einsum as _einsum,
     eye as _eye,
@@ -76,6 +76,13 @@ __all__ = [
     "solve_reduced_als",
     "su_cluster_reduced_update_problem",
 ]
+
+
+def _copy_array(value):
+    # Autoray's Torch copy is detach().clone(). Reduced evolution must keep
+    # derivatives through copied targets and, especially, extracted SU values.
+    value = _native(value)
+    return value.clone() if ar.infer_backend(value) == 'torch' else _backend_copy(value)
 
 
 def _require_bool(name: str, value: bool) -> None:

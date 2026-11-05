@@ -8,6 +8,14 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Prepared cluster replay:** `pepsy.bp.PreparedLoopClusterUpdate` binds
+  dense Torch PEPO gate layouts and six-site Cotengra contraction programs,
+  with fresh tensor/gauge values, bounded caches and rank-growth rebuilds.
+  Preserve source barriers, gate order, pair truncations and ALS policy.
+- **Reduced-update gradients:** clone Torch targets and SU gauges without
+  detaching; Autoray's generic Torch copy detached singular-value derivatives
+  from reconstructed operators, despite preserving forward values.
+
 - **Dense Torch cluster ALS:** opt into `solver="torch"` for batched physical
   RHS contractions and certified Cholesky solves with the reference spectral
   fallback. Optional `torch_backend="aot_eager"` captures array contractions

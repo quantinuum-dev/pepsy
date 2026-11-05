@@ -138,6 +138,11 @@ documents the optional dense Torch solver, AOT capture, measurement costs and
 the limits of accumulated local fidelities. Full pair-result snapshots are
 retained only with `return_results=True`.
 
+For repeated dense Torch PEPO schedules, use
+[`pepsy.bp.PreparedLoopClusterUpdate`](../bp.md#prepared-ordered-pepo-cluster-replay).
+It prepares six-site geometry and contraction programs while preserving
+the input order, source barriers and pair truncations.
+
 ## Prepared dense simple update
 
 `pepsy.operators.PreparedSimpleUpdate` snapshots a dense complex Torch PEPO,
