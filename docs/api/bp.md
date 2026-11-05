@@ -159,6 +159,15 @@ This is a direct finite-cluster approximation with SU/BP exterior closure.
 It is distinct from the explicit cut-edge $P+Q$ series below. Package readiness
 does not establish stability or convergence of a long χ6 trajectory.
 
+For a complete Eli-circuit replay, use the downstream
+[current six-site command](https://github.com/rezaquant/pepsy_examples/blob/main/experiments/mps_magnetization/benchmark/eli_global_cost/RUNBOOK.md#current-six-site-cluster-update).
+That runner calls this public API and moves each active gauge's RMS scale
+into the network exponent after every pair. Its scalar trace estimate
+defaults to **boundary MPS with cap 3χ**. This is an example-workflow policy;
+`gate_loop_cluster` itself constructs local updates and computes no global
+trace cost. Use Pepsy `9e57d5e` or later for the corrected exterior-weighted
+gauges and operand-order cache keys.
+
 For the first-pass local full-update style compression, use
 `compress_reduced_loop_cluster`. It selects the active bond, fills a finite
 cluster by `max_distance`, closes its cut bonds with either SU vectors or
@@ -1150,9 +1159,9 @@ cluster regions do not pay the open-edge enumeration cost. Inspect
 `info["open_rho_cluster_region_costs"]` or
 `info["open_scalar_cluster_region_costs"]` for its contraction decisions.
 The same one-BP/many-support workflow is runnable in the downstream example
-`../pepsy_examples/symmetric_tensors/peps/bp_open_rho_series.py`; the
+`../pepsy_examples/advanced/symmetric_tensors/peps/bp_open_rho_series.py`; the
 long-range native doublon comparison is in
-`../pepsy_examples/symmetric_tensors/peps/bp_long_doublon_4x4.py`.
+`../pepsy_examples/advanced/symmetric_tensors/peps/bp_long_doublon_4x4.py`.
 
 To measure a long-range operator without materializing the diagnostic rho, use
 the scalar companion. It keeps the same open-path, closed-loop, and

@@ -1,6 +1,7 @@
 # Cluster PEPO backend and downstream optimization status
 
-Reviewed 2026-10-12 at `bf83def`, the published Pepsy `develop` → `main` merge.
+Updated 2026-11-05 for the corrected six-site gate API on `develop`.
+The earlier published `develop` → `main` merge was `bf83def` on 2026-10-12.
 This page owns the current capability and validation routes. Detailed earlier
 updates are preserved in the [archived ledger](notes/2026-10-12-cluster-status-archive.md).
 Its older “working-tree” and “unpublished” statements retain their original dates.
@@ -28,9 +29,12 @@ corrects half-weighted active-gauge extraction and order-insensitive tree
 cache keys. Earlier long-time cluster trials used the incorrect gauge
 spectra; preserve their numerical records without interpreting them as
 validation of the corrected method.
-The corrected 23-qubit homogeneous depth20 χ6 test gives exact scalar cost
-0.0516255383, versus 0.8648849089 before the fix and matched-target HRS
-0.0476403551. Public RMS-to-exponent bookkeeping keeps the operator amplitude
+The fixes are published on `develop` in `9e57d5e`. The corrected 23-qubit
+homogeneous depth20 χ6 test gives **MPS-boundary cap18 cost 0.0516255525**,
+versus 0.8648848491 at the same cap before the fix and matched-target HRS
+0.0476403551. The downstream [current usage](https://github.com/rezaquant/pepsy_examples/blob/main/experiments/mps_magnetization/benchmark/eli_global_cost/RUNBOOK.md#current-six-site-cluster-update)
+defaults to MPS scalar readout at 3χ; archived exact readouts remain historical
+diagnostics. Public RMS-to-exponent bookkeeping keeps the operator amplitude
 while bounding gauge scales. This is one measured case; finite-χ/cluster/ALS
 convergence remains unverified.
 
@@ -48,8 +52,8 @@ actual devices and the replacement trial uses a corrected snapshot.
 
 The [centered-cluster readiness record](../../history/2026-11-05-centered-cluster-updates.md)
 adds base-patch selection, one-sided dense PEPO gates and accelerator solves.
-The χ6 interior-patch CPU/CUDA pilot agrees and remains finite; long-time
-χ6 stability remains unmeasured. The earlier native reduced-shape failure
+The χ6 interior-patch CPU/CUDA pilot agrees and remains finite; the corrected
+full-T=6 case above provides a separate measurement. The earlier native reduced-shape failure
 is fixed; five unrelated fermionic readout failures reproduce on the baseline.
 
 The [November 5 local-gauge follow-up](../../history/2026-11-05-local-bond-svd-gauges.md)
@@ -99,8 +103,9 @@ compressed-trace failures remain unresolved.
 
 The [promotion handoff](../../history/2026-10-12-develop-main-promotion.md)
 records integration into `main`. These commits are later development work,
-not a new tagged release. The latest local smoke checkpoint passed **94 tests**;
-it covers API/import/layout contracts and does not certify every numerical path.
+not a new tagged release. That promotion's smoke checkpoint passed **94 tests**;
+the November 5 publication review records **112** newer smoke passes.
+These cover API/import/layout contracts and do not certify every numerical path.
 
 | Dated check | Result and scope | Evidence |
 | --- | --- | --- |
