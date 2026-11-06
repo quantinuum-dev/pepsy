@@ -5,6 +5,15 @@ environment work before extending independent-cluster batching. No maintained
 numerical implementation or default changed in this investigation. The earlier
 cluster batching change is committed and pushed as `aadd8eb` on `develop`.
 
+**Baseline correction:** the timings below explicitly override
+`contraction_opt='greedy'`. Ordinary `PepsOptimizer` construction already calls
+`build_optimizer()` when no optimizer is supplied, and the final FU norm
+contraction receives that reusable Cotengra optimizer. The 12.86x kernel
+comparison is against forced greedy, not against this existing default. It
+does not establish a missing planner/cache feature or a default-driver speedup.
+The follow-up comparison below confirms that the existing default finds a
+matching-cost fast path.
+
 ## Independence differs from the cluster method
 
 FU reads a global reduced norm environment. Disjoint six-site patches do not
@@ -105,23 +114,51 @@ Normalized environment matrices differ by 3.89e-15 in Frobenius norm. Both
 compute the same contraction up to floating-point order; no chi, boundary
 fitting policy, target or convergence tolerance changes.
 
-This is a **measured prototype on one warm graph**, not an integrated FU option
-or an end-to-end speedup. An integration should select/cache a norm-specific
-path separately from the boundary optimizer, check memory limits, and validate
-sequential trajectories, both PEPO legs, PEPS, supported backends and numerical
-conditioning. Replacing the global `contraction_opt` would also alter boundary
-work and is not the change tested here. The near-singular solver comparison
-above still motivates physical/reference checks after changing contraction
-order.
+This is a **measured alternative path on one forced-greedy warm graph**. The
+default already has reusable Cotengra search; no new planner integration is
+justified without comparing it. If a norm-specific policy is later useful,
+measure planning and cached lookup overhead separately from execution, retain
+memory controls, and validate sequential trajectories and physical/reference
+quantities. Replacing global `contraction_opt` would also alter boundary work
+and is not the change tested here.
+
+### Existing default comparison
+
+The follow-up uses the same final norm graph and adds
+`build_optimizer(parallel=False)` with its existing search budget/objective.
+Disabling search parallelism bounds the diagnostic's host resource use; it
+does not change the FU contraction or enable a new numerical route. Alternate
+all three fixed trees over four repetitions and discard the first:
+
+| Path | Median contraction seconds | Estimated FLOPs | Largest intermediate elements |
+| --- | ---: | ---: | ---: |
+| Forced greedy | 0.93779 | 32,912,098,848 | 16,422,912 |
+| Randomized greedy, 64 trials | 0.07510 | 1,957,872,384 | 4,105,728 |
+| Existing `build_optimizer()` | 0.07454 | 1,957,872,384 | 4,105,728 |
+
+The existing planner matches the alternative's cost and execution time. Its
+initial search takes 1.64481 s; a repeated cached tree lookup takes 0.000304 s.
+Building the two simple reference trees takes 0.00184 s in total. Normalized
+environment difference from greedy is 4.51e-15 for the default tree. Absolute
+device timings differ between runs, so compare the interleaved results within
+this table rather than mixing timing columns from different runs.
+
+**Correction to the initial recommendation:** no execution improvement over
+the default is demonstrated. Planner startup cost or cache misses may merit
+profiling, but an additional norm planner/cache is not established as necessary.
+Warm FU profiling must be repeated with the existing default before ranking
+new optimization work. The earlier forced-greedy stage timings remain scoped
+to that explicit configuration.
 
 ## Classification and next experiments
 
 - **Adopt:** retain the existing source-validated transverse and strip reuse,
   exact-rank skips and optional same-bond opposite-leg fusion. These are
   already implemented, not new opportunities.
-- **Prototype, first priority:** integrate guarded norm-specific contraction
-  planning/cache and validate full trajectories. The identical-operand test
-  above targets the measured warm-path bottleneck without simultaneous gates.
+- **Already implemented:** reusable Cotengra planning reaches the fast final
+  norm path in this check. Do not count the forced-greedy improvement as a new
+  default FU feature. Profile default-route startup/cache misses and complete
+  gate timings before proposing a new policy.
 - **Prototype:** batch shape-compatible boundary kernels across independent
   trajectories, or separate boundary fronts when both must be rebuilt.
   Bound memory and preserve per-member compression/convergence decisions.
@@ -141,6 +178,9 @@ Temporary scripts/results under `/tmp`:
 - `pepsy-fu-stage-probe-20261105.py`: the same sequence with environment stages.
 - `pepsy-fu-norm-path-probe-20261105.py`: bounded planning and identical-operand
   contraction comparison; `mature-norm-path.json` records its result.
+- `pepsy-fu-default-path-probe-20261105.py`: three-way comparison including
+  existing `build_optimizer()`; `mature-norm-default-comparison.json` records
+  its result and `mature-final-norm-graph.pkl` retains the graph.
 - `pepsy-fu-opportunities-20261105/`: JSON results and fixed-problem tensors.
 
 CUDA probes require device access outside the restricted sandbox. The active
