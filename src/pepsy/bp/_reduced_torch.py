@@ -202,4 +202,5 @@ def solve(problem, *, max_bond, max_iterations, tol, rcond,
         fidelity_status=fidelity_status,
         solver_report=dict(**counts, torch_backend=torch_backend,
                            environment='open reduced tensor; physical RHS batching'),
+        target_norm=target_norm,
     )

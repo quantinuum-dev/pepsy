@@ -140,6 +140,12 @@ or clipping the environment spectrum; `raw_min_eigenvalue` is then `None`.
 Torch/CuPy local solves remain in their backend even above Quimb's
 automatic dense-solve threshold. No physical-identity-expanded metric is
 materialized by the default Quimb route.
+`apply_reduced_loop_cluster_gate` and `gate_loop_cluster` accept
+`materialize_physical=False` to skip the separate gauge-inserted physical
+snapshot when only the updated SU core/gauges and scalar diagnostics are
+needed. Then each result has `physical_tn=None`. The default remains `True`.
+Reconstruct a physical network explicitly from a copied core and its gauges
+when needed; skipping the snapshot does not change the numerical update.
 Long-running streams should set `strip_exponent=True` (or call public
 `pepsy.operators.renorm_gauge` manually after each pair). It moves the positive gauge
 RMS scale into `tn.exponent`, preserving the represented amplitude while
@@ -355,6 +361,12 @@ sweep; QR/normal also retain their half-sweep measurements. The default
 unmonitored behavior is unchanged, with these status fields set to `None`.
 Monitoring is unavailable for autodiff and native Symmray's graded-SVD route.
 
+`ReducedALSSolution.target_norm` retains the Python scalar already computed
+by dense Torch (including batches), Quimb, or monitored QR/normal ALS.
+It is `None` when that solver did not record it. Logging can reuse it without
+contracting the target again. This scalar describes the solved problem;
+`problem.target_norm` still recomputes from current tensors after mutations.
+
 Dense ALS also accepts `initial_factors=(left, right)` instead of restarting
 from a target SVD. Shapes are `(left_dim, physical_left, rank)` and
 `(rank, physical_right, right_dim)`, with matching backend, dtype and device.
@@ -466,6 +478,9 @@ algorithm. Every pair moves its gauge RMS into the network exponent.
 `step_callback(index, result)` receives the original zero-based gate index;
 one-site gates have `result=None`. `return_results=True` returns
 `(core, tuple_of_pair_results)`; otherwise full results are not accumulated.
+Pass `materialize_physical=False` to omit each pair's separate `physical_tn`
+snapshot while retaining its problem, solution and scalar diagnostics.
+The default `True` preserves physical snapshots for existing callers.
 `inplace=False` copies the input core while updating the supplied gauge map,
 as in the ordinary gate-stream API. Trackers can span multiple slices.
 

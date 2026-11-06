@@ -200,6 +200,71 @@ def test_prepared_copy_replay_preserves_the_input_core():
     torch.testing.assert_close(state.to_dense(), torch.eye(64, dtype=torch.complex128))
 
 
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+@pytest.mark.parametrize('execution', ['prepared', 'reference'])
+def test_omitting_physical_snapshots_preserves_stream_values_and_gradients(
+        device, execution, monkeypatch):
+    state = initial(device, random=True)
+    schedule = [(((0, 1), (1, 1)), 'lower'), (((0, 0), (0, 1)), 'upper')]
+    plan = PreparedLoopClusterUpdate(state, schedule, max_bond=2, max_iterations=2,
+                                     tol=0., optimize='greedy')
+    original_insert = qtn.TensorNetwork.gauge_simple_insert
+    insertions = []
+
+    def count_insertions(*args, **kwargs):
+        insertions.append(1)
+        return original_insert(*args, **kwargs)
+
+    monkeypatch.setattr(qtn.TensorNetwork, 'gauge_simple_insert', count_insertions)
+    outputs = []
+    for materialize in (True, False):
+        value = torch.tensor(.17, dtype=torch.float64, device=device, requires_grad=True)
+        matrices = [gate(value, 2, device), gate(.21, 2, device)]
+        work, gauges, rows = state.copy(), {}, []
+        tracker = LoopClusterUpdateTracker(keep_records=False)
+        start = len(insertions)
+        for index in range(2):
+            if execution == 'prepared':
+                work, results = plan.apply(work, matrices, gauges=gauges, start=index,
+                    stop=index+1, tracker=tracker, return_results=True,
+                    materialize_physical=materialize)
+            else:
+                sites, side = schedule[index]
+                work, results = gate_loop_cluster(work, [(matrices[index], sites, side)],
+                    gauges=gauges, max_bond=2, cluster_mode='loopunion', base_radius=4,
+                    fillin=True, max_loop_size=0, psd_project=False, optimize='greedy',
+                    strip_exponent=True, tracker=tracker, return_results=True,
+                    materialize_physical=materialize,
+                    als_opts=dict(solver='torch', max_iterations=2, tol=0., monitor_convergence=True))
+            rows.extend(results)
+        assert len(insertions)-start == (4 if materialize else 2)
+        assert all((row.physical_tn is not None) is materialize for row in rows)
+        dense = physical(work, gauges)
+        gradient = torch.autograd.grad(dense.abs().square().sum(), value)[0]
+        outputs.append((dense, gradient, work.exponent, tracker.summary(), rows))
+    expected, actual = outputs
+    for index in (0, 1, 2):
+        torch.testing.assert_close(actual[index], expected[index], rtol=2e-8, atol=2e-9)
+    assert actual[3] == expected[3]
+    for row, ref in zip(actual[4], expected[4]):
+        assert row.solution.costs == pytest.approx(ref.solution.costs)
+        assert row.solution.iterations == ref.solution.iterations == 2
+        assert row.solution.target_norm == pytest.approx(row.problem.target_norm, rel=1e-12)
+
+
+def test_snapshot_option_is_validated_before_mutation():
+    state = initial()
+    schedule = [(((0, 1), (1, 1)), 'lower')]
+    plan = PreparedLoopClusterUpdate(state, schedule, optimize='greedy')
+    tensors, gauges = [t.data for t in state.tensors], {}
+    with pytest.raises(TypeError, match='materialize_physical'):
+        plan.apply(state, [gate(.1, 2)], gauges=gauges, materialize_physical=1)
+    with pytest.raises(TypeError, match='materialize_physical'):
+        gate_loop_cluster(state, [(gate(.1, 2), schedule[0][0], 'lower')],
+                          gauges=gauges, materialize_physical=1)
+    assert not gauges and all(t.data is old for t, old in zip(state.tensors, tensors))
+
+
 def test_prepared_preserves_boundary_validation_and_cost_preflight():
     state = initial(random=True)
     schedule, gates = [(((0, 0), (0, 1)), 'upper')], [gate(.1, 2)]

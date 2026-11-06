@@ -60,6 +60,8 @@ def test_batch_matches_sequential_updates_and_retains_each_active_gauge(device, 
         for actual, expected in zip(candidate[2], outputs[0][2]):
             torch.testing.assert_close(actual.solution.theta(), expected.solution.theta(), **tolerance)
             assert actual.solution.iterations == expected.solution.iterations == 4
+            assert actual.solution.target_norm == pytest.approx(
+                actual.problem.target_norm, rel=8e-5 if dtype == 'complex64' else 2e-12)
             assert actual.solution.local_fidelity == pytest.approx(expected.solution.local_fidelity,
                                                                    abs=tolerance['atol'])
         assert candidate[3].accumulated_local_fidelity == pytest.approx(

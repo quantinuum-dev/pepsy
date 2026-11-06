@@ -2261,6 +2261,7 @@ def gate_loop_cluster(
     strip_exponent: bool = False,
     inplace=True,
     return_results: bool = False,
+    materialize_physical: bool = True,
 ):
     """Apply a PEPS gate stream with reduced loop-cluster updates.
 
@@ -2305,6 +2306,8 @@ def gate_loop_cluster(
     :func:`renorm_gauge` calls. Dense Torch callers may opt into
     ``als_opts={'solver': 'torch'}``, with optional ``torch_backend='aot_eager'``
     inside that dictionary. Existing automatic solver selection is unchanged.
+    ``materialize_physical=False`` omits the separate ``physical_tn`` snapshot
+    from pair results; the updated core and gauges are unchanged.
     """
     if gauges is None and isinstance(where, dict):
         gauges = where
@@ -2313,6 +2316,8 @@ def gate_loop_cluster(
         gauges = {}
     if not isinstance(strip_exponent, bool):
         raise TypeError('strip_exponent must be a bool')
+    if not isinstance(materialize_physical, bool):
+        raise TypeError('materialize_physical must be a bool')
     if tracker is not None:
         from ..bp.cluster_updates import LoopClusterUpdateTracker
 
@@ -2493,6 +2498,7 @@ def gate_loop_cluster(
                 als_opts=als_opts_use,
                 regauge_opts=regauge_opts_use,
                 inplace=True,
+                materialize_physical=materialize_physical,
             )
             if strip_exponent:
                 # Preserve amplitude while preventing gauge-scale growth

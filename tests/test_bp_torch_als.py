@@ -103,6 +103,21 @@ def test_optional_fidelity_does_not_run_when_disabled(monkeypatch):
         assert result.local_fidelity is None and result.fidelity_status == 'not_requested'
 
 
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+@pytest.mark.parametrize('solver', ['torch', 'quimb'])
+def test_solver_norm_is_a_scalar_snapshot_without_caching_mutable_problem(device, solver):
+    problem = problem_on(device)
+    norm = problem.target_norm
+    solution = solve_reduced_als(problem, solver=solver, max_bond=2, max_iterations=2,
+                                 tol=0., monitor_convergence=True)
+    assert isinstance(solution.target_norm, float)
+    assert solution.target_norm == pytest.approx(norm, rel=2e-12)
+    # Public problem diagnostics must still reflect new array values.
+    problem.target.mul_(2.)
+    assert problem.target_norm == pytest.approx(4*norm, rel=2e-12)
+    assert solution.target_norm == pytest.approx(norm, rel=2e-12)
+
+
 def test_fidelity_rejects_bad_metrics_and_avoids_scale_overflow():
     assert _validated_local_fidelity(1e200, 1e200, 1e200, 1e-16) == (1., 'valid')
     for norm, target, overlap, status in ((0., 1., 0., 'nonpositive_norm'),

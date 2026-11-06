@@ -420,13 +420,16 @@ class PreparedLoopClusterUpdate:
                      for (k, pair, _), problem, solution in zip(selected, problems, solutions))
 
     def apply(self, network, gates, *, gauges, start=0, stop=None, tracker=None,
-              step_callback=None, inplace=True, return_results=False):
+              step_callback=None, inplace=True, return_results=False,
+              materialize_physical=True):
         """Replay ``[start:stop]`` of the original full gate bank in order.
 
         Gauges are updated in place. ``step_callback(index, result)`` receives
         the original zero-based gate index; result is None for one-site gates.
         Reuse a tracker across calls to retain local products across source
         barriers. Full pair results are retained only when requested.
+        ``materialize_physical=False`` omits their unused physical snapshots;
+        the updated core and gauge dictionary are identical.
         """
         import torch
         from .cluster_updates import LoopClusterUpdateTracker
@@ -436,6 +439,8 @@ class PreparedLoopClusterUpdate:
         )
         from ..operators import renorm_gauge
 
+        if not isinstance(materialize_physical, bool):
+            raise TypeError('materialize_physical must be a bool')
         if stop is None:
             stop = len(self.slots)
         if (not isinstance(start, int) or not isinstance(stop, int)
@@ -497,7 +502,7 @@ class PreparedLoopClusterUpdate:
                                   tol=self.tol, monitor_convergence=True,
                                   measure_fidelity=tracker is not None, torch_backend=self.torch_backend),
                     regauge_opts={}, inplace=True, result_type=ReducedLoopClusterGateResult,
-                    solution=solution)
+                    solution=solution, materialize_physical=materialize_physical)
                 renorm_gauge(work, gauges, slot.sites, smudge=0.)
                 if tracker is not None:
                     tracker.record(result)

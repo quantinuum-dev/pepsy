@@ -129,4 +129,5 @@ def solve(problems, *, max_bond, max_iterations, tol, measure_fidelity, rcond=1e
         termination_reason=reasons[i], local_fidelity=fidelities[i][0],
         local_infidelity=None if fidelities[i][0] is None else 1-fidelities[i][0],
         fidelity_status=fidelities[i][1], solver_report=dict(**counts[i], torch_backend=None,
-            environment='open reduced tensor; independent cluster batch')) for i in range(count))
+            environment='open reduced tensor; independent cluster batch'),
+        target_norm=norms[i]) for i in range(count))

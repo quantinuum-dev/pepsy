@@ -1395,6 +1395,8 @@ class ReducedALSSolution:
     The native Quimb route reports initial/final objectives by default, or
     each complete sweep with ``monitor_convergence=True``. Monitoring also
     supplies ``iterations``, ``converged`` and ``termination_reason``.
+    ``target_norm`` retains the scalar computed by the solver when available;
+    it describes the solved problem, not subsequent mutations of its arrays.
     """
 
     left: Any
@@ -1408,6 +1410,7 @@ class ReducedALSSolution:
     local_infidelity: float | None = None
     fidelity_status: str = 'not_requested'
     solver_report: dict[str, Any] = field(default_factory=dict)
+    target_norm: float | None = None
 
     def theta(self):
         """Return the optimized joint reduced tensor."""
@@ -1416,7 +1419,7 @@ class ReducedALSSolution:
 
 @dataclass(frozen=True)
 class ReducedLoopClusterGateResult:
-    """Result of one reduced loop-cluster PEPS or PEPO gate update."""
+    """One reduced gate update; ``physical_tn`` is absent when not requested."""
 
     core: Any
     gauges: dict[str, Any]
@@ -2826,11 +2829,13 @@ def _solve_reduced_als_quimb(
             left=left, right=right, costs=tuple(costs), solver='quimb',
             iterations=iteration, converged=converged,
             termination_reason=reason or 'max_iterations',
+            target_norm=target_norm,
         )
 
+    target_norm = problem.target_norm
     qtn.tensor_network_fit_als(
         tn_fit, tn_target, steps=max_iterations, tol=tol, tnAA=tn_aa,
-        tnAB=tn_ab, xBB=problem.target_norm, inplace=False, **fit_opts,
+        tnAB=tn_ab, xBB=target_norm, inplace=False, **fit_opts,
     )
 
     left_tensor = tn_aa["__KET__", "__VAR0__"]
@@ -2852,6 +2857,7 @@ def _solve_reduced_als_quimb(
         right=right,
         costs=(initial_cost, final_cost),
         solver='quimb',
+        target_norm=target_norm,
     )
 
 
@@ -3515,7 +3521,8 @@ def solve_reduced_als(
                               solver='qr' if use_qr else 'normal',
                               iterations=iteration if monitor_convergence else None,
                               converged=converged if monitor_convergence else None,
-                              termination_reason=(reason or 'max_iterations') if monitor_convergence else None)
+                              termination_reason=(reason or 'max_iterations') if monitor_convergence else None,
+                              target_norm=target_norm)
     return _with_local_fidelity(problem, solution, measure_fidelity)
 
 
@@ -3580,6 +3587,7 @@ def _local_svd_reduced_state(
     *,
     inplace,
     output_gauges=None,
+    materialize_physical=True,
 ):
     """Extract the active SU gauge in its full exterior-weighted metric."""
     import quimb.tensor as qtn
@@ -3668,8 +3676,12 @@ def _local_svd_reduced_state(
         core = tn
     # Rebuild after the SVD has aligned any absent native charge sectors on
     # the active bond. Raw native input factors can omit different zero blocks.
-    physical_tn = core.copy()
-    physical_tn.gauge_simple_insert(updated_gauges)
+    # Stream callers need only the updated SU representation. Avoid a full
+    # network gauge insertion when its separate physical snapshot is unused.
+    physical_tn = None
+    if materialize_physical:
+        physical_tn = core.copy()
+        physical_tn.gauge_simple_insert(updated_gauges)
     info = {
         "method": "local_svd", "bond_ind": pair.bond_ind,
         "singular_values_normalized": False,
@@ -3690,6 +3702,7 @@ def _finish_reduced_gate(
     inplace,
     result_type,
     solution=None,
+    materialize_physical=True,
 ):
     """Solve and extract the active SU gauge without a global gauge sweep."""
     _validate_local_regauge_opts(regauge_opts)
@@ -3699,6 +3712,7 @@ def _finish_reduced_gate(
     core, updated_gauges, physical_tn, su_info, reused = _local_svd_reduced_state(
         tn, pair, solution, inplace=inplace,
         output_gauges=gauges if precomputed and pair.input_mode == 'su_core' else None,
+        materialize_physical=materialize_physical,
     )
     if inplace and hasattr(gauges, "clear"):
         gauges.clear()
@@ -3965,6 +3979,7 @@ def apply_reduced_loop_cluster_gate(
     als_opts: dict[str, Any] | None = None,
     regauge_opts: dict[str, Any] | None = None,
     inplace: bool = False,
+    materialize_physical: bool = True,
 ) -> ReducedLoopClusterGateResult:
     """Apply one adjacent two-site PEPS gate with the reduced loop metric.
 
@@ -3991,7 +4006,11 @@ def apply_reduced_loop_cluster_gate(
     ``loop_cache`` optionally reuses topology-only generalized-loop geometry
     when the same active bond is updated repeatedly with different loop
     cutoffs. It does not cache tensor contractions or boundary messages.
+
+    ``materialize_physical=False`` omits the separate physical network from
+    the result (``physical_tn=None``); the updated core and gauges are retained.
     """
+    _require_bool('materialize_physical', materialize_physical)
     # Preserve the historical ``(tn, gauges, gate)`` positional form while
     # allowing the natural message-only ``(tn, gate, ...)`` form.
     if gate is None:
@@ -4055,4 +4074,5 @@ def apply_reduced_loop_cluster_gate(
         regauge_opts=regauge_opts,
         inplace=inplace,
         result_type=ReducedLoopClusterGateResult,
+        materialize_physical=materialize_physical,
     )

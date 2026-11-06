@@ -8,6 +8,12 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Loop-cluster replay overhead:** `materialize_physical=False` skips unused
+  physical-network snapshots in reduced gates, gate streams and prepared
+  replay; existing defaults retain them. Dense ALS results expose the scalar
+  `target_norm` already computed during solving for diagnostic reuse, without
+  caching mutable problem tensors or changing ALS/stopping/gauge policy.
+
 - **Independent cluster batches (experimental):** opt into
   `PreparedLoopClusterUpdate(..., batch_size="auto")` to discover compatible
   disjoint ready clusters from gate/lattice dependencies and current workspace;

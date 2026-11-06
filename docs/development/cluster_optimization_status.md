@@ -1,6 +1,6 @@
 # Cluster PEPO backend and downstream optimization status
 
-Updated 2026-11-05 for the corrected six-site gate API on `develop`.
+Updated 2026-11-06 for the loop-cluster replay overhead controls on `develop`.
 The earlier published `develop` → `main` merge was `bf83def` on 2026-10-12.
 This page owns the current capability and validation routes. Detailed earlier
 updates are preserved in the [archived ledger](notes/2026-10-12-cluster-status-archive.md).
@@ -26,6 +26,11 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Host gradient solvers | Native Torch/JAX parameters with SciPy/NLopt host control and explicit budget/result validation; NLopt supports an opt-in maximum derivative threshold separate from step tolerance | [Gradient solvers](../api/solvers/gradient.md) |
 
 ## Publication and validation
+
+The [replay-overhead follow-up](../../history/2026-11-06-loop-cluster-replay-overhead.md)
+adds optional omission of physical-network snapshots and a solver scalar
+target norm for logging reuse. The Eli runner selects these controls for
+prepared and reference replay; numerical update policy remains unchanged.
 
 The [batch commit review](../../history/2026-11-05-cluster-batch-precommit-review.md)
 adds experimental same-network cluster batching through
