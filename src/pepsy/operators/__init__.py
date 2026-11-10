@@ -155,6 +155,7 @@ _SYMBOL_MODULES.update({name: ".diagnostics" for name in _DIAGNOSTIC_EXPORTS})
 _SYMBOL_MODULES["MPOBraiding"] = ".mpo_space"
 _SYMBOL_MODULES["MPOPhysicalSpace"] = ".mpo_space"
 _SYMBOL_MODULES["PauliMPO"] = ".pauli_mpo"
+_SYMBOL_MODULES["PauliDampingMPO"] = ".pauli_damping"
 _SYMBOL_MODULES["decompose_pauli"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliCompressionReport"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliBondCompressionReport"] = ".pauli_mpo"
@@ -176,6 +177,7 @@ _SUBMODULES = (
     "pepo_cluster",
     "diagnostics",
     "pauli_mpo",
+    "pauli_damping",
 )
 
 __all__ = [
@@ -204,6 +206,7 @@ __all__ = [
     *_MPO_CLUSTER_COMPATIBILITY_EXPORTS,
     *_DIAGNOSTIC_EXPORTS,
     "PauliMPO",
+    "PauliDampingMPO",
     "decompose_pauli",
     "PauliCompressionReport",
     "PauliBondCompressionReport",

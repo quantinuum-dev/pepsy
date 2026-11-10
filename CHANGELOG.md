@@ -8,6 +8,18 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Pauli MPO / DAOE:** add exact Pauli-weight damping through
+  `PauliMPO.apply_daoe`, preserving native cores and separating filtering from
+  SVD compression. Expose reusable `PauliDampingMPO` objects with explicit
+  dimension-four Quimb MPO export, independent diagonal-core copies, scalar
+  factor queries and `PauliMPO.apply_damping`. Fix even-chain native
+  subtraction/commutators, real-core complex promotion, dtype/device-aware
+  constants and gradient-preserving
+  dense readout. Keep in-place channels native, invalidate stale gate/channel
+  reports and reject noninteger gate sites. Partial-SVD diagnostics now include
+  the uncomputed spectrum via reconstruction residuals. A scalable DAOE
+  evolution driver remains future work.
+
 - **Torch SVD backward:** allow `TorchLinalgConfig.svd_gap_rtol` to select
   the relative stabilized gap threshold while preserving the `1e-6` default.
   The direct JAX `svd_jax` call likewise accepts `gap_rtol`. Narrower

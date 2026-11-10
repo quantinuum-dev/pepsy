@@ -40,9 +40,20 @@ These are the names to use in new code.
 | Ordered PEPO products | `PEPOClusterFactor`, `PEPOClusterProductExpansion`, `CompiledPEPOClusterProduct` | `operators.pepo_cluster` (implementation: `operators.pepo_product`) |
 | PEPO composition | `compose_pepo_layers`, `compose_cluster_expansion_pepo` | `operators.pepo_cluster` |
 | Pauli operator algebra | `PauliMPO`, `decompose_pauli`, `PauliCompressionReport`, `PauliBondCompressionReport` | `operators.pauli_mpo` |
+| Pauli coefficient damping | `PauliDampingMPO` | `operators.pauli_damping` |
 | Exact MPO structural layer | `MPOAutomaton`, `MPOChannel`, `MPOTransition` | `operators.mpo_automaton` |
 | Native tree operators | `TreeMPO`, `TreePEPO`, `TreeSubPEPO`, `ham_tn.to_tree_mpo`, `ham_tn.to_tree_pepo` | `optimizers.tree`, `optimizers.tree_peps`, `operators.hamiltonians` |
 | Elementary gates/builders | gate constructors (`x`, `rx`, `cnot`, etc.), `gate`, `build_mpo_from_gates`, `build_pepo_from_gates` | `operators.gates` |
+
+`PauliDampingMPO` owns reusable weight-counter construction, explicit
+dimension-four Quimb MPO export and direct diagonal application.
+`PauliMPO.apply_daoe` is its one-application convenience wrapper;
+`apply_damping` reuses an existing filter. They keep filtering separate from
+native SVD compression and Hamiltonian evolution;
+see the [DAOE API](../../api/operators/pauli_mpo.md#daoe-weight-filter) and
+[readiness audit](../notes/2026-11-09-pauli-mpo-daoe.md).
+The [reusable MPO audit](../notes/2026-11-09-pauli-damping-mpo.md) records
+the explicit export/application checks and current 1D scope.
 
 The API lifecycle is:
 

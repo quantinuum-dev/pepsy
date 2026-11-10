@@ -1,11 +1,10 @@
-"""Sparse Pauli-basis operators with an MPO execution boundary.
+"""Sparse or core-backed Pauli-basis operators with an MPO boundary.
 
-``PauliMPO`` keeps an operator in a canonical sparse expansion over
-``I``, ``X``, ``Y`` and ``Z`` strings.  It is deliberately a front end to
-Pepsy's existing :class:`~pepsy.operators.mpo.FirstDegreeMPO`: exact Pauli
-algebra and Pauli-basis traces stay native, while general tensor-network
-operations such as MPS application, Quimb contraction, MPO compression, and
-higher-order exponentials use the established MPO implementation.
+``PauliMPO`` stores canonical sparse strings or native coefficient cores
+over ``I``, ``X``, ``Y`` and ``Z``. Algebra, traces, SVD compression and DAOE
+filtering stay in that basis. General MPS application, Quimb contraction,
+numerical MPO compression and higher-order exponentials use Pepsy's existing
+:class:`~pepsy.operators.mpo.FirstDegreeMPO` boundary.
 
 Short strings passed to :meth:`PauliMPO.from_terms` are translated across the
 chain.  Thus ``(J, "ZZ")`` is the nearest-neighbor sum and ``(h, "X")`` is
@@ -26,6 +25,7 @@ import autoray as ar
 import numpy as np
 
 from .._internal.validation import is_strict_integer, normalize_integer_tuple
+from ..backends.convert import infer_backend_converter_from_sample
 from .mpo_semantic import FirstDegreeMPO, MPOProductTerm
 
 __all__ = [
@@ -177,10 +177,16 @@ def _concatenate(values, axis):
 
 
 def _zeros(shape, *, like):
-    return ar.do("zeros", tuple(shape), like=like)
+    return _array_like(np.zeros(tuple(shape)), like)
 
 
 def _array_like(value, like):
+    # Autoray's ``like`` selects a backend, not the reference dtype/device.
+    # Use the shared converter so constant masks also work with complex,
+    # single-precision and accelerator-resident coefficient cores.
+    converter = infer_backend_converter_from_sample(like)
+    if converter is not None:
+        return converter(value)
     return ar.do("array", np.asarray(value), like=like)
 
 
@@ -234,7 +240,11 @@ def _complexify(value):
 
     if _is_complex_array(value):
         return value
-    return ar.do("astype", value, dtype=complex)
+    dtype = ar.get_dtype_name(value)
+    target = "complex64" if dtype in {"float16", "bfloat16", "float32"} else "complex128"
+    # The NumPy/JAX astype adapters take dtype positionally. A dtype name
+    # also avoids promoting every float32 coefficient core to complex128.
+    return ar.astype(value, target)
 
 
 def _host_array(value):
@@ -307,22 +317,9 @@ def _normalize_sites(sites, nsites, *, sort=True, distinct=True):
 def _normalize_where(where, nsites):
     """Normalize gate support while preserving the supplied qubit order."""
 
-    if isinstance(where, Integral):
-        where = (int(where),)
-    else:
-        try:
-            where = tuple(int(site) for site in where)
-        except TypeError as exc:
-            raise TypeError(
-                "where must be an integer or an iterable of integers."
-            ) from exc
-    if not where:
-        raise ValueError("where must contain at least one site.")
-    if len(set(where)) != len(where):
-        raise ValueError("where must contain distinct sites.")
-    if any(site < 0 or site >= nsites for site in where):
-        raise ValueError(f"where must lie in the range 0..{nsites - 1}.")
-    return where
+    # Keep the same strict integer contract as constructors/partial traces;
+    # silently rounding a floating-point support can apply a gate elsewhere.
+    return _normalize_sites(where, nsites, sort=False)
 
 
 def _as_dense_matrix(operator):
@@ -689,6 +686,7 @@ def _native_direct_sum(left_cores, right_cores, sign=1):
         return (_add(left_cores[0], _multiply(sign, right_cores[0])),)
     result = []
     left = left_cores[0]
+    # The scalar multiplies the whole right train once, not once per site.
     right = _multiply(sign, right_cores[0])
     result.append(_concatenate((left, right), 1))
     for left, right in zip(left_cores[1:-1], right_cores[1:-1]):
@@ -699,13 +697,13 @@ def _native_direct_sum(left_cores, right_cores, sign=1):
             1,
         )
         bottom = _concatenate(
-            (_zeros((rl, lr, physical), like=left), _multiply(sign, right)),
+            (_zeros((rl, lr, physical), like=left), right),
             1,
         )
         result.append(_concatenate((top, bottom), 0))
     result.append(
         _concatenate(
-            (left_cores[-1], _multiply(sign, right_cores[-1])),
+            (left_cores[-1], right_cores[-1]),
             0,
         )
     )
@@ -881,6 +879,19 @@ def _svd(matrix, *, method="svd", max_rank=None, oversample=8, n_iter=2, seed=No
     )
 
 
+def _svd_discarded_weight(matrix, u, singular_values, vh, rank):
+    """Include the uncomputed spectrum when a partial SVD is used."""
+
+    if len(singular_values) < min(_host_shape(matrix)):
+        # A truncated eigensolver does not return the discarded singular
+        # values. Its returned tail can be empty even for a large error;
+        # measure the residual on the backend rather than claiming exactness.
+        residual = matrix - (u[:, :rank] * singular_values[:rank]) @ vh[:rank]
+        return float(_host_array(ar.do("linalg.norm", residual)))
+    discarded = _host_array(singular_values)[rank:]
+    return float(np.linalg.norm(discarded))
+
+
 def _compress_core_chain(
     cores,
     *,
@@ -918,16 +929,16 @@ def _compress_core_chain(
             cutoff_mode=cutoff_mode,
             max_bond=max_bond,
         )
-        discarded = host_singular_values[rank:]
-        discarded_weight_squared += float(np.vdot(discarded, discarded).real)
-        discarded_ranks.append(int(len(host_singular_values) - rank))
+        discarded_weight = _svd_discarded_weight(matrix, u, singular_values, vh, rank)
+        discarded_weight_squared += discarded_weight**2
+        discarded_ranks.append(min(_host_shape(matrix)) - rank)
         bond_reports.append(
             PauliBondCompressionReport(
                 bond=site - 1,
                 original_bond=left,
                 final_bond=rank,
                 discarded_rank=max(left - rank, 0),
-                discarded_weight=float(np.linalg.norm(discarded)),
+                discarded_weight=discarded_weight,
                 largest_singular_value=(
                     float(host_singular_values[0])
                     if len(host_singular_values)
@@ -998,16 +1009,16 @@ def _compress_core_chain_left(
             cutoff_mode=cutoff_mode,
             max_bond=max_bond,
         )
-        discarded = host_singular_values[rank:]
-        discarded_weight_squared += float(np.vdot(discarded, discarded).real)
-        discarded_ranks.append(int(len(host_singular_values) - rank))
+        discarded_weight = _svd_discarded_weight(matrix, u, singular_values, vh, rank)
+        discarded_weight_squared += discarded_weight**2
+        discarded_ranks.append(min(_host_shape(matrix)) - rank)
         bond_reports.append(
             PauliBondCompressionReport(
                 bond=site,
                 original_bond=right,
                 final_bond=rank,
                 discarded_rank=max(right - rank, 0),
-                discarded_weight=float(np.linalg.norm(discarded)),
+                discarded_weight=discarded_weight,
                 largest_singular_value=(
                     float(host_singular_values[0])
                     if len(host_singular_values)
@@ -1079,8 +1090,8 @@ def _compress_core_chain_flat(
             cutoff_mode=cutoff_mode,
             max_bond=max_bond,
         )
-        discarded = host_singular_values[rank:]
-        discarded_weight_squared += float(np.vdot(discarded, discarded).real)
+        discarded_weight = _svd_discarded_weight(matrix, u, singular_values, vh, rank)
+        discarded_weight_squared += discarded_weight**2
         kept = _renormalize_singular_values(
             singular_values,
             rank,
@@ -1099,7 +1110,7 @@ def _compress_core_chain_flat(
             original_bond=left,
             final_bond=rank,
             discarded_rank=max(left - rank, 0),
-            discarded_weight=float(np.linalg.norm(discarded)),
+            discarded_weight=discarded_weight,
             largest_singular_value=(
                 float(host_singular_values[0]) if len(host_singular_values) else 0.0
             ),
@@ -1124,8 +1135,8 @@ def _compress_core_chain_flat(
             cutoff_mode=cutoff_mode,
             max_bond=max_bond,
         )
-        discarded = host_singular_values[rank:]
-        discarded_weight_squared += float(np.vdot(discarded, discarded).real)
+        discarded_weight = _svd_discarded_weight(matrix, u, singular_values, vh, rank)
+        discarded_weight_squared += discarded_weight**2
         kept = _renormalize_singular_values(
             singular_values,
             rank,
@@ -1144,7 +1155,7 @@ def _compress_core_chain_flat(
             original_bond=right,
             final_bond=rank,
             discarded_rank=max(right - rank, 0),
-            discarded_weight=float(np.linalg.norm(discarded)),
+            discarded_weight=discarded_weight,
             largest_singular_value=(
                 float(host_singular_values[0]) if len(host_singular_values) else 0.0
             ),
@@ -1229,7 +1240,7 @@ def _canonical_terms(terms, nsites):
 
 
 class PauliMPO:
-    """A sparse operator in the qubit Pauli basis with MPO operations.
+    """A sparse or core-backed qubit Pauli operator with MPO operations.
 
     Parameters
     ----------
@@ -1730,6 +1741,40 @@ class PauliMPO:
 
     compress_native = compress_pauli
 
+    def apply_damping(self, damping, *, inplace=False):
+        """Apply a reusable :class:`PauliDampingMPO` without compression."""
+
+        from .pauli_damping import PauliDampingMPO
+
+        if not isinstance(damping, PauliDampingMPO):
+            raise TypeError("damping must be a PauliDampingMPO.")
+        return damping.apply(self, inplace=inplace)
+
+    def apply_daoe(self, *, max_weight, gamma, inplace=False):
+        """Apply one exact dissipation-assisted operator evolution filter.
+
+        A Pauli string of weight ``w`` (the number of nonidentity labels) is
+        multiplied by ``exp(-gamma * max(w - max_weight, 0))``. ``max_weight``
+        must be a nonnegative integer and ``gamma`` a finite nonnegative real
+        number. They are fixed filter parameters, not differentiable inputs.
+
+        Sparse operators stay sparse; native cores use a diagonal counting
+        MPO with bond dimension at most ``max_weight + 1``. Core dtype,
+        device and coefficient gradients are preserved; integer cores are
+        promoted to floating point. No word expansion, SVD, normalization or
+        Hamiltonian evolution is performed. Call ``compress_pauli`` separately
+        to control the enlarged bonds and measure the compression error.
+
+        This is the artificial filter of arXiv:2004.05177, Eq. (1), not a
+        Kraus-channel construction. Only its action is exact; DAOE dynamics
+        at nonzero gamma approximate the physical unitary dynamics.
+        """
+
+        from .pauli_damping import PauliDampingMPO
+
+        damping = PauliDampingMPO(self.nsites, max_weight=max_weight, gamma=gamma)
+        return self.apply_damping(damping, inplace=inplace)
+
     def _combine(self, other, sign=1):
         if not isinstance(other, PauliMPO):
             return NotImplemented
@@ -2053,7 +2098,9 @@ class PauliMPO:
                 embedded_terms.append((local_coefficient, "".join(full_word)))
             global_gate = type(self)(self.nsites, embedded_terms, boundary=self.boundary)
             if self._cores:
-                like = self._cores[0]
+                # A real observable can acquire complex coefficients under
+                # a complex gate. Promote before converting the gate cores.
+                like = _complexify(self._cores[0])
                 global_gate = type(self).from_pauli_cores(
                     tuple(_array_like(core, like) for core in global_gate.to_pauli_cores()),
                     boundary=self.boundary,
@@ -2069,6 +2116,7 @@ class PauliMPO:
             if inplace:
                 self._cores = result.to_pauli_cores(copy=False)
                 self._terms = None
+                self.compression_report = None
                 return self
             return result
 
@@ -2106,6 +2154,7 @@ class PauliMPO:
         if inplace:
             self._terms = result.terms
             self._cores = None
+            self.compression_report = None
             return self
         return result
 
@@ -2171,8 +2220,11 @@ class PauliMPO:
                 max_qubits=max_qubits,
             ).scale(weight)
         if inplace:
-            self._terms = result.terms
-            self._cores = None
+            # Accessing ``terms`` here would expand a native coefficient
+            # train exponentially just to assign the already-computed result.
+            self._terms = result._terms
+            self._cores = result._cores
+            self.compression_report = None
             return self
         return result
 
@@ -2247,7 +2299,21 @@ class PauliMPO:
     def to_dense(self):
         """Materialize a dense matrix; intended for small-system checks."""
 
-        return self.to_mpo().to_dense()
+        cores = self.to_pauli_cores(copy=False)
+        if _backend_name(cores[0]) not in {"numpy", "torch", "jax", "cupy"}:
+            return self.to_mpo().to_dense()
+        reference = _complexify(cores[0])
+        basis = _pauli_basis_tensor(like=reference)
+        value = _array_like(np.ones((1, 1, 1)), reference)
+        dimension = 1
+        # Fixed left-to-right readout keeps dtype/device/gradients local to
+        # these cores, independent of a global contraction backend or an
+        # upstream cached namespace. Group all row legs before column legs.
+        for core in cores:
+            value = _einsum("aij,abp,pkl->bikjl", value, _complexify(core), basis)
+            dimension *= 2
+            value = _reshape(value, (_host_shape(core)[1], dimension, dimension))
+        return value[0]
 
     def expectation(self, mps, *, contraction_opt=None):
         """Evaluate the normalized ``<mps|self|mps>`` contraction."""
