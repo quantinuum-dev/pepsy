@@ -48,13 +48,76 @@ def reference(state, gates, schedule, gauges, tracker=None, *, iterations=4, psd
         als_opts=dict(solver='torch', max_iterations=iterations, tol=0., monitor_convergence=True))
 
 
+@pytest.mark.parametrize('sites, rows, columns', [
+    (((3, 3), (3, 4)), range(2, 5), range(2, 6)),
+    (((3, 3), (4, 3)), range(2, 6), range(2, 5)),
+    (((0, 3), (0, 4)), range(0, 2), range(2, 6)),
+    (((3, 0), (4, 0)), range(2, 6), range(0, 2)),
+    (((0, 0), (0, 1)), range(0, 2), range(0, 3)),
+])
+def test_twelve_site_patch_rotates_and_clips_at_edges(sites, rows, columns):
+    state = id_to_pepo(7, 7)
+    state.apply_to_arrays(lambda a: torch.as_tensor(a, dtype=torch.complex128))
+    plan = PreparedLoopClusterUpdate(state, [(sites, 'upper')], cluster_mode='graphdistance',
+                                     base_radius=1, fillin=True, optimize='greedy')
+    region = plan._region_for(state, plan.slots[0])
+    expected = {state.site_tag(i, j) for i in rows for j in columns}
+    actual = {tag for tid in region for tag in state.tensor_map[tid].tags
+              if tag in set(state.site_tags)}
+    assert actual == expected
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_twelve_site_prepared_matches_reference_with_fresh_environments(device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    state = qtn.PEPO.rand(4, 4, bond_dim=2, phys_dim=2, dtype='complex128', seed=319)
+    state.apply_to_arrays(lambda a: torch.as_tensor(a, dtype=torch.complex128, device=device))
+    horizontal, vertical = ((1, 1), (1, 2)), ((1, 1), (2, 1))
+    schedule = [(horizontal, 'upper'), (vertical, 'lower'), (horizontal, 'lower')]
+    matrices = [gate(.13+.03*i, 2, device) for i in range(len(schedule))]
+    settings = dict(cluster_mode='graphdistance', base_radius=1, fillin=True)
+    plan = PreparedLoopClusterUpdate(state, schedule, max_bond=2, max_iterations=2,
+                                     tol=0., optimize='greedy', **settings)
+    weights, expected_weights = {}, {}
+    actual, rows = plan.apply(state.copy(), matrices, gauges=weights, return_results=True,
+                              materialize_physical=False)
+    expected, refs = gate_loop_cluster(
+        state.copy(), [(g, sites, side) for g, (sites, side) in zip(matrices, schedule)],
+        gauges=expected_weights, max_bond=2, max_loop_size=0, psd_project=False,
+        optimize='greedy', strip_exponent=True, return_results=True, materialize_physical=False,
+        als_opts=dict(solver='torch', max_iterations=2, tol=0., monitor_convergence=True), **settings)
+    for row, ref in zip(rows, refs):
+        assert len(row.problem.terms[0].region_tids) == 12
+        assert row.problem.cluster_mode == 'graphdistance' and row.problem.base_radius == 1
+        torch.testing.assert_close(row.problem.environment.data, ref.problem.environment.data,
+                                   rtol=2e-8, atol=2e-10)
+        assert row.solution.costs[-1]/row.solution.target_norm == pytest.approx(
+            ref.solution.costs[-1]/ref.solution.target_norm, abs=2e-9)
+        a, _, _, b = row.pair.theta_shape
+        assert row.problem.environment.shape == (a, b, a, b)
+        matrix = row.problem.environment.data.reshape(a*b, a*b)
+        torch.testing.assert_close(matrix, matrix.mH)
+    assert not torch.allclose(rows[0].problem.environment.data, rows[2].problem.environment.data)
+    for offset in (0, 1):
+        scalars = []
+        for work, gauges in ((actual, weights), (expected, expected_weights)):
+            physical_work = work.copy()
+            physical_work.gauge_simple_insert(gauges)
+            selected = {fn(i, j): (i+j+offset+k) % 2 for i, j in work.sites
+                        for k, fn in enumerate((work.upper_ind, work.lower_ind))}
+            scalars.append(physical_work.isel(selected).contract(all, optimize='greedy'))
+        torch.testing.assert_close(*scalars, rtol=2e-8, atol=2e-10)
+    assert plan.info['cluster_mode'] == 'graphdistance'
+
+
 @pytest.mark.parametrize('device', ['cpu', 'cuda'])
 @pytest.mark.parametrize('psd', [False, True])
 def test_prepared_matches_sequential_across_source_barriers_and_rank_growth(device, psd):
     state = initial(device)
     a, b = ((0, 1), (1, 1)), ((0, 0), (0, 1))
     schedule = [(((0, 0),), 'upper'), (a, 'lower'), (b, 'upper'),
-                (a, 'lower'), (((1, 2),), 'lower'), (b, 'lower'), (a, 'upper')]
+                (a, 'lower'), (((1, 2),), 'lower'), (b, 'lower'), (a, 'upper'), (a, 'upper')]
     gates = [gate(.13 + .02*i, len(s), device) for i, (s, _) in enumerate(schedule)]
     plan = PreparedLoopClusterUpdate(state, schedule, max_bond=2, max_iterations=4,
                                      tol=0., psd_project=psd, optimize='greedy')
@@ -77,7 +140,7 @@ def test_prepared_matches_sequential_across_source_barriers_and_rank_growth(devi
         torch.testing.assert_close(physical(actual, weights), physical(expected, expected_weights),
                                    rtol=2e-8, atol=2e-9)
     assert seen == [(i, len(s) == 2) for i, (s, _) in enumerate(schedule)]
-    assert tracker.summary()['pair_updates'] == 5
+    assert tracker.summary()['pair_updates'] == 6
     assert tracker.accumulated_local_fidelity == pytest.approx(
         expected_tracker.accumulated_local_fidelity, abs=2e-9)
     assert plan.info['geometry_plans'] == 2

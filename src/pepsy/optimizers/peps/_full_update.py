@@ -20,9 +20,9 @@ from ..._internal.cutoff import resolve_fit_rtol
 from ...bp._backend import all_finite, dag, einsum, transpose
 from ...bp.reduced_update import (
     ReducedEnvironmentUpdateProblem, prepare_reduced_bond_pair, solve_reduced_als,
-    _psd_project_metric, _svd_initial_factors, _site_physical_inds,
+    _psd_project_metric, _svd_initial_factors, _site_physical_inds, _reduced_gate_target,
 )
-from ...operators.gates import _is_operator_tensor_network, _normalize_gate_which
+from ...operators.gates import _is_operator_tensor_network, _normalize_gate_which, _pair_pepo_gate_entries
 
 
 def options(values=None):
@@ -151,31 +151,7 @@ def boundary_strip(network, *, axis, coordinate, boundary, chi, contraction_opt,
 
 def full_update_entries(gates, state, which=None, *, fuse_pepo_legs=False):
     """Fuse adjacent opposite-leg actions on one bond; never move a gate."""
-    def sites(where):
-        if (isinstance(where, (tuple, list)) and len(where) == 2
-                and all(isinstance(s, (tuple, list)) and len(s) == 2 for s in where)):
-            return tuple(map(tuple, where))
-        return None
-
-    index = 0
-    while index < len(gates):
-        gate, where, side = gates[index]
-        first = sites(where)
-        side = _normalize_gate_which(side if side is not None else which) or 'upper'
-        if fuse_pepo_legs and first is not None and index+1 < len(gates):
-            other, other_where, other_side = gates[index+1]
-            second = sites(other_where)
-            other_side = _normalize_gate_which(other_side if other_side is not None else which) or 'upper'
-            if second is not None and set(first) == set(second) and side != other_side:
-                if first != second:
-                    dims = [state.ind_size(getattr(state, f'{other_side}_ind')(*s)) for s in second]
-                    other = ar.do('transpose', ar.do('reshape', other, (*dims, *dims)), (1, 0, 3, 2))
-                pair = (gate, other) if side == 'upper' else (other, gate)
-                yield index+2, (pair, first, 'both'), (index+1, index+2)
-                index += 2
-                continue
-        yield index+1, gates[index], (index+1,)
-        index += 1
+    yield from _pair_pepo_gate_entries(gates, state, which, fuse_pepo_legs=fuse_pepo_legs)
 
 
 class ReducedPair:
@@ -207,9 +183,10 @@ class ReducedPair:
         if which is not None and not self.operator:
             raise ValueError('full-update which selects upper/lower PEPO legs, not PEPS legs')
         self.which = (which or 'upper') if self.operator else None
-        physical = tuple(_site_physical_inds(state, site) for site in self.where)
+        all_physical = tuple(_site_physical_inds(state, site) for site in self.where)
+        physical = tuple(_site_physical_inds(state, site, self.which) for site in self.where)
         self.physical = physical
-        self.phys = tuple(index for group in physical for index in group)
+        self.phys = tuple(index for group in all_physical for index in group)
         self.gate_phys = (tuple(getattr(state, f'{"upper" if both else self.which}_ind')(*site) for site in self.where)
                           if self.operator else self.phys)
         bonds = tuple(self.tensors[0].bonds(self.tensors[1]))
@@ -225,7 +202,7 @@ class ReducedPair:
         self.dims = tuple(math.prod(group) for group in physical_dims)
         # Reuse Pepsy's existing QR/LQ reduction without requesting BP messages.
         self.reduced = prepare_reduced_bond_pair(state, where=self.where,
-                                                 input_mode='physical', run_bp=False)
+                                                 input_mode='physical', run_bp=False, which=self.which)
         self.na, _, _, self.nb = self.reduced.theta_shape
         self.qa = self.reduced.q_left.transpose(*self.external[0], self.reduced.reduced_left_ind).data.reshape(-1, self.na)
         self.qb = self.reduced.q_right.transpose(self.reduced.reduced_right_ind, *self.external[1]).data.reshape(self.nb, -1)
@@ -244,19 +221,8 @@ class ReducedPair:
                 raise ValueError('full-update gate contains nonfinite values')
             validated.append((side, payload.reshape(*dims, *dims)))
         self.gate = tuple(g for _, g in validated) if both else validated[0][1]
-        theta = self.reduced.theta_array()
-        if self.operator:
-            # Keep the spectator operator legs as batch axes. Do not form
-            # G tensor-product I on the enlarged local physical dimension.
-            theta = theta.reshape(self.na, *physical_dims[0], *physical_dims[1], self.nb)
-            for side, payload in validated:
-                expression = ('PQpq,axpyqb->axPyQb' if side == 'upper'
-                              else 'XYxy,axpyqb->aXpYqb')
-                theta = einsum(expression, payload, theta)
-            theta = transpose(theta, (0, 1, 2, 5, 3, 4))
-            self.theta = theta.reshape(self.na, self.dims[0], self.nb, self.dims[1])
-        else:
-            self.theta = einsum('PQpq,apqb->aPbQ', self.gate, theta)
+        theta = _reduced_gate_target(self.reduced, self.gate, self.which)
+        self.theta = transpose(theta, (0, 1, 3, 2))
         self.chi = int(chi)
         self.initial_factors = None
         self._svd_guess_factors = None
@@ -328,6 +294,7 @@ class ReducedPair:
     def exact_report(self):
         """No exterior metric is needed when the local SVD loses no support."""
         return dict(backend='full-update', tensor_mode=self.tensor_mode, solver='svd',
+                    reduced_physical_dimensions=self.dims,
                     success=True, converged=True, iterations=0, warmstart_loss=0.,
                     warmstart_fidelity=1., fidelity=1., infidelity=0., loss_history=[0.],
                     termination_reason='exact_svd', environment_gauge_applied=False,
@@ -389,7 +356,11 @@ class ReducedPair:
             (self.where[1], self.qb.reshape(self.nb, *self.shapes[1]), (qb_ind, *self.external[1])),
         ):
             q = qtn.Tensor(data, inds=inds)
-            bra = q.conj().reindex({ind: f'{ind}_*' for ind in inds})
+            # Untouched operator legs stay on Q and trace against the bra
+            # locally. Only virtual/reduced indices need distinct bra labels.
+            inner = set(state.inner_inds())
+            bra = q.conj().reindex({ind: f'{ind}_*' for ind in inds
+                                   if ind in inner or ind in {qa_ind, qb_ind}})
             strip = strip | q | bra
         value, _ = strip.contract(all, output_inds=(f'{qa_ind}_*', f'{qb_ind}_*', qa_ind, qb_ind),
                                   optimize=contraction_opt, strip_exponent=True)
@@ -411,6 +382,7 @@ class ReducedPair:
             raise ValueError('full-update norm environment has no positive support')
         report = {
             'norm_matrix_dimension': self.na * self.nb,
+            'reduced_physical_dimensions': self.dims,
             'norm_antihermitian_relative': float(ar.do('linalg.norm', norm - dag(norm))),
             'norm_min_eigenvalue': float(values.min()),
             'norm_negative_weight': float((-ar.do('clip', values, None, 0)).sum() / positive.sum()),

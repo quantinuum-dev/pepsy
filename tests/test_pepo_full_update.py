@@ -62,6 +62,11 @@ def test_cached_svd_start_and_small_core_balance_preserve_operator(monkeypatch, 
     gate = torch.tensor(unitary(4), dtype=getattr(torch, dtype), device=device)*(1.2+.3j)
     payload = (gate, gate.conj()) if which == 'both' else gate
     pair = ReducedPair(state, payload, ((0, 0), (0, 1)), chi=2, which=which)
+    assert pair.dims == ((4, 4) if which == 'both' else (2, 2))
+    for site, outer in zip(pair.where, (pair.reduced.q_left, pair.reduced.q_right)):
+        if which != 'both':
+            spectator = getattr(state, ('lower' if which == 'upper' else 'upper')+'_ind')(*site)
+            assert spectator in outer.inds
     guess, target = pair.initial_states()
     # A complex normalization phase must update the cached starting factors too.
     pair.normalize_target(2.5+.1j)

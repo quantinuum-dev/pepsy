@@ -6,6 +6,7 @@ The original gate order and every pair truncation remain explicit.
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from dataclasses import replace
 from functools import partial
 import math
 
@@ -73,7 +74,8 @@ class PreparedLoopClusterUpdate:
     """Replay an ordered dense Torch PEPO stream with prepared local geometry.
 
     ``schedule`` contains ``(sites, leg)`` entries with one/two lattice sites
-    and ``leg='upper'`` or ``'lower'``. Gate arrays supplied to :meth:`apply`
+    and ``leg='upper'`` or ``'lower'``. A two-site ``'both'`` entry takes
+    ``(upper_gate, lower_gate)``. Gate arrays supplied to :meth:`apply`
     use the same native convention as ``gate_loop_cluster``: lower action is
     ``O G.T``. Prepare a right-applied lower gate's transpose once beforehand.
 
@@ -82,10 +84,14 @@ class PreparedLoopClusterUpdate:
     contraction program; it never pads ranks or reuses an old environment.
     ALS, its conditioning checks and final gauge extraction use the existing
     reduced-update routines. Gate/truncation dependencies and commit order
-    are preserved, with no gate fusion.
+    are preserved by default. ``fuse_pepo_legs=True`` opts into one fit for
+    adjacent opposite-leg gates on the same bond, without reordering and
+    without crossing any apply boundary. Automatic pairing requires batch size one.
 
-    This first prepared path supports the direct six-site loop-union patch
-    with SU boundary gauges, dense complex Torch qubit PEPOs and Torch ALS.
+    The default is the direct six-site loop-union patch. Use
+    ``cluster_mode='graphdistance', base_radius=1, fillin=True`` for a
+    rotated twelve-site rectangle in the bulk. Both use SU boundary gauges,
+    dense complex Torch qubit PEPOs and Torch ALS.
     Other cluster/message/backend routes retain ``gate_loop_cluster``.
 
     ``batch_size>1`` opts into eager batches of consecutive shape-compatible,
@@ -99,7 +105,8 @@ class PreparedLoopClusterUpdate:
     def __init__(self, network, schedule, *, max_bond=6, max_iterations=10,
                  tol=1e-8, psd_project=False, torch_backend=None, optimize=None,
                  max_peak_memory_log2=None, max_flops_log10=None,
-                 max_programs=512, batch_size=1):
+                 max_programs=512, batch_size=1, cluster_mode='loopunion',
+                 base_radius=4, fillin=True, fuse_pepo_legs=False):
         import torch
         import quimb.tensor as qtn
         from ._compression_utils import ContractionPlanCache, validate_cost_options
@@ -118,6 +125,16 @@ class PreparedLoopClusterUpdate:
             raise ValueError('tol must be finite and nonnegative')
         if not isinstance(psd_project, bool):
             raise TypeError('psd_project must be a bool')
+        if not isinstance(fuse_pepo_legs, bool):
+            raise TypeError('fuse_pepo_legs must be a bool')
+        if fuse_pepo_legs and batch_size != 1:
+            raise ValueError('adjacent joint updates currently require batch_size=1')
+        if cluster_mode not in {'loopunion', 'graphdistance'}:
+            raise ValueError("cluster_mode must be 'loopunion' or 'graphdistance'")
+        if isinstance(base_radius, bool) or not isinstance(base_radius, int) or base_radius < 0:
+            raise ValueError('base_radius must be a nonnegative integer')
+        if not isinstance(fillin, (bool, int)) or fillin < 0:
+            raise ValueError('fillin must be a nonnegative integer or bool')
         if torch_backend not in {None, 'aot_eager'}:
             raise ValueError('torch_backend must be None or aot_eager')
         if batch_size != 1 and torch_backend is not None:
@@ -135,8 +152,10 @@ class PreparedLoopClusterUpdate:
         self.slots = []
         for sites, which in schedule:
             sites = tuple(tuple(site) for site in sites)
-            if which not in {'upper', 'lower'} or len(sites) not in {1, 2}:
-                raise ValueError('schedule requires one/two sites and an upper/lower leg')
+            if which not in {'upper', 'lower', 'both'} or len(sites) not in {1, 2}:
+                raise ValueError('schedule requires upper/lower or joint both on two sites')
+            if which == 'both' and len(sites) != 2:
+                raise ValueError('joint upper/lower cluster gates require two sites')
             tids = tuple(_single_tid(network, site) for site in sites)
             if len(set(tids)) != len(tids):
                 raise ValueError('two-site gates require distinct sites')
@@ -159,6 +178,8 @@ class PreparedLoopClusterUpdate:
             raise ValueError('prepared cluster schedule cannot be empty')
         self.max_bond, self.max_iterations, self.tol = max_bond, max_iterations, tol
         self.psd_project, self.torch_backend = psd_project, torch_backend
+        self.cluster_mode, self.base_radius, self.fillin = cluster_mode, base_radius, fillin
+        self.fuse_pepo_legs = fuse_pepo_legs
         self.optimize = (build_optimizer(parallel=False, progbar=False, max_repeats=8, max_time=.5)
                          if optimize is None else optimize)
         max_flops_log10, max_peak_memory_log2, on_budget = validate_cost_options(
@@ -184,6 +205,7 @@ class PreparedLoopClusterUpdate:
             self._auto_lookahead = max(64, 8*len(network.tensor_map))
         self._programs = OrderedDict()
         self._counts = dict(applications=0, pair_updates=0, one_site_updates=0,
+                            physical_gate_actions=0, joint_pair_updates=0,
                             program_hits=0, program_misses=0, program_evictions=0,
                             cluster_batches=0, batched_pair_updates=0, largest_batch=0,
                             lookahead_pair_updates=0)
@@ -210,12 +232,16 @@ class PreparedLoopClusterUpdate:
     def info(self):
         """Scalar execution/cache counts; no tensor data or environments."""
         return dict(**self._counts, geometry_plans=len(self._geometry),
+                    cluster_mode=self.cluster_mode, base_radius=self.base_radius, fillin=self.fillin,
+                    physical_reduction='acted leg retained; untouched leg on Q',
+                    fuse_pepo_legs=self.fuse_pepo_legs,
                     contraction_programs=len(self._programs), batch_size=self.batch_size,
                     auto_batch_limit=self._auto_batch_limit,
                     auto_workspace_bytes=self._auto_workspace_bytes,
                     auto_estimated_member_bytes=self._auto_member_bytes,
                     batch_histogram=dict(self._batch_histogram),
-                    ordering=('input commits; dependency-ready preparation' if self.batch_size == 'auto'
+                    ordering=('input; adjacent opposite-leg pairs; no reordering' if self.fuse_pepo_legs else
+                              'input commits; dependency-ready preparation' if self.batch_size == 'auto'
                               else 'input; no fusion or reordering'))
 
     def _region_for(self, work, slot):
@@ -225,7 +251,8 @@ class PreparedLoopClusterUpdate:
         if slot.sites not in self._batch_regions:
             patch = work.select_local(
                 tuple(work.site_tag(s) for s in slot.sites), which='any',
-                max_distance=4, mode='loopunion', fillin=1, grow_from='all', virtual=True)
+                max_distance=self.base_radius, mode=self.cluster_mode, fillin=int(self.fillin),
+                grow_from='all', virtual=True)
             self._batch_regions[slot.sites] = frozenset(patch.tensor_map)
         return self._batch_regions[slot.sites]
 
@@ -295,7 +322,8 @@ class PreparedLoopClusterUpdate:
 
     def _program_for(self, pair):
         if pair.where not in self._geometry:
-            spectators = pair._cluster_tids(4, mode='loopunion', fillin=True)
+            spectators = pair._cluster_tids(
+                self.base_radius, mode=self.cluster_mode, fillin=self.fillin)
             self._geometry[pair.where] = spectators, pair.full_cluster_radius()
         spectators, radius = self._geometry[pair.where]
         ket = (pair.q_left, pair.q_right, *(pair.tn.tensor_map[tid] for tid in spectators))
@@ -334,12 +362,12 @@ class PreparedLoopClusterUpdate:
         term = LoopClusterTerm(frozenset((*spectators, pair.left_tid, pair.right_tid)),
                                1, spectators, program.boundary)
         return LoopClusterReducedUpdateProblem(
-            pair=pair, gate=gate, base_radius=4, max_loop_size=0, full_radius=radius,
+            pair=pair, gate=gate, base_radius=self.base_radius, max_loop_size=0, full_radius=radius,
             loop_regions=(), terms=(term,), environment=environment, metric=metric,
             raw_metric=_LazyReducedMetric(pair, raw), linear_term=linear, target=target,
             psd_projected=self.psd_project, raw_min_eigenvalue=minimum,
             clipped_eigenvalues=clipped, contraction_costs=(program.cost,),
-            contraction_cost=program.cost, cluster_mode='loopunion', fillin=True, which=which)
+            contraction_cost=program.cost, cluster_mode=self.cluster_mode, fillin=self.fillin, which=which)
 
     def _batch(self, work, gates, gauges, index, stop, measure_fidelity, *, excluded=frozenset()):
         """Fit independent patches; publish all mutations in original input order."""
@@ -374,7 +402,7 @@ class PreparedLoopClusterUpdate:
                 skipped_writes.update(writes)
                 continue
             pair = prepare_reduced_bond_pair(work, gauges, where=slot.sites,
-                                             input_mode='su_core', run_bp=False)
+                                             input_mode='su_core', run_bp=False, which=slot.which)
             prepared = self._program_for(pair)
             program, tids, _ = prepared
             key = program.structure, program.shapes, pair.theta_shape
@@ -430,6 +458,8 @@ class PreparedLoopClusterUpdate:
         barriers. Full pair results are retained only when requested.
         ``materialize_physical=False`` omits their unused physical snapshots;
         the updated core and gauge dictionary are identical.
+        A callback for a fused pair uses its last original input index;
+        ``result.su_info['original_steps']`` retains both one-based indices.
         """
         import torch
         from .cluster_updates import LoopClusterUpdateTracker
@@ -456,10 +486,17 @@ class PreparedLoopClusterUpdate:
         for index in range(start, stop):
             gate = gates[index]
             width = len(self.slots[index].sites)
-            if (not isinstance(gate, torch.Tensor) or gate.dtype != self.dtype
-                    or gate.device != self.device or tuple(gate.shape) not in
-                    {(2**width, 2**width), (2,)*(2*width)}):
-                raise ValueError('gate arrays must match the prepared dimensions, Torch dtype and device')
+            if self.slots[index].which == 'both':
+                if not isinstance(gate, (tuple, list)) or len(gate) != 2:
+                    raise ValueError('joint gates require (upper_gate, lower_gate)')
+                payloads = gate
+            else:
+                payloads = (gate,)
+            for payload in payloads:
+                if (not isinstance(payload, torch.Tensor) or payload.dtype != self.dtype
+                        or payload.device != self.device or tuple(payload.shape) not in
+                        {(2**width, 2**width), (2,)*(2*width)}):
+                    raise ValueError('gate arrays must match the prepared dimensions, Torch dtype and device')
         real_dtype = network.tensors[0].data.real.dtype
         for index, gauge in gauges.items():
             if (not isinstance(gauge, torch.Tensor) or gauge.device != self.device
@@ -475,8 +512,20 @@ class PreparedLoopClusterUpdate:
         if self.batch_size == 'auto':
             self._auto_workspace_bytes = self._available_batch_memory()
         pending = {}
-        for index in range(start, stop):
-            slot, gate = self.slots[index], gates[index]
+        def updates():
+            if not self.fuse_pepo_legs:
+                for i in range(start, stop):
+                    yield i, self.slots[i], gates[i], (i,)
+                return
+            from ..operators.gates import _pair_pepo_gate_entries
+
+            entries = [(gates[i], self.slots[i].sites, self.slots[i].which) for i in range(start, stop)]
+            for end, (payload, _, side), steps in _pair_pepo_gate_entries(
+                    entries, work, fuse_pepo_legs=True):
+                yield start+end-1, replace(self.slots[start+steps[0]-1], which=side), payload, tuple(
+                    start+s-1 for s in steps)
+
+        for index, slot, gate, original_steps in updates():
             result = None
             if len(slot.sites) == 1:
                 tensor = work.tensor_map[slot.tids[0]]
@@ -494,7 +543,7 @@ class PreparedLoopClusterUpdate:
                     pair, problem, solution = pending.pop(index)
                 else:
                     pair = prepare_reduced_bond_pair(work, gauges, where=slot.sites,
-                                                     input_mode='su_core', run_bp=False)
+                                                     input_mode='su_core', run_bp=False, which=slot.which)
                     problem = self._problem(pair, gate, slot.which)
                 result = _finish_reduced_gate(
                     work, gauges, pair, problem, max_bond=self.max_bond,
@@ -507,8 +556,11 @@ class PreparedLoopClusterUpdate:
                 if tracker is not None:
                     tracker.record(result)
                 self._counts['pair_updates'] += 1
+                self._counts['joint_pair_updates'] += int(slot.which == 'both')
+                result.su_info['original_steps'] = tuple(i+1 for i in original_steps)
                 if return_results:
                     results.append(result)
+            self._counts['physical_gate_actions'] += 2 if slot.which == 'both' else 1
             if step_callback is not None:
                 step_callback(index, result)
         return (work, tuple(results)) if return_results else work

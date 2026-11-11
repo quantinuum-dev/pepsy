@@ -98,6 +98,27 @@ def test_overlapping_environment_patches_are_not_batched(size):
     assert plan.info['cluster_batches'] == 0
 
 
+def test_larger_patches_prevent_batches_that_were_disjoint_at_six_sites():
+    state, schedule = setup()
+    six = PreparedLoopClusterUpdate(state, schedule, optimize='greedy')
+    assert not six._region_for(state, six.slots[0]) & six._region_for(state, six.slots[1])
+    outputs = []
+    for size in (1, 2, 'auto'):
+        plan = PreparedLoopClusterUpdate(
+            state, schedule, max_bond=2, max_iterations=2, tol=0., optimize='greedy',
+            batch_size=size, cluster_mode='graphdistance', base_radius=1, fillin=True)
+        assert plan._region_for(state, plan.slots[0]) & plan._region_for(state, plan.slots[1])
+        gauges = weights(state)
+        out, results = plan.apply(state.copy(), matrices(.17, state), gauges=gauges,
+                                   return_results=True, materialize_physical=False)
+        assert plan.info['cluster_batches'] == 0
+        outputs.append((out, gauges, results))
+    for actual in outputs[1:]:
+        for sites, _ in schedule:
+            torch.testing.assert_close(pair_amplitude(*outputs[0][:2], sites),
+                                       pair_amplitude(*actual[:2], sites))
+
+
 def test_rank_growth_and_one_site_barriers_preserve_physical_operator():
     from pepsy.tensors import id_to_pepo
 

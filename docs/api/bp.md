@@ -97,6 +97,13 @@ is retained. Graph radius one instead selects eight sites; enabling fill-in
 there gives twelve. These selection controls are separate from an expansion
 cutoff or retained bond dimension.
 
+For a **twelve-site 4×3 patch**, use `cluster_mode="graphdistance"`,
+`base_radius=1`, `fillin=True`. In the bulk this selects three rows and
+four columns around a horizontal bond, rotated for a vertical bond. Patches
+are clipped at open edges. Only the two active tensors are fitted; the
+remaining tensors supply the environment. This selection is available in
+both `gate_loop_cluster` and `PreparedLoopClusterUpdate`.
+
 ```python
 from pepsy.bp import ContractionPlanCache
 from pepsy.operators import gate_loop_cluster
@@ -126,6 +133,43 @@ returned core; their fusion is private to the reduced pair. Lower-leg gates
 implement $O G^T$, so pass $G^T$ once when the intended action is $O G$.
 One-sided native fermionic PEPO gate updates are explicitly unsupported here.
 
+One-sided dense PEPO gate updates now choose the QR/LQ grouping from `which`:
+only the acted physical leg stays in the reduced factors, and the untouched
+leg stays on Q and traces into the environment. No separate index-moving
+operation is needed. Prepared replay and the ordinary gate wrapper use the
+same grouping. `prepare_reduced_bond_pair(..., which="upper"|"lower")` exposes
+it directly. The preparation default `which=None` retains both legs for
+gate-independent compression; explicit `which="both"` also retains both.
+Joint upper/lower full-update fits keep both legs, fused privately, and use
+one target and one fit. Sequential gate streams retain their separate
+truncations unless the user opts into adjacent pairing below.
+The lower-level `apply_reduced_loop_cluster_gate` also accepts
+`which="both"` with `(upper_gate, lower_gate)` for one joint fit. To apply
+$GOG^\dagger$, use `(G, G.conj())` under the existing lower-leg transpose
+convention. Stream wrappers retain separate fits by default. To request a
+joint entry, use:
+
+```python
+# Native lower convention: this pair represents G O G.H.
+core = gate_loop_cluster(core, [((G, G.conj()), sites, "both")],
+                         gauges=gauges, max_bond=D)
+plan = PreparedLoopClusterUpdate(core, [(sites, "both")], max_bond=D)
+# plan.apply(..., [(G, G.conj())], gauges=gauges) uses one environment/fit.
+```
+
+Alternatively pass `fuse_pepo_legs=True` to either wrapper/plan to pair only
+**adjacent opposite-leg gates on the same bond**. The second gate's site
+ordering is aligned to the first. No gate moves, and a one-site gate,
+another bond, a same-leg action or an `apply(start, stop)`/call boundary
+prevents pairing. Automatic pairing currently requires prepared
+`batch_size=1`. Explicit joint entries also work without automatic pairing.
+
+The callback uses the last original zero-based entry index for each fit;
+`result.su_info['original_steps']` retains one-based input positions. Prepared
+`info` distinguishes `physical_gate_actions`, `pair_updates` and
+`joint_pair_updates`. Joint fits change where truncation occurs, so their
+finite-bond result need not equal two separate fits.
+
 Every pair update contracts current tensors and SU boundary weights into
 the reduced environment, runs ALS, and extracts only the active diagonal
 gauge locally. Gauge extraction restores the two full endpoint factors and
@@ -140,6 +184,25 @@ or clipping the environment spectrum; `raw_min_eigenvalue` is then `None`.
 Torch/CuPy local solves remain in their backend even above Quimb's
 automatic dense-solve threshold. No physical-identity-expanded metric is
 materialized by the default Quimb route.
+
+The left QR and right LQ expose reduced virtual dimensions $r_L,r_R$.
+One patch contraction gives the four-index environment, then Hermitianization:
+
+$$
+{\color{blue}N_{\rm env}}\in\mathbb C^{r_L\times r_R\times r_L\times r_R},
+\qquad N\leftarrow (N+N^\dagger)/2.
+$$
+
+As a matrix its shape is $(r_Lr_R)\times(r_Lr_R)$. Physical indices remain
+in the target $T_{a p q b}$ and contribute implicit identity factors to the
+metric; they are not stored in $N_{\rm env}$. For uniform bulk bonds $D$,
+acted physical dimension $d_a$ and spectator dimension $d_s$ on Q,
+$r\leq\min(d_sD^3,d_aD)$. A one-sided qubit PEPO gate has $d_a=d_s=2$;
+joint upper/lower reduction has $d_a=4,d_s=1$. At bulk $D=6$ these give
+$r=12$ versus 24, and sixteen times fewer target/environment entries.
+The environment is recomputed once per pair update and reused within ALS.
+The selected outer subspaces can change finite-bond fit errors; smaller
+arrays do not establish better physical accuracy or full-run throughput.
 `apply_reduced_loop_cluster_gate` and `gate_loop_cluster` accept
 `materialize_physical=False` to skip the separate gauge-inserted physical
 snapshot when only the updated SU core/gauges and scalar diagnostics are
@@ -446,7 +509,7 @@ contracted. `on_budget="warn"` additionally emits a warning, while
 
 `PreparedLoopClusterUpdate` prepares a fixed ordered schedule for dense
 complex64/complex128 Torch qubit PEPOs. It binds one-/two-site gate selectors,
-one-site axis permutations, six-site loop-union geometry and shape-specific
+one-site axis permutations, selected cluster geometry and shape-specific
 Cotengra contraction programs. Programs receive **fresh** QR factors,
 spectator tensors and SU boundary weights on every pair update. No numerical
 environment, messages or fixed-point values are reused.
@@ -454,7 +517,7 @@ environment, messages or fixed-point values are reused.
 ```python
 from pepsy.bp import LoopClusterUpdateTracker, PreparedLoopClusterUpdate
 
-# schedule entries: (tuple_of_sites, "upper" or "lower")
+# schedule entries: (tuple_of_sites, "upper", "lower", or two-site "both")
 plan = PreparedLoopClusterUpdate(
     core, schedule, max_bond=6, max_iterations=10, tol=1e-8,
     psd_project=False, torch_backend=None, max_peak_memory_log2=28,
@@ -467,8 +530,14 @@ core = plan.apply(core, gate_bank, gauges=gauges, start=first_slice_end,
 counts = plan.info
 ```
 
+The package default retains the six-site loop-union patch. Pass
+`cluster_mode="graphdistance", base_radius=1, fillin=True` to prepare the
+rotated twelve-site 4×3 rectangle. `plan.info` records the resolved selector;
+batch read footprints and contraction programs use that same selector.
+
 `gate_bank` covers the complete schedule; `[start:stop]` selects each source
-slice without reordering or fusing gates. Arrays and mutable SU gauge vectors
+slice without reordering; fits remain separate unless `fuse_pepo_legs=True`.
+Pairing cannot cross a slice boundary. Arrays and mutable SU gauge vectors
 must match the plan's Torch device and precision. Lower-leg gates retain the
 native $O G^T$ convention: transpose each intended right-applied matrix once
 before forming the bank. Source barriers, all pair truncations, ALS stopping,
@@ -496,7 +565,7 @@ Optional `torch_backend="aot_eager"` captures the shared ALS kernels. The
 prepared environment uses Cotengra's generated Torch contraction program;
 one separate AOT graph per lattice bond would churn the shared capture cache.
 Prepared replay keeps update commits in input order and does not batch
-independent networks. Native symmetry, directed messages, other base clusters and added loop
+independent networks. Native symmetry, directed messages and added loop
 corrections retain the ordinary `gate_loop_cluster` route.
 
 For an experimental batch of independent updates in the same network, set

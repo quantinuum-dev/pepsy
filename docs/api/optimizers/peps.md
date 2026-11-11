@@ -1093,10 +1093,15 @@ upper gives $GO$, lower gives $OG^T$. Supply `G.T` on the lower legs for $OG$.
 One-site gates, mixed streams and custom upper/lower index formats follow the
 same rules; input order is preserved across selector barriers.
 
-The shared QR/LQ reduction temporarily fuses the active lower/upper legs into
-physical dimension $d_{\rm in}d_{\rm out}$, then restores them on reconstruction.
-Gates contract into the selected reduced leg while the spectator leg stays
-explicit; no $G\otimes I$ array is formed. Positive-environment projection,
+The shared QR/LQ reduction keeps only the acted operator leg in the reduced
+factors for one-sided gates. The untouched physical leg stays on Q and is
+traced into the norm environment. Joint upper/lower fits retain both physical
+legs in the reduced factors, privately fused to dimension
+$d_{\rm in}d_{\rm out}$ and restored on reconstruction. Exact targets,
+index formats and operator scale are preserved in either grouping. Reports
+include `reduced_physical_dimensions`. No $G\otimes I$ array is formed.
+The smaller one-sided outer subspaces can change finite-bond fit errors.
+Positive-environment projection,
 ALS, optional gauges, exact-SVD shortcuts, boundary/strip caches and strip/layer
 refinement reuse the PEPS kernels. Reduced/full-tensor pair L-BFGS works too.
 

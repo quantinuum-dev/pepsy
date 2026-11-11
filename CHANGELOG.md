@@ -8,6 +8,24 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Optional joint cluster updates:** ordinary and prepared PEPO cluster
+  streams accept explicit `both` entries or opt-in `fuse_pepo_legs=True` to
+  fit adjacent opposite-leg gates on one bond together. No reordering or
+  pairing across call/source barriers; separate updates remain the default.
+  Prepared replay records physical actions and joint fits separately.
+
+- **Gate-dependent PEPO reduction:** one-sided cluster and full updates keep
+  only the acted physical leg in reduced QR/LQ factors and trace the untouched
+  leg on Q into the environment. Joint upper/lower fits retain both legs.
+  `prepare_reduced_bond_pair(which=...)` exposes this grouping; its omitted
+  selector preserves the full-physical compression layout. Finite-bond fit
+  results can change; source gate order, scale and gauge extraction are retained.
+
+- **Prepared cluster selection:** `PreparedLoopClusterUpdate` accepts
+  `cluster_mode`, `base_radius` and `fillin`. Graph distance one with fill-in
+  gives the rotated twelve-site 4×3 bulk patch, including correct edge clipping
+  and batch read footprints. The package default remains the six-site patch.
+
 - **Loop-cluster replay overhead:** `materialize_physical=False` skips unused
   physical-network snapshots in reduced gates, gate streams and prepared
   replay; existing defaults retain them. Dense ALS results expose the scalar

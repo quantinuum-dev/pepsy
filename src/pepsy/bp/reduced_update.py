@@ -111,17 +111,22 @@ def _copy_boundary_messages(boundary_messages):
     return copied
 
 
-def _site_physical_inds(tn, site) -> tuple[str, ...]:
+def _site_physical_inds(tn, site, which=None) -> tuple[str, ...]:
     """Return the local physical indices for a PEPS or PEPO site.
 
     PEPS expose one physical index through ``site_ind``.  PEPOs expose their
-    operator legs separately as ``lower_ind`` and ``upper_ind``; the reduced
-    update fuses those two legs temporarily into one Frobenius-norm physical
-    index.
+    operator legs separately. A one-sided selector retains only the acted
+    leg in the reduced factors; the other physical leg stays on Q.
     """
     if hasattr(tn, "site_ind"):
+        if which is not None:
+            raise ValueError("which selects a PEPO operator leg, not a PEPS physical leg")
         return (tn.site_ind(site),)
     if hasattr(tn, "lower_ind") and hasattr(tn, "upper_ind"):
+        if which in {"lower", "upper"}:
+            return (getattr(tn, which + "_ind")(site),)
+        if which not in {None, "both"}:
+            raise ValueError("which must be 'upper', 'lower', 'both', or None")
         return (tn.lower_ind(site), tn.upper_ind(site))
     raise TypeError(
         "reduced bond updates require a PEPS-like tensor network exposing "
@@ -737,9 +742,9 @@ class ReducedBondPair:
     On the selected bond, ``q_left @ r_left`` and ``l_right @ q_right``
     reconstruct its two original site tensors exactly. The reduced tensors have
     canonical index layouts ``(r_left, physical_left, bond)`` and
-    ``(bond, physical_right, r_right)``. For a PEPO, ``tn`` temporarily fuses
-    each active site's lower and upper operator legs into its physical index;
-    reconstruction unfuses them before returning the network.
+    ``(bond, physical_right, r_right)``. With one-sided PEPO ``which``, the
+    untouched physical leg stays on Q. With ``which=None`` or ``'both'``,
+    ``tn`` fuses both operator legs temporarily and reconstruction unfuses them.
     """
 
     tn: Any
@@ -771,6 +776,7 @@ class ReducedBondPair:
         default_factory=ReducedLoopClusterCache,
         repr=False,
     )
+    which: str | None = None
 
     @property
     def bond_dimension(self) -> int:
@@ -899,6 +905,14 @@ class ReducedBondPair:
 
     def gate_target_tn(self, gate) -> Any:
         """Return the untruncated, gate-applied target state for this bond."""
+        if getattr(self, "which", None) == 'both':
+            target = _reduced_gate_target(self, gate)
+            rank = min(target.shape[0]*target.shape[1], target.shape[2]*target.shape[3])
+            return self.reconstruct_tn(*_svd_initial_factors(target, rank))
+        if getattr(self, "which", None) in {"upper", "lower"}:
+            return self.tn.gate_inds(
+                gate, (self.physical_left_ind, self.physical_right_ind), contract=True,
+            )
         return self.tn.gate(gate, where=self.where, contract=True)
 
     def _site_distances(self) -> dict[Any, int]:
@@ -1460,6 +1474,7 @@ def prepare_reduced_bond_pair(
     message_psd_floor: float = 0.0,
     bp_convergence: str = "ignore",
     smudge: float = 0.0,
+    which: str | None = None,
 ) -> ReducedBondPair:
     """Prepare an adjacent physical PEPS or PEPO bond for a reduced update.
 
@@ -1467,8 +1482,8 @@ def prepare_reduced_bond_pair(
     ----------
     tn
         PEPS or PEPO core with external simple-update gauges removed. For a
-        PEPO, the active lower/upper physical legs are fused only on a private
-        reduced-update copy and restored on reconstruction.
+        PEPO, ``which`` selects the physical legs retained in the reduced
+        factors. Any fusion is private and restored on reconstruction.
     gauges
         Optional converged external SU/Vidal gauge vectors. With
         ``input_mode="su_core"`` they are inserted into a copied core; with
@@ -1497,6 +1512,10 @@ def prepare_reduced_bond_pair(
         Relative eigenvalue floor used by ``message_psd_project``.
     where
         Ordered pair ``(left_site, right_site)`` of adjacent PEPS sites.
+    which
+        PEPO ``'lower'`` or ``'upper'`` leaves the untouched operator leg
+        on each Q factor. ``None`` (default) or ``'both'`` retains both legs,
+        for joint actions or gate-independent compression. PEPS use ``None``.
     smudge
         Optional regularizer passed to ``gauge_simple_insert``.
 
@@ -1553,8 +1572,10 @@ def prepare_reduced_bond_pair(
             f"{site_left!r} and {site_right!r}, found {bond_inds!r}"
         )
     bond_ind = bond_inds[0]
-    physical_left_original_inds = _site_physical_inds(work, site_left)
-    physical_right_original_inds = _site_physical_inds(work, site_right)
+    physical_left_original_inds = _site_physical_inds(work, site_left, which)
+    physical_right_original_inds = _site_physical_inds(work, site_right, which)
+    if which in {"upper", "lower"} and is_symmray_array(left_tensor.data):
+        raise NotImplementedError("one-sided reduced PEPO gates currently require dense arrays")
     for side, site, tensor, physical_inds in (
         ("left", site_left, left_tensor, physical_left_original_inds),
         ("right", site_right, right_tensor, physical_right_original_inds),
@@ -1740,6 +1761,7 @@ def prepare_reduced_bond_pair(
         ),
         boundary_messages=copied_boundary_messages,
         bp_info=bp_info,
+        which=which,
     )
 
 
@@ -1773,13 +1795,24 @@ def _apply_two_site_gate(theta, gate):
     return _einsum("xyuv,auvb->axyb", gate, theta)
 
 
-def _reduced_gate_target(pair, gate, which=None):
+def _reduced_gate_target(pair, gate, which=None, *, theta=None):
     """Apply one PEPS or explicit PEPO-leg gate without lifting G tensor I."""
-    theta = pair.theta_array()
+    theta = pair.theta_array() if theta is None else theta
+    selected = getattr(pair, "which", None)
+    which = selected if which is None else which
+    if selected in {"upper", "lower"}:
+        if which != selected:
+            raise ValueError('gate leg does not match the prepared reduced pair')
+        return _apply_two_site_gate(theta, None if gate is None else _cast_like(gate, theta))
     if which is None or gate is None:
         return _apply_two_site_gate(theta, gate)
+    if which == "both":
+        if not isinstance(gate, (tuple, list)) or len(gate) != 2:
+            raise ValueError("paired PEPO update requires upper and lower gates")
+        theta = _reduced_gate_target(pair, gate[0], 'upper', theta=theta)
+        return _reduced_gate_target(pair, gate[1], 'lower', theta=theta)
     if which not in {"upper", "lower"}:
-        raise ValueError("which must be 'upper', 'lower', or None")
+        raise ValueError("which must be 'upper', 'lower', 'both', or None")
     if len(pair.physical_left_original_inds) != 2:
         raise ValueError("which selects a PEPO operator leg, not a PEPS physical leg")
     if is_symmray_array(theta):
@@ -1802,8 +1835,9 @@ def _reduced_gate_target(pair, gate, which=None):
 def _metric_from_environment(pair: ReducedBondPair, environment):
     """Expand ``E`` with physical identity factors to form dense ``N_red``.
 
-    The active reduced tensors carry the physical legs but the exterior does
-    not. Consequently ``N_red`` is ``E`` tensored with the two physical
+    The active reduced tensors carry the acted physical legs. Any untouched
+    operator legs on Q have already been traced into the exterior. Thus
+    ``N_red`` is ``E`` tensored with the two acted physical
     identity operators, with rows ordered as bra ``(r_L, p_L, p_R, r_R)``.
     """
     environment = _open_environment_data(environment)
@@ -1898,7 +1932,7 @@ def exact_reduced_update_problem(
         psd_floor=psd_floor,
     )
 
-    target = _apply_two_site_gate(pair.theta_array(), gate)
+    target = _reduced_gate_target(pair, gate)
     metric, linear_term = _metric_views(
         pair,
         environment,
@@ -3685,6 +3719,8 @@ def _local_svd_reduced_state(
     info = {
         "method": "local_svd", "bond_ind": pair.bond_ind,
         "singular_values_normalized": False,
+        "physical_which": getattr(pair, 'which', None),
+        "reduced_target_shape": pair.theta_shape,
     }
     reused = sum(index != pair.bond_ind for index in gauges)
     return core, updated_gauges, physical_tn, info, reused
@@ -4001,7 +4037,9 @@ def apply_reduced_loop_cluster_gate(
     six-site base patch directly when ``max_loop_size=0``. Dense PEPO gates
     can select ``which='upper'`` or ``which='lower'``; lower gates act with
     Quimb's ``O G^T`` convention. Explicit right-applied gates require one
-    transpose supplied by the caller.
+    transpose supplied by the caller. One-sided gates keep the untouched
+    physical leg on Q. With ``which='both'``, pass ``(upper_gate, lower_gate)``
+    for one joint fit retaining both physical legs.
 
     ``loop_cache`` optionally reuses topology-only generalized-loop geometry
     when the same active bond is updated repeatedly with different loop
@@ -4032,6 +4070,7 @@ def apply_reduced_loop_cluster_gate(
         tn,
         gauges,
         where=where,
+        which=which,
         boundary_messages=boundary_messages,
         input_mode=input_mode,
         run_bp=run_bp,

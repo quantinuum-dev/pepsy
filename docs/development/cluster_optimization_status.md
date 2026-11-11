@@ -1,6 +1,7 @@
 # Cluster PEPO backend and downstream optimization status
 
-Updated 2026-11-06 for the loop-cluster replay overhead controls on `develop`.
+Updated 2026-11-10 for configurable prepared patches and gate-dependent
+PEPO QR/LQ grouping on `develop`.
 The earlier published `develop` → `main` merge was `bf83def` on 2026-10-12.
 This page owns the current capability and validation routes. Detailed earlier
 updates are preserved in the [archived ledger](notes/2026-10-12-cluster-status-archive.md).
@@ -16,7 +17,7 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Constructed PEPO traces | `trace_exp` traces the selected PEPO with its caps/compression; `partition_trace_exp` names the separate scalar shortcut | [Trace contract](../api/operators/cluster_expansion.md#trace-of-the-constructed-pepo) |
 | Local cluster updates | Centered six-site loop-union patch, direct SU/BP-closed reduced environment, native dense ALS and local diagonal-gauge extraction; dense PEPO upper/lower streams | [BP cluster updates](../api/bp.md#centered-six-site-gate-updates) |
 | Dense Torch cluster ALS | Opt-in certified Cholesky solves with spectral fallback, optional AOT capture, local fidelity records and per-pair stream scale bookkeeping | [Torch ALS and fidelity](../api/bp.md#dense-torch-als-and-local-fidelity) |
-| Prepared cluster replay | Dense Torch PEPO schedule/layout and Cotengra program reuse; fresh six-site contractions, rank-growth rebuilds and unchanged truncation order | [Prepared cluster replay](../api/bp.md#prepared-ordered-pepo-cluster-replay) |
+| Prepared cluster replay | Dense Torch PEPO schedule/layout and Cotengra program reuse; configurable cluster selection including rotated twelve-site rectangles, fresh contractions, rank-growth rebuilds and unchanged truncation order | [Prepared cluster replay](../api/bp.md#prepared-ordered-pepo-cluster-replay) |
 | Independent cluster batches (experimental) | `batch_size="auto"` discovers compatible ready patches with lattice/dependency/workspace limits; integer caps retain consecutive groups; per-pair stopping and ordered gauge/exponent commits | [Auto scheduling](notes/2026-11-05-auto-cluster-batches.md), [initial measurements](notes/2026-11-05-independent-cluster-batches.md) |
 | Ordered PEPO residuals | `residual_exp` constructs the connected-cluster ordered product minus identity on a square OBC/PBC lattice, with an optional post-subtraction SVD bond cap | [Ordered products](../api/operators/cluster_expansion.md#ordered-pepo-products) |
 | Native bosonic cluster MPOs | Exact Torch/JAX autodiff and sector-preserving NumPy/Torch compressed assembly within documented modes | [Native MPO scope](../api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos) |
@@ -26,6 +27,22 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Host gradient solvers | Native Torch/JAX parameters with SciPy/NLopt host control and explicit budget/result validation; NLopt supports an opt-in maximum derivative threshold separate from step tolerance | [Gradient solvers](../api/solvers/gradient.md) |
 
 ## Publication and validation
+
+The [adjacent joint-update follow-up](../../history/2026-11-10-adjacent-joint-cluster.md)
+adds explicit `both` entries and opt-in adjacent opposite-leg fits to ordinary
+and prepared cluster replay. Source barriers and input order are retained;
+Cotengra execution and clipped edge/corner geometry have dedicated checks.
+
+The [gate-dependent reduction follow-up](../../history/2026-11-10-pepo-physical-leg-reduction.md)
+keeps untouched operator legs on Q for one-sided gates in ordinary/prepared
+cluster replay and native full update. Joint upper/lower fits retain both
+legs. Dense targets and costs are validated independently; finite-bond
+accuracy and full-trajectory performance remain separate measurements.
+
+The [twelve-site follow-up](../../history/2026-11-10-twelve-site-cluster.md)
+adds prepared selector controls. The Eli runner now defaults to rotated 4×3
+patches for new 10×10 loop-cluster runs, retaining six sites elsewhere and
+an explicit override. Existing archives retain their frozen settings.
 
 The [replay-overhead follow-up](../../history/2026-11-06-loop-cluster-replay-overhead.md)
 adds optional omission of physical-network snapshots and a solver scalar
