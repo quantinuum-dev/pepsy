@@ -48,6 +48,16 @@ Configure FIT modes with:
   public `BoundaryFitDiagnostic`; add `fit_timing_sync_device=True` only when
   kernel-complete accelerator profiling is required.
 
+`reuse-direct` and `reuse-src` reuse a fitted boundary only as a starting
+guess, then fit the current target. Non-differentiable NumPy/Torch/CuPy
+one-site/global FIT opens undersized warm bonds with zero padding and QR
+canonicalization, preserving the represented starting state. Otherwise
+one-site sweeps could remain trapped at a small earlier bond dimension.
+A lowered cap, differentiable inputs or other backends use a fresh disposable
+seed when needed. Two-site/block FIT grows locally and retains low-rank warm
+starts. Native Symmray initialization keeps its existing capability/fallback
+behavior. Diagnostics label padded starts `reuse-expanded`.
+
 For the direct modes on a multilayer, non-flat target,
 `fit_layer_mode="joint"` (default) compresses all tagged layers in a boundary
 target together. Set `fit_layer_mode="sequential"` to compress layers one at a

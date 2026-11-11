@@ -1,6 +1,8 @@
 # Cluster PEPO backend and downstream optimization status
 
-Reviewed 2026-10-12 at `bf83def`, the published Pepsy `develop` → `main` merge.
+Updated 2026-11-10 for configurable prepared patches and gate-dependent
+PEPO QR/LQ grouping on `develop`.
+The earlier published `develop` → `main` merge was `bf83def` on 2026-10-12.
 This page owns the current capability and validation routes. Detailed earlier
 updates are preserved in the [archived ledger](notes/2026-10-12-cluster-status-archive.md).
 Its older “working-tree” and “unpublished” statements retain their original dates.
@@ -13,6 +15,10 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Downstream MPS replay | Native mode discovery, named DMRG schedules and arbitrary-support sub-MPO fit windows; Gaugy preserves logical permutation indices and cached targets | [MPS guide](../api/optimizers/mps.md), [scoped alignment evidence](notes/2026-10-13-mps-mode-alignment.md) |
 | Interaction clusters | Shared graph inventories, ordered product adapters, structural reuse and explicit construction budgets | [Interaction clusters](../api/operators/interaction_clusters.md) |
 | Constructed PEPO traces | `trace_exp` traces the selected PEPO with its caps/compression; `partition_trace_exp` names the separate scalar shortcut | [Trace contract](../api/operators/cluster_expansion.md#trace-of-the-constructed-pepo) |
+| Local cluster updates | Centered six-site loop-union patch, direct SU/BP-closed reduced environment, native dense ALS and local diagonal-gauge extraction; dense PEPO upper/lower streams | [BP cluster updates](../api/bp.md#centered-six-site-gate-updates) |
+| Dense Torch cluster ALS | Opt-in certified Cholesky solves with spectral fallback, optional AOT capture, local fidelity records and per-pair stream scale bookkeeping | [Torch ALS and fidelity](../api/bp.md#dense-torch-als-and-local-fidelity) |
+| Prepared cluster replay | Dense Torch PEPO schedule/layout and Cotengra program reuse; configurable cluster selection including rotated twelve-site rectangles, fresh contractions, rank-growth rebuilds and unchanged truncation order | [Prepared cluster replay](../api/bp.md#prepared-ordered-pepo-cluster-replay) |
+| Independent cluster batches (experimental) | `batch_size="auto"` discovers compatible ready patches with lattice/dependency/workspace limits; integer caps retain consecutive groups; per-pair stopping and ordered gauge/exponent commits | [Auto scheduling](notes/2026-11-05-auto-cluster-batches.md), [initial measurements](notes/2026-11-05-independent-cluster-batches.md) |
 | Ordered PEPO residuals | `residual_exp` constructs the connected-cluster ordered product minus identity on a square OBC/PBC lattice, with an optional post-subtraction SVD bond cap | [Ordered products](../api/operators/cluster_expansion.md#ordered-pepo-products) |
 | Native bosonic cluster MPOs | Exact Torch/JAX autodiff and sector-preserving NumPy/Torch compressed assembly within documented modes | [Native MPO scope](../api/operators/mpo_cluster.md#native-block-sparse-cluster-mpos) |
 | Repeated cluster evaluation | Experimental compact channels; supported frontier/automaton MPO and symbolic/algebraic PEPO preparation retain separate capability and budget checks | [Compact channels](../api/operators/cluster_channels.md) |
@@ -21,6 +27,112 @@ Its older “working-tree” and “unpublished” statements retain their origi
 | Host gradient solvers | Native Torch/JAX parameters with SciPy/NLopt host control and explicit budget/result validation; NLopt supports an opt-in maximum derivative threshold separate from step tolerance | [Gradient solvers](../api/solvers/gradient.md) |
 
 ## Publication and validation
+
+The [adjacent joint-update follow-up](../../history/2026-11-10-adjacent-joint-cluster.md)
+adds explicit `both` entries and opt-in adjacent opposite-leg fits to ordinary
+and prepared cluster replay. Source barriers and input order are retained;
+Cotengra execution and clipped edge/corner geometry have dedicated checks.
+
+The [gate-dependent reduction follow-up](../../history/2026-11-10-pepo-physical-leg-reduction.md)
+keeps untouched operator legs on Q for one-sided gates in ordinary/prepared
+cluster replay and native full update. Joint upper/lower fits retain both
+legs. Dense targets and costs are validated independently; finite-bond
+accuracy and full-trajectory performance remain separate measurements.
+
+The [twelve-site follow-up](../../history/2026-11-10-twelve-site-cluster.md)
+adds prepared selector controls. The Eli runner now defaults to rotated 4×3
+patches for new 10×10 loop-cluster runs, retaining six sites elsewhere and
+an explicit override. Existing archives retain their frozen settings.
+
+The [replay-overhead follow-up](../../history/2026-11-06-loop-cluster-replay-overhead.md)
+adds optional omission of physical-network snapshots and a solver scalar
+target norm for logging reuse. The Eli runner selects these controls for
+prepared and reference replay; numerical update policy remains unchanged.
+
+The [batch commit review](../../history/2026-11-05-cluster-batch-precommit-review.md)
+adds experimental same-network cluster batching through
+`PreparedLoopClusterUpdate(batch_size="auto")` or integer consecutive caps.
+Sequential replay remains the default. The review validates read/write
+dependencies, ordered gauge merges and CPU/CUDA mixed-gate/cache-eviction
+cases; measured gains and limitations remain in the linked records above.
+
+The [prepared-replay follow-up](../../history/2026-11-05-prepared-cluster-replay.md)
+adds reusable six-site geometry and array contraction programs to the existing
+middle-out PEPO benchmark. A saved χ6 96-action CUDA diagnostic improved by
+**1.04694×**, with identical pair errors/iterations and cap18 MPS readout.
+It also fixes detached SU-gauge derivatives exposed by multi-gate finite
+differences. Gate order, source barriers and truncations remain unchanged;
+independent-network batching and whole-step CUDA capture remain deferred.
+The final affected selection passed **520 package tests** and **110 benchmark
+tests**. Fresh full-suite fail-fast still stops at the known native fermionic
+readout failure; the handoff records its separate scope.
+
+The [Torch ALS follow-up](../../history/2026-11-05-torch-cluster-als.md)
+implements guarded dense solves: three saved χ6 GPU pair
+updates improved by 1.64–1.87× with matched local errors and stopping.
+The implementation was published in Pepsy `6478f6b`; examples `a290a7c`
+select it in the existing 3×2 PEPO benchmark. A subsequent review also
+preserves gradients for raw Torch environments; its fresh checks are
+recorded in the linked handoff.
+The final follow-up selection passed **500 package tests** and **104 downstream
+benchmark tests**. This is scoped validation, separate from the earlier
+full-suite failure described below.
+It adds optional local fidelity tracking and per-pair stream RMS bookkeeping.
+Compilation is validated but did not consistently beat eager. This bounded
+replay does not establish whole-trajectory speed or convergence; see the
+[measurement record](notes/2026-11-05-torch-cluster-als.md).
+The affected BP, API/layout and PEPS/PEPO full-update selection passed
+**480 tests**, including CUDA. Full-suite fail-fast still stops at the
+previously reproduced native fermionic exact-readout failure; the handoff
+records that scope separately.
+The second review fixed an AOT cache omission for autocast state/dtype;
+**240 focused tests** then passed, including CUDA backward checks and
+rectangular real/complex layouts. This is a later scoped check, separate
+from the earlier 480-test integration selection.
+
+The [local-cluster implementation audit](../../history/2026-11-05-loop-cluster-audit.md)
+corrects half-weighted active-gauge extraction and order-insensitive tree
+cache keys. Earlier long-time cluster trials used the incorrect gauge
+spectra; preserve their numerical records without interpreting them as
+validation of the corrected method.
+The fixes are published on `develop` in `9e57d5e`. The corrected 23-qubit
+homogeneous depth20 χ6 test gives **MPS-boundary cap18 cost 0.0516255525**,
+versus 0.8648848491 at the same cap before the fix and matched-target HRS
+0.0476403551. The downstream [current usage](https://github.com/rezaquant/pepsy_examples/blob/main/experiments/mps_magnetization/benchmark/eli_global_cost/RUNBOOK.md#current-six-site-cluster-update)
+defaults to MPS scalar readout at 3χ; archived exact readouts remain historical
+diagnostics. Public RMS-to-exponent bookkeeping keeps the operator amplitude
+while bounding gauge scales. This is one measured case; finite-χ/cluster/ALS
+convergence remains unverified.
+
+The [Hermitian-only follow-up](../../history/2026-11-05-loop-cluster-hermitian-environment.md)
+removes the diagnostic eigensolve when reduced builders receive
+`psd_project=False`; the raw minimum eigenvalue is then absent. The downstream
+six-site trial explicitly selects this mode. Public builder defaults retain
+their existing PSD policy; long-time χ6 stability remains unverified.
+
+The [CUDA-preservation audit](../../history/2026-11-05-loop-cluster-cuda-preservation.md)
+fixes a silent Torch-to-NumPy conversion in the public cluster gate stream.
+Earlier low-level CUDA checks remain valid, but the first downstream
+GPU-labeled gate-stream prefix was CPU execution. New regressions assert
+actual devices and the replacement trial uses a corrected snapshot.
+
+The [centered-cluster readiness record](../../history/2026-11-05-centered-cluster-updates.md)
+adds base-patch selection, one-sided dense PEPO gates and accelerator solves.
+The χ6 interior-patch CPU/CUDA pilot agrees and remains finite; the corrected
+full-T=6 case above provides a separate measurement. The earlier native reduced-shape failure
+is fixed; five unrelated fermionic readout failures reproduce on the baseline.
+
+The [November 5 local-gauge follow-up](../../history/2026-11-05-local-bond-svd-gauges.md)
+replaces global SU regauging in BP reduced gate/compression updates with
+local QR/LQ and SVD gauge extraction. Its CPU/CUDA checks are separate from
+the 10×10 boundary-MPS FU campaigns and do not establish χ6 stability.
+
+The [November 4 FU follow-up](../../history/2026-11-04-full-update-factor-reuse.md)
+records SVD-factor reuse, small-core final balancing and native dense
+local-solve dispatch, included with the local-cluster changes on `develop`.
+The [publication review](../../history/2026-11-05-publication-review.md)
+records fresh validation and baseline failures separately from the historical
+downstream CPU16 performance measurements.
 
 The [Torch scheduling follow-up](../../history/2026-10-30-prepared-su-scheduling.md)
 batches compatible ready updates across independent schedules. The compiler
@@ -57,8 +169,9 @@ compressed-trace failures remain unresolved.
 
 The [promotion handoff](../../history/2026-10-12-develop-main-promotion.md)
 records integration into `main`. These commits are later development work,
-not a new tagged release. The latest local smoke checkpoint passed **94 tests**;
-it covers API/import/layout contracts and does not certify every numerical path.
+not a new tagged release. That promotion's smoke checkpoint passed **94 tests**;
+the November 5 publication review records **112** newer smoke passes.
+These cover API/import/layout contracts and do not certify every numerical path.
 
 | Dated check | Result and scope | Evidence |
 | --- | --- | --- |

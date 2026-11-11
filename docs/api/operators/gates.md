@@ -120,6 +120,29 @@ Native Symmray `BlockVector` gauges use the same rule, reducing over backend
 blocks and weighting every singular value equally even when sector sizes
 differ. Blocks remain native, and the scale is detached at the block backend.
 
+## Local six-site cluster updates
+
+Use `pepsy.operators.gate_loop_cluster` for adjacent two-site PEPS/PEPO
+updates with a finite SU/BP-closed norm environment. The
+[centered six-site recipe](../bp.md#centered-six-site-gate-updates) specifies
+`cluster_mode="loopunion", base_radius=4, fillin=True, max_loop_size=0`,
+PEPO upper/lower leg conventions and amplitude-preserving gauge handling.
+Keep the local patch size distinct from the PEPO bond cap and any later
+boundary-MPS scalar readout.
+
+Set `strip_exponent=True` for amplitude-preserving RMS bookkeeping after
+every pair in a long stream. Pass `tracker=LoopClusterUpdateTracker()` from
+`pepsy.bp` to retain scalar local fidelity records across calls. The
+[Torch ALS and fidelity recipe](../bp.md#dense-torch-als-and-local-fidelity)
+documents the optional dense Torch solver, AOT capture, measurement costs and
+the limits of accumulated local fidelities. Full pair-result snapshots are
+retained only with `return_results=True`.
+
+For repeated dense Torch PEPO schedules, use
+[`pepsy.bp.PreparedLoopClusterUpdate`](../bp.md#prepared-ordered-pepo-cluster-replay).
+It prepares six-site geometry and contraction programs while preserving
+the input order, source barriers and pair truncations.
+
 ## Prepared dense simple update
 
 `pepsy.operators.PreparedSimpleUpdate` snapshots a dense complex Torch PEPO,

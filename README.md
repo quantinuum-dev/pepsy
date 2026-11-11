@@ -28,6 +28,8 @@ or [stabilizer](docs/api/optimizers/stabilizer_tn.md) guide.
 
 Reuse and batch independent PEPO gate schedules with
 [prepared simple update](docs/api/operators/gates.md#prepared-dense-simple-update).
+For local 3×2 PEPS/PEPO cluster updates, use the
+[six-site gate API](docs/api/bp.md#centered-six-site-gate-updates).
 
 [Documentation](docs/index.md) · [Examples](docs/examples.md) ·
 [Contributing](CONTRIBUTING.md)

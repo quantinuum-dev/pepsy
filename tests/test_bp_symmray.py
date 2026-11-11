@@ -195,6 +195,45 @@ def _spinless_sign_sensitive_peps():
     return state, fermion, dense_state
 
 
+@pytest.mark.parametrize("su_core", [False, True])
+def test_native_local_svd_gauge_preserves_state_and_charge_spaces(su_core):
+    from pepsy.bp.reduced_update import (
+        ReducedALSSolution, _local_svd_reduced_state, prepare_reduced_bond_pair,
+    )
+    from pepsy.bp.gauges import _symmray_block_vector, _symmray_bond_chargemap
+
+    state, _, _ = _spinless_sign_sensitive_peps()
+    tn = state.tn
+    gauges = {
+        index: _symmray_block_vector(
+            tn, index,
+            np.linspace(0.7, 1.3, sum(_symmray_bond_chargemap(tn, index).values())),
+        )
+        for index in tn.inner_inds()
+    } if su_core else {}
+    pair = prepare_reduced_bond_pair(
+        tn, gauges, where=((0, 0), (1, 0)), run_bp=False,
+        input_mode="su_core" if su_core else "physical",
+    )
+    solution = ReducedALSSolution(pair.r_left.data, pair.l_right.data, ())
+    expected = pair.reconstruct_tn()
+    core, updated, physical, info, _ = _local_svd_reduced_state(
+        tn, pair, solution, inplace=False,
+    )
+    rebuilt = core.copy()
+    rebuilt.gauge_simple_insert(updated)
+    for actual in (physical, rebuilt):
+        np.testing.assert_allclose(
+            actual.to_dense().to_dense(), expected.to_dense().to_dense(),
+            rtol=1e-11, atol=1e-11,
+        )
+    assert all(type(t.data).__module__.startswith("symmray") for t in core.tensors)
+    assert info["method"] == "local_svd"
+    for index in gauges:
+        if index != pair.bond_ind:
+            np.testing.assert_array_equal(updated[index].to_dense(), gauges[index].to_dense())
+
+
 def test_native_reduced_loop_compression_uses_graded_svd_adapter():
     """Native U1 tensors stay block-sparse through reduced compression."""
     state, fermion, _ = _spinless_sign_sensitive_peps()

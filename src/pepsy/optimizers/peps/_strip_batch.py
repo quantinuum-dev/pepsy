@@ -5,6 +5,7 @@ from numbers import Integral
 import quimb.tensor as qtn
 
 from ...operators import gate_simple
+from ...operators.gates import _is_operator_tensor_network
 from ...backends import infer_backend_signature
 
 
@@ -76,18 +77,25 @@ def collect_strip_batch(owner, start, width=1):
     return owner.gates[start:end], end - start, end
 
 
-def simple_update_guess(state, entries, *, chi, cutoff, cutoff_mode):
+def simple_update_guess(state, entries, *, chi, cutoff, cutoff_mode,
+                        which=None, return_source=False):
     """Evolve a private gauge representation, absorbing its gauges exactly once."""
     guess = state.copy()
     gauges = {}
     guess.gauge_all_simple_(gauges=gauges)
-    for gate, where, which in entries:
-        if which is not None:
+    if return_source:
+        source = guess.copy()
+        source.gauge_simple_insert(gauges)
+    operator = _is_operator_tensor_network(state)
+    for gate, where, side in entries:
+        side = which if side is None else side
+        if side is not None and not operator:
             raise ValueError('simple-update guesses require physical PEPS gates')
         gate_simple(guess, gate, where, gauges=gauges, max_bond=chi,
+                    which=(side or 'upper') if operator else None,
                     cutoff=cutoff, cutoff_mode=cutoff_mode, renorm=False)
     guess.gauge_simple_insert(gauges)
-    return guess
+    return (source, guess) if return_source else guess
 
 
 def reuse_boundary_guesses(sweeper, previous):

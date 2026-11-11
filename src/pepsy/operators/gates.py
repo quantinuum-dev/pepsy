@@ -1379,15 +1379,45 @@ def _swap_gate_for_site_pair(
     return _convert_internal_gate_to_backend(swap_gate, inferred_converter)
 
 
-def _normalize_gate_which(which):
+def _normalize_gate_which(which, *, allow_both=False):
     """Normalize an upper/lower layer selector."""
     if which is None:
         return None
 
     which_norm = str(which).strip().lower()
-    if which_norm not in ("upper", "lower"):
+    if which_norm not in (("upper", "lower", "both") if allow_both else ("upper", "lower")):
         raise ValueError("which must be 'upper' or 'lower' (case-insensitive).")
     return which_norm
+
+
+def _pair_pepo_gate_entries(gates, state, which=None, *, fuse_pepo_legs=False):
+    """Pair adjacent opposite-leg actions on the same 2D bond without moving gates."""
+    def sites(where):
+        if (isinstance(where, (tuple, list)) and len(where) == 2
+                and all(isinstance(s, (tuple, list)) and len(s) == 2 for s in where)):
+            return tuple(map(tuple, where))
+        return None
+
+    index = 0
+    while index < len(gates):
+        gate, where, side = gates[index]
+        first = sites(where)
+        side = _normalize_gate_which(side if side is not None else which, allow_both=True) or 'upper'
+        if fuse_pepo_legs and side != 'both' and first is not None and index+1 < len(gates):
+            other, other_where, other_side = gates[index+1]
+            second = sites(other_where)
+            other_side = _normalize_gate_which(
+                other_side if other_side is not None else which, allow_both=True) or 'upper'
+            if second is not None and set(first) == set(second) and {side, other_side} == {'upper', 'lower'}:
+                if first != second:
+                    dims = [state.ind_size(getattr(state, f'{other_side}_ind')(*s)) for s in second]
+                    other = ar.do('transpose', ar.do('reshape', other, (*dims, *dims)), (1, 0, 3, 2))
+                pair = (gate, other) if side == 'upper' else (other, gate)
+                yield index+2, (pair, first, 'both'), (index+1, index+2)
+                index += 2
+                continue
+        yield index+1, gates[index], (index+1,)
+        index += 1
 
 
 def _ind_id_from_which(which, arity):
@@ -1561,7 +1591,7 @@ def _looks_like_where_payload(where):
     return False
 
 
-def _looks_like_gate_where_pair_entry(item, *, allow_which=False):
+def _looks_like_gate_where_pair_entry(item, *, allow_which=False, allow_both=False):
     """Return True when ``item`` has canonical ``(gate, where[, which])`` shape."""
     if (
         allow_which
@@ -1571,7 +1601,7 @@ def _looks_like_gate_where_pair_entry(item, *, allow_which=False):
         and _looks_like_where_payload(item[1])
     ):
         try:
-            _normalize_gate_which(item[2])
+            _normalize_gate_which(item[2], allow_both=allow_both)
         except ValueError:
             return False
         return True
@@ -1607,7 +1637,7 @@ def _looks_like_parallel_gate_where_alias(gates, where):
 
 
 def _normalize_gate_entries(
-    gates, where=None, *, allow_empty=True, allow_which=False
+    gates, where=None, *, allow_empty=True, allow_which=False, allow_both=False
 ):
     """Normalize gate input into canonical entries.
 
@@ -1621,13 +1651,13 @@ def _normalize_gate_entries(
         raise ValueError("gates must not be None.")
 
     if where is not None:
-        if _looks_like_gate_where_pair_entry(gates, allow_which=allow_which):
+        if _looks_like_gate_where_pair_entry(gates, allow_which=allow_which, allow_both=allow_both):
             raise ValueError(
                 "Do not pass a separate where when gates is already a bundled entry."
             )
         if isinstance(gates, (tuple, list)) and len(gates) > 0:
             if all(
-                _looks_like_gate_where_pair_entry(item, allow_which=allow_which)
+                _looks_like_gate_where_pair_entry(item, allow_which=allow_which, allow_both=allow_both)
                 for item in gates
             ):
                 raise ValueError(
@@ -1638,7 +1668,7 @@ def _normalize_gate_entries(
                 len(gates) > 1
                 and isinstance(where, (tuple, list))
                 and not _looks_like_gate_where_pair_entry(
-                    gates, allow_which=allow_which
+                    gates, allow_which=allow_which, allow_both=allow_both
                 )
             ):
                 raise ValueError(
@@ -1654,7 +1684,7 @@ def _normalize_gate_entries(
             return [(gates, where, None)]
         return [(gates, where)]
 
-    if _looks_like_gate_where_pair_entry(gates, allow_which=allow_which):
+    if _looks_like_gate_where_pair_entry(gates, allow_which=allow_which, allow_both=allow_both):
         gate_i, where_i = gates[0], gates[1]
         if _looks_like_parallel_gate_where_alias(gate_i, where_i):
             raise ValueError(
@@ -1680,17 +1710,18 @@ def _normalize_gate_entries(
             raise ValueError("gates must not be empty.")
 
         if all(
-            _looks_like_gate_where_pair_entry(item, allow_which=allow_which)
+            _looks_like_gate_where_pair_entry(item, allow_which=allow_which, allow_both=allow_both)
             for item in gates
         ):
             if allow_which:
                 return [
-                    (item[0], item[1], _normalize_gate_which(item[2]) if len(item) == 3 else None)
+                    (item[0], item[1], _normalize_gate_which(item[2], allow_both=allow_both)
+                     if len(item) == 3 else None)
                     for item in gates
                 ]
             return [(item[0], item[1]) for item in gates]
         if any(
-            _looks_like_gate_where_pair_entry(item, allow_which=allow_which)
+            _looks_like_gate_where_pair_entry(item, allow_which=allow_which, allow_both=allow_both)
             for item in gates
         ):
             raise ValueError(
@@ -2240,6 +2271,8 @@ def gate_loop_cluster(
     max_loop_size: int = 0,
     max_cluster_size: int | None = None,
     base_radius: int = 0,
+    cluster_mode: str = "graphdistance",
+    fillin: bool | int = False,
     include_full_system: bool | None = None,
     autocomplete: bool = True,
     tree_reduction: bool = True,
@@ -2255,15 +2288,22 @@ def gate_loop_cluster(
     smudge: float = 0.0,
     als_opts=None,
     regauge_opts=None,
+    tracker=None,
+    strip_exponent: bool = False,
     inplace=True,
     return_results: bool = False,
+    materialize_physical: bool = True,
+    fuse_pepo_legs: bool = False,
+    step_callback=None,
 ):
     """Apply a PEPS gate stream with reduced loop-cluster updates.
 
     This is the gate-stream bridge for
     :func:`pepsy.bp.apply_reduced_loop_cluster_gate`. Adjacent two-site gates
-    are updated by the open-leg loop-cluster metric and re-gauged into the
-    supplied SU ``gauges`` dictionary. ``input_mode="su_core"`` makes that
+    are updated by the open-leg loop-cluster metric, extracting only their
+    active diagonal SU gauge by local QR/LQ and SVD. Exterior gauges and
+    spectator core tensors stay fixed; missing initial gauges are identities.
+    ``input_mode="su_core"`` makes that
     representation explicit; ``input_mode="physical"`` treats gauges as
     boundary-only closures for an already gauged network. Alternatively, pass
     frozen directed D2BP ``boundary_messages`` keyed by
@@ -2281,18 +2321,62 @@ def gate_loop_cluster(
     ``loop_cache`` optionally reuses generalized-loop geometry for repeated
     updates of the same active bond. A cache is topology-only: contractions,
     tensor values, and boundary messages are always rebuilt.
+
+    Set ``cluster_mode='loopunion', base_radius=4, fillin=True`` for the
+    centered six-site square-lattice patch. ``max_loop_size=0`` contracts that
+    patch directly. Dense PEPOs require an explicit upper/lower selector,
+    including per-entry overrides; lower-leg action follows Quimb's O G^T
+    convention. ``optimize`` accepts a Pepsy Cotengra optimizer, and
+    ``plan_cache`` reuses contraction trees with current tensor values.
+
+    Pass a :class:`pepsy.bp.LoopClusterUpdateTracker` as ``tracker`` to retain
+    scalar fidelity records after each pair fit, across stream chunks. This
+    enables ``als_opts['measure_fidelity']`` unless explicitly disabled.
+    The product of local fidelities is a heuristic, not global fidelity.
+    ``strip_exponent=True`` moves each active gauge's positive RMS scale into
+    the network exponent after every pair, preserving amplitude and avoiding
+    gauge-scale overflow in long streams. It replaces manual per-pair
+    :func:`renorm_gauge` calls. Dense Torch callers may opt into
+    ``als_opts={'solver': 'torch'}``, with optional ``torch_backend='aot_eager'``
+    inside that dictionary. Existing automatic solver selection is unchanged.
+    ``materialize_physical=False`` omits the separate ``physical_tn`` snapshot
+    from pair results; the updated core and gauges are unchanged.
+
+    Dense PEPO ``which='both'`` takes ``(upper_gate, lower_gate)`` on two
+    sites and performs one fit. ``fuse_pepo_legs=True`` opts into pairing only
+    adjacent opposite-leg entries on the same bond, realigning reversed site
+    order without reordering entries. Separate fits remain the default.
+    Each call is a barrier. ``step_callback(index, result)`` receives the last
+    original zero-based entry index of each update, and None for one-site gates.
     """
     if gauges is None and isinstance(where, dict):
         gauges = where
         where = None
     if gauges is None:
         gauges = {}
+    if not isinstance(strip_exponent, bool):
+        raise TypeError('strip_exponent must be a bool')
+    if not isinstance(materialize_physical, bool):
+        raise TypeError('materialize_physical must be a bool')
+    if not isinstance(fuse_pepo_legs, bool):
+        raise TypeError('fuse_pepo_legs must be a bool')
+    if fuse_pepo_legs and not _is_operator_tensor_network(tn):
+        raise ValueError('fuse_pepo_legs requires a PEPO')
+    if tracker is not None:
+        from ..bp.cluster_updates import LoopClusterUpdateTracker
+
+        if not isinstance(tracker, LoopClusterUpdateTracker):
+            raise TypeError('tracker must be a LoopClusterUpdateTracker or None')
+    als_opts_use = {} if als_opts is None else dict(als_opts)
+    if tracker is not None:
+        als_opts_use.setdefault('measure_fidelity', True)
     tn_work = tn if inplace else (tn.copy() if hasattr(tn, "copy") else tn)
-    entries = _normalize_gate_entries(
-        G, where=where, allow_empty=True, allow_which=True
-    )
-    which_default = _normalize_gate_which(which)
+    which_default = _normalize_gate_which(which, allow_both=True)
+    entries = ([(G, where, None)] if where is not None and which_default == 'both' else
+               _normalize_gate_entries(G, where=where, allow_empty=True, allow_which=True,
+                                       allow_both=True))
     results = []
+    input_mode_use = input_mode
     regauge_opts_use = {} if regauge_opts is None else dict(regauge_opts)
 
     native_symmray = any(
@@ -2311,42 +2395,31 @@ def gate_loop_cluster(
             "updates are not implemented."
         )
 
-    # A supplied message tree belongs to the current tensor network. Running
-    # SU gauging here would change the tensors while leaving those messages
-    # attached to the old representation, so only initialize gauges on the
-    # pure-SU route.
+    # Missing gauges are identities: initialize the representation without
+    # changing spectator tensors or performing a whole-network SU sweep.
     if (
         not native_symmray
         and boundary_messages is None
         and entries
         and any(index not in gauges for index in tn_work.inner_inds())
     ):
-        from ..bp import gauge_all_simple
+        from ..bp.reduced_update import _identity_bond_gauge
 
-        initial_gauge_opts = dict(regauge_opts_use)
-        initial_gauge_opts.setdefault("max_iterations", 20)
-        initial_gauge_opts.setdefault("tol", 0.0)
-        gauge_all_simple(
-            tn_work,
-            gauges=gauges,
-            inplace=True,
-            **initial_gauge_opts,
-        )
+        for index in tn_work.inner_inds():
+            if index not in gauges:
+                gauges[index] = _identity_bond_gauge(tn_work, index)
 
-    if not native_symmray and any(
-        hasattr(tensor.data, "to_dense") for tensor in tn_work.tensor_map.values()
-    ):
-        for tensor in tn_work.tensor_map.values():
-            if hasattr(tensor.data, "to_dense"):
-                tensor.modify(data=np.asarray(ar.to_numpy(tensor.data.to_dense())))
-        for index, gauge in tuple(gauges.items()):
-            if hasattr(gauge, "to_dense"):
-                gauges[index] = np.asarray(ar.to_numpy(gauge.to_dense()))
-
-    for gate_payload, where_payload, which_payload in entries:
-        if not native_symmray and hasattr(gate_payload, "to_dense"):
-            gate_payload = np.asarray(ar.to_numpy(gate_payload.to_dense()))
-
+    # Dense Torch tensors also expose to_dense(). Its presence is not evidence
+    # of a symmetry wrapper and must never trigger conversion to NumPy/CPU.
+    # Native symmetry capability checks above already select supported routes.
+    if fuse_pepo_legs and which_default is None and ind_id is not None:
+        which_default = _operator_which_from_ind_id(tn_work, ind_id)
+    if fuse_pepo_legs and which_default is None and any(side is None for _, _, side in entries):
+        raise ValueError("PEPO loop-cluster gates require which='upper' or 'lower'")
+    updates = (_pair_pepo_gate_entries(entries, tn_work, which_default, fuse_pepo_legs=True)
+               if fuse_pepo_legs else
+               ((i+1, entry, (i+1,)) for i, entry in enumerate(entries)))
+    for end, (gate_payload, where_payload, which_payload), original_steps in updates:
         if _is_explicit_index_where(where_payload):
             raise ValueError(
                 "gate_loop_cluster() requires lattice site coordinates, not "
@@ -2368,11 +2441,21 @@ def gate_loop_cluster(
         else:
             raise ValueError("Could not infer gate dimensionality from where.")
 
+        is_operator = _is_operator_tensor_network(tn_work)
+        which_local = _normalize_gate_which(
+            which_payload if which_payload is not None else which_default, allow_both=True
+        )
         ind_id_local = ind_id
-        if which_payload is not None:
-            ind_id_local = _ind_id_from_which(which_payload, arity)
-        elif which_default is not None:
-            ind_id_local = _ind_id_from_which(which_default, arity)
+        if is_operator:
+            if which_local == 'both' and len(where_norm) != 2:
+                raise ValueError('joint upper/lower cluster gates require two sites')
+            if which_local is None and ind_id is not None:
+                which_local = _operator_which_from_ind_id(tn_work, ind_id)
+            if which_local is None:
+                raise ValueError("PEPO loop-cluster gates require which='upper' or 'lower'")
+            ind_id_local = None
+        elif which_local is not None:
+            ind_id_local = _ind_id_from_which(which_local, arity)
         if ind_id_local is not None:
             _validate_gate_target_inds_exist(tn_work, where_norm, ind_id_local)
 
@@ -2388,6 +2471,16 @@ def gate_loop_cluster(
 
         try:
             if len(where_norm) == 1:
+                if is_operator:
+                    # A one-site physical action commutes with all virtual SU
+                    # weights. Gate that one leg directly; PEPO gate_simple's
+                    # sandwich semantics are not the requested one-sided action.
+                    site = where_norm[0]
+                    physical_ind = getattr(tn_work, which_local + "_ind")(*site)
+                    tn_work.gate_inds_(gate_payload, (physical_ind,), contract=True)
+                    if step_callback is not None:
+                        step_callback(end-1, None)
+                    continue
                 if not gauges:
                     raise TypeError(
                         "gate_loop_cluster() one-site gates require SU gauges; "
@@ -2402,6 +2495,8 @@ def gate_loop_cluster(
                     smudge=smudge,
                     inplace=True,
                 )
+                if step_callback is not None:
+                    step_callback(end-1, None)
                 continue
 
             if len(where_norm) != 2:
@@ -2424,42 +2519,58 @@ def gate_loop_cluster(
 
             from ..bp import apply_reduced_loop_cluster_gate
 
-            results.append(
-                apply_reduced_loop_cluster_gate(
-                    tn_work,
-                    gauges,
-                    gate_payload,
-                    where=where_norm,
-                    boundary_messages=boundary_messages,
-                    input_mode=input_mode,
-                    run_bp=run_bp,
-                    bp_runner=bp_runner,
-                    bp_opts=bp_opts,
-                    message_psd_project=message_psd_project,
-                    message_psd_floor=message_psd_floor,
-                    bp_convergence=bp_convergence,
-                    max_bond=max_bond,
-                    max_loop_size=max_loop_size,
-                    max_cluster_size=max_cluster_size,
-                    base_radius=base_radius,
-                    include_full_system=include_full_system,
-                    autocomplete=autocomplete,
-                    tree_reduction=tree_reduction,
-                    psd_project=psd_project,
-                    psd_floor=psd_floor,
-                    optimize=optimize,
-                    loop_cache=loop_cache,
-                    plan_cache=plan_cache,
-                    cost_check=cost_check,
-                    max_flops_log10=max_flops_log10,
-                    max_peak_memory_log2=max_peak_memory_log2,
-                    on_budget=on_budget,
-                    smudge=smudge,
-                    als_opts=als_opts,
-                    regauge_opts=regauge_opts_use,
-                    inplace=True,
-                )
+            result = apply_reduced_loop_cluster_gate(
+                tn_work,
+                gauges,
+                gate_payload,
+                where=where_norm,
+                which=which_local if is_operator else None,
+                boundary_messages=boundary_messages,
+                input_mode=input_mode_use,
+                run_bp=run_bp,
+                bp_runner=bp_runner,
+                bp_opts=bp_opts,
+                message_psd_project=message_psd_project,
+                message_psd_floor=message_psd_floor,
+                bp_convergence=bp_convergence,
+                max_bond=max_bond,
+                max_loop_size=max_loop_size,
+                max_cluster_size=max_cluster_size,
+                base_radius=base_radius,
+                cluster_mode=cluster_mode,
+                fillin=fillin,
+                include_full_system=include_full_system,
+                autocomplete=autocomplete,
+                tree_reduction=tree_reduction,
+                psd_project=psd_project,
+                psd_floor=psd_floor,
+                optimize=optimize,
+                loop_cache=loop_cache,
+                plan_cache=plan_cache,
+                cost_check=cost_check,
+                max_flops_log10=max_flops_log10,
+                max_peak_memory_log2=max_peak_memory_log2,
+                on_budget=on_budget,
+                smudge=smudge,
+                als_opts=als_opts_use,
+                regauge_opts=regauge_opts_use,
+                inplace=True,
+                materialize_physical=materialize_physical,
             )
+            if strip_exponent:
+                # Preserve amplitude while preventing gauge-scale growth
+                # between pairs in a long multigate call.
+                renorm_gauge(tn_work, gauges, where_norm, smudge=0.)
+            if tracker is not None:
+                tracker.record(result)
+            result.su_info['original_steps'] = original_steps
+            if step_callback is not None:
+                step_callback(end-1, result)
+            if return_results:
+                results.append(result)
+            # Pair updates return an SU core plus explicit weights even when
+            # the first input was physical. Subsequent gates must insert them.
+            input_mode_use = "su_core"
         finally:
             if ind_id_local is not None and has_site_ind_id:
                 tn_work.site_ind_id = old_site_ind_id

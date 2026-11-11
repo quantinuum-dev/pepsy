@@ -88,6 +88,155 @@ correction = loop_cluster_expand(
 
 ## Reduced loop-cluster compression
 
+### Centered six-site gate updates
+
+Use Quimb's loop-union selector for the **3×2 patch** around a horizontal
+bond (and its rotation around a vertical bond). Cutoff four selects both
+plaquettes sharing that bond. At a lattice edge, only the available plaquette
+is retained. Graph radius one instead selects eight sites; enabling fill-in
+there gives twelve. These selection controls are separate from an expansion
+cutoff or retained bond dimension.
+
+For a **twelve-site 4×3 patch**, use `cluster_mode="graphdistance"`,
+`base_radius=1`, `fillin=True`. In the bulk this selects three rows and
+four columns around a horizontal bond, rotated for a vertical bond. Patches
+are clipped at open edges. Only the two active tensors are fitted; the
+remaining tensors supply the environment. This selection is available in
+both `gate_loop_cluster` and `PreparedLoopClusterUpdate`.
+
+```python
+from pepsy.bp import ContractionPlanCache
+from pepsy.operators import gate_loop_cluster
+from pepsy.tensors import build_optimizer
+
+optimizer = build_optimizer(parallel=False, progbar=False)
+plans = ContractionPlanCache()
+core, updates = gate_loop_cluster(
+    core, gates, gauges=gauges, input_mode="su_core",
+    max_bond=6,
+    cluster_mode="loopunion", base_radius=4, fillin=True,
+    max_loop_size=0,  # direct base-cluster contraction
+    psd_project=False,
+    optimize=optimizer, plan_cache=plans,
+    als_opts={"solver": "quimb", "max_iterations": 10,
+              "tol": 1e-8, "monitor_convergence": True},
+    inplace=False, return_results=True,
+)
+```
+
+Here `core` and `gauges` are an existing SU representation. The gate-stream
+wrapper updates the gauge dictionary to match its returned core; use a copied
+dictionary when retaining the old representation. For a dense PEPO, give
+`which="upper"` / `"lower"`, or entries `(gate, where, side)`. One-site gates
+use the native nontruncating route. PEPO operator legs remain separate in the
+returned core; their fusion is private to the reduced pair. Lower-leg gates
+implement $O G^T$, so pass $G^T$ once when the intended action is $O G$.
+One-sided native fermionic PEPO gate updates are explicitly unsupported here.
+
+One-sided dense PEPO gate updates now choose the QR/LQ grouping from `which`:
+only the acted physical leg stays in the reduced factors, and the untouched
+leg stays on Q and traces into the environment. No separate index-moving
+operation is needed. Prepared replay and the ordinary gate wrapper use the
+same grouping. `prepare_reduced_bond_pair(..., which="upper"|"lower")` exposes
+it directly. The preparation default `which=None` retains both legs for
+gate-independent compression; explicit `which="both"` also retains both.
+Joint upper/lower full-update fits keep both legs, fused privately, and use
+one target and one fit. Sequential gate streams retain their separate
+truncations unless the user opts into adjacent pairing below.
+The lower-level `apply_reduced_loop_cluster_gate` also accepts
+`which="both"` with `(upper_gate, lower_gate)` for one joint fit. To apply
+$GOG^\dagger$, use `(G, G.conj())` under the existing lower-leg transpose
+convention. Stream wrappers retain separate fits by default. To request a
+joint entry, use:
+
+```python
+# Native lower convention: this pair represents G O G.H.
+core = gate_loop_cluster(core, [((G, G.conj()), sites, "both")],
+                         gauges=gauges, max_bond=D)
+plan = PreparedLoopClusterUpdate(core, [(sites, "both")], max_bond=D)
+# plan.apply(..., [(G, G.conj())], gauges=gauges) uses one environment/fit.
+```
+
+Alternatively pass `fuse_pepo_legs=True` to either wrapper/plan to pair only
+**adjacent opposite-leg gates on the same bond**. The second gate's site
+ordering is aligned to the first. No gate moves, and a one-site gate,
+another bond, a same-leg action or an `apply(start, stop)`/call boundary
+prevents pairing. Automatic pairing currently requires prepared
+`batch_size=1`. Explicit joint entries also work without automatic pairing.
+
+The callback uses the last original zero-based entry index for each fit;
+`result.su_info['original_steps']` retains one-based input positions. Prepared
+`info` distinguishes `physical_gate_actions`, `pair_updates` and
+`joint_pair_updates`. Joint fits change where truncation occurs, so their
+finite-bond result need not equal two separate fits.
+
+Every pair update contracts current tensors and SU boundary weights into
+the reduced environment, runs ALS, and extracts only the active diagonal
+gauge locally. Gauge extraction restores the two full endpoint factors and
+includes full exterior SU weights before QR/LQ and the bond-sized SVD.
+Those weights are removed on their support afterward. An SVD of the bare
+reduced ALS factors preserves the state but gives incorrect SU boundary
+spectra; on an untruncated tree the corrected gauges reproduce the independent
+Schmidt spectrum. No whole-network gauging or pair-sized matrix is needed.
+Contraction-plan keys retain operand order because Cotengra trees label their
+leaves by position. `psd_project=False` keeps Hermitianization without computing
+or clipping the environment spectrum; `raw_min_eigenvalue` is then `None`.
+Torch/CuPy local solves remain in their backend even above Quimb's
+automatic dense-solve threshold. No physical-identity-expanded metric is
+materialized by the default Quimb route.
+
+The left QR and right LQ expose reduced virtual dimensions $r_L,r_R$.
+One patch contraction gives the four-index environment, then Hermitianization:
+
+$$
+{\color{blue}N_{\rm env}}\in\mathbb C^{r_L\times r_R\times r_L\times r_R},
+\qquad N\leftarrow (N+N^\dagger)/2.
+$$
+
+As a matrix its shape is $(r_Lr_R)\times(r_Lr_R)$. Physical indices remain
+in the target $T_{a p q b}$ and contribute implicit identity factors to the
+metric; they are not stored in $N_{\rm env}$. For uniform bulk bonds $D$,
+acted physical dimension $d_a$ and spectator dimension $d_s$ on Q,
+$r\leq\min(d_sD^3,d_aD)$. A one-sided qubit PEPO gate has $d_a=d_s=2$;
+joint upper/lower reduction has $d_a=4,d_s=1$. At bulk $D=6$ these give
+$r=12$ versus 24, and sixteen times fewer target/environment entries.
+The environment is recomputed once per pair update and reused within ALS.
+The selected outer subspaces can change finite-bond fit errors; smaller
+arrays do not establish better physical accuracy or full-run throughput.
+`apply_reduced_loop_cluster_gate` and `gate_loop_cluster` accept
+`materialize_physical=False` to skip the separate gauge-inserted physical
+snapshot when only the updated SU core/gauges and scalar diagnostics are
+needed. Then each result has `physical_tn=None`. The default remains `True`.
+Reconstruct a physical network explicitly from a copied core and its gauges
+when needed; skipping the snapshot does not change the numerical update.
+Long-running streams should set `strip_exponent=True` (or call public
+`pepsy.operators.renorm_gauge` manually after each pair). It moves the positive gauge
+RMS scale into `tn.exponent`, preserving the represented amplitude while
+preventing scalar gauge magnitudes from overflowing local contractions.
+Dense Torch gate streams retain their tensor/gauge devices. A November 5
+profiling audit found and removed an older `to_dense()` feature-detection
+branch that silently converted dense Torch inputs to NumPy; verify actual
+tensor devices when assessing historical GPU-labeled runs.
+
+`plan_cache` retains topology/shape-dependent contraction trees; it never
+retains environment values. Explicit BP boundary messages describe one state
+snapshot and must be refreshed as that state changes. The base-patch options
+also reach `compress_reduced_loop_cluster`,
+`su_cluster_reduced_update_problem`, and `loop_cluster_reduced_update_problem`.
+
+This is a direct finite-cluster approximation with SU/BP exterior closure.
+It is distinct from the explicit cut-edge $P+Q$ series below. Package readiness
+does not establish stability or convergence of a long χ6 trajectory.
+
+For a complete Eli-circuit replay, use the downstream
+[current six-site command](https://github.com/rezaquant/pepsy_examples/blob/main/experiments/mps_magnetization/benchmark/eli_global_cost/RUNBOOK.md#current-six-site-cluster-update).
+That runner calls this public API and moves each active gauge's RMS scale
+into the network exponent after every pair. Its scalar trace estimate
+defaults to **boundary MPS with cap 3χ**. This is an example-workflow policy;
+`gate_loop_cluster` itself constructs local updates and computes no global
+trace cost. Use Pepsy `9e57d5e` or later for the corrected exterior-weighted
+gauges and operand-order cache keys.
+
 For the first-pass local full-update style compression, use
 `compress_reduced_loop_cluster`. It selects the active bond, fills a finite
 cluster by `max_distance`, closes its cut bonds with either SU vectors or
@@ -121,8 +270,10 @@ supplied SU gauge mapping means that `tn` is an SU core; set
 `input_mode="physical"` when `tn` already contains the gauge factors and the
 vectors should be used only as diagonal closures.
 
-Set `regauge=True` to refresh SU gauges after truncation; the default returns
-the compressed physical network without refreshing them. Set
+Set `regauge=True` to extract the active bond's diagonal gauge by local
+QR/LQ and SVD after truncation; the default returns the compressed physical
+network without extracting a gauge. Exterior SU gauges and spectator core
+tensors remain unchanged. Set
 `max_loop_size>0` to add the open-leg loop-cluster correction on top of the
 finite base cluster. For the paper's total-region convention, use
 `max_cluster_size=...`; it includes the active/base support and is mutually
@@ -178,7 +329,7 @@ The returned loop problem records the choice as
 objective separately if a Hessian-level justification is required.
 
 The solver options accept `solver="auto"` (the default), `solver="quimb"`,
-`solver="autodiff"`, `solver="qr"`, or `solver="normal"`, plus a relative
+`solver="torch"`, `solver="autodiff"`, `solver="qr"`, or `solver="normal"`, plus a relative
 `regularization` value. The autodiff route uses Quimb's public autodiff
 fitter after factorizing the reduced open environment, so it retains the same
 weighted objective without converting tensors to NumPy.
@@ -196,7 +347,73 @@ block-sparse through the graded SVD adapter; use `solver="auto"` or
 `solver="quimb"` there. Dense QR/autodiff refinement is intentionally not
 available for native arrays because it would flatten charge sectors.
 
-For dense Quimb, QR, and normal ALS, `monitor_convergence=True` opts into
+### Dense Torch ALS and local fidelity
+
+For dense Torch PEPS/PEPOs, opt into `als_opts={"solver": "torch"}`.
+This contracts the open environment directly, batches physical indices as
+multiple RHS columns, and avoids rebuilding tensor networks for each sweep.
+Local Cholesky solves run only with a conservative certificate that the
+reference relative eigenvalue floor is inactive and a small solve residual.
+Other matrices use the reference Hermitian eigensolve and relative clipping.
+QR/LQ balancing, rank, tolerance and complete-sweep stopping are retained.
+`solution.solver_report` counts Cholesky and spectral solves. This path requires
+the retained open environment; explicit dense metric/linear overrides,
+regularization and other solver-specific options are rejected.
+The default `solver="auto"` still selects Quimb.
+
+`torch_backend="aot_eager"` inside `als_opts` optionally captures contraction
+kernels and their backward, using the same version-sensitive Torch AOT
+interface as prepared simple update. Shapes/devices/gradient/autocast signatures have
+separate bounded cached charts. Rank selection, conditioning checks, QR/LQ,
+stopping and environment construction stay outside capture. Inductor is
+unsupported. Use `torch_backend=None` for eager execution; compilation has
+startup costs and does not guarantee a speedup for sequential cluster ALS.
+
+`measure_fidelity=True` adds these `ReducedALSSolution` fields:
+`local_fidelity`, `local_infidelity`, and `fidelity_status`. With the selected
+local environment $N$ and fitted/target reduced tensors $x,t$,
+
+$$
+{\color{blue} F_{\rm local}} =
+\frac{|\langle x|N|t\rangle|^2}
+{\langle x|N|x\rangle\langle t|N|t\rangle},
+\qquad I_{\rm local}=1-F_{\rm local}.
+$$
+
+This preserves complex overlap and removes overall phase and amplitude.
+Nonfinite/nonpositive norms or a fidelity outside its physical range return
+`None` with an explanatory status; only roundoff above one is clipped.
+Torch ALS reuses the weighted target and final weighted residual, adding
+scalar inner products and host scalar transfers. Other solvers evaluate the
+needed local contractions when requested. No global readout is performed.
+Fidelity is disabled by default.
+
+For scalar tracking across gate-stream chunks:
+
+```python
+from pepsy.bp import LoopClusterUpdateTracker
+from pepsy.operators import gate_loop_cluster
+
+tracker = LoopClusterUpdateTracker()  # keep_records=False for totals only
+core = gate_loop_cluster(
+    core, gates, gauges=gauges, max_bond=6,
+    cluster_mode="loopunion", base_radius=4, fillin=True, max_loop_size=0,
+    psd_project=False, strip_exponent=True, tracker=tracker,
+    als_opts={"solver": "torch", "max_iterations": 10, "tol": 1e-8,
+              "monitor_convergence": True, "torch_backend": None},
+)
+rows = tracker.records
+totals = tracker.summary()
+```
+
+A tracker enables fidelity measurement unless explicitly disabled in
+`als_opts`. It records one row per two-site fit, retains no tensor networks
+or device arrays, and can be reused across chunks; `reset()` starts a new
+trajectory. One-site gates have no truncation record. The accumulated product
+$\prod_j F_{{\rm local},j}$ is a heuristic diagnostic, **not global fidelity
+or an error bound**. Any unavailable local fidelity makes that product `None`.
+
+For dense Quimb, Torch, QR, and normal ALS, `monitor_convergence=True` opts into
 complete-sweep stopping and fills `ReducedALSSolution.iterations`, `converged`,
 and `termination_reason`. The stopping criterion is squared residual divided
 by target norm at most `tol`, or absolute complete-sweep cost change divided
@@ -207,20 +424,39 @@ sweep; QR/normal also retain their half-sweep measurements. The default
 unmonitored behavior is unchanged, with these status fields set to `None`.
 Monitoring is unavailable for autodiff and native Symmray's graded-SVD route.
 
+`ReducedALSSolution.target_norm` retains the Python scalar already computed
+by dense Torch (including batches), Quimb, or monitored QR/normal ALS.
+It is `None` when that solver did not record it. Logging can reuse it without
+contracting the target again. This scalar describes the solved problem;
+`problem.target_norm` still recomputes from current tensors after mutations.
+
+Dense ALS also accepts `initial_factors=(left, right)` instead of restarting
+from a target SVD. Shapes are `(left_dim, physical_left, rank)` and
+`(rank, physical_right, right_dim)`, with matching backend, dtype and device.
+The fit retains that rank, bounded by `max_bond`, and copies the supplied
+arrays. Quimb, Torch, QR and normal ALS support this; autodiff and native symmetry
+require the default initializer. Two-site PEPS/PEPO full update uses this
+to pass its chosen SVD, environment-gauged or SU warm start into ALS.
+
 For explicit dense diagnostics, use `problem.dense_metric()` and
 `problem.dense_linear_term()`. Direct problem builders also accept
 `materialize_metric=True`, but this is unnecessary for the native Quimb path.
 All reduced problem builders Hermitianize and PSD-project the smaller open
 environment by default. `problem.raw_min_eigenvalue` and
-`problem.clipped_eigenvalues` expose the projection diagnostics.
+`problem.clipped_eigenvalues` expose the projection diagnostics. With
+`psd_project=False`, only Hermitianization runs: no diagnostic eigensolve,
+`raw_min_eigenvalue=None`, and zero clipped eigenvalues.
 The builder return types share the `ReducedUpdateProblem` type alias for
 annotations. `ReducedEnvironmentUpdateProblem(pair, environment, target)`
 also accepts an externally contracted reduced environment, such as the checked
 boundary-MPS environment used by `PepsOptimizer` two-site updates. It does not
-claim an exact environment or run BP. The shared `solve_reduced_als` result
-reports `solver="quimb"`, `"qr"`, or `"normal"` on those dense routes;
+claim an exact environment or run BP. Supply a labeled Quimb tensor or a
+native backend array ordered `(ket_left, ket_right, bra_left, bra_right)`.
+Raw Torch arrays retain their environment gradients; array `.data` is not
+used to unwrap them. The shared `solve_reduced_als` result
+reports `solver="quimb"`, `"torch"`, `"qr"`, or `"normal"` on those dense routes;
 other routes retain `None` when no route diagnostic is available.
-The full-system `max_cluster_size` cutoff is an exact small-system
+With `tree_reduction=False`, the full-system `max_cluster_size` cutoff is an exact small-system
 oracle (up to the requested Hermitian/PSD projection), so a practical
 convergence study compares a ladder of total cutoffs against
 `exact_reduced_update_problem(..., psd_project=False)` and reports the open
@@ -237,6 +473,26 @@ For compatibility with gate streams, `apply_reduced_loop_cluster_gate` and
 updates: `input_mode`, fresh-BP controls, PSD message handling, and contraction
 cost budgets are forwarded through the wrapper.
 
+After restoring endpoint factors $L,R$ with full exterior SU weights,
+the gate helpers compute
+
+$$
+L=Q_L A,\qquad R=B Q_R,\qquad
+AB=U\,{\color{blue}S}\,V^\dagger,
+\qquad {\color{purple}\Lambda_{\rm new}}=S.
+$$
+
+The new active gauge retains its full amplitude. The two core tensors are reconstructed from
+`Q_L U` and `V† Q_R`, removing the full exterior SU weights used in
+that split. Exterior gauges stay fixed; no
+`gauge_all_simple` sweep runs at initialization or after a gate. Missing
+initial gauges are identity vectors. Physical/BP inputs receive identity
+gauges on the other bonds; boundary-only gauge values are not absorbed into
+that output representation. Zero exterior weights use a support pseudoinverse.
+The local spectrum is an SU representation choice, not an exact Schmidt
+spectrum for a loopy network. Legacy `regauge_opts` entries `max_iterations`
+and `tol` are deprecated and ignored with a warning; other entries are rejected.
+
 Pass the same `ReducedLoopClusterCache` through repeated updates of one
 active bond with `loop_cache=cache` to reuse generalized-loop geometry. The
 cache is topology-only; each update still rebuilds contractions and uses the
@@ -248,6 +504,128 @@ Pass `cost_check=True` to expose Cotengra's `flops_log10` and
 contraction raises `CompressionBudgetError` before tensor values are
 contracted. `on_budget="warn"` additionally emits a warning, while
 `on_budget="ignore"` reports and continues.
+
+### Prepared ordered PEPO cluster replay
+
+`PreparedLoopClusterUpdate` prepares a fixed ordered schedule for dense
+complex64/complex128 Torch qubit PEPOs. It binds one-/two-site gate selectors,
+one-site axis permutations, selected cluster geometry and shape-specific
+Cotengra contraction programs. Programs receive **fresh** QR factors,
+spectator tensors and SU boundary weights on every pair update. No numerical
+environment, messages or fixed-point values are reused.
+
+```python
+from pepsy.bp import LoopClusterUpdateTracker, PreparedLoopClusterUpdate
+
+# schedule entries: (tuple_of_sites, "upper", "lower", or two-site "both")
+plan = PreparedLoopClusterUpdate(
+    core, schedule, max_bond=6, max_iterations=10, tol=1e-8,
+    psd_project=False, torch_backend=None, max_peak_memory_log2=28,
+)
+tracker = LoopClusterUpdateTracker(keep_records=False)
+core = plan.apply(core, gate_bank, gauges=gauges, start=0, stop=first_slice_end,
+                  tracker=tracker)
+core = plan.apply(core, gate_bank, gauges=gauges, start=first_slice_end,
+                  tracker=tracker)
+counts = plan.info
+```
+
+The package default retains the six-site loop-union patch. Pass
+`cluster_mode="graphdistance", base_radius=1, fillin=True` to prepare the
+rotated twelve-site 4×3 rectangle. `plan.info` records the resolved selector;
+batch read footprints and contraction programs use that same selector.
+
+`gate_bank` covers the complete schedule; `[start:stop]` selects each source
+slice without reordering; fits remain separate unless `fuse_pepo_legs=True`.
+Pairing cannot cross a slice boundary. Arrays and mutable SU gauge vectors
+must match the plan's Torch device and precision. Lower-leg gates retain the
+native $O G^T$ convention: transpose each intended right-applied matrix once
+before forming the bank. Source barriers, all pair truncations, ALS stopping,
+endpoint QR/LQ and final local SVD extraction remain the ordinary reduced
+algorithm. Every pair moves its gauge RMS into the network exponent.
+
+`step_callback(index, result)` receives the original zero-based gate index;
+one-site gates have `result=None`. `return_results=True` returns
+`(core, tuple_of_pair_results)`; otherwise full results are not accumulated.
+Pass `materialize_physical=False` to omit each pair's separate `physical_tn`
+snapshot while retaining its problem, solution and scalar diagnostics.
+The default `True` preserves physical snapshots for existing callers.
+`inplace=False` copies the input core while updating the supplied gauge map,
+as in the ordinary gate-stream API. Trackers can span multiple slices.
+
+Bond growth generates a new contraction program. The default cache retains
+at most 512 programs and their trees; set `max_programs` to change that limit.
+`plan.info` reports program hits/misses/evictions, geometry plans and operation
+counts. The plan retains no evolving state or gauge arrays. Topology, index
+order, operator dimensions, dtype and device changes require a new plan.
+Boundary weights remain checked for finite, real, nonnegative values; one
+combined device verdict replaces separate synchronizations for each cut bond.
+
+Optional `torch_backend="aot_eager"` captures the shared ALS kernels. The
+prepared environment uses Cotengra's generated Torch contraction program;
+one separate AOT graph per lattice bond would churn the shared capture cache.
+Prepared replay keeps update commits in input order and does not batch
+independent networks. Native symmetry, directed messages and added loop
+corrections retain the ordinary `gate_loop_cluster` route.
+
+For an experimental batch of independent updates in the same network, set
+`PreparedLoopClusterUpdate(..., batch_size="auto")` to discover ready groups,
+or choose an integer cap such as `batch_size=4`. The default `batch_size=1`
+retains sequential execution. An explicit integer groups consecutive gates
+only. Its batches require disjoint complete patches and matching environment
+programs/shapes.
+Gate endpoints alone are insufficient: another update must not change a
+spectator in the local metric. One-site gates, overlaps, incompatible shapes
+and each `apply(start=..., stop=...)` boundary end a consecutive batch.
+
+`"auto"` uses the actual lattice topology and gate read/write footprints to
+look ahead for compatible independent clusters. A later fit may cross an
+earlier action only when neither action writes a tensor read by the other.
+The selected clusters have disjoint complete patches. Independent one-site
+actions and incompatible shapes may be skipped; their dependencies still
+constrain all later candidates. Other ready groups can run while a previous
+lookahead result waits for its original commit position. Every `apply`
+boundary remains a barrier, and mutations/callbacks retain original order.
+
+Automatic width is bounded by the pair count, lattice size divided by the
+smallest scheduled patch, and a preparation cap of 16. Lookahead examines at
+most `max(64, 8 * number_of_site_tensors)` actions within the current call.
+Current operand shapes/ranks, the explicit contraction cost limits, and an
+estimated working-memory allowance reduce the width further. The estimate
+includes full-network preparation snapshots as well as local contractions
+and ALS buffers. On CUDA the allowance is at most 2 GiB and one quarter of
+currently free device memory; on CPU it is at most 512 MiB and one eighth of
+available host memory. Available memory is refreshed while groups remain
+pending. Auto falls back to individual updates when no batch fits. This is
+a bounded heuristic, not a globally optimal schedule or a memory guarantee.
+
+Eager Torch batches the environment contractions, initial SVD, ALS equations,
+guarded local solves and inter-sweep QR/LQ. Each pair keeps its own rank,
+spectral fallback and stopping decision. Pair preparation and final local SU
+gauge extraction remain sequential. Output mutations, exponent changes,
+tracker records and callbacks are committed in original order; unrelated
+gauges from earlier members survive the merge. Callbacks are observational:
+they must not modify tensors, gauges or later gates already prepared in a batch.
+Integer batching above one and `"auto"` currently require eager Torch.
+`info` reports `cluster_batches`, `batched_pair_updates`, `largest_batch`,
+`lookahead_pair_updates`, `batch_histogram` and the configured `batch_size`.
+Auto also reports `auto_batch_limit`, `auto_workspace_bytes` and the latest
+`auto_estimated_member_bytes`, so actual opportunities and chosen widths are
+inspectable. The [auto scheduling record](../development/notes/2026-11-05-auto-cluster-batches.md)
+contains correctness checks, real-stream opportunity counts and bounded timings.
+
+The contraction preflight includes the simultaneous batch workspace and total
+batch FLOPs. It estimates contraction intermediates, not total process memory;
+ALS buffers and retained results also consume memory. Larger batches can be
+slower or consume substantially more memory. The
+[bounded measurement](../development/notes/2026-11-05-independent-cluster-batches.md)
+uses synthetic disjoint patches and is separate from whole-trajectory speed.
+
+Torch reduced-state copies preserve the singular-value graph through SU
+gauges. This matters for derivatives of the returned physical operator over
+multiple gates: a detached gauge copy can preserve values while dropping part
+of the derivative. Gate and gauge gradients are checked against finite
+differences with native/stabilized linear algebra on supported charts.
 
 ## Selected-bond PEPS/PEPO compression
 
@@ -1047,9 +1425,9 @@ cluster regions do not pay the open-edge enumeration cost. Inspect
 `info["open_rho_cluster_region_costs"]` or
 `info["open_scalar_cluster_region_costs"]` for its contraction decisions.
 The same one-BP/many-support workflow is runnable in the downstream example
-`../pepsy_examples/symmetric_tensors/peps/bp_open_rho_series.py`; the
+`../pepsy_examples/advanced/symmetric_tensors/peps/bp_open_rho_series.py`; the
 long-range native doublon comparison is in
-`../pepsy_examples/symmetric_tensors/peps/bp_long_doublon_4x4.py`.
+`../pepsy_examples/advanced/symmetric_tensors/peps/bp_long_doublon_4x4.py`.
 
 To measure a long-range operator without materializing the diagnostic rho, use
 the scalar companion. It keeps the same open-path, closed-loop, and

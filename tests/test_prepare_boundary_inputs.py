@@ -580,6 +580,54 @@ def test_compbdy_guess_src_uses_direct_for_one_site_boundary():
     assert comp._fit_init_strategy_used == "direct"
 
 
+@pytest.mark.parametrize('strategy', ['reuse-direct', 'reuse-src'])
+@pytest.mark.parametrize('backend', ['numpy', 'torch', 'cuda'])
+@pytest.mark.parametrize('fit_mode', ['dmrg', 'dmrg2'])
+def test_reused_boundary_can_grow_to_requested_rank(strategy, backend, fit_mode):
+    ket = qtn.PEPS.rand(3, 2, bond_dim=2, dtype='complex128', seed=81)
+    _, norm = pepsy.build_bra_ket(ket=ket)
+    boundary = pepsy.BdyMPS(tn_double=norm, chi=4)
+    comp = pepsy.CompBdy(norm, boundary.mps_b, fit_mode=fit_mode,
+                        fit_init_strategy=strategy, fit_max_bond=4)
+    target = qtn.MPS_rand_state(3, 4, phys_dim=4, dtype='complex128', seed=83,
+                                site_tag_id='X{}')
+    old = qtn.MPS_rand_state(3, 1, phys_dim=4, dtype='complex128', seed=84,
+                             site_tag_id='X{}')
+    old.exponent = .25
+    if backend in {'torch', 'cuda'}:
+        torch = pytest.importorskip('torch')
+        if backend == 'cuda' and not torch.cuda.is_available():
+            pytest.skip('CUDA unavailable')
+        for tn in (target, old):
+            tn.apply_to_arrays(lambda x: torch.tensor(x, device='cuda' if backend == 'cuda' else 'cpu'))
+    guess = comp._build_fit_initial_guess(target, old, 'X{}', fitted=True)
+    if fit_mode == 'dmrg':
+        assert guess is not old and guess.max_bond() == 4
+        outer = target.outer_inds()
+        before = ar.to_numpy(old.contract(all, output_inds=outer).data)
+        after = ar.to_numpy(guess.contract(all, output_inds=outer).data)
+        np.testing.assert_allclose(after, before, atol=2e-12, rtol=2e-12)
+        assert comp._fit_init_strategy_used == 'reuse-expanded'
+    else:
+        assert guess is old and guess.max_bond() == 1
+    fit = pepsy.FIT(target, p=guess, site_tag_id='X{}', inplace=False)
+    comp.n_iter = 4
+    comp._run_fit_solver(fit, old)
+    outer = target.outer_inds()
+    a = ar.to_numpy(fit.p.contract(all, output_inds=outer).data).reshape(-1)
+    b = ar.to_numpy(target.contract(all, output_inds=outer).data).reshape(-1)
+    fidelity = abs(np.vdot(a, b))**2/(np.vdot(a, a).real*np.vdot(b, b).real)
+    if fit_mode == 'dmrg':
+        assert fidelity > 1-2e-12
+    else:
+        initial = ar.to_numpy(old.contract(all, output_inds=outer).data).reshape(-1)
+        initial_fidelity = abs(np.vdot(initial, b))**2/(np.vdot(initial, initial).real*np.vdot(b, b).real)
+        assert fidelity >= initial_fidelity
+        assert 1 < fit.p.max_bond() <= 4
+    assert comp._build_fit_initial_guess(target, fit.p, 'X{}', fitted=True) is fit.p
+    assert comp._fit_init_strategy_used == 'reuse'
+
+
 def test_compbdy_diagnostic_allows_one_site_boundary_bond():
     """One-site boundary diagnostics should represent the absent bond as None."""
     ket = qtn.PEPS.rand(Lx=1, Ly=2, bond_dim=2, seed=53, dtype="complex128")

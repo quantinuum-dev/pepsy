@@ -11,8 +11,10 @@ solve before constructing the local environment.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import math
 from typing import Any, TypeAlias
+import warnings
 
 import numpy as np
 import autoray as ar
@@ -23,7 +25,7 @@ from ._backend import (
     array as _backend_array,
     cast_like as _cast_like,
     conj as _conj,
-    copy as _copy_array,
+    copy as _backend_copy,
     dag as _dag,
     einsum as _einsum,
     eye as _eye,
@@ -76,6 +78,13 @@ __all__ = [
 ]
 
 
+def _copy_array(value):
+    # Autoray's Torch copy is detach().clone(). Reduced evolution must keep
+    # derivatives through copied targets and, especially, extracted SU values.
+    value = _native(value)
+    return value.clone() if ar.infer_backend(value) == 'torch' else _backend_copy(value)
+
+
 def _require_bool(name: str, value: bool) -> None:
     """Validate a public boolean option without accepting integer lookalikes."""
     if not isinstance(value, bool):
@@ -102,17 +111,22 @@ def _copy_boundary_messages(boundary_messages):
     return copied
 
 
-def _site_physical_inds(tn, site) -> tuple[str, ...]:
+def _site_physical_inds(tn, site, which=None) -> tuple[str, ...]:
     """Return the local physical indices for a PEPS or PEPO site.
 
     PEPS expose one physical index through ``site_ind``.  PEPOs expose their
-    operator legs separately as ``lower_ind`` and ``upper_ind``; the reduced
-    update fuses those two legs temporarily into one Frobenius-norm physical
-    index.
+    operator legs separately. A one-sided selector retains only the acted
+    leg in the reduced factors; the other physical leg stays on Q.
     """
     if hasattr(tn, "site_ind"):
+        if which is not None:
+            raise ValueError("which selects a PEPO operator leg, not a PEPS physical leg")
         return (tn.site_ind(site),)
     if hasattr(tn, "lower_ind") and hasattr(tn, "upper_ind"):
+        if which in {"lower", "upper"}:
+            return (getattr(tn, which + "_ind")(site),)
+        if which not in {None, "both"}:
+            raise ValueError("which must be 'upper', 'lower', 'both', or None")
         return (tn.lower_ind(site), tn.upper_ind(site))
     raise TypeError(
         "reduced bond updates require a PEPS-like tensor network exposing "
@@ -198,7 +212,9 @@ def _open_environment_data(environment):
     matrix rows and ket indices on columns. Keeping this convention explicit
     prevents accidental transposes when passing ``E`` to Quimb ALS.
     """
-    data = environment.data if hasattr(environment, "data") else environment
+    # Unwrap a labeled Quimb tensor only. Torch Tensor.data detaches autograd,
+    # and NumPy ndarray.data exposes a memoryview rather than the array.
+    data = environment.data if hasattr(environment, "inds") else environment
     return _native(data)
 
 
@@ -555,12 +571,16 @@ class ReducedLoopClusterCache:
         autocomplete: bool,
         max_cluster_size: int | None = None,
         tree_reduction: bool = True,
+        cluster_mode: str = "graphdistance",
+        fillin: bool | int = False,
     ):
         """Return counted active-anchored regions and raw loop regions."""
         from quimb.tensor.belief_propagation.regions import gen_region_counts
 
         anchor = frozenset(
-            {pair.left_tid, pair.right_tid, *pair._cluster_tids(base_radius)}
+            {pair.left_tid, pair.right_tid, *pair._cluster_tids(
+                base_radius, mode=cluster_mode, fillin=fillin,
+            )}
         )
         if max_cluster_size is not None:
             if not isinstance(max_cluster_size, (int, np.integer)):
@@ -722,9 +742,9 @@ class ReducedBondPair:
     On the selected bond, ``q_left @ r_left`` and ``l_right @ q_right``
     reconstruct its two original site tensors exactly. The reduced tensors have
     canonical index layouts ``(r_left, physical_left, bond)`` and
-    ``(bond, physical_right, r_right)``. For a PEPO, ``tn`` temporarily fuses
-    each active site's lower and upper operator legs into its physical index;
-    reconstruction unfuses them before returning the network.
+    ``(bond, physical_right, r_right)``. With one-sided PEPO ``which``, the
+    untouched physical leg stays on Q. With ``which=None`` or ``'both'``,
+    ``tn`` fuses both operator legs temporarily and reconstruction unfuses them.
     """
 
     tn: Any
@@ -756,6 +776,7 @@ class ReducedBondPair:
         default_factory=ReducedLoopClusterCache,
         repr=False,
     )
+    which: str | None = None
 
     @property
     def bond_dimension(self) -> int:
@@ -775,7 +796,7 @@ class ReducedBondPair:
     def theta(self) -> Any:
         """Return the current joint reduced tensor in canonical index order."""
         theta = self.r_left @ self.l_right
-        return _reordered(
+        theta = _reordered(
             theta,
             (
                 self.reduced_left_ind,
@@ -784,6 +805,15 @@ class ReducedBondPair:
                 self.reduced_right_ind,
             ),
         )
+        if is_symmray_array(theta.data):
+            # Contraction may omit empty sectors, but the physical spaces
+            # remain those of the prepared pair, including zero amplitudes.
+            data = theta.data.copy_with(indices=(
+                *self.r_left.data.indices[:2], *self.l_right.data.indices[1:],
+            ))
+            data.fill_missing_blocks()
+            theta.modify(data=data)
+        return theta
 
     def theta_array(self):
         """Return :meth:`theta` in its native Quimb backend."""
@@ -875,6 +905,14 @@ class ReducedBondPair:
 
     def gate_target_tn(self, gate) -> Any:
         """Return the untruncated, gate-applied target state for this bond."""
+        if getattr(self, "which", None) == 'both':
+            target = _reduced_gate_target(self, gate)
+            rank = min(target.shape[0]*target.shape[1], target.shape[2]*target.shape[3])
+            return self.reconstruct_tn(*_svd_initial_factors(target, rank))
+        if getattr(self, "which", None) in {"upper", "lower"}:
+            return self.tn.gate_inds(
+                gate, (self.physical_left_ind, self.physical_right_ind), contract=True,
+            )
         return self.tn.gate(gate, where=self.where, contract=True)
 
     def _site_distances(self) -> dict[Any, int]:
@@ -911,19 +949,28 @@ class ReducedBondPair:
             default=0,
         )
 
-    def _cluster_tids(self, radius: int) -> tuple[Any, ...]:
+    def _cluster_tids(
+        self, radius: int, *, mode: str = "graphdistance", fillin: bool | int = False,
+    ) -> tuple[Any, ...]:
         """Return spectator tensors inside an active-bond-centred cluster."""
-        if not isinstance(radius, int) or radius < 0:
+        if not isinstance(radius, (int, np.integer)) or radius < 0:
             raise ValueError("radius must be a nonnegative integer")
+        if mode not in {"graphdistance", "loopunion"}:
+            raise ValueError("cluster_mode must be 'graphdistance' or 'loopunion'")
+        if not isinstance(fillin, (bool, int, np.integer)) or fillin < 0:
+            raise ValueError("fillin must be a nonnegative integer or bool")
+        # Select on the original site graph, before opening the active bond
+        # for the environment. Both sites anchor every loop in loopunion mode.
+        patch = self.tn.select_local(
+            tuple(self.tn.site_tag(site) for site in self.where), which="any",
+            max_distance=int(radius), mode=mode, fillin=int(fillin),
+            grow_from="all", virtual=True,
+        )
         active_tids = {self.left_tid, self.right_tid}
-        distances = self._site_distances()
         return tuple(
             tid
             for tid in self.tn.tensor_map
-            if (
-                tid not in active_tids
-                and distances.get(tid, float("inf")) <= radius
-            )
+            if tid not in active_tids and tid in patch.tensor_map
         )
 
     def _su_boundary_message(self, index: str, inside_tid):
@@ -1124,6 +1171,8 @@ class ReducedBondPair:
         radius: int,
         *,
         optimize="auto-hq",
+        cluster_mode: str = "graphdistance",
+        fillin: bool | int = False,
         cost_check=False,
         max_flops_log10=None,
         max_peak_memory_log2=None,
@@ -1136,7 +1185,7 @@ class ReducedBondPair:
         factors.
         """
         return self._cluster_environment_from_tids(
-            self._cluster_tids(radius),
+            self._cluster_tids(radius, mode=cluster_mode, fillin=fillin),
             optimize=optimize,
             cost_check=cost_check,
             max_flops_log10=max_flops_log10,
@@ -1210,7 +1259,8 @@ class ReducedEnvironmentUpdateProblem(_ReducedUpdateProblemMixin):
     consumers without running BP or rebuilding an exact exterior. Environment
     legs are ket-left, ket-right, bra-left, bra-right. ``target`` is ordered
     left-reduced, left-physical, right-physical, right-reduced. The caller owns
-    environment approximation and Hermitian/PSD projection. Physical identity
+    environment approximation and Hermitian/PSD projection. ``environment``
+    accepts a labeled Quimb tensor or a native backend array. Physical identity
     factors stay implicit when ``metric`` and ``linear_term`` are None.
     """
 
@@ -1238,7 +1288,7 @@ class ExactReducedUpdateProblem(_ReducedUpdateProblemMixin):
     linear_term: Any
     target: Any
     psd_projected: bool = True
-    raw_min_eigenvalue: float = 0.0
+    raw_min_eigenvalue: float | None = None
     clipped_eigenvalues: int = 0
     contraction_cost: dict[str, float] | None = None
 
@@ -1250,8 +1300,9 @@ class SUClusterReducedUpdateProblem(_ReducedUpdateProblemMixin):
     Larger radii retain physical-site tensors in the active-bond-centred
     cluster. The stored SU gauges, or supplied directed D2BP messages, close
     only the bonds cut by that cluster; no BP iteration is run. At
-    :attr:`full_radius`, no boundary closure remains and the metric is the
-    finite-system exact metric. The open environment is retained directly;
+    :attr:`full_radius` in graph-distance mode, no boundary closure remains
+    and the metric is the finite-system exact metric. In loop-union mode the
+    cutoff instead bounds each loop's site count. The open environment is retained directly;
     the dense ``N_red`` view is lazy.
     """
 
@@ -1266,9 +1317,12 @@ class SUClusterReducedUpdateProblem(_ReducedUpdateProblemMixin):
     linear_term: Any
     target: Any
     psd_projected: bool = True
-    raw_min_eigenvalue: float = 0.0
+    raw_min_eigenvalue: float | None = None
     clipped_eigenvalues: int = 0
     contraction_cost: dict[str, float] | None = None
+    cluster_mode: str = "graphdistance"
+    fillin: bool | int = False
+    which: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1312,13 +1366,16 @@ class LoopClusterReducedUpdateProblem(_ReducedUpdateProblemMixin):
     linear_term: Any
     target: Any
     psd_projected: bool
-    raw_min_eigenvalue: float
+    raw_min_eigenvalue: float | None
     clipped_eigenvalues: int
     max_cluster_size: int | None = None
     tree_reduction: bool = True
     combination: str = "additive"
     contraction_costs: tuple[dict[str, float], ...] = ()
     contraction_cost: dict[str, float] | None = None
+    cluster_mode: str = "graphdistance"
+    fillin: bool | int = False
+    which: str | None = None
 
     @property
     def boundary_inds(self) -> tuple[str, ...]:
@@ -1352,6 +1409,8 @@ class ReducedALSSolution:
     The native Quimb route reports initial/final objectives by default, or
     each complete sweep with ``monitor_convergence=True``. Monitoring also
     supplies ``iterations``, ``converged`` and ``termination_reason``.
+    ``target_norm`` retains the scalar computed by the solver when available;
+    it describes the solved problem, not subsequent mutations of its arrays.
     """
 
     left: Any
@@ -1361,6 +1420,11 @@ class ReducedALSSolution:
     iterations: int | None = None
     converged: bool | None = None
     termination_reason: str | None = None
+    local_fidelity: float | None = None
+    local_infidelity: float | None = None
+    fidelity_status: str = 'not_requested'
+    solver_report: dict[str, Any] = field(default_factory=dict)
+    target_norm: float | None = None
 
     def theta(self):
         """Return the optimized joint reduced tensor."""
@@ -1369,7 +1433,7 @@ class ReducedALSSolution:
 
 @dataclass(frozen=True)
 class ReducedLoopClusterGateResult:
-    """Result of one reduced loop-cluster PEPS or PEPO gate update."""
+    """One reduced gate update; ``physical_tn`` is absent when not requested."""
 
     core: Any
     gauges: dict[str, Any]
@@ -1410,6 +1474,7 @@ def prepare_reduced_bond_pair(
     message_psd_floor: float = 0.0,
     bp_convergence: str = "ignore",
     smudge: float = 0.0,
+    which: str | None = None,
 ) -> ReducedBondPair:
     """Prepare an adjacent physical PEPS or PEPO bond for a reduced update.
 
@@ -1417,8 +1482,8 @@ def prepare_reduced_bond_pair(
     ----------
     tn
         PEPS or PEPO core with external simple-update gauges removed. For a
-        PEPO, the active lower/upper physical legs are fused only on a private
-        reduced-update copy and restored on reconstruction.
+        PEPO, ``which`` selects the physical legs retained in the reduced
+        factors. Any fusion is private and restored on reconstruction.
     gauges
         Optional converged external SU/Vidal gauge vectors. With
         ``input_mode="su_core"`` they are inserted into a copied core; with
@@ -1447,6 +1512,10 @@ def prepare_reduced_bond_pair(
         Relative eigenvalue floor used by ``message_psd_project``.
     where
         Ordered pair ``(left_site, right_site)`` of adjacent PEPS sites.
+    which
+        PEPO ``'lower'`` or ``'upper'`` leaves the untouched operator leg
+        on each Q factor. ``None`` (default) or ``'both'`` retains both legs,
+        for joint actions or gate-independent compression. PEPS use ``None``.
     smudge
         Optional regularizer passed to ``gauge_simple_insert``.
 
@@ -1503,8 +1572,10 @@ def prepare_reduced_bond_pair(
             f"{site_left!r} and {site_right!r}, found {bond_inds!r}"
         )
     bond_ind = bond_inds[0]
-    physical_left_original_inds = _site_physical_inds(work, site_left)
-    physical_right_original_inds = _site_physical_inds(work, site_right)
+    physical_left_original_inds = _site_physical_inds(work, site_left, which)
+    physical_right_original_inds = _site_physical_inds(work, site_right, which)
+    if which in {"upper", "lower"} and is_symmray_array(left_tensor.data):
+        raise NotImplementedError("one-sided reduced PEPO gates currently require dense arrays")
     for side, site, tensor, physical_inds in (
         ("left", site_left, left_tensor, physical_left_original_inds),
         ("right", site_right, right_tensor, physical_right_original_inds),
@@ -1690,6 +1761,7 @@ def prepare_reduced_bond_pair(
         ),
         boundary_messages=copied_boundary_messages,
         bp_info=bp_info,
+        which=which,
     )
 
 
@@ -1702,7 +1774,12 @@ def _apply_two_site_gate(theta, gate):
             raise ValueError(
                 "native Symmray two-site gates must be rank-four tensors"
             )
-        return _einsum("xyuv,auvb->axyb", gate, theta)
+        target = _einsum("xyuv,auvb->axyb", gate, theta)
+        target = target.copy_with(indices=(
+            theta.indices[0], gate.indices[0], gate.indices[1], theta.indices[3],
+        ))
+        target.fill_missing_blocks()
+        return target
     d_left = theta.shape[1]
     d_right = theta.shape[2]
     gate = _native(gate)
@@ -1718,11 +1795,49 @@ def _apply_two_site_gate(theta, gate):
     return _einsum("xyuv,auvb->axyb", gate, theta)
 
 
+def _reduced_gate_target(pair, gate, which=None, *, theta=None):
+    """Apply one PEPS or explicit PEPO-leg gate without lifting G tensor I."""
+    theta = pair.theta_array() if theta is None else theta
+    selected = getattr(pair, "which", None)
+    which = selected if which is None else which
+    if selected in {"upper", "lower"}:
+        if which != selected:
+            raise ValueError('gate leg does not match the prepared reduced pair')
+        return _apply_two_site_gate(theta, None if gate is None else _cast_like(gate, theta))
+    if which is None or gate is None:
+        return _apply_two_site_gate(theta, gate)
+    if which == "both":
+        if not isinstance(gate, (tuple, list)) or len(gate) != 2:
+            raise ValueError("paired PEPO update requires upper and lower gates")
+        theta = _reduced_gate_target(pair, gate[0], 'upper', theta=theta)
+        return _reduced_gate_target(pair, gate[1], 'lower', theta=theta)
+    if which not in {"upper", "lower"}:
+        raise ValueError("which must be 'upper', 'lower', 'both', or None")
+    if len(pair.physical_left_original_inds) != 2:
+        raise ValueError("which selects a PEPO operator leg, not a PEPS physical leg")
+    if is_symmray_array(theta):
+        raise NotImplementedError("one-sided reduced PEPO gates currently require dense arrays")
+    dims_left = pair.physical_left_original_dims
+    dims_right = pair.physical_right_original_dims
+    axis = 1 if which == "upper" else 0
+    dl, dr = dims_left[axis], dims_right[axis]
+    gate = _cast_like(gate, theta)
+    if gate.shape not in {(dl * dr, dl * dr), (dl, dr, dl, dr)}:
+        raise ValueError(f"{which} PEPO gate has incompatible shape {gate.shape}")
+    gate = _reshape(gate, (dl, dr, dl, dr))
+    expanded = _reshape(theta, (theta.shape[0], *dims_left, *dims_right, theta.shape[3]))
+    # The unacted operator legs remain batch axes. Lower-leg action follows
+    # Quimb's O G^T convention; callers transpose a right-applied G once.
+    expression = "PQpq,axpyqb->axPyQb" if which == "upper" else "XYxy,axpyqb->aXpYqb"
+    return _reshape(_einsum(expression, gate, expanded), theta.shape)
+
+
 def _metric_from_environment(pair: ReducedBondPair, environment):
     """Expand ``E`` with physical identity factors to form dense ``N_red``.
 
-    The active reduced tensors carry the physical legs but the exterior does
-    not. Consequently ``N_red`` is ``E`` tensored with the two physical
+    The active reduced tensors carry the acted physical legs. Any untouched
+    operator legs on Q have already been traced into the exterior. Thus
+    ``N_red`` is ``E`` tensored with the two acted physical
     identity operators, with rows ordered as bra ``(r_L, p_L, p_R, r_R)``.
     """
     environment = _open_environment_data(environment)
@@ -1777,7 +1892,8 @@ def exact_reduced_update_problem(
     psd_project, psd_floor
         Hermitian/PSD projection controls. The projection is applied to the
         smaller open environment before any physical identity factors are
-        introduced.
+        introduced. With ``psd_project=False`` only Hermitianization runs,
+        and ``raw_min_eigenvalue`` is None (no spectral diagnostic).
     cost_check, max_flops_log10, max_peak_memory_log2, on_budget
         Optional Cotengra preflight and budget controls.
     """
@@ -1816,7 +1932,7 @@ def exact_reduced_update_problem(
         psd_floor=psd_floor,
     )
 
-    target = _apply_two_site_gate(pair.theta_array(), gate)
+    target = _reduced_gate_target(pair, gate)
     metric, linear_term = _metric_views(
         pair,
         environment,
@@ -1841,7 +1957,10 @@ def su_cluster_reduced_update_problem(
     pair: ReducedBondPair,
     gate,
     *,
+    which: str | None = None,
     radius: int = 0,
+    cluster_mode: str = "graphdistance",
+    fillin: bool | int = False,
     optimize="auto-hq",
     materialize_metric: bool = False,
     psd_project: bool = True,
@@ -1873,12 +1992,22 @@ def su_cluster_reduced_update_problem(
         ``pair.full_cluster_radius()``, the cluster contains every spectator
         and this function equals :func:`exact_reduced_update_problem` up to
         numerical contraction error.
+    cluster_mode, fillin
+        Quimb patch selection: ``graphdistance`` preserves the radius default;
+        ``loopunion`` interprets radius as the maximum loop size, with both
+        active sites required in each loop. At cutoff four, an interior square
+        lattice bond selects its two adjacent plaquettes (six sites).
+        ``fillin`` adds multiply-connected corner sites as in Quimb.
+    which
+        For dense PEPOs, ``upper`` or ``lower`` selects one operator leg.
+        With ``None``, gate acts on the full (possibly fused) physical space.
     materialize_metric
         If true, eagerly form the physical-identity-expanded dense ``N_red``
         and ``b_red``. The default keeps both as lazy compatibility views.
     psd_project, psd_floor
         Hermitian/PSD projection controls applied to the smaller open
-        environment.
+        environment. With ``psd_project=False`` no eigensolve runs and
+        ``raw_min_eigenvalue`` is None.
     cost_check, max_flops_log10, max_peak_memory_log2, on_budget
         Optional Cotengra preflight and budget controls.
     """
@@ -1907,6 +2036,8 @@ def su_cluster_reduced_update_problem(
         contraction_cost,
     ) = pair._cluster_environment_tensor(
         radius,
+        cluster_mode=cluster_mode,
+        fillin=fillin,
         optimize=optimize,
         cost_check=cost_check,
         max_flops_log10=max_flops_log10,
@@ -1919,7 +2050,7 @@ def su_cluster_reduced_update_problem(
         psd_project=psd_project,
         psd_floor=psd_floor,
     )
-    target = _apply_two_site_gate(pair.theta_array(), gate)
+    target = _reduced_gate_target(pair, gate, which)
     metric, linear_term = _metric_views(
         pair,
         environment,
@@ -1941,6 +2072,9 @@ def su_cluster_reduced_update_problem(
         raw_min_eigenvalue=raw_min,
         clipped_eigenvalues=clipped,
         contraction_cost=contraction_cost,
+        cluster_mode=cluster_mode,
+        fillin=fillin,
+        which=which,
     )
 
 
@@ -1993,6 +2127,8 @@ def _loop_cluster_region_counts(
     max_cluster_size: int | None = None,
     tree_reduction: bool = True,
     cache: ReducedLoopClusterCache | None = None,
+    cluster_mode: str = "graphdistance",
+    fillin: bool | int = False,
 ):
     """Return active-anchored open-leg loop regions and counting numbers.
 
@@ -2017,6 +2153,8 @@ def _loop_cluster_region_counts(
         autocomplete=autocomplete,
         max_cluster_size=max_cluster_size,
         tree_reduction=tree_reduction,
+        cluster_mode=cluster_mode,
+        fillin=fillin,
     )
 
 
@@ -2100,24 +2238,20 @@ def _project_open_environment_if_requested(
     if psd_project:
         return _psd_project_open_environment(pair, environment, psd_floor)
 
-    data = _open_environment_data(environment)
-    left_dim, _, _, right_dim = pair.theta_shape
-    matrix = _reshape(
-        _transpose(data, (2, 3, 0, 1)),
-        (left_dim * right_dim, left_dim * right_dim),
-    )
-    eigenvalues = ar.do("linalg.eigvalsh", matrix)
-    raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
-    return environment, raw_min, 0
+    # Hermitian-only callers avoid the spectral cost, including diagnostics.
+    return environment, None, 0
 
 
 def loop_cluster_reduced_update_problem(
     pair: ReducedBondPair,
     gate,
     *,
+    which: str | None = None,
     max_loop_size: int = 0,
     max_cluster_size: int | None = None,
     base_radius: int = 0,
+    cluster_mode: str = "graphdistance",
+    fillin: bool | int = False,
     include_full_system: bool | None = None,
     autocomplete: bool = True,
     tree_reduction: bool = True,
@@ -2142,11 +2276,19 @@ def loop_cluster_reduced_update_problem(
     legs open and closes only its outer boundary with stored SU or directed
     D2BP messages.
 
+    ``cluster_mode='loopunion', base_radius=4, fillin=True`` selects the two
+    plaquettes around an interior square-lattice bond. This base-patch selection
+    is independent of ``max_loop_size``, which adds environment corrections.
+    ``which`` selects a dense PEPO upper/lower gate without lifting it onto a
+    larger fused physical space.
+
     ``max_loop_size=0`` returns the base-radius environment, followed by the
     requested Hermitian/PSD projection. When ``include_full_system`` is true,
     or when ``max_loop_size`` is at least the number of PEPS site tensors, the
     system-covering region is included and the smaller nested regions cancel,
     yielding the dense exact oracle up to that same projection.
+    With ``psd_project=False``, only Hermitianization runs; the environment
+    spectrum is not computed and ``raw_min_eigenvalue`` is None.
 
     ``materialize_metric=True`` eagerly expands the retained open environment
     into the dense physical metric. The default is recommended for native
@@ -2216,6 +2358,8 @@ def loop_cluster_reduced_update_problem(
         max_cluster_size=max_cluster_size,
         tree_reduction=tree_reduction,
         cache=loop_cache,
+        cluster_mode=cluster_mode,
+        fillin=fillin,
     )
 
     active_tids = {pair.left_tid, pair.right_tid}
@@ -2289,29 +2433,11 @@ def loop_cluster_reduced_update_problem(
             psd_floor,
         )
     else:
-        raw_data = _open_environment_data(raw_environment)
-        raw_matrix = _reshape(
-            _transpose(raw_data, (2, 3, 0, 1)),
-            (
-                pair.theta_shape[0] * pair.theta_shape[3],
-                pair.theta_shape[0] * pair.theta_shape[3],
-            ),
-        )
-        if is_symmray_array(raw_matrix):
-            eigenvalues, _ = raw_matrix.eigh()
-            eigenvalues = (
-                eigenvalues.to_dense()
-                if hasattr(eigenvalues, "to_dense")
-                else ar.to_numpy(eigenvalues)
-            )
-            raw_min = float(np.min(eigenvalues)) if eigenvalues.size else 0.0
-        else:
-            eigenvalues = ar.do("linalg.eigvalsh", raw_matrix)
-            raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
         environment = raw_environment
+        raw_min = None
         clipped = 0
 
-    target = _apply_two_site_gate(pair.theta_array(), gate)
+    target = _reduced_gate_target(pair, gate, which)
     metric, linear_term = _metric_views(
         pair,
         environment,
@@ -2343,6 +2469,9 @@ def loop_cluster_reduced_update_problem(
         combination="additive",
         contraction_costs=tuple(contraction_costs),
         contraction_cost=aggregate_costs(contraction_costs),
+        cluster_mode=cluster_mode,
+        fillin=fillin,
+        which=which,
     )
 
 
@@ -2575,7 +2704,9 @@ def _metric_to_quimb_environment(pair: ReducedBondPair, metric):
 def _quimb_environment_for_problem(problem):
     """Select the retained open environment or validate a custom metric."""
     if problem.metric is None or isinstance(problem.metric, _LazyReducedMetric):
-        return problem.environment.copy()
+        if hasattr(problem.environment, 'inds'):
+            return problem.environment.copy()
+        return _open_environment_tensor(problem.pair, _open_environment_data(problem.environment))
     return _metric_to_quimb_environment(problem.pair, _native(problem.metric))
 
 
@@ -2588,6 +2719,7 @@ def _solve_reduced_als_quimb(
     rcond: float,
     quimb_opts: dict[str, Any] | None = None,
     monitor_convergence: bool = False,
+    initial_factors=None,
 ) -> ReducedALSSolution:
     """Solve the reduced ALS problem through Quimb's public TN ALS API."""
     import quimb.tensor as qtn
@@ -2610,7 +2742,8 @@ def _solve_reduced_als_quimb(
 
     pair = problem.pair
     left_dim, physical_left, physical_right, right_dim = problem.shape
-    left, right = _svd_initial_factors(problem.target, max_bond)
+    left, right = (_svd_initial_factors(problem.target, max_bond)
+                   if initial_factors is None else tuple(map(_copy_array, initial_factors)))
     initial_cost = problem.cost(_einsum("aps,sqb->apqb", left, right))
 
     ket_bond = qtn.rand_uuid()
@@ -2679,7 +2812,10 @@ def _solve_reduced_als_quimb(
     tn_target = qtn.TensorNetwork([target.copy()])
 
     fit_opts = {
-        "dense_solve": "auto",
+        # Quimb's large-system iterative route uses SciPy LinearOperator,
+        # which cannot consume native accelerator dtypes. Keep dense local
+        # norm solves in the array backend, as in Pepsy's boundary-MPS FU.
+        "dense_solve": True if ar.infer_backend(left) in {"torch", "cupy"} else "auto",
         "solver": None,
         "solver_maxiter": 4,
         "solver_dense": "eigh",
@@ -2727,11 +2863,13 @@ def _solve_reduced_als_quimb(
             left=left, right=right, costs=tuple(costs), solver='quimb',
             iterations=iteration, converged=converged,
             termination_reason=reason or 'max_iterations',
+            target_norm=target_norm,
         )
 
+    target_norm = problem.target_norm
     qtn.tensor_network_fit_als(
         tn_fit, tn_target, steps=max_iterations, tol=tol, tnAA=tn_aa,
-        tnAB=tn_ab, xBB=problem.target_norm, inplace=False, **fit_opts,
+        tnAB=tn_ab, xBB=target_norm, inplace=False, **fit_opts,
     )
 
     left_tensor = tn_aa["__KET__", "__VAR0__"]
@@ -2753,6 +2891,7 @@ def _solve_reduced_als_quimb(
         right=right,
         costs=(initial_cost, final_cost),
         solver='quimb',
+        target_norm=target_norm,
     )
 
 
@@ -3098,6 +3237,43 @@ def _reduced_als_stop(previous, current, target_norm, tol):
     return None
 
 
+def _validated_local_fidelity(norm, target_norm, overlap_abs, eps):
+    """Validate the local metric without hiding indefinite/zero norms."""
+    if not all(math.isfinite(x) for x in (norm, target_norm, overlap_abs)):
+        return None, 'nonfinite_metric'
+    if norm <= 0 or target_norm <= 0:
+        return None, 'nonpositive_norm'
+    # Avoid overflow/underflow in norm*target_norm and abs(overlap)**2.
+    ratio = overlap_abs / math.sqrt(norm) / math.sqrt(target_norm)
+    fidelity = ratio * ratio
+    if not math.isfinite(fidelity) or fidelity > 1 + 256*eps:
+        return None, 'unphysical_metric'
+    return min(1., fidelity), 'valid'
+
+
+def _with_local_fidelity(problem, solution, enabled):
+    """Measure a phase-invariant fidelity in the same retained environment."""
+    if not enabled:
+        return solution
+    theta = solution.theta()
+    if problem.metric is None or isinstance(problem.metric, _LazyReducedMetric):
+        norm = _open_environment_quadratic(problem.pair, problem.environment, theta)
+        applied = _open_environment_apply(problem.pair, problem.environment, problem.target)
+        overlap = _einsum('ApqB,ApqB->', _conj(theta), applied)
+    else:
+        vector = _reshape(theta, (-1,))
+        metric = _native(problem.metric)
+        norm = _scalar_float(_real(_einsum('i,ij,j->', _conj(vector), metric, vector)))
+        overlap = _einsum('i,ij,j->', _conj(vector), metric, _reshape(problem.target, (-1,)))
+    eps = np.finfo(np.float32 if ar.get_dtype_name(theta) in {'float32', 'complex64'} else np.float64).eps
+    fidelity, status = _validated_local_fidelity(
+        norm, problem.target_norm, _scalar_float(_backend_abs(overlap)), eps,
+    )
+    return replace(solution, local_fidelity=fidelity,
+                   local_infidelity=None if fidelity is None else 1-fidelity,
+                   fidelity_status=status)
+
+
 def solve_reduced_als(
     problem: ReducedUpdateProblem,
     *,
@@ -3110,6 +3286,9 @@ def solve_reduced_als(
     quimb_opts: dict[str, Any] | None = None,
     autodiff_opts: dict[str, Any] | None = None,
     monitor_convergence: bool = False,
+    initial_factors: tuple[Any, Any] | None = None,
+    measure_fidelity: bool = False,
+    torch_backend: str | None = None,
 ) -> ReducedALSSolution:
     """Solve a reduced two-site projection by alternating least squares.
 
@@ -3132,6 +3311,26 @@ def solve_reduced_als(
     uses cost/target_norm <= tol or the absolute complete-sweep cost change
     divided by target_norm <= tol; tol=0 requests the full iteration budget.
     The dense QR/normal routes use the same criterion when monitoring.
+    ``initial_factors=(left, right)`` supplies a dense ALS warm start instead
+    of the target SVD. Its shapes are ``(left_dim, physical_left, rank)`` and
+    ``(rank, physical_right, right_dim)``. The fit retains that rank, at most
+    ``max_bond``. Native symmetry and autodiff routes require the default SVD.
+
+    ``solver="torch"`` opts into dense Torch contractions with physical
+    indices batched as RHS columns and guarded Cholesky local solves. An
+    uncertified matrix retains the reference relative spectral floor via
+    eigendecomposition. QR/LQ balancing and complete-sweep stopping remain.
+    ``torch_backend="aot_eager"`` optionally compiles the contraction kernels;
+    the default ``None`` is eager. Capture uses Torch's version-sensitive
+    AOT interface, as does prepared simple update.
+    Conditioning, rank decisions and stopping run outside the compiled graphs.
+    This path requires the retained open environment without dense overrides
+    and does not accept regularization or other solver-specific options.
+
+    ``measure_fidelity=True`` records normalized squared complex overlap in
+    the same local environment, plus its infidelity and validation status.
+    Nonfinite, nonpositive or unphysical metrics give ``None``. This is a
+    local approximation diagnostic, not global state/operator fidelity.
     """
     if not isinstance(max_iterations, int) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
@@ -3141,6 +3340,11 @@ def solve_reduced_als(
         raise ValueError("tol must be finite and nonnegative")
     if not isinstance(monitor_convergence, bool):
         raise TypeError('monitor_convergence must be a bool')
+    _require_bool('measure_fidelity', measure_fidelity)
+    if torch_backend not in {None, 'aot_eager'}:
+        raise ValueError('torch_backend must be None or aot_eager')
+    if torch_backend is not None and solver != 'torch':
+        raise ValueError("torch_backend requires solver='torch'")
     if not np.isfinite(regularization) or regularization < 0.0:
         raise ValueError("regularization must be finite and nonnegative")
     if not isinstance(solver, str) or solver not in {
@@ -3149,9 +3353,10 @@ def solve_reduced_als(
         "normal",
         "qr",
         "quimb",
+        "torch",
     }:
         raise ValueError(
-            "solver must be 'auto', 'autodiff', 'normal', 'qr', or 'quimb'"
+            "solver must be 'auto', 'autodiff', 'normal', 'qr', 'quimb', or 'torch'"
         )
 
     left_dim, physical_left, physical_right, right_dim = problem.shape
@@ -3161,8 +3366,26 @@ def solve_reduced_als(
         raise ValueError("max_bond must be a positive integer")
     max_bond = min(max_bond, left_dim * physical_left, physical_right * right_dim)
 
+    if initial_factors is not None:
+        if is_symmray_array(problem.target) or solver == 'autodiff':
+            raise NotImplementedError('initial_factors requires dense ALS')
+        if not isinstance(initial_factors, (tuple, list)) or len(initial_factors) != 2:
+            raise ValueError('initial_factors must contain left and right arrays')
+        left, right = initial_factors
+        rank = left.shape[-1] if getattr(left, 'ndim', 0) == 3 else 0
+        if (not 1 <= rank <= max_bond or left.shape != (left_dim, physical_left, rank)
+                or getattr(right, 'shape', None) != (rank, physical_right, right_dim)):
+            raise ValueError('initial_factors shapes or rank do not match the reduced problem')
+        from ..backends import infer_backend_signature
+        if any(infer_backend_signature(value) != infer_backend_signature(problem.target)
+               for value in initial_factors):
+            raise ValueError('initial_factors must match target backend, dtype and device')
+        if not all(_all_finite(value) for value in initial_factors):
+            raise ValueError('initial_factors must be finite')
+        max_bond = rank
+
     if monitor_convergence and (is_symmray_array(problem.target) or solver == 'autodiff'):
-        raise ValueError('monitor_convergence is supported only for dense Quimb/QR/normal ALS')
+        raise ValueError('monitor_convergence is supported only for dense Quimb/Torch/QR/normal ALS')
 
     if is_symmray_array(problem.target):
         if regularization:
@@ -3170,11 +3393,25 @@ def solve_reduced_als(
                 "regularization is not yet available for native Symmray "
                 "reduced compression"
             )
-        return _solve_reduced_als_symmray(
+        solution = _solve_reduced_als_symmray(
             problem,
             max_bond=max_bond,
             solver=solver,
         )
+        return _with_local_fidelity(problem, solution, measure_fidelity)
+
+    if solver == 'torch':
+        if regularization or quimb_opts or autodiff_opts:
+            raise ValueError("solver='torch' does not accept regularization, quimb_opts or autodiff_opts")
+        if (problem.metric is not None and not isinstance(problem.metric, _LazyReducedMetric)
+                or problem.linear_term is not None and not isinstance(problem.linear_term, _LazyReducedVector)):
+            raise ValueError("solver='torch' requires the retained open environment without dense overrides")
+        from ._reduced_torch import solve
+
+        return solve(problem, max_bond=max_bond, max_iterations=max_iterations,
+                     tol=tol, rcond=rcond, monitor_convergence=monitor_convergence,
+                     initial_factors=initial_factors, torch_backend=torch_backend,
+                     measure_fidelity=measure_fidelity)
 
     # Native Quimb ALS is the stable default because it contracts the open
     # environment directly. Regularization, explicit autodiff, and indefinite
@@ -3190,7 +3427,7 @@ def solve_reduced_als(
                 "solver='qr' or solver='auto' with regularization=0"
             )
         try:
-            return _solve_reduced_als_quimb(
+            solution = _solve_reduced_als_quimb(
                 problem,
                 max_bond=max_bond,
                 max_iterations=max_iterations,
@@ -3198,22 +3435,26 @@ def solve_reduced_als(
                 rcond=rcond,
                 quimb_opts=quimb_opts,
                 monitor_convergence=monitor_convergence,
+                initial_factors=initial_factors,
             )
+            return _with_local_fidelity(problem, solution, measure_fidelity)
         except ValueError:
             if requested_solver != "auto":
                 raise
             solver = "qr"
 
     if solver == "autodiff":
-        return _solve_reduced_als_autodiff(
+        solution = _solve_reduced_als_autodiff(
             problem,
             max_bond=max_bond,
             max_iterations=max_iterations,
             tol=tol,
             autodiff_opts=autodiff_opts,
         )
+        return _with_local_fidelity(problem, solution, measure_fidelity)
 
-    left, right = _svd_initial_factors(problem.target, max_bond)
+    left, right = (_svd_initial_factors(problem.target, max_bond)
+                   if initial_factors is None else tuple(map(_copy_array, initial_factors)))
     metric = _dense_problem_metric(problem)
     linear = _dense_problem_linear_term(problem, metric)
     metric_scale = _metric_scale(metric)
@@ -3310,77 +3551,55 @@ def solve_reduced_als(
         elif abs(costs[-2] - current_cost) <= tol * max(1.0, costs[-2]):
             break
 
-    return ReducedALSSolution(left=left, right=right, costs=tuple(costs),
+    solution = ReducedALSSolution(left=left, right=right, costs=tuple(costs),
                               solver='qr' if use_qr else 'normal',
                               iterations=iteration if monitor_convergence else None,
                               converged=converged if monitor_convergence else None,
-                              termination_reason=(reason or 'max_iterations') if monitor_convergence else None)
+                              termination_reason=(reason or 'max_iterations') if monitor_convergence else None,
+                              target_norm=target_norm)
+    return _with_local_fidelity(problem, solution, measure_fidelity)
 
 
-def _valid_warm_start_gauge(tn, index: str, gauge):
-    """Return a positive matching gauge vector, or ``None`` if unusable."""
-    if gauge is None:
-        return None
+def _identity_bond_gauge(tn, index):
+    """Build an identity SU vector in the bond's native backend/sectors."""
+    tensor = tn.tensor_map[next(iter(tn.ind_map[index]))]
+    if is_symmray_array(tensor.data):
+        from .gauges import _symmray_block_vector, _symmray_bond_chargemap
 
-    if is_symmray_array(gauge) and hasattr(gauge, "blocks"):
-        if not getattr(gauge, "ndim", 1) == 1:
-            return None
-        values = tuple(
-            np.asarray(ar.to_numpy(block)).reshape(-1)
-            for block in gauge.blocks.values()
+        return _symmray_block_vector(
+            tn, index,
+            np.ones(sum(_symmray_bond_chargemap(tn, index).values())),
         )
-        if not values:
-            return None
-        values = np.concatenate(values)
-        if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
-            return None
-        return _copy_array(gauge)
-
-    gauge = _native(gauge)
-    if gauge.ndim != 1 or gauge.shape != (tn.ind_size(index),):
-        return None
-    if _is_complex(gauge):
-        if _scalar_float(ar.do("max", _backend_abs(ar.do("imag", gauge)))) > 1e-12:
-            return None
-        gauge = _real(gauge)
-    if not _all_finite(gauge) or _scalar_bool(ar.do("any", gauge <= 0.0)):
-        return None
-    return _copy_array(gauge)
+    return _ones(tn.ind_size(index), like=tensor.data)
 
 
-def _warm_start_core_from_physical_tn(physical_tn, gauges):
-    """Return ``(core, initial_gauges, reused)`` for compensated SU gauging."""
-    gauges = {} if gauges is None else gauges
-    initial_gauges = {}
-    reused = 0
+def _inverse_gauge_root(gauge):
+    """Invert a nonnegative gauge on its support without dividing by zero."""
+    def inverse(values):
+        supported = values != 0
+        safe = ar.do("where", supported, values, 1.0)
+        return ar.do("where", supported, safe ** -0.5, 0.0)
 
-    for index in physical_tn.inner_inds():
-        gauge = _valid_warm_start_gauge(physical_tn, index, gauges.get(index))
-        if gauge is None:
-            sample = next(iter(physical_tn.tensor_map.values())).data
-            if is_symmray_array(sample):
-                # Autoray has no generic ``ones`` rule for Symmray.  Build a
-                # charge-preserving block vector in the bond's native charge
-                # layout instead of densifying the warm-start gauge.
-                from .gauges import _symmray_block_vector, _symmray_bond_chargemap
+    if is_symmray_array(gauge):
+        result = gauge.copy()
+        result.apply_to_arrays(inverse)
+        return result
+    return inverse(gauge)
 
-                gauge = _symmray_block_vector(
-                    physical_tn,
-                    index,
-                    np.ones(sum(_symmray_bond_chargemap(physical_tn, index).values())),
-                )
-            else:
-                gauge = _ones(physical_tn.ind_size(index), like=sample)
-        else:
-            reused += 1
-        initial_gauges[index] = gauge
 
-    core = physical_tn.copy()
-    if initial_gauges:
-        core.gauge_simple_insert(
-            {index: 1.0 / gauge for index, gauge in initial_gauges.items()}
+def _validate_local_regauge_opts(options):
+    """Retain legacy sweep controls without running a whole-network sweep."""
+    options = {} if options is None else dict(options)
+    unknown = set(options).difference({"max_iterations", "tol"})
+    if unknown:
+        raise TypeError(f"local SVD gauge extraction does not accept {sorted(unknown)!r}")
+    if options:
+        warnings.warn(
+            "regauge_opts sweep controls are deprecated and ignored; reduced "
+            "updates now extract only the active gauge by local SVD",
+            DeprecationWarning,
+            stacklevel=3,
         )
-    return core, initial_gauges, reused
 
 
 def _restore_tensor_network_data(destination, source) -> None:
@@ -3395,42 +3614,116 @@ def _restore_tensor_network_data(destination, source) -> None:
     destination.exponent = source.exponent
 
 
-def _regauge_reduced_state(
+def _local_svd_reduced_state(
     tn,
-    gauges,
-    physical_tn,
+    pair,
+    solution,
     *,
-    regauge_opts,
     inplace,
+    output_gauges=None,
+    materialize_physical=True,
 ):
-    """Re-gauge a reconstructed physical state and return its SU data."""
-    from .gauges import copy_gauges, gauge_all_simple
+    """Extract the active SU gauge in its full exterior-weighted metric."""
+    import quimb.tensor as qtn
 
-    regauge_core, initial_gauges, reused = _warm_start_core_from_physical_tn(
-        physical_tn,
-        gauges,
+    left = qtn.Tensor(
+        solution.left,
+        inds=(pair.reduced_left_ind, pair.physical_left_ind, pair.bond_ind),
     )
-    su_info: dict[str, Any] = {}
-    regauge_opts.setdefault("max_iterations", 20)
-    regauge_opts.setdefault("tol", 0.0)
-    core, updated_gauges, su_info = gauge_all_simple(
-        regauge_core,
-        gauges=initial_gauges,
-        info=su_info,
-        inplace=True,
-        **regauge_opts,
+    right = qtn.Tensor(
+        solution.right,
+        inds=(pair.bond_ind, pair.physical_right_ind, pair.reduced_right_ind),
     )
+    left = pair.q_left @ left
+    right = right @ pair.q_right
+    gauges = pair.su_gauges if pair.input_mode == "su_core" else {}
+    # The physical working copy carries sqrt(lambda) on exterior legs. SU
+    # spectra instead use full lambda there: include the missing half before
+    # the endpoint QR/LQ. SVD of the unweighted reduced factors preserves the
+    # state but supplies incorrect closures for subsequent cluster updates.
+    for tensor in (left, right):
+        for index in tensor.inds:
+            if index != pair.bond_ind and index in gauges:
+                tensor.multiply_index_diagonal_(index, gauges[index] ** 0.5)
+    # Factor the rank-sized core rather than forming the full optimized pair.
+    # cutoff=0 and renorm=0 retain its amplitude and introduce no new truncation.
+    q_left, a = left.split(
+        left_inds=tuple(ix for ix in left.inds if ix != pair.bond_ind),
+        method="qr", get="tensors",
+    )
+    b, q_right = right.split(
+        left_inds=(pair.bond_ind,), method="lq", get="tensors",
+    )
+    u, s, v = (a @ b).split(
+        left_inds=qtn.bonds(q_left, a), method="svd", absorb=None,
+        cutoff=0.0, renorm=0, get="tensors", bond_ind=pair.bond_ind,
+    )
+    left = _reordered(q_left @ u, left.inds)
+    right = _reordered(v @ q_right, right.inds)
+    singular_values = s.data
+    # Independent fits may share a preparation snapshot. Merge against the
+    # current output gauges so a preceding commit's unrelated bond survives.
+    output_gauges = (gauges if output_gauges is None else {
+        ix: _cast_like(value, gauges[ix]) if ix in gauges else value
+        for ix, value in output_gauges.items()
+    })
+    updated_gauges = {
+        index: _copy_array(output_gauges[index]) if index in output_gauges
+        else _identity_bond_gauge(tn, index)
+        for index in tn.inner_inds() if index != pair.bond_ind
+    }
+    updated_gauges[pair.bond_ind] = _copy_array(singular_values)
+    core = tn.copy()
+    for tid, tensor, physical_ind, original_inds, original_dims in (
+        (pair.left_tid, left, pair.physical_left_ind,
+         pair.physical_left_original_inds, pair.physical_left_original_dims),
+        (pair.right_tid, right, pair.physical_right_ind,
+         pair.physical_right_original_inds, pair.physical_right_original_dims),
+    ):
+        if is_symmray_array(tensor.data):
+            reference = pair.tn.tensor_map[tid].transpose(*tensor.inds).data
+            data = tensor.data.copy_with(indices=tuple(
+                tensor.data.indices[axis] if index == pair.bond_ind else reference.indices[axis]
+                for axis, index in enumerate(tensor.inds)
+            ))
+            data.fill_missing_blocks()
+            tensor.modify(data=data)
+        # Remove full exterior lambda after the weighted split. Only the two
+        # endpoint cores change; the physical state and exterior gauges do not.
+        for index in tensor.inds:
+            if index != pair.bond_ind and index in gauges:
+                tensor.multiply_index_diagonal_(
+                    index, _inverse_gauge_root(gauges[index]) ** 2,
+                )
+        if len(original_inds) > 1:
+            tensor = tensor.unfuse(
+                {physical_ind: original_inds}, {physical_ind: original_dims},
+            )
+        tensor.transpose_(*tn.tensor_map[tid].inds)
+        core.tensor_map[tid].modify(data=tensor.data)
 
     if inplace:
-        _restore_tensor_network_data(tn, core)
-        gauges.clear()
-        gauges.update(copy_gauges(updated_gauges))
+        # Do not even replace spectator arrays: their identity/version can
+        # participate in downstream environment-cache invalidation.
+        for tid in (pair.left_tid, pair.right_tid):
+            tn.tensor_map[tid].modify(data=core.tensor_map[tid].data)
         core = tn
-        updated_gauges = gauges
-    else:
-        updated_gauges = copy_gauges(updated_gauges)
-
-    return core, updated_gauges, su_info, reused
+    # Rebuild after the SVD has aligned any absent native charge sectors on
+    # the active bond. Raw native input factors can omit different zero blocks.
+    # Stream callers need only the updated SU representation. Avoid a full
+    # network gauge insertion when its separate physical snapshot is unused.
+    physical_tn = None
+    if materialize_physical:
+        physical_tn = core.copy()
+        physical_tn.gauge_simple_insert(updated_gauges)
+    info = {
+        "method": "local_svd", "bond_ind": pair.bond_ind,
+        "singular_values_normalized": False,
+        "physical_which": getattr(pair, 'which', None),
+        "reduced_target_shape": pair.theta_shape,
+    }
+    reused = sum(index != pair.bond_ind for index in gauges)
+    return core, updated_gauges, physical_tn, info, reused
 
 
 def _finish_reduced_gate(
@@ -3444,24 +3737,23 @@ def _finish_reduced_gate(
     regauge_opts,
     inplace,
     result_type,
+    solution=None,
+    materialize_physical=True,
 ):
-    """Solve, reconstruct, and re-gauge any reduced environment problem."""
-    solution = solve_reduced_als(problem, max_bond=max_bond, **als_opts)
-    physical_tn = pair.reconstruct_tn(solution.left, solution.right)
-
-    regauge_gauges = pair.su_gauges if pair.input_mode == "su_core" else {}
-    core, updated_gauges, su_info, reused = _regauge_reduced_state(
-        tn,
-        regauge_gauges,
-        physical_tn,
-        regauge_opts=regauge_opts,
-        inplace=inplace,
+    """Solve and extract the active SU gauge without a global gauge sweep."""
+    _validate_local_regauge_opts(regauge_opts)
+    precomputed = solution is not None
+    if solution is None:
+        solution = solve_reduced_als(problem, max_bond=max_bond, **als_opts)
+    core, updated_gauges, physical_tn, su_info, reused = _local_svd_reduced_state(
+        tn, pair, solution, inplace=inplace,
+        output_gauges=gauges if precomputed and pair.input_mode == 'su_core' else None,
+        materialize_physical=materialize_physical,
     )
-    if pair.input_mode != "su_core" and hasattr(gauges, "clear"):
+    if inplace and hasattr(gauges, "clear"):
         gauges.clear()
-        gauges.update(
-            {index: _copy_array(gauge) for index, gauge in updated_gauges.items()}
-        )
+        gauges.update(updated_gauges)
+        updated_gauges = gauges
 
     return result_type(
         core=core,
@@ -3490,6 +3782,8 @@ def compress_reduced_loop_cluster(
     bp_convergence: str = "ignore",
     max_bond: int | None = None,
     max_distance: int = 0,
+    cluster_mode: str = "graphdistance",
+    fillin: bool | int = False,
     max_loop_size: int = 0,
     max_cluster_size: int | None = None,
     include_full_system: bool | None = None,
@@ -3523,9 +3817,10 @@ def compress_reduced_loop_cluster(
 
     ``max_loop_size=0`` is the inexpensive buffered-cluster pass. A positive
     ``max_loop_size`` switches to the additive open-leg loop-cluster metric,
-    with ``max_distance`` as its base region. Set ``regauge=True`` to refresh
-    SU gauges after truncation; the default returns the compressed physical
-    tensor network with no gauge refresh. A changed bond dimension invalidates
+    with ``max_distance`` as its base region. Set ``regauge=True`` to extract
+    only the active SU gauge by local SVD after truncation; exterior gauges
+    and spectator core tensors stay fixed. The default returns the physical
+    tensor network. A changed bond dimension invalidates
     the old BP messages, so rerun D2BP before another compression step.
 
     Parameters
@@ -3558,7 +3853,10 @@ def compress_reduced_loop_cluster(
         Maximum active-bond dimension ``chi``. ``None`` keeps the original
         dimension.
     max_distance
-        Tensor-graph fill-in radius around the active pair.
+        Graph radius, or maximum base-loop size with ``cluster_mode='loopunion'``.
+    cluster_mode, fillin
+        Shared Quimb base-patch selector. Loop-union cutoff four gives the
+        centered six-site patch on an interior square-lattice bond.
     max_loop_size, max_cluster_size
         Raw generalized-loop cutoff or paper-facing total-region cutoff.
         Specify at most one nonzero cutoff. ``max_cluster_size`` includes the
@@ -3576,7 +3874,8 @@ def compress_reduced_loop_cluster(
         Optional Cotengra preflight and budget controls. All loop-region trees
         are built before any region contraction.
     regauge
-        Whether to return a fresh SU core/gauge representation after ALS.
+        Extract the active diagonal gauge by local SVD after ALS, preserving
+        exterior gauges and spectator core tensors.
     inplace
         Mutate ``tn`` with the returned representation. With ``regauge=False``
         this is only allowed when no external gauges were supplied.
@@ -3622,6 +3921,8 @@ def compress_reduced_loop_cluster(
         max_loop_size=max_loop_size,
         max_cluster_size=max_cluster_size,
         base_radius=max_distance,
+        cluster_mode=cluster_mode,
+        fillin=fillin,
         include_full_system=include_full_system,
         autocomplete=autocomplete,
         tree_reduction=tree_reduction,
@@ -3640,13 +3941,14 @@ def compress_reduced_loop_cluster(
     physical_tn = pair.reconstruct_tn(solution.left, solution.right)
 
     if regauge:
-        core, updated_gauges, su_info, reused = _regauge_reduced_state(
-            tn,
-            pair.su_gauges if pair.input_mode == "su_core" else {},
-            physical_tn,
-            regauge_opts=regauge_opts,
-            inplace=inplace,
+        _validate_local_regauge_opts(regauge_opts)
+        core, updated_gauges, physical_tn, su_info, reused = _local_svd_reduced_state(
+            tn, pair, solution, inplace=inplace,
         )
+        if inplace:
+            gauges_work.clear()
+            gauges_work.update(updated_gauges)
+            updated_gauges = gauges_work
     else:
         if inplace and pair.input_mode == "su_core":
             raise ValueError(
@@ -3682,6 +3984,7 @@ def apply_reduced_loop_cluster_gate(
     gate=None,
     *,
     where,
+    which: str | None = None,
     boundary_messages=None,
     input_mode: str = "auto",
     run_bp: bool = True,
@@ -3694,6 +3997,8 @@ def apply_reduced_loop_cluster_gate(
     max_loop_size: int = 0,
     max_cluster_size: int | None = None,
     base_radius: int = 0,
+    cluster_mode: str = "graphdistance",
+    fillin: bool | int = False,
     include_full_system: bool | None = None,
     autocomplete: bool = True,
     tree_reduction: bool = True,
@@ -3710,6 +4015,7 @@ def apply_reduced_loop_cluster_gate(
     als_opts: dict[str, Any] | None = None,
     regauge_opts: dict[str, Any] | None = None,
     inplace: bool = False,
+    materialize_physical: bool = True,
 ) -> ReducedLoopClusterGateResult:
     """Apply one adjacent two-site PEPS gate with the reduced loop metric.
 
@@ -3719,15 +4025,30 @@ def apply_reduced_loop_cluster_gate(
     boundaries for the current working network; if gauges are also supplied,
     the messages must correspond to the gauged working network. The helper
     builds the QR/LQ reduced pair, solves the loop-cluster weighted ALS
-    problem, reconstructs the updated physical PEPS, and then re-gauges it
-    into a fresh SU core/gauge representation. The re-gauging is warm-started
-    without double-counting old gauges: matching positive old gauges are first
-    compensated out of the reconstructed physical state.
+    problem, and extracts the active diagonal SU gauge from an SVD of the
+    optimized endpoint factors' small QR/LQ core, with full exterior SU
+    weights included in that split. Exterior gauges and spectator core
+    tensors remain fixed. The singular values retain their amplitude, and
+    full exterior gauges are removed on their support. No whole-network
+    gauge sweep is performed. Legacy ``regauge_opts`` sweep controls are
+    deprecated and ignored with a warning.
+
+    ``cluster_mode='loopunion', base_radius=4, fillin=True`` contracts the
+    six-site base patch directly when ``max_loop_size=0``. Dense PEPO gates
+    can select ``which='upper'`` or ``which='lower'``; lower gates act with
+    Quimb's ``O G^T`` convention. Explicit right-applied gates require one
+    transpose supplied by the caller. One-sided gates keep the untouched
+    physical leg on Q. With ``which='both'``, pass ``(upper_gate, lower_gate)``
+    for one joint fit retaining both physical legs.
 
     ``loop_cache`` optionally reuses topology-only generalized-loop geometry
     when the same active bond is updated repeatedly with different loop
     cutoffs. It does not cache tensor contractions or boundary messages.
+
+    ``materialize_physical=False`` omits the separate physical network from
+    the result (``physical_tn=None``); the updated core and gauges are retained.
     """
+    _require_bool('materialize_physical', materialize_physical)
     # Preserve the historical ``(tn, gauges, gate)`` positional form while
     # allowing the natural message-only ``(tn, gate, ...)`` form.
     if gate is None:
@@ -3749,6 +4070,7 @@ def apply_reduced_loop_cluster_gate(
         tn,
         gauges,
         where=where,
+        which=which,
         boundary_messages=boundary_messages,
         input_mode=input_mode,
         run_bp=run_bp,
@@ -3762,9 +4084,12 @@ def apply_reduced_loop_cluster_gate(
     problem = loop_cluster_reduced_update_problem(
         pair,
         gate,
+        which=which,
         max_loop_size=max_loop_size,
         max_cluster_size=max_cluster_size,
         base_radius=base_radius,
+        cluster_mode=cluster_mode,
+        fillin=fillin,
         include_full_system=include_full_system,
         autocomplete=autocomplete,
         tree_reduction=tree_reduction,
@@ -3788,4 +4113,5 @@ def apply_reduced_loop_cluster_gate(
         regauge_opts=regauge_opts,
         inplace=inplace,
         result_type=ReducedLoopClusterGateResult,
+        materialize_physical=materialize_physical,
     )

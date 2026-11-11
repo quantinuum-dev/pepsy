@@ -42,15 +42,15 @@ class ContractionPlanCache:
 
     @staticmethod
     def _topology_key(network, output_inds, optimize):
+        # Cotengra trees label leaves by operand position, not tensor tags.
+        # A reordered network needs a new tree even with identical topology.
         tensors = tuple(
-            sorted(
-                (
-                    tuple(tensor.inds),
-                    tuple(tensor.shape),
-                    tuple(sorted(map(repr, tensor.tags))),
-                )
-                for tensor in network.tensors
+            (
+                tuple(tensor.inds),
+                tuple(tensor.shape),
+                tuple(sorted(map(repr, tensor.tags))),
             )
+            for tensor in network.tensors
         )
         return (tensors, tuple(output_inds), repr(optimize))
 

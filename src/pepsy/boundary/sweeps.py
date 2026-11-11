@@ -7,6 +7,7 @@ from numbers import Integral
 import time
 import warnings
 
+import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 from tqdm.auto import tqdm
@@ -972,8 +973,31 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         if self.fit_init_strategy == "direct":
             return boundary_mps
         if self.fit_init_strategy.startswith("reuse-") and fitted:
-            self._fit_init_strategy_used = "reuse"
-            return boundary_mps
+            fixed_rank = self.fit_mode == 'global' or (self.fit_mode == 'eff' and self.fit_block_size == 1)
+            can_reuse = True
+            expanded = False
+            if fixed_rank and int(boundary_mps.L) > 1 and not self._uses_symmray_arrays(boundary_mps):
+                from .metrics import _boundary_at_geometric_capacity
+                cap = self.fit_max_bond or int(boundary_mps.max_bond())
+                can_reuse = int(boundary_mps.max_bond()) <= cap
+                if can_reuse and not _boundary_at_geometric_capacity(boundary_mps, cap):
+                    # One-site FIT cannot grow an undersized old boundary.
+                    # Zero padding followed by QR opens its allowed space
+                    # without changing the represented warm start. Keep
+                    # rank-deficient QR out of differentiable/JAX guesses.
+                    native = all(ar.infer_backend(t.data) in {'numpy', 'torch', 'cupy'}
+                                 and not getattr(t.data, 'requires_grad', False)
+                                 for t in boundary_mps)
+                    if native:
+                        boundary_mps = boundary_mps.copy()
+                        boundary_mps.expand_bond_dimension(cap, rand_strength=0., inplace=True)
+                        boundary_mps.left_canonicalize_(normalize=False)
+                        expanded = True
+                    else:
+                        can_reuse = False
+            if can_reuse:
+                self._fit_init_strategy_used = 'reuse-expanded' if expanded else 'reuse'
+                return boundary_mps
 
         # There is no compression problem for a one-site MPS. Quimb's SRC
         # implementation assumes at least one internal bond, so preserve the

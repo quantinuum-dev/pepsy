@@ -220,7 +220,8 @@ the unrestricted split. Rank-deficient QR factors can still make derivatives
 unreliable; `canonize=False` is an explicit alternative, not a general cure.
 Check gradients and convergence with the boundary cap for the intended circuit.
 
-For normalized inputs and unitary gates, the known target squared norm is one.
+For normalized PEPS inputs and unitary gates, the known target squared norm
+is one.
 The driver normalizes the initial state and each compressed candidate, and
 reuses the known target norm. Set `normalize_initial=False` only for an already
 normalized input. Nonunitary gates require `non_unitary=True` or an explicit,
@@ -233,7 +234,22 @@ exact unit norm. Long-run fidelity improvements need separate benchmarks.
 
 Two-site full update defaults to reduced-tensor ALS, `gauge=False`, one
 `boundary_chi=2*D**2` shared by normalization and evaluation, and cached boundary
-MPS with `fit_mode="dmrg"`. Boundary/norm convergence probes and automatic
+MPS with `fit_mode="dmrg"`, `fit_init_strategy="reuse-direct"`, and
+`boundary_kwargs={"n_iter": 4}`. Cold cuts use direct compression; a previously
+fitted boundary is used only as a starting guess when a changed cut is refitted
+against its current target. Set `fit_init_strategy="guess-src"` to test seeded
+SRC for every guess, or `"reuse-src"` to use SRC only for cold cuts. Unsupported
+native SRC capabilities retain the existing warned direct fallback.
+One-site boundary reuse zero-pads and canonicalizes an undersized dense,
+non-differentiable seed, preserving its represented state while opening the
+requested bond space. An early low-rank cut therefore cannot prevent later
+growth. Differentiable/unsupported starts and reduced caps retain fresh seeding.
+
+Explicit initialization and `boundary_kwargs['n_iter']` override these defaults,
+including when switching into full-update mode at `run()`. To reproduce older
+FU runs select `fit_init_strategy="guess-direct", boundary_kwargs={"n_iter": 2}`
+when those were their recorded settings. Four iterations are a budget, not
+evidence of boundary convergence. Boundary/norm convergence probes and automatic
 evaluation cap retries are disabled. Set `boundary_convergence=True` or a
 mapping to opt into convergence checks.
 
@@ -519,11 +535,13 @@ accepted as a two-site alias. For one-site ALS within row/column sweeps,
 keep `update_style="row-column"` and select `optimizer="als"` below.
 The two-site path follows the reduced-tensor scheme
 in [Lubasch, Cirac and Bañuls, Sec. III B](https://arxiv.org/pdf/1405.3259).
-Currently it supports nearest-neighbor coordinate pairs on dense Torch or CuPy
-complex64/complex128 PEPS, with Pepsy boundary MPS (direct or DMRG fitting).
+It supports nearest-neighbor coordinate pairs on dense Torch or CuPy
+complex64/complex128 PEPS and [PEPO](#native-pepo-full-update), with Pepsy
+boundary MPS (direct or DMRG fitting).
 It does not support differentiation through the update or native symmetry
 arrays. `k_2q_batch="auto"` means one two-site gate in this mode; integers
-greater than one are rejected. For row/column fitting, `k_2q_batch=1` explicitly
+greater than one are rejected. PEPO opposite-leg actions on one bond can
+share that update with `fuse_pepo_legs=True`. For row/column fitting, `k_2q_batch=1` explicitly
 selects gate-by-gate fitting; `"auto"` retains automatic batching.
 
 Boundary `fit_mode` can be `"direct"`, `"dmrg"` (the default, also `"eff"`),
@@ -618,7 +636,26 @@ requires that route, while `solver="qr"` requires weighted least squares.
 All new contractions receive Pepsy's Cotengra optimizer. The shared solver
 starts from the target's SVD in the selected basis. Its result is compared against
 the SVD guesses in the same positive metric, retaining the
-lowest cost. The final internal bond is balanced with SVD.
+lowest cost. Initial SVD factors are retained for the starting point and
+baseline comparison. With `gauge=False`, final balancing uses QR/LQ followed
+by a bond-sized SVD, without reconstructing and decomposing the larger pair.
+The explicit environment-gauge path retains its full final SVD. These are
+exact factor rearrangements at the existing rank cap, not approximate SVDs.
+
+Native Torch/CuPy local ALS uses dense backend solves even above Quimb's
+automatic size threshold, avoiding its incompatible SciPy LinearOperator
+route. Pair reports include `norm_matrix_dimension`, the size of the reduced
+environment eigendecomposition; it excludes physical identity expansion.
+
+For ordered source chunks, call `set_gates(chunk)` and `run()` on the same
+optimizer. Each call schedules only that chunk while source-validated boundary
+and strip caches survive between calls. `reset_traces=False` additionally
+retains diagnostic records and local fidelity products. Changed tensor arrays,
+versions and numerical boundary settings still invalidate dependent entries.
+At finite boundary caps, retained compression guesses and floating-point
+gauge changes can alter the approximate trajectory; validate full evolutions
+separately from small exact-environment reconstruction checks.
+
 External PEPS tensors remain unchanged by the pair fit.
 When explicitly enabled, environment gauges use two independent unfoldings of the same square root.
 Internally `N = root.H @ root`, so the paper's QR/LQ construction for
@@ -746,6 +783,13 @@ can group compatible gates to increase reuse within a strip. Transverse
 boundary cuts remain cached across strip changes, while the prefix/suffix
 cache holds only the active strip. Legal commuting reorderings preserve the
 exact circuit, but can change finite-bond truncation results.
+
+Each pair's `optimizer_result['boundary_mps_steps']` lists the directional
+absorption steps: `direction`, spatial `coordinate`, cut key, and `action`
+(`"build"` or `"reuse"`). Direct boundary mode keeps BRA/KET layers separate
+by default and compresses each onto the preceding MPS in spatial order.
+Valid cuts retain their MPS objects. The trace is empty for exact-SVD updates
+that need no boundary environment.
 
 For reduced tensors, `rcond=None` selects 1e-12 for complex128 and 1e-6 for complex64. Diagnostics
 include the raw environment's anti-Hermitian residual, minimum eigenvalue,
@@ -916,8 +960,16 @@ gates. Pauli commutation uses the parity of different nonidentity axes on
 shared sites: XX and YY commute on the same bond but generally do not on
 bonds sharing only one site. There is no near-commuting numerical tolerance.
 Unknown dense gates retain their overlapping dependencies; trainable gates,
-unsupported arrays, selectors, and non-neighbor gates remain global barriers.
+unsupported arrays, PEPS selectors, and non-neighbor gates remain global barriers.
 Smart scheduling requires dense NumPy, Torch, or CuPy state arrays.
+
+Native PEPO upper/lower selectors participate in `row`, `column` and `smart`
+scheduling. Dependencies include the physical leg: upper and lower actions
+commute even on the same sites, while same-leg dependencies retain the usual
+commutation checks. Single-site fusion combines only actions on the same
+site **and** leg, in their original multiplication order. Selected physical
+dimensions must be two for this qubit scheduler; other dimensions remain
+barriers. Constructor `which` and per-entry overrides follow the same rules.
 
 Among legal next pair updates, the scheduler prefers the active strip and
 unused bonds within its current refinement block. It pulls in required
@@ -998,6 +1050,125 @@ boundaries, only when `timing=True`. This can affect runtime and is intended
 for profiling. Inner slice timers remain unsynchronized host wall times and
 are explicitly marked as such. Timing off adds no accelerator barriers and
 does not enable extra contractions or alter optimization settings.
+
+### Native PEPO full update
+
+Pass a native PEPO as `state`. Its two physical legs, operator class, backend,
+dtype and device are retained. The default leg is `"upper"`; each gate's
+third field overrides the constructor's `which`.
+The existing coordinate-adjacency requirement remains: periodic wrap-around
+bonds are not accepted by this gate-stream full-update path.
+
+```python
+fit = PepsOptimizer(
+    operator,
+    [(G, ((0, 0), (0, 1)), "upper"),
+     (G.conj(), ((0, 0), (0, 1)), "lower")],
+    chi=D, mode="full-update",
+    full_update_kwargs={"solver": "auto"},
+)
+operator = fit.run()
+```
+
+Use `fit.run(warmstart_method="simple-update")` to initialize the pair solver
+from SU instead of the default reduced SVD. This works for PEPS and PEPO,
+with upper/lower selection, reduced ALS or L-BFGS, and full-tensor L-BFGS.
+SU runs on a private copy, preserving scale (`renorm=False`), and changes
+only the disposable guess. Its pre-gate gauged source represents the same
+operator and supplies the frozen QR/LQ bases; the target remains untruncated.
+One private gauging pass seeds persistent SU weights. Later pairs remove and
+restore half-weights only on their active sites, and refresh the active bond
+after ALS/L-BFGS with an untruncated local gauge step. Exterior arrays are
+preserved, allowing valid boundary and strip caches to survive. Weights are
+initialization hints, not a claim of a converged global SU environment.
+They persist across gates and repeated `run()` calls, independently of trace
+resets. `set_state`, external tensor mutation, or an accepted strip/layer
+refinement reinitializes the SU representation. Pair reports expose
+`su_gauge_reuse` with initialization, reuse and local-refresh counts.
+It is separate from `fit_init_strategy`, which initializes boundary MPS fits.
+
+For unitary `G`, this applies ${\color{blue}O\mapsto GOG^\dagger}$ on the
+selected sites. The existing physical-leg convention applies gates as supplied:
+upper gives $GO$, lower gives $OG^T$. Supply `G.T` on the lower legs for $OG$.
+One-site gates, mixed streams and custom upper/lower index formats follow the
+same rules; input order is preserved across selector barriers.
+
+The shared QR/LQ reduction keeps only the acted operator leg in the reduced
+factors for one-sided gates. The untouched physical leg stays on Q and is
+traced into the norm environment. Joint upper/lower fits retain both physical
+legs in the reduced factors, privately fused to dimension
+$d_{\rm in}d_{\rm out}$ and restored on reconstruction. Exact targets,
+index formats and operator scale are preserved in either grouping. Reports
+include `reduced_physical_dimensions`. No $G\otimes I$ array is formed.
+The smaller one-sided outer subspaces can change finite-bond fit errors.
+Positive-environment projection,
+ALS, optional gauges, exact-SVD shortcuts, boundary/strip caches and strip/layer
+refinement reuse the PEPS kernels. Reduced/full-tensor pair L-BFGS works too.
+
+The metric is normalized **Frobenius operator overlap**:
+
+$$
+{\color{purple}F(O,T)=
+\frac{|\operatorname{Tr}(O^\dagger T)|^2}
+{\operatorname{Tr}(O^\dagger O)\operatorname{Tr}(T^\dagger T)}}.
+$$
+
+PEPO initial and output normalization default to **off**; PEPS defaults remain
+unchanged. Independent norm and fidelity contractions are **off by default**
+for two-site full update. ALS still uses its local norm environment, residual
+and local fidelity estimate. Enable independent pre/post checks with
+`measure_infidelity=True, measure_final_infidelity=True`, or boundary
+calibration with `boundary_convergence`. Requested diagnostics measure the
+target norm, with no assumed value of one or $2^L$.
+For an unscaled $L$-qubit Pauli string, $\operatorname{Tr}(O^\dagger O)=2^L$;
+scaling it by $a$ gives $|a|^2 2^L$. General operators have their own norms.
+Explicit `normalize_initial=True` or `normalize_final=True` sets the Frobenius
+norm to one at the requested stage. `normalize_target` follows `non_unitary`;
+leave it false when nonunitary operator evolution must retain its amplitude.
+Both direct and DMRG boundary compression contract both physical legs in
+the norm and overlap networks.
+
+PSD projection applies to the local norm environment $N$, not the operator.
+Pair fidelity remains a local environment estimate. This evolves a PEPO itself;
+`run_pepo(U)` above uses a separate full-step fitting path.
+
+#### Joint upper/lower action on one bond
+
+Use `fit.run(fuse_pepo_legs=True)` to fit adjacent opposite-leg gates on
+the same bond together. The default is `False`. For upper gate $U$ and
+lower gate $L$, the exact target is ${\color{blue}T=U O L^T}$, followed by
+one reduced pair fit. Each gate contracts into its own physical leg; no
+product superoperator or intermediate target truncation is introduced.
+
+```python
+fit = PepsOptimizer(
+    operator,
+    [(U, ((0, 0), (0, 1)), "upper"),
+     (U.conj(), ((0, 0), (0, 1)), "lower")],
+    chi=D, mode="full-update", fit_mode="direct",
+)
+operator = fit.run(fuse_pepo_legs=True)
+```
+
+The two gates share QR/LQ reduction, the boundary environment and the fit.
+Reversed site order is aligned automatically. Input traversal pairs only
+adjacent entries; `gate_order="smart"` can bring compatible same-bond
+opposite-leg actions together while retaining same-leg dependencies. Same-leg
+gates and intervening barriers are not fused by this option.
+
+Both SVD and persistent SU initialization, reduced ALS, reduced/full pair
+L-BFGS and strip/layer refinement support joint updates. The SU guess keeps
+the first action untruncated and truncates only after the second action.
+Layer refinement never ends its exact target between the paired actions,
+even if its target-bond budget is crossed there. Direct and DMRG boundaries
+are supported and remain cached between joint fits. Each combined record has
+`joint_pepo_legs=True`, `operator_gate_count=2`, and both original positions
+in `original_steps`; local fidelity describes the combined compression.
+
+Joint fitting can preserve amplitudes lost by two separate truncations.
+For example, a unitary sandwich of the identity remains the identity at
+bond dimension one; separate upper/lower truncations can shrink its scale
+even when their final normalized operator fidelity equals one.
 
 ## Local solver defaults
 
@@ -1124,12 +1295,16 @@ controls with `optimizer_options` or per-run
 With adaptive sweep checks, the target norm is measured during calibration
 and reused throughout that fit, overriding the unitary shortcut below.
 
-For global mode or `boundary_convergence=False`, default unitary evolution
-passes `norm_target=1` to every
+For PEPS in global mode or with `boundary_convergence=False`, default unitary
+evolution passes `norm_target=1` to every
 pre/post fidelity evaluation and to variational cleanup, avoiding the
 enlarged target's norm contraction. This assumes that the incoming retained
 PEPS is normalized and the gates are unitary. The compressed candidate's
 norm is still measured at `evaluation_chi`.
+
+PEPO targets always have their norm measured unless the caller explicitly
+supplies `norm_target`, even when output normalization is enabled. A unitary
+gate preserves an operator's Frobenius norm, which need not be one.
 
 Set `infidelity_kwargs={"norm_target": None}` to explicitly measure the
 target norm, or supply a known scalar/scaled norm. Constructor settings and
@@ -1260,7 +1435,10 @@ optimization restores the already normalized warm start. Thus the retained
 state has unit norm according to the selected finite-cap contraction, which
 does not guarantee an exactly unit dense norm at insufficient boundary chi.
 Increase `normalize_chi` to check convergence. `normalize_final=False` skips
-candidate/direct-output normalization; warm starts are always normalized.
+candidate/direct-output normalization; row/column and global warm starts
+are always normalized. Two-site full update preserves the target scale in
+its warm start. PEPO initial and output normalization are off by default;
+see [native PEPO full update](#native-pepo-full-update).
 `normalize_target=None` follows `non_unitary`; set `non_unitary=True` for
 nonunitary evolution or explicitly override `normalize_target=True/False`.
 Adaptive sweeps measure the unchanged target norm before fitting. Outside
