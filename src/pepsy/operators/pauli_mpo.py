@@ -1,8 +1,8 @@
 """Sparse or core-backed Pauli-basis operators with an MPO boundary.
 
 ``PauliMPO`` stores canonical sparse strings or native coefficient cores
-over ``I``, ``X``, ``Y`` and ``Z``. Algebra, traces, SVD compression and DAOE
-filtering stay in that basis. General MPS application, Quimb contraction,
+over ``I``, ``X``, ``Y`` and ``Z``. Algebra, traces, SVD/DMT compression and
+DAOE filtering stay in that basis. General MPS application, Quimb contraction,
 numerical MPO compression and higher-order exponentials use Pepsy's existing
 :class:`~pepsy.operators.mpo.FirstDegreeMPO` boundary.
 
@@ -1740,6 +1740,50 @@ class PauliMPO:
         return result
 
     compress_native = compress_pauli
+
+    def compress_dmt(
+        self, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density", inplace=False,
+        return_report=False,
+    ):
+        """Compress while preserving all contiguous three-site partial traces.
+
+        ``variant='density'`` truncates connected correlations and requires
+        nonzero trace. ``'operator'`` uses the raw-block DMT variant, including
+        for traceless Heisenberg observables. ``cutoff`` and ``cutoff_mode``
+        apply only to the unprotected spectrum; protected factors are never
+        renormalized. ``cutoff='auto'`` uses Pepsy's dtype-aware policy.
+        Only open chains with dense floating/complex cores are supported.
+        A log-scaled check of all local marginals raises FloatingPointError
+        if the sweep cannot preserve them at the working precision.
+        """
+        from ._pauli_dmt import compress_dmt
+
+        return compress_dmt(
+            self, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
+            inplace=inplace, return_report=return_report,
+        )
+
+    def apply_gate_dmt(
+        self, gate, where, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
+        mode="conjugate", inplace=False, return_report=False, trace_guard="auto",
+    ):
+        """Apply a two-qubit gate locally, then DMT-split the acted-on bond.
+
+        Sites must be adjacent and increasing. The target is formed exactly
+        before protected compression; no global gate MPO is constructed.
+        For repeated evolution use ``pepsy.optimizers.PauliDMT`` to reuse
+        the canonical centre and trace environments between gates.
+        ``trace_guard='auto'`` checks resolved nonzero traces; set it to
+        ``True`` to force checking or ``False`` for traceless inputs with
+        trace roundoff. This guard does not certify all local marginals.
+        """
+        from ._pauli_dmt import gate_dmt
+
+        return gate_dmt(
+            self, gate, where, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode,
+            variant=variant, mode=mode, inplace=inplace,
+            return_report=return_report, trace_guard=trace_guard,
+        )
 
     def apply_damping(self, damping, *, inplace=False):
         """Apply a reusable :class:`PauliDampingMPO` without compression."""

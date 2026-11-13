@@ -130,6 +130,226 @@ use full SVD and `renorm=False`. Reports describe compression diagnostics,
 not an observable-error guarantee, especially for `form="flat"` or renormalized
 results.
 
+## Protected density matrix truncation (DMT)
+
+`compress_dmt` preserves all partial traces on up to three contiguous sites
+through compression, to numerical precision. For a density matrix these are
+the local reduced density matrices; consequently compression preserves energy
+when every Hamiltonian term fits inside such a region.
+
+```python
+rho = PauliMPO.from_terms(8, [
+    (2.0**-8, "IIIIIIII"),
+    (0.05 * 2.0**-8, "Z"),
+])
+rho, report = rho.compress_dmt(
+    max_bond=32, variant="density", return_report=True,
+)
+print(report.final_bond_dimensions, report.max_constraint_error)
+```
+
+The variants are explicit:
+
+| `variant` | Truncation target | Use |
+| --- | --- | --- |
+| `"density"` (default) | Unprotected **connected** correlation block | Density operators with a numerically well-conditioned nonzero trace |
+| `"operator"` | Unprotected **raw** block | General operators, including traceless Heisenberg observables |
+
+The density variant follows [White et al., III](https://link.aps.org/accepted/10.1103/PhysRevB.97.035127);
+the traceless variant follows [Yi-Thomas et al., Appendix D](https://arxiv.org/pdf/2310.06886).
+Both use Quimb's public `array_split` with Autoray backend dispatch. The
+implementation first exposes compact Schmidt support, protects the local
+directions, truncates only the complementary block, and reconstructs through
+thin factors and one directional QR. Existing-chain compression works with
+the bond centre rather than forming a larger two-site tensor.
+
+`max_bond` is a positive integer. `cutoff` defaults to zero. A numeric cutoff
+or `"auto"` applies **only** to the unprotected singular spectrum; protected
+directions have no physics cutoff and there is no post-truncation
+renormalization. `"auto"` uses Pepsy's dtype-aware policy: `1e-12` for
+`float64`/`complex128` and `1e-6` for `float32`/`complex64`, as in
+`MpoOptimizer`. It differs from newer Quimb exact-SVD `"auto"` defaults.
+This is a rank-selection heuristic, not an automatic error or stability bound.
+
+`cutoff_mode` defaults to `"rel"`; `"auto"` and `None` also select `"rel"`.
+The supported modes follow Quimb's interpretation, applied to the **residual**
+singular values. For `"abs"`, `"sum1"` and `"sum2"`, units are those of the
+un-normalized Hilbert–Schmidt norm of the represented operator, matching
+ordinary `PauliMPO.compress_pauli`; internal Pauli-coefficient scaling is
+accounted for. The relative modes are invariant under overall rescaling.
+
+| Mode | Cutoff criterion on the residual spectrum |
+| --- | --- |
+| `"rel"` | Drop singular values below `cutoff * largest` |
+| `"abs"` | Drop singular values below `cutoff` |
+| `"sum1"` / `"sum2"` | Bound the sum of discarded values / squared values by `cutoff` |
+| `"rsum1"` / `"rsum2"` | Bound those sums relative to the corresponding total |
+
+For example, `cutoff="auto", cutoff_mode="rsum2"` uses a relative **squared**
+weight threshold of `1e-12` in double precision; this is not a `1e-12`
+norm-error threshold. `max_bond` can force additional truncation beyond the
+cutoff, and the residual criterion is not a bound on later physical-observable
+error. When an already fitting operator has no room under the conservative
+protected-rank construction, it can be returned unchanged even with a cutoff.
+
+Up to four protected directions on each side reserve up to
+eight channels. If the conservative rank budget cannot accommodate them,
+the operation raises rather than changing the constraints. An already fitting
+operator can pass through with a smaller cap. This conservative rejection
+does not prove no alternative lower-rank completion exists.
+
+Only dense `float32`/`float64`/`complex64`/`complex128` cores on **open** chains
+are currently supported.
+Source backend, homogeneous dtype and device are retained. The initial and
+final support factorizations use zero cutoff: small singular directions can
+carry resolved local data on long chains. Protected-basis rank decisions
+account for support conditioning, check the original partial-trace constraints,
+and retry with a stricter rank tolerance when needed. The density variant
+rejects a trace at roundoff relative
+to the active operator norm, rather than regularizing division by the trace.
+
+The centre and norms are rescaled to avoid underflow for long normalized
+density matrices. Standalone `compress_dmt` additionally checks every
+three-site marginal after the sweep using log-scaled trace environments,
+with linear chain cost and a tolerance proportional to chain length and
+machine precision. It raises `FloatingPointError` when this check fails;
+increase `max_bond` or use double precision. Strongly correlated 128-site
+mixtures at cap 12 can fail this check; cap 24 recovers their exact rank.
+Neither floating-point arithmetic nor DMT guarantees preservation at an
+arbitrarily small bond dimension.
+
+The full marginal check applies to `compress_dmt` only. `apply_gate_dmt` and
+`PauliDMT` also offer `trace_guard`, a per-gate comparison of the gated
+target's trace with the split result. It raises `FloatingPointError` if a
+single relative trace defect exceeds `32 * sqrt(machine_epsilon)`.
+
+- `trace_guard="auto"` enables the guard for `variant="density"`. For
+  `variant="operator"`, it enables the guard only when the initial trace
+  coefficient exceeds eight machine epsilons times the global coefficient
+  norm. This avoids treating ordinary roundoff in a traceless operator as a
+  meaningful nonzero trace.
+- `trace_guard=True` forces the guard when a nonzero trace is physically known
+  but too small for that heuristic. `False` disables it; this can be useful
+  for genuinely traceless observables with accumulated trace roundoff.
+  `run.trace_guard_active` reports the resolved choice on `PauliDMT`.
+
+This guard stops the previously observed large drift in the 128-site float32
+identity-gate test when explicitly enabled, and catches a 192-site
+double-precision example with `"auto"` before its trace becomes badly
+corrupted. The raw/operator 128-site float32 input has an unresolved initial
+trace by the auto heuristic, so its guard remains off unless explicitly
+enabled. Auto classification is heuristic and can also mistake accumulated
+roundoff for a nonzero trace. The guard does not undo preceding gates, cap
+accumulated drift, or check all local marginals. Check trace, target observables,
+bond dimension and precision convergence during long evolutions.
+
+For NumPy input, one possible mitigation is to explicitly promote the cores
+before constructing the driver, so its working state is double precision:
+
+```python
+from pepsy.optimizers import PauliDMT
+
+rho64 = PauliMPO.from_pauli_cores([
+    core.astype("float64") for core in rho.to_pauli_cores()
+])
+run = PauliDMT(rho64, max_bond=24, variant="density")
+```
+
+For complex cores use `complex128` instead. This changes the working and
+output dtype; it reduced the error in one difficult 128-site test but does
+not guarantee stability. Check physical observables and convergence even in
+double precision.
+
+`PauliDMTReport` and `PauliDMTBondReport` are exported from `pepsy.operators`.
+Per-bond records contain input/output rank, protected ranks, residual rank,
+discarded residual weight and support loss. The report also contains the
+resolved numeric `cutoff` and `cutoff_mode`. Weights use the Pauli coefficient
+norm, equivalent to the normalized Hilbert-Schmidt norm. Protected ranks are
+reported as zero when an already-fitting bond takes a QR pass-through without
+computing the protected bases; zero then means **not computed**. Constraint residuals
+are collected only with `return_report=True`; `max_constraint_error` checks
+the original bond matrix and physical constraint vectors.
+`max_relative_constraint_error` divides each panel error by its target norm.
+This ratio can be large for nearly zero partial traces of traceless operators;
+the split guard uses a normwise backward error there. Absolute coefficient
+residuals can be tiny while physical density-matrix errors are appreciable,
+which motivates the additional standalone sweep check. These are separate from ordinary SVD norm-survival
+diagnostics. With `inplace=True`, a failed standalone call leaves the source
+unchanged.
+
+### Local gates and persistent evolution
+
+```python
+rho = rho.apply_gate_dmt(
+    two_qubit_gate, (3, 4), max_bond=32, variant="density",
+    mode="conjugate",  # U rho U†; use "heisenberg" for U† O U
+)
+```
+
+Sites must be adjacent and increasing. The two-site target is formed before
+any deliberate truncation, without an embedded global gate MPO. The local
+Pauli transfer matrix is real for conjugation in the Hermitian Pauli basis;
+real coefficient cores remain real.
+
+For repeated updates, `pepsy.optimizers.PauliDMT` owns the canonical centre and
+lazily updated identity environments, avoiding whole-chain preparation per
+gate. It supports explicit gates and second-order even/odd/even evolution:
+
+```python
+import numpy as np
+from pepsy.optimizers import PauliDMT
+
+L = 8
+X = np.array([[0., 1.], [1., 0.]])
+Z = np.diag([1., -1.])
+I = np.eye(2)
+bond_h = np.kron(Z, Z) + 0.3 * (np.kron(X, I) + np.kron(I, X))
+initial = PauliMPO.from_terms(L, [(1.0, (L // 2,), "Z")])
+run = PauliDMT(
+    initial, max_bond=32, variant="operator", mode="heisenberg",
+    diagnostics=True,
+)
+evolved = run.evolve([bond_h] * (L - 1), dt=0.05, steps=20)
+correlation = initial.inner(evolved, normalized=True)
+# Or: run.apply_gate(two_qubit_gate, (3, 4))
+```
+
+The Hamiltonian is exactly `sum_j bond_hamiltonians[j]`, with one Hermitian
+4-by-4 matrix per bond. Assign onsite fields to these matrices without double
+counting your intended Hamiltonian. Gates are prepared once per `evolve` call
+with backend-native Hermitian eigendecomposition. Shared Hamiltonian objects
+reuse that decomposition and their half/full-step transfers within the call.
+They are prepared again on the next call, allowing changed parameters and
+fresh autograd graphs. No process-global linear-algebra registration is
+performed. `run.state` is an
+independent snapshot. `run.report` retains only the latest gate or final
+timestep, so diagnostic memory does not grow with elapsed time. Successful
+gates are committed as they execute; a failed evolution call can leave a
+partially completed timestep. Standalone operations instead own disposable
+workspaces.
+
+The workspace carries its canonical centre and normalized identity-prefix/
+suffix caches across updates, invalidating only affected ranges. Each parity
+layer sweeps toward the opposite end; the next timestep starts near the
+current centre. This avoids a full return sweep between timesteps. Gates
+within a layer commute exactly, but finite-bond DMT compression is nonlinear:
+the centre-aware layer order is part of this approximation. The same order
+continues when evolution is split across calls. Prefer this persistent driver
+over repeatedly invoking standalone `apply_gate_dmt`, which must prepare its
+own canonical workspace each time.
+
+For fixed-rank Torch differentiation, use the existing
+`TorchLinalgConfig(stabilized=True)` policy and verify objective gradients.
+Adaptive support/rank decisions are eager; end-to-end JIT, degenerate-spectrum
+derivatives, GPU and native symmetry support are not established by CPU forward
+checks. Near-singular support or tied spectra can make the selected global
+approximation sensitive to roundoff and internal gauge choices. The local
+partial-trace checks have the numerical limitations described above. DMT
+preserves local data at each split in exact arithmetic; it does not guarantee global
+positivity, exact later local dynamics or zero Trotter error. Check timestep
+and bond convergence independently. Implementation evidence and limitations
+are in the [DMT design note](../../development/notes/2026-11-13-pauli-dmt-design.md).
+
 ## DAOE weight filter
 
 `apply_daoe(max_weight=..., gamma=...)` applies the artificial dissipation

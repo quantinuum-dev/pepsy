@@ -159,6 +159,8 @@ _SYMBOL_MODULES["PauliDampingMPO"] = ".pauli_damping"
 _SYMBOL_MODULES["decompose_pauli"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliCompressionReport"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliBondCompressionReport"] = ".pauli_mpo"
+_SYMBOL_MODULES["PauliDMTReport"] = "._pauli_dmt"
+_SYMBOL_MODULES["PauliDMTBondReport"] = "._pauli_dmt"
 _SUBMODULES = (
     "cluster",
     "cluster_plan",
@@ -210,6 +212,8 @@ __all__ = [
     "decompose_pauli",
     "PauliCompressionReport",
     "PauliBondCompressionReport",
+    "PauliDMTReport",
+    "PauliDMTBondReport",
     *_SUBMODULES,
 ]
 

@@ -8,6 +8,22 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Pauli DMT:** add explicit density/connected and raw-operator protected
+  compression through `PauliMPO.compress_dmt`, adjacent local
+  `apply_gate_dmt`, and `pepsy.optimizers.PauliDMT` second-order evolution.
+  Reuse Quimb decompositions and Autoray backends; preserve three-site partial
+  traces through truncation, with separate support/residual diagnostics,
+  compact reconstruction and persistent trace/canonical environments.
+  Rescale small centres/norms, retain protected Schmidt support, and verify
+  standalone sweep marginals with log-scaled environments; reject insufficient
+  precision rather than returning an unchecked local error.
+  Use directional final QR, reuse unchanged SVD/prepared gates locally, and
+  carry the canonical centre through serpentine parity sweeps.
+  Support dtype-aware `cutoff="auto"` and Quimb cutoff modes on the
+  unprotected spectrum, with physical-norm units for absolute policies.
+  Avoid refactoring a fully protected bond for positive cutoffs and detect
+  excessive per-gate trace defects for resolved nonzero-trace inputs.
+
 - **Pauli MPO / DAOE:** add exact Pauli-weight damping through
   `PauliMPO.apply_daoe`, preserving native cores and separating filtering from
   SVD compression. Expose reusable `PauliDampingMPO` objects with explicit

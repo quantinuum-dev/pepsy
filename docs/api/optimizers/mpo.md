@@ -1,5 +1,9 @@
 # `pepsy.optimizers.mpo.optimizer`
 
+For native Pauli-coefficient evolution with protected local partial traces,
+use [`PauliDMT`](../operators/pauli_mpo.md#local-gates-and-persistent-evolution).
+It implements DMT compression separately from the ordinary MPO replay below.
+
 ## Minimal replay and option groups
 
 ```python

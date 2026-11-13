@@ -7,6 +7,11 @@ important downstream time-compression consumer that depends on Pepsy behavior.
 
 ## Layout
 
+- `pauli_dmt.py`: `PauliDMT` local operator TEBD. Owns persistent canonical
+  and trace environments through `operators._pauli_dmt`, prepares local
+  transfer matrices once per evolution call, and retains bounded reports.
+  See the [DMT API](../../api/operators/pauli_mpo.md#protected-density-matrix-truncation-dmt).
+
 - `_stream_events.py`: shared control, conditional, and sub-MPO parsing.
   Geometry and tree replay use this module directly, without importing MPS
   replay. Existing parser imports from `mps.optimizer` remain available.
