@@ -364,6 +364,12 @@ The spinful interaction gate is the exact native Symmray operator
 ``(1, 1, 1, exp(-i dt U))`` in Symmray's ordered Hubbard basis. Pass
 ``imaginary=True`` to use the corresponding ``exp(-dt U n_up n_down)`` gate.
 
+Generic ``operator_gate`` and ``exponential`` retain the complete physical
+charge space: zero generator sectors contribute identity, including at zero
+angle. Missing blocks are filled on an owned native copy before fusion, so
+cached sparse observables and Hamiltonian terms remain unchanged. This also
+applies to two-site spin and hopping generators with inactive sectors.
+
 ``param_gate(name, params)`` and the module-level fermion gate generators
 (``fermion_interaction_param_gen``, ``fermion_density_param_gen``, and
 ``fermion_hopping_param_gen``) follow the Quimb parameter-generator

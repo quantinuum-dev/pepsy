@@ -1060,6 +1060,12 @@ before each split, and restores the physical ket afterward. Thus `R`, `L`, and
 `RL` are honored exactly without dense conversion or Jordan-Wigner
 bosonization.
 
+Reversed native gates can give both virtual boundary legs the same dualness.
+FIT applies the parity correction to each dual leg independently, preserving
+an exact initial guess through one-site updates in either sweep direction.
+Native MPS initialization establishes the canonical center with a full graded
+sweep rather than a dense identity scan without charge-index metadata.
+
 The `dmrg`, `dmrg2`, and `dmrg3` schedules apply to native U1, U1xU1,
 and Z2 fermionic states as well as ordinary arrays. `dmrg` uses one-site FIT, while `dmrg2` and `dmrg3` perform their fixed
 block warm-up before one-site

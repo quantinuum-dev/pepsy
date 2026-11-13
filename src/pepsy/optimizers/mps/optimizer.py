@@ -1971,7 +1971,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # Backend tensors may be traced. Discovering isometries numerically
         # requires Python boolean conversions; a full sweep is traceable and
         # establishes the same authoritative center without that scan.
-        cur_orthog = None if self.backend in ("jax", "torch") else "calc"
+        # Native charge blocks also cannot supply a dense ``eye(d)`` for
+        # Quimb's scan: its identity needs explicit charge-index metadata.
+        cur_orthog = None if self.backend in ("jax", "torch", "symmray") else "calc"
         self.p.canonicalize_([center], cur_orthog=cur_orthog, info=self.info_c)
         self._current_orthog(self.p)
 

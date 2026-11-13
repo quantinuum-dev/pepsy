@@ -2139,6 +2139,9 @@ def test_fermion_to_mpo_accepts_arbitrary_neutral_term_support():
         [(1.0, ((2, "create"), (0, "number"), (3, "annihilate")))],
         sites=(0, 1, 2, 3),
     )
+    # Compare in the MPO's full physical space, including zero components
+    # within a total-charge sector that sparse fusion would otherwise drop.
+    embedded_term.fill_missing_blocks()
     assert mpo.to_dense().allclose(
         embedded_term.fuse((0, 1, 2, 3), (4, 5, 6, 7))
     )

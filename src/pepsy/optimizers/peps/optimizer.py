@@ -264,7 +264,9 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         solver; two-site defaults to reduced ALS and processes each two-site gate.
     gate_order : {"input", "column", "row", "smart"} | None, default=None
         None selects column order in sweep mode (row for ``update_style="row"``),
-        and input order in global/two-site modes, including run-time overrides.
+        input order in global mode, and smart order for full/two-site updates,
+        including run-time overrides. Submit separate runs to preserve source
+        or circuit-depth barriers that are not represented in the gate queue.
         Row/column policies reorder commuting two-qubit blocks into strips.
         Disjoint gates commute; overlapping gates must both be diagonal for
         these two policies. ``last_gate_order`` maps the executed
@@ -298,8 +300,10 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         estimates, and sweep environment updates. Defaults are
         ``n_iter=10``, ``direction="y"``, ``max_separation=1``,
         ``track_boundary_fidelity=False``, and ``strip_exponent=True``.
-        Sweep and full-update boundary FIT default to ``fit_init_strategy="reuse-direct"``;
-        full update uses ``n_iter=4``. Other modes use ``"guess-direct"``.
+        Full update defaults to ``fit_mode="direct"``; other modes keep their
+        previous FIT defaults. Sweep and full-update boundary FIT default to
+        ``fit_init_strategy="reuse-direct"``; full update uses ``n_iter=4``
+        when a variational boundary mode is selected. Other modes use ``"guess-direct"``.
         Cuts are refitted after changes;
         explicit direct arguments or mapping entries override this policy.
         FIT controls such as ``fit_mode``, ``fit_layer_mode``, ``layer_tags``,
@@ -391,7 +395,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         ``False`` hides it and ``True`` enables it.
     full_update_kwargs : mapping, optional
         Dense Torch/CuPy nearest-neighbor two-site fitting controls for
-        ``mode="full-update"``: ``max_iterations=50``, ``rtol="auto"``,
+        ``mode="full-update"``: ``max_iterations=20``, ``rtol="auto"``,
         dtype-dependent ``rcond=None``, ``gauge=False``, and ``solver="auto"``.
         With ``gauge=True``, ``gauge_qr="qr:auto"`` opts into Quimb's adaptive
         Cholesky QR for the two environment gauges; ``gauge_qr="qr"`` keeps
@@ -608,7 +612,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
             direct_fit_kwargs,
         )
         if self._boundary_fit_auto:
-            self.boundary_kwargs['fit_mode'] = 'dmrg' if self._active_full_update else 'eff'
+            self.boundary_kwargs['fit_mode'] = 'direct' if self._active_full_update else 'eff'
         if self._boundary_init_auto and (self.mode == 'sweep' or self._active_full_update):
             self.boundary_kwargs['fit_init_strategy'] = 'reuse-direct'
         if self._boundary_iter_auto and self._active_full_update:
@@ -661,6 +665,8 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
 
     @staticmethod
     def _default_gate_order(mode, style):
+        if mode == 'full-update' or (mode == 'sweep' and style == 'two-site'):
+            return 'smart'
         if mode == 'sweep' and style != 'two-site':
             return 'row' if style == 'row' else 'column'
         return 'input'
@@ -911,6 +917,8 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
                       and method in {'dmrg', 'fit'}
                       and normalize_boundary_engine(self.boundary_engine, self.state) != 'quimb-mps')
             opts['fit_layer_mode'] = 'sequential' if direct else 'joint'
+            if direct and opts.get('layer_tags') is None:
+                opts['layer_tags'] = ('BRA', 'KET')
         return opts
 
     def normalize(self, state=None, *, normalize_chi=None, **kwargs):
@@ -3138,7 +3146,7 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         if self._evaluation_retries_auto:
             self.evaluation_max_retries = 0 if self._active_full_update else 2
         if self._boundary_fit_auto:
-            self.boundary_kwargs['fit_mode'] = 'dmrg' if self._active_full_update else 'eff'
+            self.boundary_kwargs['fit_mode'] = 'direct' if self._active_full_update else 'eff'
         if self._boundary_init_auto:
             self.boundary_kwargs['fit_init_strategy'] = (
                 'reuse-direct' if run_mode in {'sweep', 'full-update'} else _DEFAULT_BOUNDARY_KWARGS['fit_init_strategy']

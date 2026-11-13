@@ -1781,6 +1781,10 @@ def _get_d2_edge_partial_trace_excited(
 def _rho_trace(rho):
     """Trace a reduced density matrix, including omitted Symmray blocks."""
     if _is_symmray_array(rho):
+        # Forbidden-charge corrections can have no blocks or index sectors.
+        # Their trace is zero; Symmray cannot densify an empty index map.
+        if rho.num_blocks == 0:
+            return 0.0
         return np.trace(_symmray_to_dense(rho))
     return ar.do("trace", rho)
 

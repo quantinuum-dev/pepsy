@@ -8,6 +8,36 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Native BP open-rho sweeps:** treat empty Symmray correction blocks as
+  zero trace instead of attempting an invalid dense conversion. Coverage
+  includes U1, U1U1, Z2, and Z2Z2.
+- **Native fermionic gate exponentials:** retain identity on zero-generator
+  charge sectors before fusion, fixing generic spin/interaction gates and
+  Etienne replay without changing Hubbard Hamiltonian coefficients.
+- **Native one-site FIT:** correct each virtual environment leg's parity
+  independently after reversed gates. Native MPS initialization also avoids
+  dense identity scans that lack charge-index metadata.
+
+- **Full-update boundary default:** two-site full update now uses direct
+  boundary compression. Select `fit_mode="dmrg"` for the previous default;
+  finite-cap environments and numerical results can differ.
+
+- **Full-update gate ordering:** `PepsOptimizer` now defaults to smart ordering
+  for two-site full updates. Pass `gate_order="input"` to retain the previous
+  default, and submit separate runs for source/depth barriers.
+
+- **CUDA full-update synchronization:** collect SVD-rank and norm-metric
+  diagnostics in small grouped transfers, reuse an evaluated initial loss,
+  and classify fixed CUDA gates in bounded batches for smart/row/column
+  ordering. Keep exact gate-dependency checks and ALS stopping criteria.
+- **Full-update SU warm starts:** use Quimb's public single-index diagonal
+  multiplication so retained weights work on Quimb builds without the
+  plural-index helper.
+
+- **Full-update iteration default:** `PepsOptimizer` now defaults to a
+  maximum of 20 pair-solver iterations instead of 50. Explicit
+  `full_update_kwargs['max_iterations']` retains precedence.
+
 - **Optional joint cluster updates:** ordinary and prepared PEPO cluster
   streams accept explicit `both` entries or opt-in `fuse_pepo_legs=True` to
   fit adjacent opposite-leg gates on one bond together. No reordering or

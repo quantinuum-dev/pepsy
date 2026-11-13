@@ -19,6 +19,27 @@ def fixture(dtype='complex128', shape=(2, 2), bond=2):
     return state, gate, policy
 
 
+@pytest.mark.parametrize('controls,expected', [({}, 20), ({'max_iterations': 7}, 7)])
+def test_full_update_pair_iteration_default_and_override(controls, expected):
+    state, gate, _ = fixture()
+    opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=2,
+                        mode='full-update', full_update_kwargs=controls)
+    assert opt.full_update_kwargs['max_iterations'] == expected
+
+
+@pytest.mark.parametrize('constructor_order,run_order,expected', [
+    (None, None, 'smart'), ('input', None, 'input'), (None, 'column', 'column'),
+])
+def test_full_update_smart_default_and_explicit_gate_order(constructor_order, run_order, expected):
+    state, gate, _ = fixture()
+    opt = PepsOptimizer(state, [(gate, ((0, 0), (0, 1)))], chi=2,
+                        mode='full-update', gate_order=constructor_order,
+                        fit_mode='direct', boundary_chi=8, normalize_initial=False,
+                        contraction_opt='greedy', full_update_kwargs={'max_iterations': 2})
+    opt.run(gate_order=run_order, normalize_final=False)
+    assert opt.last_gate_order['policy'] == expected
+
+
 @pytest.mark.parametrize('fit_mode', ['direct', 'zipup', 'dmrg', 'dmrg2'])
 def test_boundary_default_preserves_separate_layers_or_joint_fit(monkeypatch, fit_mode):
     from pepsy.boundary import CompBdy
@@ -125,7 +146,7 @@ def test_full_update_driver_checks_chi_and_normalizes_output():
 
 
 @pytest.mark.parametrize('selection', ['alias', 'style', 'run-style'])
-def test_full_update_defaults_use_one_fixed_chi_and_cached_dmrg(monkeypatch, selection):
+def test_full_update_defaults_use_one_fixed_chi_and_cached_direct(monkeypatch, selection):
     state, gate, policy = fixture(shape=(3, 3))
     gates = [(gate, ((1, 0), (1, 1))), (gate, ((1, 1), (1, 2)))]
     constructor = {'mode': 'full-update'} if selection == 'alias' else (
@@ -142,6 +163,7 @@ def test_full_update_defaults_use_one_fixed_chi_and_cached_dmrg(monkeypatch, sel
     monkeypatch.setattr(opt, 'estimate_infidelity', unexpected_probe)
     run_options = {'update_style': 'two-site'} if selection == 'run-style' else {}
     out = opt.run(**run_options)
+    assert opt.last_gate_order['policy'] == 'smart'
     assert opt.boundary_chi == 8
     assert opt._boundary_chi_for_norm() == 8
     assert opt._boundary_chi_for_infidelity() == 8
@@ -149,7 +171,9 @@ def test_full_update_defaults_use_one_fixed_chi_and_cached_dmrg(monkeypatch, sel
     assert opt.evaluation_max_retries == 0
     assert not opt.accept_if_improved
     assert opt.evaluation_records == []
-    assert opt.boundary_kwargs['fit_mode'] == 'dmrg'
+    assert opt.boundary_kwargs['fit_mode'] == 'direct'
+    assert opt._metric_boundary_options()['fit_layer_mode'] == 'sequential'
+    assert opt._metric_boundary_options()['layer_tags'] == ('BRA', 'KET')
     assert opt.boundary_kwargs['fit_init_strategy'] == 'reuse-direct'
     assert opt.boundary_kwargs['n_iter'] == 4
     assert opt.full_update_kwargs['tensor_mode'] == 'reduced'

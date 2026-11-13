@@ -1631,6 +1631,7 @@ def test_fermionic_open_rho_is_native_diagnostic_and_scalar_path_is_graded():
         ("U1", 2, None),
         ("U1U1", 4, site_charge_alternating((1, 0), (0, 1))),
         ("Z2", 2, None),
+        ("Z2Z2", 4, site_charge_alternating((1, 0), (0, 1))),
     ),
 )
 def test_fermionic_open_rho_sweep_supports_native_symmetries(
@@ -1638,7 +1639,7 @@ def test_fermionic_open_rho_sweep_supports_native_symmetries(
     phys_dim,
     site_charge,
 ):
-    """One-BP open-rho sweeps preserve native U1, U1U1, and Z2 arrays."""
+    """Native open-rho sweeps include zero corrections without densifying them."""
     state = SymPEPS.random(
         1,
         4,

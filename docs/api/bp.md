@@ -1377,6 +1377,8 @@ multigraph, so period-two seam bonds remain distinct paths and loop edges.
 This path performs an explicit configuration sum and normalizes only after
 the sum; it does not apply the scalar disconnected-loop resummation used by
 `partial_trace_edge_loop_series_expand`.
+Native Symmray correction terms with no stored charge blocks contribute zero
+trace without dense conversion; the returned density matrix remains native.
 
 For a cutoff sweep, reuse both the converged messages and the two caches. The
 same `info` dictionary keeps already-contracted rho terms, regional

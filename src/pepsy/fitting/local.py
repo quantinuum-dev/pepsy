@@ -2173,15 +2173,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if right_environment_ind is not None
             else None
         )
-        if left_axis is not None and right_axis is not None:
-            data.phase_flip(
-                left_axis if data.duals[left_axis] else right_axis,
-                inplace=True,
-            )
-        elif left_axis is not None and data.duals[left_axis]:
-            data.phase_flip(left_axis, inplace=True)
-        elif right_axis is not None and data.duals[right_axis]:
-            data.phase_flip(right_axis, inplace=True)
+        # Reversed native gates can orient both virtual legs the same way.
+        # Each dual environment leg needs its own parity correction; assuming
+        # exactly one is dual changes an already exact one-site projection.
+        dual_environment_axes = tuple(
+            axis for axis in (left_axis, right_axis)
+            if axis is not None and data.duals[axis]
+        )
+        if dual_environment_axes:
+            data.phase_flip(*dual_environment_axes, inplace=True)
 
         dual_physical_axes = tuple(
             axis

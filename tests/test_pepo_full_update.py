@@ -333,17 +333,69 @@ def test_pepo_strip_cache_reuse_matches_uncached_updates(monkeypatch, warmstart_
     np.testing.assert_allclose(outputs[0], outputs[1], rtol=2e-9, atol=2e-10)
 
 
-def test_pepo_positive_norm_projection_and_environment_gauges():
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_pepo_positive_norm_projection_and_environment_gauges(device):
     import torch
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
     state = fixture()
-    pair = ReducedPair(state, torch.tensor(unitary(4)), ((0, 0), (0, 1)), chi=2,
+    state.apply_to_arrays(lambda x: x.to(device))
+    pair = ReducedPair(state, torch.tensor(unitary(4), device=device), ((0, 0), (0, 1)), chi=2,
                        which='lower')
-    norm = torch.eye(pair.na*pair.nb, dtype=torch.complex128)
+    norm = torch.eye(pair.na*pair.nb, dtype=torch.complex128, device=device)
     norm[0, 0], norm[-1, -1], norm[0, 1] = -.01, 0., .01j
     output, report = pair.optimize(norm, {'solver': 'qr', 'gauge': True, 'max_iterations': 4})
     assert report['norm_negative_weight'] > 0 and report['norm_clipped_eigenvalues'] > 0
     assert report['norm_antihermitian_relative'] > 0
     assert isinstance(output, qtn.PEPO) and np.isfinite(dense(output)).all()
+
+
+@pytest.mark.parametrize('dtype', ['complex64', 'complex128'])
+@pytest.mark.parametrize('rank_case', ['zero', 'exact', 'discarded'])
+def test_cuda_svd_rank_and_discarded_weight_match_cpu(dtype, rank_case):
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    state = fixture(dtype=dtype)
+    results = []
+    for device in ('cpu', 'cuda'):
+        local = state.copy()
+        local.apply_to_arrays(lambda x: x.to(device))
+        pair = ReducedPair(local, torch.tensor(unitary(4), dtype=getattr(torch, dtype), device=device),
+                           ((0, 0), (0, 1)), chi=2, which='lower')
+        rows, cols = pair.na * pair.dims[0], pair.dims[1] * pair.nb
+        matrix = torch.zeros((rows, cols), dtype=getattr(torch, dtype), device=device)
+        if rank_case != 'zero':
+            eps = 2.**-23 if dtype == 'complex64' else 2.**-52
+            values = ((1., .4, 0., 0.) if rank_case == 'exact' else
+                      (1., .4, 2*eps*max(rows, cols), .5*eps*max(rows, cols)))
+            matrix[torch.arange(4, device=device), torch.arange(4, device=device)] = torch.tensor(
+                values, dtype=getattr(torch, dtype), device=device)
+        pair.theta = matrix.reshape(pair.na, pair.dims[0], pair.dims[1], pair.nb).permute(0, 1, 3, 2)
+        pair.initial_states(build_target=False)
+        results.append((pair.target_rank, pair.warmstart_exact, pair.discarded_weight))
+    assert results[0][0] == {'zero': 0, 'exact': 2, 'discarded': 3}[rank_case]
+    assert results[1][:2] == results[0][:2]
+    assert results[1][2] == pytest.approx(results[0][2], rel=1e-6, abs=1e-35)
+
+
+def test_cuda_deferred_psd_diagnostics_match_scalar_reference():
+    import torch
+    from pepsy.bp.reduced_update import _psd_project_metric
+
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    metric = torch.tensor([[1., .1j, 0.], [.03, -.2, 0.], [0., 0., .4]],
+                          dtype=torch.complex128, device='cuda')
+    expected = _psd_project_metric(metric, 0., return_spectrum=True)
+    actual = _psd_project_metric(metric, 0., return_spectrum=True, defer_diagnostics=True)
+    torch.testing.assert_close(actual[0], expected[0])
+    assert float(actual[1]) == pytest.approx(expected[1])
+    assert int(actual[2]) == expected[2]
+    for a, b in zip(actual[3:], expected[3:]):
+        torch.testing.assert_close(a, b)
+    with pytest.raises(ValueError, match='zero floor'):
+        _psd_project_metric(metric, .01, defer_diagnostics=True)
 
 
 @pytest.mark.parametrize('tensor_mode', ['reduced', 'full'])

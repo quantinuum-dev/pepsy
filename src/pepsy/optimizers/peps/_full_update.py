@@ -26,7 +26,7 @@ from ...operators.gates import _is_operator_tensor_network, _normalize_gate_whic
 
 
 def options(values=None):
-    result = {'max_iterations': 50, 'rtol': 'auto', 'rcond': None, 'gauge': False,
+    result = {'max_iterations': 20, 'rtol': 'auto', 'rcond': None, 'gauge': False,
               'gauge_qr': 'qr',
               'tensor_mode': 'reduced', 'skip_exact': True,
               'solver': 'auto', 'refine_sweeps': 0, 'refine_rtol': 'auto',
@@ -258,12 +258,28 @@ class ReducedPair:
             self.na * self.dims[0], self.dims[1] * self.nb)
         u, s, vh = ar.do('linalg.svd', matrix)
         eps = 2.**-23 if ar.get_dtype_name(matrix) == 'complex64' else 2.**-52
-        threshold = eps * max(matrix.shape) * float(s[0])
-        self.target_rank = int(ar.do('sum', s > threshold))
+        if ar.infer_backend(s) == 'torch' and s.is_cuda:
+            import torch
+            # Rank controls tensor shapes on the host. Collect it and the
+            # discarded-weight diagnostics in one small device transfer.
+            threshold = (s[0].to(torch.float64) * (eps * max(matrix.shape))).to(s.dtype)
+            numerical_rank = torch.sum(s > threshold)
+            retained = numerical_rank.clamp(min=1, max=self.chi)
+            squares = s.square()
+            discarded = torch.sum(squares * (torch.arange(s.numel(), device=s.device) >= retained))
+            stats = torch.stack((numerical_rank.to(torch.float64),
+                                 torch.sum(squares).to(torch.float64),
+                                 discarded.to(torch.float64))).detach().cpu().tolist()
+            self.target_rank, total, discarded_weight = int(stats[0]), stats[1], stats[2]
+        else:
+            threshold = eps * max(matrix.shape) * float(s[0])
+            self.target_rank = int(ar.do('sum', s > threshold))
+            total = float(ar.do('sum', s**2))
+            rank = max(1, min(self.chi, self.target_rank))
+            discarded_weight = float(ar.do('sum', s[rank:]**2))
         self.warmstart_exact = 0 < self.target_rank <= self.chi
         rank = max(1, min(self.chi, self.target_rank))
-        total = float(ar.do('sum', s**2))
-        self.discarded_weight = float(ar.do('sum', s[rank:]**2)) / total if total > 0 else 0.
+        self.discarded_weight = discarded_weight / total if total > 0 else 0.
 
         def factors(count):
             roots = ar.do('sqrt', s[:count])
@@ -377,15 +393,30 @@ class ReducedPair:
         if float(scale) == 0:
             raise ValueError('full-update norm environment is zero')
         norm = norm / scale
-        projected, _, clipped, values, vectors, positive = _psd_project_metric(norm, 0., return_spectrum=True)
-        if float(positive.max()) <= 0:
+        on_cuda = ar.infer_backend(norm) == 'torch' and norm.is_cuda
+        projected, _, clipped, values, vectors, positive = _psd_project_metric(
+            norm, 0., return_spectrum=True, defer_diagnostics=on_cuda)
+        if on_cuda:
+            import torch
+            diagnostics = torch.stack((positive.max(), torch.linalg.norm(norm - norm.mH),
+                values.min(), (-values.clamp(max=0)).sum() / positive.sum(),
+                clipped.to(values.dtype))).detach().cpu().tolist()
+            positive_max, antihermitian, minimum, negative_weight, clipped = diagnostics
+            clipped = int(clipped)
+        else:
+            positive_max = float(positive.max())
+        if positive_max <= 0:
             raise ValueError('full-update norm environment has no positive support')
+        if not on_cuda:
+            antihermitian = float(ar.do('linalg.norm', norm - dag(norm)))
+            minimum = float(values.min())
+            negative_weight = float((-ar.do('clip', values, None, 0)).sum() / positive.sum())
         report = {
             'norm_matrix_dimension': self.na * self.nb,
             'reduced_physical_dimensions': self.dims,
-            'norm_antihermitian_relative': float(ar.do('linalg.norm', norm - dag(norm))),
-            'norm_min_eigenvalue': float(values.min()),
-            'norm_negative_weight': float((-ar.do('clip', values, None, 0)).sum() / positive.sum()),
+            'norm_antihermitian_relative': antihermitian,
+            'norm_min_eigenvalue': minimum,
+            'norm_negative_weight': negative_weight,
             'rcond': rcond, 'environment_gauge_applied': False,
             'gauge_qr': controls['gauge_qr'] if controls['gauge'] else None,
             'norm_clipped_eigenvalues': clipped,
@@ -427,7 +458,8 @@ class ReducedPair:
             return einsum('apbq,abcd,cpdq->', a.conj(), n, b)
 
         target_norm = inner(theta, theta).real
-        if not all_finite(target_norm) or float(target_norm) <= 0:
+        target_norm_value = float(target_norm)
+        if not math.isfinite(target_norm_value) or target_norm_value <= 0:
             raise ValueError('full-update target has no positive environment norm')
 
         def loss(left, right):
@@ -458,9 +490,11 @@ class ReducedPair:
         baseline_norm = float(inner(baseline, baseline).real)
         baseline_fidelity = (float(abs(inner(baseline, theta)) ** 2 / (baseline_norm * target_norm))
                              if baseline_norm > 0. else None)
-        if baseline_loss < loss(left, right):
+        initial_loss = loss(left, right)
+        if baseline_loss < initial_loss:
             left, right = baseline_left, baseline_right
-        history = [loss(left, right)]
+            initial_loss = baseline_loss
+        history = [initial_loss]
         solution = self.solve(n, theta, left, right, controls, tolerance, rcond)
         proposed_left, proposed_right = solution.left, transpose(solution.right, (0, 2, 1))
         current = loss(proposed_left, proposed_right)
@@ -470,7 +504,8 @@ class ReducedPair:
             history.append(current)
         candidate = einsum('apk,kbq->apbq', left, right)
         fidelity = abs(inner(candidate, theta)) ** 2 / (inner(candidate, candidate).real * target_norm)
-        if not all_finite(fidelity):
+        fidelity_value = float(fidelity.real)
+        if not math.isfinite(fidelity_value):
             raise ValueError('full-update candidate has an unusable positive-environment norm')
         # Undo the environment gauges, then balance the internal bond by SVD.
         left = einsum('ac,cpk->apk', inv_a, left)
@@ -496,8 +531,8 @@ class ReducedPair:
                                      if solution.solver == 'lbfgs' else
                                      'normalized residual or complete-sweep cost change'),
                       loss_history=history,
-                      solver_costs=[float(c) / float(target_norm) for c in solution.costs],
-                      fidelity=float(fidelity.real), infidelity=max(0., min(1., 1. - float(fidelity.real))),
+                      solver_costs=[float(c) / target_norm_value for c in solution.costs],
+                      fidelity=fidelity_value, infidelity=max(0., min(1., 1. - fidelity_value)),
                       fidelity_convention='local positive-environment estimate; not global fidelity')
         return self.state_from(left, right), report
 
