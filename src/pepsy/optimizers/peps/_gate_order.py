@@ -112,6 +112,45 @@ def _pauli_support(gate, n, constants):
     return None
 
 
+def _cuda_pauli_supports(gates, n, constants):
+    """Classify fixed CUDA gates in bounded groups with one host read each."""
+    import torch
+    from ...backends import infer_backend_converter_from_sample, infer_backend_signature
+
+    words, first, second, rows, cols = _PATTERNS[n]
+    matrix = torch.stack([gate.reshape(2**n, 2**n) for gate in gates]) + 0j
+    key = (n, infer_backend_signature(matrix[0]))
+    if key not in constants:
+        convert = infer_backend_converter_from_sample(matrix[0])
+        constants[key] = convert(first), convert(second), convert([2**i for i in range(len(words))]).real
+    first, second, weights = constants[key]
+    expected = (matrix[:, 0, 0, None, None, None] * first[None]
+                + matrix[:, rows, cols, None, None] * second[None])
+    matches = torch.all(matrix[:, None] == expected, dim=(-2, -1))
+    masks = torch.sum(matches * weights, dim=-1).to(torch.int64)
+    diagonal = torch.all(matrix == torch.diag_embed(torch.diagonal(matrix, dim1=-2, dim2=-1)),
+                         dim=(-2, -1))
+    stats = torch.stack((masks, diagonal.to(torch.int64)), dim=-1).cpu().tolist()
+    result = []
+    for mask, is_diagonal in stats:
+        if mask:
+            result.append((words[(mask & -mask).bit_length() - 1],))
+        elif is_diagonal:
+            result.append(tuple(product('IZ', repeat=n)))
+        else:
+            result.append(None)
+    return result
+
+
+def _cuda_diagonal_gates(gates):
+    """Apply the existing exact diagonal test to a bounded CUDA batch."""
+    import torch
+
+    matrices = torch.stack([gate.reshape(4, 4) for gate in gates])
+    diagonal = torch.diag_embed(torch.diagonal(matrices, dim1=-2, dim2=-1))
+    return (torch.count_nonzero(matrices - diagonal, dim=(-2, -1)) == 0).cpu().tolist()
+
+
 def _commute(a, b):
     sites_a, words_a = a[:2]
     sites_b, words_b = b[:2]
@@ -225,6 +264,26 @@ def _schedule(entries, descriptors, preferred, *, pair_opposite_legs=False):
 def _smart_order(optimizer, entries, *, pair_opposite_legs=False):
     ordered, block, descriptors = [], [], []
     signatures, constants = {}, {}
+    # Classifications depend only on gate values, so they can be computed
+    # before scheduling while unsupported gates remain ordering barriers.
+    # Group only nondifferentiable Torch CUDA gates; other backends retain
+    # the ordinary scalar path. Bound memory independently of stream length.
+    from ...backends import infer_backend_signature
+    cuda_groups = {}
+    seen = set()
+    for _, entry in entries:
+        sites = fixed_gate_sites(optimizer, entry)
+        gate = entry[0]
+        key = (id(gate), len(sites)) if sites is not None else None
+        if (key is not None and key not in seen and ar.infer_backend(gate) == 'torch'
+                and gate.is_cuda):
+            seen.add(key)
+            cuda_groups.setdefault((len(sites), infer_backend_signature(gate)), []).append((key, gate))
+    for (arity, _), group in cuda_groups.items():
+        for start in range(0, len(group), 128):
+            batch = group[start:start+128]
+            values = _cuda_pauli_supports([gate for _, gate in batch], arity, constants)
+            signatures.update((item[0], value) for item, value in zip(batch, values))
     def flush():
         if block:
             # Compare refinement-block counts, then strip changes. This is a
@@ -337,13 +396,30 @@ def order_gates(optimizer, policy, *, pair_opposite_legs=False):
         inner = min(a[1 - axis], b[1 - axis])
         return orientation, strip, inner if strip % 2 == 0 else -inner
 
+    from ...backends import infer_backend_signature
+    cuda_diagonal, cuda_groups = {}, {}
+    seen = set()
+    for entry in entries:
+        gate = entry[1][0]
+        if (sortable(entry) and id(gate) not in seen and ar.infer_backend(gate) == 'torch'
+                and gate.is_cuda):
+            seen.add(id(gate))
+            cuda_groups.setdefault(infer_backend_signature(gate), []).append(gate)
+    for group in cuda_groups.values():
+        for start in range(0, len(group), 128):
+            batch = group[start:start+128]
+            cuda_diagonal.update((id(gate), diagonal)
+                                 for gate, diagonal in zip(batch, _cuda_diagonal_gates(batch)))
+
     ordered, block = [], []
     supports = set()
     nondiagonal_supports = set()
     for entry in entries:
         if sortable(entry):
             support = {(tuple(site), _gate_leg(optimizer, entry[1])) for site in entry[1][1]}
-            diagonal = optimizer._gate_bond_factor(entry[1][0]) == 2
+            gate = entry[1][0]
+            diagonal = (cuda_diagonal[id(gate)] if id(gate) in cuda_diagonal
+                        else optimizer._gate_bond_factor(gate) == 2)
             conflicts = nondiagonal_supports if diagonal else supports
             if support & conflicts:
                 ordered.extend(sorted(block, key=key))

@@ -50,7 +50,10 @@ class SimpleUpdateWarmStart:
             values = [ar.do('sqrt', self.gauges[ix]) for ix in indices]
             if inverse:
                 values = [1 / value for value in values]
-            tensor.multiply_index_diagonals_(indices, values)
+            # Quimb's public single-index operation is available in both
+            # supported and current builds; diagonal factors commute.
+            for index, value in zip(indices, values):
+                tensor.multiply_index_diagonal_(index, value)
 
     def prepare(self, state, gate, where, *, which, chi, cutoff, cutoff_mode):
         if not self.matches(state):

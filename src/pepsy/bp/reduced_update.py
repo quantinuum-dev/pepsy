@@ -2158,28 +2158,37 @@ def _loop_cluster_region_counts(
     )
 
 
-def _psd_project_metric(metric, psd_floor: float, *, return_spectrum=False):
-    """Return a Hermitian PSD projection and projection diagnostics."""
+def _psd_project_metric(metric, psd_floor: float, *, return_spectrum=False,
+                        defer_diagnostics=False):
+    """Return a Hermitian PSD projection and projection diagnostics.
+
+    With ``defer_diagnostics`` and a zero floor, keep the minimum and clipped
+    count on their native backend so the caller can collect them together.
+    """
     if psd_floor < 0.0:
         raise ValueError("psd_floor must be nonnegative")
 
     hermitian = 0.5 * (metric + _dag(metric))
     eigenvalues, eigenvectors = ar.do("linalg.eigh", hermitian)
-    raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
-    scale = (
-        max(1.0, _scalar_float(ar.do("max", _backend_abs(eigenvalues))))
-        if eigenvalues.shape[0]
-        else 1.0
-    )
-    floor = float(psd_floor) * scale
-    clipped = ar.do(
-        "maximum",
-        eigenvalues,
-        _backend_array(floor, like=eigenvalues),
-    )
+    if defer_diagnostics:
+        if psd_floor != 0.0:
+            raise ValueError("deferred PSD diagnostics require a zero floor")
+        raw_min = eigenvalues[0] if eigenvalues.shape[0] else 0.0
+        floor = 0.0
+    else:
+        raw_min = _scalar_float(eigenvalues[0]) if eigenvalues.shape[0] else 0.0
+        scale = (
+            max(1.0, _scalar_float(ar.do("max", _backend_abs(eigenvalues))))
+            if eigenvalues.shape[0]
+            else 1.0
+        )
+        floor = float(psd_floor) * scale
+    clipped = (ar.do("clip", eigenvalues, 0.0, None) if defer_diagnostics else
+               ar.do("maximum", eigenvalues, _backend_array(floor, like=eigenvalues)))
     projected = (eigenvectors * clipped) @ _dag(eigenvectors)
     projected = 0.5 * (projected + _dag(projected))
-    result = projected, raw_min, _scalar_int(ar.do("sum", eigenvalues < floor))
+    count = ar.do("sum", eigenvalues < floor)
+    result = projected, raw_min, count if defer_diagnostics else _scalar_int(count)
     if return_spectrum:
         # Boundary full-update gauges need the same eigensystem: returning it
         # avoids a second decomposition of the already projected metric.

@@ -18,6 +18,54 @@ _NATIVE_REPLAY_MODES = (
 )
 
 
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
+@pytest.mark.parametrize(
+    ("mode", "sweep_sequence"),
+    [("dmrg", "R"), ("dmrg", "L"), ("dmrg", "RL"),
+     ("dmrg2", "RL"), ("dmrg3", "RL")],
+)
+def test_native_fermion_reversed_gate_fit_preserves_exact_guess(
+    backend, symmetry, mode, sweep_sequence,
+):
+    """Reversed gates need independent parity phases on both virtual legs."""
+    converter = None
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        converter = py.backend_torch(device="cpu", dtype=torch.complex128)
+    fermion = py.Fermion(spinful=True, symmetry=symmetry, to_backend=converter)
+    state = py.ps_to_mps(
+        4, fermion=fermion, occupations=fermion.half_filled_occupations(4),
+        dtype="complex128", to_backend=converter, seed=3,
+    )
+    gate = fermion.hopping_gate(0.17, t=1.0)
+    # Entangle across the fitted window's boundary before reversing its bond.
+    # Starting a new optimizer also exercises native canonical initialization.
+    for edge in ((0, 3), (1, 2)):
+        state.gate_with_auto_swap_(gate, edge, max_bond=16, cutoff=1e-12)
+    reference = state.copy(deep=True)
+    reference.gate_with_auto_swap_(gate, (1, 0), max_bond=16, cutoff=1e-12)
+
+    optimizer = py.MpsOptimizer(
+        state, [(gate, (1, 0))], chi=16, mode=mode, contraction_opt="greedy",
+    )
+    output = optimizer.run(
+        progbar=False, n_iter=3, cutoff=1e-12, target_cutoff=0.0,
+        fit_sweep_sequence=sweep_sequence, fit_rtol=None, stabilize_unitary=False,
+    )
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in output)
+    assert output.max_bond() <= 16
+    assert float(np.real(py.to_float(py.tn_fidelity(output, reference)))) == pytest.approx(
+        1.0, abs=1e-10,
+    )
+    diagnostics = optimizer._last_dmrg_fit_diagnostics
+    assert diagnostics["backend"] == "fit"
+    assert not diagnostics["fallback"]
+    if mode == "dmrg":
+        assert diagnostics["block_size"] == 1
+        assert diagnostics["adaptive_sweeps"] == 0
+
+
 def test_fit_gate_three_site_symmray_uses_native_block_splits():
     """Symmray three-site FIT should preserve charge and fermionic blocks."""
     pytest.importorskip("symmray")

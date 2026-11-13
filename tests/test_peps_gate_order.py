@@ -5,7 +5,66 @@ import pytest
 import quimb.tensor as qtn
 
 from pepsy.optimizers.peps import PepsOptimizer
-from pepsy.optimizers.peps._gate_order import order_gates
+from pepsy.optimizers.peps._gate_order import (
+    _cuda_diagonal_gates, _cuda_pauli_supports, _pauli_patterns, _pauli_support, order_gates,
+)
+
+
+@pytest.mark.parametrize('arity', [1, 2])
+@pytest.mark.parametrize('dtype', ['complex64', 'complex128'])
+def test_cuda_batch_gate_classification_matches_scalar_reference(arity, dtype):
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    _, first, second, _, _ = _pauli_patterns(arity)
+    convert = lambda x: torch.as_tensor(x, dtype=getattr(torch, dtype), device='cuda')
+    gates = [convert(a) * (.6+.2j) + convert(b) * (.3-.1j)
+             for a, b in zip(first, second)]
+    dim = 2**arity
+    gates.extend((torch.zeros((dim, dim), dtype=getattr(torch, dtype), device='cuda'),
+                  torch.diag(convert(range(1, dim+1))),
+                  convert(np.arange(dim**2).reshape(dim, dim) + .13j)))
+    if arity == 2:
+        gates[-1] = gates[-1].reshape(2, 2, 2, 2)
+    expected = [_pauli_support(gate, arity, {}) for gate in gates]
+    assert _cuda_pauli_supports(gates, arity, {}) == expected
+
+
+@pytest.mark.parametrize('dtype', ['complex64', 'complex128'])
+def test_cuda_batch_diagonal_check_matches_scalar_reference(dtype):
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    diagonal = torch.diag(torch.tensor([1, 1j, 2, -1], dtype=getattr(torch, dtype), device='cuda'))
+    arbitrary = torch.ones((4, 4), dtype=getattr(torch, dtype), device='cuda')
+    nonfinite = diagonal.clone()
+    nonfinite[0, 0] = float('inf')
+    gates = [diagonal, arbitrary.reshape(2, 2, 2, 2), nonfinite]
+    expected = [PepsOptimizer._gate_bond_factor(gate) == 2 for gate in gates]
+    assert _cuda_diagonal_gates(gates) == expected
+
+
+def test_cuda_smart_gate_order_matches_scalar_classification(monkeypatch):
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    from pepsy.optimizers.peps import _gate_order
+
+    state = qtn.PEPO.rand(3, 3, bond_dim=1, dtype='complex128', seed=13)
+    state.apply_to_arrays(lambda x: torch.tensor(x, device='cuda'))
+    x = torch.tensor([[0, 1], [1, 0]], dtype=torch.complex128, device='cuda')
+    rx = torch.eye(2, dtype=torch.complex128, device='cuda') * .8 + .6j*x
+    zz = torch.diag(torch.tensor([1, 1j, 1j, 1], dtype=torch.complex128, device='cuda'))
+    entries = [(rx, (0, 0), 'upper'), (zz, ((0, 0), (1, 0)), 'upper'),
+               (zz.clone(), ((0, 1), (1, 1)), 'lower'), (rx.clone(), (1, 0), 'lower'),
+               (zz.clone(), ((1, 0), (2, 0)), 'upper'),
+               (zz.clone(), ((1, 0), (1, 1)), 'lower')]
+    opt = PepsOptimizer(state, entries, chi=2, normalize_initial=False)
+    actual = [index for index, _ in order_gates(opt, 'smart', pair_opposite_legs=True)]
+    monkeypatch.setattr(_gate_order, '_cuda_pauli_supports',
+                        lambda gates, n, constants: [_pauli_support(g, n, constants) for g in gates])
+    reference = [index for index, _ in order_gates(opt, 'smart', pair_opposite_legs=True)]
+    assert actual == reference
 
 
 @pytest.mark.parametrize('policy', ['row', 'column'])

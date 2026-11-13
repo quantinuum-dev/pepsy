@@ -1937,8 +1937,15 @@ def _gate_from_term(term, dt, *, imaginary=False):
             "Hamiltonian terms must have one-site shape (d, d) or two-site "
             "shape (da, db, da, db)."
         )
+    if callable(getattr(term, "fill_missing_blocks", None)):
+        # A sparse zero generator block exponentiates to identity, not zero.
+        # Fill before fusion: otherwise absent physical sectors disappear
+        # from fused indices. Cached observables keep their sparse layout.
+        term = term.copy()
+        term.fill_missing_blocks()
+    matrix = term.reshape(matrix_shape)
     scale = -dt if imaginary else -1j * dt
-    return ar.do("linalg.expm", scale * term.reshape(matrix_shape)).reshape(shape)
+    return ar.do("linalg.expm", scale * matrix).reshape(shape)
 
 
 def _zero_like_charge(charge):

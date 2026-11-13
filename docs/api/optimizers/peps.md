@@ -232,10 +232,13 @@ exact unit norm. Long-run fidelity improvements need separate benchmarks.
 
 ## Boundary caps
 
-Two-site full update defaults to reduced-tensor ALS, `gauge=False`, one
+Two-site full update defaults to reduced-tensor ALS with at most 20 iterations
+per pair, `gauge=False`, one
 `boundary_chi=2*D**2` shared by normalization and evaluation, and cached boundary
-MPS with `fit_mode="dmrg"`, `fit_init_strategy="reuse-direct"`, and
-`boundary_kwargs={"n_iter": 4}`. Cold cuts use direct compression; a previously
+MPS with `fit_mode="direct"`. Select `fit_mode="dmrg"` explicitly for the
+previous variational boundary default. DMRG uses
+`fit_init_strategy="reuse-direct"` and `boundary_kwargs={"n_iter": 4}` by
+default. Cold cuts use direct compression; a previously
 fitted boundary is used only as a starting guess when a changed cut is refitted
 against its current target. Set `fit_init_strategy="guess-src"` to test seeded
 SRC for every guess, or `"reuse-src"` to use SRC only for cold cuts. Unsupported
@@ -245,7 +248,7 @@ non-differentiable seed, preserving its represented state while opening the
 requested bond space. An early low-rank cut therefore cannot prevent later
 growth. Differentiable/unsupported starts and reduced caps retain fresh seeding.
 
-Explicit initialization and `boundary_kwargs['n_iter']` override these defaults,
+For DMRG, explicit initialization and `boundary_kwargs['n_iter']` override these defaults,
 including when switching into full-update mode at `run()`. To reproduce older
 FU runs select `fit_init_strategy="guess-direct", boundary_kwargs={"n_iter": 2}`
 when those were their recorded settings. Four iterations are a budget, not
@@ -574,9 +577,9 @@ optimizer = PepsOptimizer(
     state, gates, chi=4, mode="sweep", update_style="two-site",
     gate_order="column",
     boundary_chi=32,                        # default 2*D**2 for D=4
-    fit_mode="dmrg",                        # default boundary compression
+    fit_mode="dmrg",                        # explicit variational boundary
     full_update_kwargs={
-        "max_iterations": 50, "rtol": "auto",
+        "max_iterations": 20, "rtol": "auto",
         "rcond": 1e-12, "gauge": False, "solver": "auto", "tensor_mode": "reduced",
     },
 )
@@ -607,6 +610,14 @@ eigenvalues are set to zero. Environment gauge conditioning is disabled by
 default (`gauge=False`). The existing explicit `gauge=True` option remains
 available; it uses independent gauges from the same square root when invertible.
 Reduction and positive-environment projection do not require this conditioning.
+
+For dense Torch CUDA inputs, full update collects SVD-rank and norm-metric
+diagnostics in small grouped device-to-host transfers. Smart, row and column
+ordering classify fixed CUDA gates in bounded batches, while preserving the
+same exact gate-dependency tests. Tensor contractions and reduced ALS retain
+their array backend; rank choices, convergence, diagnostics, and CUDA linear
+algebra can still synchronize with the host. The optional pair L-BFGS solver
+uses SciPy and exchanges its parameter and gradient vectors with the host.
 
 For non-differentiable dense Torch/CuPy full updates, opt into Quimb's adaptive
 QR for these two environment gauges:
@@ -684,7 +695,7 @@ To optimize both full site tensors jointly, use:
 ```python
 full_update_kwargs = {
     "tensor_mode": "full", "solver": "lbfgs", "gauge": False,
-    "max_iterations": 50, "rtol": "auto",
+    "max_iterations": 20, "rtol": "auto",
 }
 ```
 
@@ -936,14 +947,15 @@ overlapping non-diagonal gates commute. Single-site, trainable, or unsupported
 gates remain barriers, and a conflicting gate starts a new block.
 This preserves the exact circuit; different truncation order can still change
 the approximate result. Sweep mode defaults to `"column"` (`"row"` for
-`update_style="row"`); global and full-update modes default to `"input"`.
+`update_style="row"`); global mode defaults to `"input"` and full update
+defaults to `"smart"`.
 The traversal is a cache-friendly heuristic, not a globally optimal scheduling
 search. When depth boundaries must remain strict, submit one depth per run.
 `optimizer.last_gate_order` records one-based original gate positions in
 execution order, and the supplied gate queue is restored even after failure.
 `run(update_style=..., gate_order=...)` can override both options temporarily.
 
-For more scheduling freedom, opt into `gate_order="smart"`:
+Full update defaults to `gate_order="smart"`; select it explicitly for other modes:
 
 ```python
 optimizer = PepsOptimizer(

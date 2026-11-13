@@ -1528,7 +1528,11 @@ def test_native_fermion_pepo_reverse_simple_update_unitary_families(
         forward_gate = fermion.sxx_gate(0.13)
 
     gate_matrix = forward_gate.fuse((0, 1), (2, 3))
-    operator_matrix = operator.fuse((0, 1), (2, 3))
+    # Keep the reference sandwich in the gate's full physical charge space.
+    # Fusing a sparse term first drops zero component sectors within a charge.
+    operator_matrix = operator.copy()
+    operator_matrix.fill_missing_blocks()
+    operator_matrix = operator_matrix.fuse((0, 1), (2, 3))
     exact_local = (
         gate_matrix.H @ operator_matrix @ gate_matrix
     ).reshape((4, 4, 4, 4))
@@ -1728,6 +1732,45 @@ def test_fermion_generic_exponential_matches_named_interaction_gate():
         fermion.interaction_gate(0.2, U=3.0).to_dense(),
     )
     assert type(generic).__name__ == "U1U1FermionicArray"
+
+
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1", "Z2", "Z2Z2"])
+@pytest.mark.parametrize("imaginary", [False, True])
+def test_fermion_generic_exponential_fills_missing_zero_sectors(symmetry, imaginary):
+    """Sparse generators retain identity in every zero charge block."""
+    from scipy.linalg import expm
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    names = ["double", "number"]
+    if symmetry in {"U1", "Z2"}:
+        names += ["sx", "sy", "sz"]
+    for name in names:
+        operator = fermion.observable(name)
+        original_blocks = set(operator.blocks)
+        dense = np.asarray(operator.to_dense())
+        for theta in (0.0, 0.13):
+            gate_ = fermion.operator_gate(operator, theta, imaginary=imaginary)
+            scale = -theta if imaginary else -1j * theta
+            np.testing.assert_allclose(gate_.to_dense(), expm(scale * dense), atol=1e-13)
+            assert type(gate_) is type(operator)
+            assert set(operator.blocks) == original_blocks
+            np.testing.assert_array_equal(operator.to_dense(), dense)
+
+
+@pytest.mark.parametrize("symmetry", ["U1", "Z2"])
+@pytest.mark.parametrize("name", ["sxx", "syy", "szz", "heisenberg"])
+def test_fermion_zero_angle_two_site_gate_preserves_unoccupied_spin_sectors(symmetry, name):
+    """A spin gate acts as identity on holes and doublons at zero angle."""
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    state = pepsy.ps_to_mps(
+        3, fermion=fermion, occupations=((1, 1), (0, 1), (0, 0)), seed=17,
+    )
+    output = pepsy.MpsOptimizer(
+        state.copy(deep=True), [(fermion.operator_gate(name, 0.0), (0, 2))],
+        chi=8, mode="direct",
+    ).run(progbar=False, cutoff=1e-12)
+    assert output.norm() == pytest.approx(state.norm(), abs=1e-12)
+    assert float(np.real(pepsy.tn_fidelity(output, state))) == pytest.approx(1.0, abs=1e-12)
 
 
 def test_fermion_hopping_gate_matches_native_hamiltonian_exponential():

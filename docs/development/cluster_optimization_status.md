@@ -6,6 +6,10 @@ The earlier published `develop` → `main` merge was `bf83def` on 2026-10-12.
 This page owns the current capability and validation routes. Detailed earlier
 updates are preserved in the [archived ledger](notes/2026-10-12-cluster-status-archive.md).
 Its older “working-tree” and “unpublished” statements retain their original dates.
+The two-site full-update pair solver now defaults to 20 iterations; explicit
+iteration caps and historical recorded configurations retain their values.
+For CUDA diagnostic batching, SU warm-start compatibility and the measured
+10×10 source-slice cache comparison, see [the FU scheduling note](notes/2026-11-11-fu-cuda-scheduling.md).
 
 ## Current capabilities
 

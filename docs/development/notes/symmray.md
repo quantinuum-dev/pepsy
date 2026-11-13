@@ -14,6 +14,25 @@ Phys. Rev. Research 7, 023193 (2025).
 
 ## Upstream audit and current opportunities
 
+### 2026-11-13: cross-domain development compatibility
+
+The installed Symmray and Quimb revisions match their GitHub `main` heads
+at review time. The [cross-domain audit](2026-11-13-upstream-domain-alignment.md)
+checks VMC/gradients, fermionic PEPS/PEPO/MPS, trees, TreeMPO, and Pauli MPOs.
+It records the empty BP correction fix and separates supported sparse/flat
+paths from small CPU-only packed-layout prototypes.
+
+### 2026-11-13: native gate exponentials and one-site FIT
+
+Rechecked Symmray `0.5.1.dev2+g20035beb7`, Quimb
+`1.16.1.dev1+g3371ff40c`, Autoray `0.11.1.dev17+g7a474cab3`, and Cotengra
+`0.8.4.dev8+g646239731`. **Adopt:** public native zero-block filling before
+matrix fusion/exponentiation, and upstream NumPy `stop_gradient` dispatch.
+**Compatibility correction:** establish native canonical form without a dense
+identity scan. Graded FIT now checks each environment leg's actual dualness.
+The [dated repair record](2026-11-13-native-fermion-gates-fit.md) separates
+the gate and FIT defects, current dependency checks, and replay validation.
+
 ### 2026-10-01: native tree factor sampling
 
 Rechecked Symmray `0.4.1.dev7+g83fb22865`, Quimb
