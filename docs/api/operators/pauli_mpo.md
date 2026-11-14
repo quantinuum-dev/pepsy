@@ -148,6 +148,83 @@ rho, report = rho.compress_dmt(
 print(report.final_bond_dimensions, report.max_constraint_error)
 ```
 
+### Physical lattice regions
+
+Pass `regions` to replace the default chain-local regions with complete
+reduced-operator constraints on explicit MPO site sets. The sets may be
+noncontiguous in MPO order. For a square lattice, use the same `OneDMap` to
+construct the MPO and the region inventory:
+
+```python
+from pepsy.operators import PauliMPO, square_lattice_dmt_regions
+from pepsy.tensors import OneDMap
+
+mapper = OneDMap(3, 3, mode="snake")
+plaquettes = square_lattice_dmt_regions(3, 3, mapper=mapper, kind="plaquettes")
+l_shapes = square_lattice_dmt_regions(3, 3, mapper=mapper, kind="l_shapes")
+rho = PauliMPO.from_terms(9, [(2.0**-9, "I" * 9), (0.1 * 2.0**-9, (0,), "Z")])
+compressed = rho.compress_dmt(max_bond=32, regions=plaquettes + l_shapes)
+```
+
+`kind="triples"` includes both straight and L-shaped connected three-site
+regions. The helper generates open square-lattice neighborhoods; pass explicit
+MPO-site index sequences for other shapes, arbitrary ordering, or periodic
+neighbors. The mapping must match the order actually used to construct `rho`.
+The same `regions` argument is accepted by `apply_gate_dmt` and `PauliDMT`.
+
+`map_mode="snake"` follows `OneDMap`'s default column-oriented snake; it is
+not the same as `"snake-row-major"` or `"row-major"`. For a 3-by-2 lattice,
+the entries below are MPO indices at coordinates `(x, y)`, with `x` as the
+row and `y` as the column:
+
+```text
+snake       snake-row-major    row-major
+0 1         0 5                0 1
+3 2         1 4                2 3
+4 5         2 3                4 5
+```
+
+An explicit `mapper` takes precedence over `map_mode`, as in
+`MPOBasis.from_square_lattice`. `PauliMPO` does not store lattice coordinates,
+so it cannot detect a mismatched mapping. Check that the mapper describes the
+ordering of the density MPO, not just the order of an unrelated state.
+
+When the density MPO is constructed in the **storage order** of an MPS whose
+logical sites were permuted by `MpsOptimizer`, supply its position-to-logical
+mapping as `site_order`:
+
+```python
+logical_mapper = OneDMap(3, 3, mode="row-major")
+regions = square_lattice_dmt_regions(
+    3, 3, mapper=logical_mapper, site_order=mps_optimizer.logical_order,
+)
+```
+
+Here the logical labels must use `logical_mapper`. If the density MPO was
+constructed from a logical-order readout instead, omit `site_order`. The
+returned regions are a snapshot: when a permutation changes the storage order,
+rebuild them and create a new `PauliDMT` workspace before further compression.
+This helper only maps regions; it does not convert an MPS wavefunction into a
+density MPO.
+
+Each constrained split preserves every selected region immediately before and
+after **compression**, not across the preceding gate. The region list replaces
+the default contiguous chain regions; include both explicitly if needed. A
+per-split, log-scaled physical-region check raises on excessive numerical
+error before committing that split. A standalone `inplace` sweep commits only
+after the entire sweep succeeds. The protected subspace construction can reject
+a bond budget even when some other constrained factorization might fit.
+
+The full Pauli panel of each region is checked, so its cost grows as `4**k`
+for `k` protected sites. Selected subspaces can require large bonds, and a
+numerically resolved trace and stable precision are still required. Neither
+positivity nor accuracy of the complete time evolution is guaranteed.
+The adjacent-gate methods require MPO-neighboring sites, including for a 2D
+lattice. For a physically local but MPO-nonadjacent pair, one available route
+is `rho.apply_gate(gate, sites, atol=0.0).compress_dmt(..., regions=regions)`;
+the exact gate embedding can substantially increase intermediate bond sizes.
+There is no geometry-aware automatic nonlocal gate scheduler here.
+
 The variants are explicit:
 
 | `variant` | Truncation target | Use |

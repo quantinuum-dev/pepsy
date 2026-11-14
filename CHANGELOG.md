@@ -8,6 +8,11 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Lattice Pauli DMT:** accept configurable physical-region site sets and
+  generate square-lattice plaquettes or connected triples; protect their
+  reduced operators during DMT compression and adjacent gate updates. Map
+  permuted MPS storage positions with `site_order`.
+
 - **Pauli DMT:** add explicit density/connected and raw-operator protected
   compression through `PauliMPO.compress_dmt`, adjacent local
   `apply_gate_dmt`, and `pepsy.optimizers.PauliDMT` second-order evolution.

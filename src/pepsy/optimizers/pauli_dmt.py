@@ -43,10 +43,13 @@ class PauliDMT:
     certify all local marginals; monitor observables and convergence.
     ``cutoff='auto'`` uses Pepsy's dtype-aware cutoff; ``cutoff_mode``
     follows Quimb and applies only to the unprotected residual.
+    ``regions`` replaces contiguous three-site protection with complete
+    reduced-operator constraints on the given MPO-site sequences. Geometry-
+    selected splits check those regions before committing each update.
     """
 
     def __init__(self, operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
-                 mode="conjugate", diagnostics=False, trace_guard="auto"):
+                 mode="conjugate", diagnostics=False, trace_guard="auto", regions=None):
         if not isinstance(operator, PauliMPO):
             raise TypeError("operator must be a PauliMPO.")
         if mode not in {"conjugate", "heisenberg"}:
@@ -55,7 +58,7 @@ class PauliDMT:
         self.time = 0.0
         self._workspace = _PauliDMTWorkspace(
             operator, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
-            diagnostics=diagnostics, trace_guard=trace_guard,
+            diagnostics=diagnostics, trace_guard=trace_guard, regions=regions,
         )
 
     @property

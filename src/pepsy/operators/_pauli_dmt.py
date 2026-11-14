@@ -8,6 +8,7 @@ or Pauli-word expansion are used by the compression kernel.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from itertools import product
 import math
 from numbers import Integral
 
@@ -27,6 +28,7 @@ from .pauli_mpo import (
     _reshape,
     _transpose,
 )
+from .pauli_dmt_geometry import _normalize_regions
 
 __all__ = ["PauliDMTBondReport", "PauliDMTReport"]
 
@@ -155,7 +157,7 @@ def _epsilon(x):
 
 
 def _basis(vectors, rtol):
-    """Rank-reveal at most four directions, protecting identity first."""
+    """Rank-reveal protected directions, protecting identity first."""
     scale = _float(_norm(vectors))
     if scale == 0:
         return vectors[:, :0]
@@ -164,6 +166,8 @@ def _basis(vectors, rtol):
     ni = _float(identity_norm)
     q0 = identity / identity_norm if ni else identity[:, :0]
     rest = vectors[:, 1:]
+    if not rest.shape[1]:
+        return q0
     if ni:
         rest = rest - q0 @ (_dag(q0) @ rest)
     u, s, _, _ = _svd(rest)
@@ -317,6 +321,68 @@ def _local_trace_data(cores):
         left, log = normalize(left @ cores[j][:, :, 0])
         left_log += log
     return panels
+
+
+def _region_trace_data(cores, regions):
+    """Log-scaled Pauli coefficient panels for arbitrary MPO site sets."""
+    panels = []
+    for region in regions:
+        sites = set(region)
+        v = _reshape(_array_like(np.ones(1), cores[0]), (1, 1))
+        log_scale = 0.
+        for j, core in enumerate(cores):
+            if j in sites:
+                v = _reshape(_einsum("ia,abp->ipb", v, core), (-1, core.shape[1]))
+            else:
+                v = v @ core[:, :, 0]
+            norm = _float(_norm(v))
+            if norm:
+                v = v / norm
+                log_scale += math.log(norm)
+            else:
+                log_scale = -math.inf
+        panels.append((_reshape(v, (-1,)), log_scale))
+    return panels
+
+
+def _region_patterns(regions, nsites):
+    """Sufficient protected strings at each cut, with identity first."""
+    plans = []
+    for bond in range(nsites - 1):
+        left, right = {(): None}, {(): None}
+        for region in regions:
+            ls = tuple(s for s in region if s <= bond)
+            rs = tuple(s for s in region if s > bond)
+            if not ls or not rs:
+                continue
+            side, sites = (left, ls) if len(ls) <= len(rs) else (right, rs)
+            for labels in product(range(4), repeat=len(sites)):
+                pattern = tuple((s, p) for s, p in zip(sites, labels) if p)
+                side[pattern] = None
+        plans.append((tuple(left), tuple(right)))
+    return tuple(plans)
+
+
+def _region_vectors(cores, bond, patterns, eye):
+    """Map physical strings to the active two-site virtual bases."""
+    left_patterns, right_patterns = patterns
+    left, right = [], []
+    one = _array_like(np.ones(1), cores[0])
+    for pattern in left_patterns:
+        labels = dict(pattern)
+        v = one
+        for j in range(bond):
+            v = _unit(v @ cores[j][:, :, labels.get(j, 0)])
+        v = _einsum("a,p->ap", ar.do("conj", v), eye[:, labels.get(bond, 0)])
+        left.append(_reshape(v, (-1,)))
+    for pattern in right_patterns:
+        labels = dict(pattern)
+        v = one
+        for j in range(len(cores) - 1, bond + 1, -1):
+            v = _unit(cores[j][:, :, labels.get(j, 0)] @ v)
+        v = _einsum("p,b->pb", eye[:, labels.get(bond + 1, 0)], v)
+        right.append(_reshape(v, (-1,)))
+    return ar.do("stack", left, axis=1), ar.do("stack", right, axis=1)
 
 
 def _check_local_trace_data(before, after, *, norm, epsilon, n):
@@ -519,12 +585,15 @@ class _PauliDMTWorkspace:
     """Owned cores and persistent canonical/trace state for local sweeps."""
 
     def __init__(self, operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
-                 diagnostics=False, trace_guard="auto"):
+                 diagnostics=False, trace_guard="auto", regions=None):
         if not (isinstance(trace_guard, bool) or trace_guard == "auto"):
             raise ValueError("trace_guard must be 'auto', True or False.")
         if operator.boundary != "open":
             raise NotImplementedError("DMT currently requires an open PauliMPO.")
         self.cores = list(operator.to_pauli_cores(copy=True))
+        self.regions = _normalize_regions(regions, len(self.cores))
+        self.region_patterns = (_region_patterns(self.regions, len(self.cores))
+                                if self.regions is not None else None)
         backends = {ar.infer_backend(a) for a in self.cores}
         if len(backends) != 1 or "symmray" in backends:
             raise TypeError("DMT requires homogeneous dense backend arrays.")
@@ -608,10 +677,20 @@ class _PauliDMTWorkspace:
             theta = _einsum("abp,bcq->apqc", a, b)
             theta = _einsum("PQpq,apqb->aPQb", _reshape(transfer, (4, 4, 4, 4)), theta)
             matrix = _reshape(theta, (4 * dl, 4 * dr))
-        left_env, right_env = self.environments.at(bond, bond + 2)
-        eye = self.eye
-        lv = _reshape(_einsum("a,pm->apm", ar.do("conj", left_env), eye), (dl * 4, 4))
-        rv = _reshape(_einsum("pm,b->pbm", eye, right_env), (dr * 4, 4))
+        if self.regions is None:
+            left_env, right_env = self.environments.at(bond, bond + 2)
+            eye = self.eye
+            lv = _reshape(_einsum("a,pm->apm", ar.do("conj", left_env), eye), (dl * 4, 4))
+            rv = _reshape(_einsum("pm,b->pbm", eye, right_env), (dr * 4, 4))
+        else:
+            lv, rv = _region_vectors(self.cores, bond, self.region_patterns[bond], self.eye)
+            target_cores = list(self.cores)
+            if transfer is not None:
+                exact_left, exact_right = _qr(matrix)
+                exact_rank = exact_left.shape[1]
+                target_cores[bond] = _transpose(_reshape(exact_left, (dl, 4, exact_rank)), (0, 2, 1))
+                target_cores[bond + 1] = _transpose(_reshape(exact_right, (exact_rank, 4, dr)), (0, 2, 1))
+            before_regions = _region_trace_data(target_cores, self.regions)
         if left_map is not None:
             lv, rv = _dag(left_map) @ lv, right_map @ rv
         left, right, report = _split(
@@ -621,13 +700,21 @@ class _PauliDMTWorkspace:
             monitor_trace=self.monitor_trace and transfer is not None,
             # At an open boundary the corresponding trace environment is
             # scalar, so the four physical directions span that entire side.
-            _fully_protected=transfer is not None and (bond == 0 or bond + 2 == len(self.cores)),
+            _fully_protected=self.regions is None and transfer is not None and (
+                bond == 0 or bond + 2 == len(self.cores)),
         )
         if left_map is not None:
             left, right = left_map @ left, right @ right_map
         rank = left.shape[1]
-        self.cores[bond] = _transpose(_reshape(left, (dl, 4, rank)), (0, 2, 1))
-        self.cores[bond + 1] = _transpose(_reshape(right, (rank, 4, dr)), (0, 2, 1))
+        new_left = _transpose(_reshape(left, (dl, 4, rank)), (0, 2, 1))
+        new_right = _transpose(_reshape(right, (rank, 4, dr)), (0, 2, 1))
+        if self.regions is not None:
+            candidate = list(self.cores)
+            candidate[bond], candidate[bond + 1] = new_left, new_right
+            _check_local_trace_data(before_regions, _region_trace_data(candidate, self.regions),
+                                    norm=_float(_norm(matrix)), epsilon=_epsilon(matrix),
+                                    n=len(self.cores))
+        self.cores[bond], self.cores[bond + 1] = new_left, new_right
         self.environments.invalidate(bond, bond + 2)
         self.center = bond + (absorb == "right")
         self.reports.append(report)
@@ -665,19 +752,21 @@ def _gate_transfer(gate, like, mode):
 
 
 def compress_dmt(operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
-                 inplace=False, return_report=False):
+                 inplace=False, return_report=False, regions=None):
     workspace = _PauliDMTWorkspace(
         operator, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
         # A standalone sweep has its own complete marginal check and never
         # applies a gate, so classifying a trace guard would be unused work.
-        diagnostics=return_report, trace_guard=False,
+        diagnostics=return_report, trace_guard=False, regions=regions,
     )
-    before = _local_trace_data(operator.to_pauli_cores(copy=False))
+    before = (_local_trace_data(operator.to_pauli_cores(copy=False)) if workspace.regions is None
+              else _region_trace_data(operator.to_pauli_cores(copy=False), workspace.regions))
     norm = _float(_norm(workspace.cores[0]))
     for bond in range(operator.nsites - 1):
         workspace.split_pair(bond)
     _check_local_trace_data(
-        before, _local_trace_data(workspace.cores), norm=norm,
+        before, (_local_trace_data(workspace.cores) if workspace.regions is None
+                 else _region_trace_data(workspace.cores, workspace.regions)), norm=norm,
         epsilon=_epsilon(workspace.cores[0]), n=operator.nsites,
     )
     return _finish(operator, workspace, inplace, return_report)
@@ -695,13 +784,13 @@ def _finish(operator, workspace, inplace, return_report):
 
 
 def gate_dmt(operator, gate, where, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
-             mode="conjugate", inplace=False, return_report=False, trace_guard="auto"):
+             mode="conjugate", inplace=False, return_report=False, trace_guard="auto", regions=None):
     where = _normalize_where(where, operator.nsites)
     if len(where) != 2 or where[1] != where[0] + 1:
         raise ValueError("DMT gates require two adjacent sites in increasing order.")
     workspace = _PauliDMTWorkspace(
         operator, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
-        diagnostics=return_report, trace_guard=trace_guard,
+        diagnostics=return_report, trace_guard=trace_guard, regions=regions,
     )
     transfer = _gate_transfer(gate, workspace.cores[0], mode)
     workspace.split_pair(where[0], transfer)

@@ -1743,9 +1743,13 @@ class PauliMPO:
 
     def compress_dmt(
         self, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density", inplace=False,
-        return_report=False,
+        return_report=False, regions=None,
     ):
-        """Compress while preserving all contiguous three-site partial traces.
+        """Compress while preserving partial traces on protected regions.
+
+        ``regions`` is an iterable of nonempty MPO-site index sequences; each
+        specifies a complete reduced operator to preserve. ``None`` preserves
+        all contiguous three-site partial traces, as in the original 1D DMT.
 
         ``variant='density'`` truncates connected correlations and requires
         nonzero trace. ``'operator'`` uses the raw-block DMT variant, including
@@ -1760,12 +1764,12 @@ class PauliMPO:
 
         return compress_dmt(
             self, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
-            inplace=inplace, return_report=return_report,
+            inplace=inplace, return_report=return_report, regions=regions,
         )
 
     def apply_gate_dmt(
         self, gate, where, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
-        mode="conjugate", inplace=False, return_report=False, trace_guard="auto",
+        mode="conjugate", inplace=False, return_report=False, trace_guard="auto", regions=None,
     ):
         """Apply a two-qubit gate locally, then DMT-split the acted-on bond.
 
@@ -1776,13 +1780,15 @@ class PauliMPO:
         ``trace_guard='auto'`` checks resolved nonzero traces; set it to
         ``True`` to force checking or ``False`` for traceless inputs with
         trace roundoff. This guard does not certify all local marginals.
+        ``regions`` selects complete protected reduced operators by MPO site
+        indices; ``None`` uses the original contiguous three-site regions.
         """
         from ._pauli_dmt import gate_dmt
 
         return gate_dmt(
             self, gate, where, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode,
             variant=variant, mode=mode, inplace=inplace,
-            return_report=return_report, trace_guard=trace_guard,
+            return_report=return_report, trace_guard=trace_guard, regions=regions,
         )
 
     def apply_damping(self, damping, *, inplace=False):
