@@ -325,23 +325,44 @@ def _local_trace_data(cores):
 
 def _region_trace_data(cores, regions):
     """Log-scaled Pauli coefficient panels for arbitrary MPO site sets."""
+    def normalize(value):
+        norm = _float(_norm(value))
+        return (value / norm, math.log(norm)) if norm else (value, -math.inf)
+
+    n = len(cores)
+    one = _array_like(np.ones(1), cores[0])
+    left = [(one, 0.)]
+    last_start = max(min(region) for region in regions)
+    first_stop = min(max(region) + 1 for region in regions)
+    for core in cores[:last_start]:
+        value, log = normalize(left[-1][0] @ core[:, :, 0])
+        left.append((value, left[-1][1] + log))
+    right = [None] * (n + 1)
+    right[n] = one, 0.
+    for j in range(n - 1, first_stop - 1, -1):
+        value, log = normalize(cores[j][:, :, 0] @ right[j + 1][0])
+        right[j] = value, right[j + 1][1] + log
+
     panels = []
     for region in regions:
         sites = set(region)
-        v = _reshape(_array_like(np.ones(1), cores[0]), (1, 1))
-        log_scale = 0.
-        for j, core in enumerate(cores):
+        start, stop = min(region), max(region) + 1
+        v = _reshape(left[start][0], (1, -1))
+        log_scale = left[start][1]
+        for j in range(start, stop):
+            core = cores[j]
             if j in sites:
-                v = _reshape(_einsum("ia,abp->ipb", v, core), (-1, core.shape[1]))
+                # Fuse the outgoing bond and Pauli index for a matrix multiply;
+                # the final transpose restores Pauli-before-bond panel order.
+                v = v @ _reshape(core, (core.shape[0], core.shape[1] * 4))
+                v = _transpose(_reshape(v, (-1, core.shape[1], 4)), (0, 2, 1))
+                v = _reshape(v, (-1, core.shape[1]))
             else:
                 v = v @ core[:, :, 0]
-            norm = _float(_norm(v))
-            if norm:
-                v = v / norm
-                log_scale += math.log(norm)
-            else:
-                log_scale = -math.inf
-        panels.append((_reshape(v, (-1,)), log_scale))
+            v, log = normalize(v)
+            log_scale += log
+        v, log = normalize(v @ right[stop][0])
+        panels.append((_reshape(v, (-1,)), log_scale + log + right[stop][1]))
     return panels
 
 
@@ -363,22 +384,24 @@ def _region_patterns(regions, nsites):
     return tuple(plans)
 
 
-def _region_vectors(cores, bond, patterns, eye):
+def _region_vectors(cores, bond, patterns, eye, environments):
     """Map physical strings to the active two-site virtual bases."""
     left_patterns, right_patterns = patterns
     left, right = [], []
-    one = _array_like(np.ones(1), cores[0])
+    environments.at(bond, bond + 2)
     for pattern in left_patterns:
         labels = dict(pattern)
-        v = one
-        for j in range(bond):
+        first = next((site for site, _ in pattern if site < bond), bond)
+        v = environments.left[first]
+        for j in range(first, bond):
             v = _unit(v @ cores[j][:, :, labels.get(j, 0)])
         v = _einsum("a,p->ap", ar.do("conj", v), eye[:, labels.get(bond, 0)])
         left.append(_reshape(v, (-1,)))
     for pattern in right_patterns:
         labels = dict(pattern)
-        v = one
-        for j in range(len(cores) - 1, bond + 1, -1):
+        last = max((site for site, _ in pattern if site > bond + 1), default=bond + 1)
+        v = environments.right[last + 1]
+        for j in range(last, bond + 1, -1):
             v = _unit(cores[j][:, :, labels.get(j, 0)] @ v)
         v = _einsum("p,b->pb", eye[:, labels.get(bond + 1, 0)], v)
         right.append(_reshape(v, (-1,)))
@@ -683,7 +706,8 @@ class _PauliDMTWorkspace:
             lv = _reshape(_einsum("a,pm->apm", ar.do("conj", left_env), eye), (dl * 4, 4))
             rv = _reshape(_einsum("pm,b->pbm", eye, right_env), (dr * 4, 4))
         else:
-            lv, rv = _region_vectors(self.cores, bond, self.region_patterns[bond], self.eye)
+            lv, rv = _region_vectors(self.cores, bond, self.region_patterns[bond], self.eye,
+                                     self.environments)
             target_cores = list(self.cores)
             if transfer is not None:
                 exact_left, exact_right = _qr(matrix)

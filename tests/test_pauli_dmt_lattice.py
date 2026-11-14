@@ -1,5 +1,7 @@
 """Physical-region DMT checks against dense partial traces."""
 
+from itertools import product
+
 import numpy as np
 import pytest
 from scipy.linalg import expm
@@ -195,6 +197,114 @@ def test_gate_preserves_regions_of_evolved_target():
                                    dense_marginal(target, 9, region), atol=2e-12, rtol=2e-12)
     direct = initial.apply_gate_dmt(gate, (bond, bond + 1), max_bond=40, regions=regions)
     np.testing.assert_allclose(direct.to_dense(), actual, atol=2e-12, rtol=2e-12)
+
+
+def test_geometric_gate_environments_follow_nonmonotonic_sweeps():
+    initial, _, _ = product_mixture(6, rank=24, strength=.5)
+    regions = square_lattice_dmt_regions(3, 2, kind='plaquettes')
+    x = np.array([[0, 1], [1, 0]])
+    z = np.diag([1, -1])
+    gate = expm(-.17j * (np.kron(x, z) + .37 * np.kron(z, x)))
+    run = PauliDMT(initial, max_bond=24, regions=regions, diagnostics=True)
+    reports = []
+    for bond in (2, 4, 1, 3, 0, 4, 2, 1):
+        before = run.state.to_dense()
+        full_gate = np.kron(np.kron(np.eye(2**bond), gate), np.eye(2**(4 - bond)))
+        target = full_gate @ before @ full_gate.conj().T
+        reports.append(run.apply_gate(gate, (bond, bond + 1)))
+        actual = run.state.to_dense()
+        for region in regions:
+            np.testing.assert_allclose(dense_marginal(actual, 6, region),
+                                       dense_marginal(target, 6, region), atol=4e-12, rtol=4e-12)
+    assert any(b.input_rank > b.final_bond for b in reports)
+
+
+def test_reused_geometric_environments_match_fresh_contractions(monkeypatch):
+    import pepsy.operators._pauli_dmt as dmt
+
+    initial, _, _ = product_mixture(9, rank=48, strength=.5)
+    regions = square_lattice_dmt_regions(3, 3, kind='plaquettes')
+    optimized, report = initial.compress_dmt(max_bond=30, regions=regions, return_report=True)
+
+    def fresh_vectors(cores, bond, patterns, eye, environments):
+        del environments
+        left, right = [], []
+        for pattern in patterns[0]:
+            labels = dict(pattern)
+            v = np.ones(1, dtype=cores[0].dtype)
+            for j in range(bond):
+                v = dmt._unit(v @ cores[j][:, :, labels.get(j, 0)])
+            left.append(np.outer(v.conj(), eye[:, labels.get(bond, 0)]).reshape(-1))
+        for pattern in patterns[1]:
+            labels = dict(pattern)
+            v = np.ones(1, dtype=cores[0].dtype)
+            for j in range(len(cores) - 1, bond + 1, -1):
+                v = dmt._unit(cores[j][:, :, labels.get(j, 0)] @ v)
+            right.append(np.outer(eye[:, labels.get(bond + 1, 0)], v).reshape(-1))
+        return np.stack(left, axis=1), np.stack(right, axis=1)
+
+    monkeypatch.setattr(dmt, '_region_vectors', fresh_vectors)
+    reference, fresh_report = initial.compress_dmt(max_bond=30, regions=regions, return_report=True)
+    np.testing.assert_allclose(optimized.to_dense(), reference.to_dense(), atol=2e-12, rtol=2e-12)
+    assert report.final_bond_dimensions == fresh_report.final_bond_dimensions
+    assert any(b.discarded_weight > 0 for b in report.bond_reports)
+
+
+@pytest.mark.parametrize('scale', [1e-150, 1., 1e150])
+def test_scaled_region_panels_match_independent_partial_trace(scale):
+    from pepsy.operators._pauli_dmt import _region_trace_data
+
+    operator = PauliMPO.from_terms(6, [
+        (scale, (0, 5), 'XZ'), (.3j * scale, (1, 3), 'YZ'),
+    ])
+    regions = ((2, 4), (0, 5), (0, 2, 5), (0, 1, 3, 5))
+    for region, (panel, log_scale) in zip(
+        regions, _region_trace_data(operator.to_pauli_cores(), regions),
+    ):
+        matrix = np.zeros((2**len(region), 2**len(region)), dtype=complex)
+        if np.isfinite(log_scale):
+            coefficients = np.asarray(panel) * np.exp(log_scale) * 2**(6 - len(region))
+            for value, labels in zip(coefficients, product(range(4), repeat=len(region))):
+                basis = np.ones((1, 1), dtype=complex)
+                for label in labels:
+                    basis = np.kron(basis, _P[label])
+                matrix += value * basis
+        expected = operator.partial_trace(region, keep=True).to_dense()
+        np.testing.assert_allclose(matrix / scale, expected / scale, atol=2e-12, rtol=2e-12)
+
+
+def test_torch_geometric_gate_gradient_matches_finite_difference():
+    torch = pytest.importorskip('torch')
+    from pepsy.backends import TorchLinalgConfig
+    from test_pauli_dmt import _density
+
+    initial = _density(5)
+    cores = [np.asarray(a).real for a in initial.to_pauli_cores()]
+    regions = ((0, 2, 4),)
+    probe = PauliMPO.from_terms(5, [(1., 'XYZXI')])
+    generator = PauliMPO(2, [(1., 'ZX'), (.3, 'XI')]).to_dense()
+
+    def value(angle):
+        gate = expm(-1j * angle * generator)
+        out = PauliMPO.from_pauli_cores(cores).apply_gate_dmt(
+            gate, (1, 2), max_bond=10, regions=regions,
+        )
+        return float(np.real(probe.inner(out)))
+
+    theta = torch.tensor(.13, dtype=torch.float64, requires_grad=True)
+    tcores = [torch.tensor(a, dtype=torch.float64) for a in cores]
+    tgen = torch.tensor(generator, dtype=torch.complex128)
+    with TorchLinalgConfig(stabilized=True, svd_gap_rtol=1e-9).activated():
+        gate = torch.matrix_exp(-1j * theta * tgen)
+        out = PauliMPO.from_pauli_cores(tcores).apply_gate_dmt(
+            gate, (1, 2), max_bond=10, regions=regions,
+        )
+        loss = probe.inner(out).real
+        loss.backward()
+    expected = (value(.130001) - value(.129999)) / .000002
+    assert abs(expected) > 1e-8
+    assert np.isfinite(theta.grad.item())
+    assert theta.grad.item() == pytest.approx(expected, rel=2e-3, abs=2e-7)
 
 
 @pytest.mark.parametrize('backend', ['numpy', 'torch', 'jax'])

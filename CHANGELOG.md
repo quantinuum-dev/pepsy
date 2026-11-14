@@ -8,6 +8,10 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Lattice Pauli DMT:** reuse normalized identity environments and use
+  matrix multiplication for regional checks, reducing repeated contractions
+  without disabling per-split preservation validation.
+
 - **Lattice Pauli DMT:** accept configurable physical-region site sets and
   generate square-lattice plaquettes or connected triples; protect their
   reduced operators during DMT compression and adjacent gate updates. Map
