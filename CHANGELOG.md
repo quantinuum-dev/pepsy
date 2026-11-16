@@ -8,6 +8,12 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **JAX L-BFGS precision and restoration:** keep internal coordinates and
+  line-search buffers in a common precision while preserving objective input
+  and result dtypes. Fix mixed-precision compilation failures, rounded loss
+  caches and stale equal-loss best states; reject nonfinite initial parameters
+  and trial points that overflow the original parameter dtype.
+
 - **Native JAX L-BFGS and ordinary MPO DMT:** add
   `GradientOptimizer(solver="jax-lbfgs")` using Optax zoom line search,
   compiled device-side iteration chunks, complex coordinates, cached values

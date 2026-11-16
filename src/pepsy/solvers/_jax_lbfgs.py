@@ -70,19 +70,26 @@ def run_jax_lbfgs(params_init, loss_fn, *, lr, solver_options, n_steps,
     if len(devices) != 1:
         raise ValueError("jax-lbfgs parameters must share one device")
 
-    # A real pytree avoids complex secant/conjugation conventions and retains
-    # each leaf's precision without a promoted, host-packed flat vector.
+    # Real coordinates avoid complex secant/conjugation conventions. The
+    # objective still receives each parameter in its original dtype.
     complex_keys = {name for name, x in params.items() if jnp.iscomplexobj(x)}
     coordinates = {
         name: (x.real, x.imag) if name in complex_keys else (x,)
         for name, x in params.items()
     }
 
+    def finite_tree(tree):
+        return jnp.all(jnp.stack([jnp.all(jnp.isfinite(x))
+                                  for x in jax.tree.leaves(tree)]))
+
+    if not bool(finite_tree(coordinates)):
+        raise FloatingPointError("jax-lbfgs requires finite initial parameters")
+
     def unpack(p):
-        return {name: jax.lax.complex(*x) if name in complex_keys else x[0]
+        return {name: (jax.lax.complex(*x) if name in complex_keys else x[0]).astype(params[name].dtype)
                 for name, x in p.items()}
 
-    def objective(p):
+    def raw_objective(p):
         value = jnp.asarray(loss_fn(unpack(p)))
         if value.ndim != 0:
             raise ValueError("loss_fn must return a scalar")
@@ -92,7 +99,7 @@ def run_jax_lbfgs(params_init, loss_fn, *, lr, solver_options, n_steps,
                        "loss_fn returned a complex loss; expected a real scalar")
         return value.real
 
-    value_grad = jax.value_and_grad(objective)
+    value_grad = jax.value_and_grad(raw_objective)
 
     def checked_error(error):
         message = error.get()
@@ -102,14 +109,23 @@ def run_jax_lbfgs(params_init, loss_fn, *, lr, solver_options, n_steps,
     error, (value, grad) = jax.jit(checkify.checkify(value_grad))(coordinates)
     checked_error(error)
 
-    def finite_tree(tree):
-        return jnp.all(jnp.stack([jnp.all(jnp.isfinite(x))
-                                  for x in jax.tree.leaves(tree)]))
-
     if np.isfinite(float(value)) and not bool(finite_tree(grad)):
         raise FloatingPointError("jax-lbfgs encountered a nonfinite gradient")
     if not np.isfinite(float(value)):
         return params, [float(value)], float("inf"), float(value), "invalid_objective", 1
+
+    # Zoom's internal buffers use the first coordinate leaf's real dtype,
+    # even when its external cache was initialized with a different dtype.
+    # A common working precision prevents both loss-cache downcasts and JAX
+    # carry mismatches. Cast back only at the objective/return boundary, so
+    # loss semantics and the original parameter dtypes remain unchanged.
+    working_dtype = jnp.result_type(value.dtype, *(x.dtype for x in jax.tree.leaves(coordinates)))
+    coordinates = jax.tree.map(lambda x: x.astype(working_dtype), coordinates)
+    grad = jax.tree.map(lambda x: x.astype(working_dtype), grad)
+    value = value.astype(working_dtype)
+
+    def objective(p):
+        return raw_objective(p).astype(working_dtype)
 
     def eligible(v):
         return jnp.isfinite(v) & (
@@ -141,12 +157,16 @@ def run_jax_lbfgs(params_init, loss_fn, *, lr, solver_options, n_steps,
                     new_g = optax.tree.get(new_state, "grad")
                     info = optax.tree.get(new_state, "info")
                     valid_grad = finite_tree(new_g)
-                    finite = jnp.isfinite(new_v) & finite_tree(new_x)
+                    # A finite working coordinate can overflow when cast back
+                    # to a user's lower-precision parameter dtype.
+                    finite = jnp.isfinite(new_v) & finite_tree(unpack(new_x))
                     accept = finite & valid_grad & (new_v <= v)
-                    improved = accept & eligible(new_v) & (new_v < best_v)
-                    significant = improved & (new_v < best_v - controls["min_improve"])
-                    bx = jax.tree.map(lambda a, b: jnp.where(improved, a, b), new_x, best_x)
-                    bv = jnp.where(improved, new_v, best_v)
+                    # Prefer the latest equal-loss point: rounding can hide
+                    # genuine gradient progress near a large constant offset.
+                    replace_best = accept & eligible(new_v) & (new_v <= best_v)
+                    significant = replace_best & (new_v < best_v - controls["min_improve"])
+                    bx = jax.tree.map(lambda a, b: jnp.where(replace_best, a, b), new_x, best_x)
+                    bv = jnp.where(replace_best, new_v, best_v)
                     last_new = jnp.where(significant, step, last)
                     # A curvature failure can still supply a decreasing point;
                     # retain that point but expose the unsuccessful search.

@@ -177,9 +177,15 @@ differentiable solve. Every call initializes a fresh optimizer state, including
 when targets or penalty multipliers change between calls. Compilation is local
 to a solve; reuse across separate `run()` calls is not guaranteed.
 
-Complex parameters use real/imaginary JAX coordinates. Each leaf retains its
-shape, dtype and device, including mixed real/complex mappings. Enable JAX x64
-before creating double-precision arrays. Losses must be JAX-compatible real
+Complex parameters use real/imaginary JAX coordinates. Objectives receive and
+results retain each leaf's original shape, dtype and device, including mixed
+real/complex mappings. Internal coordinates and quasi-Newton history use the
+common real precision of the parameter leaves and the scalar loss. This keeps
+Optax's line-search buffers from rounding a float64 loss to float32, and
+supports float32 losses with float64 parameters. Mixed-precision problems may
+therefore allocate higher-precision solver state. Enable JAX x64
+before creating double-precision arrays. Initial parameters must be finite,
+including leaves the objective does not use. Losses must be JAX-compatible real
 scalars; the imaginary tolerance `1e-10` is checked inside line-search trials
 as well as at the initial point. Nonfinite trial objectives can be rejected by
 the search. A finite accepted objective with a nonfinite gradient raises
@@ -199,7 +205,11 @@ the search. A finite accepted objective with a nonfinite gradient raises
 evaluations. `n_evals` counts the initial objective/gradient and every
 line-search trial; accepted values/gradients are cached rather than recomputed.
 `history` records each visited pre-update loss, while `final_loss` describes
-the returned iterate, including the final accepted update. Reasons include
+the returned iterate, including the final accepted update. If several accepted
+points share the same best eligible loss, restoration chooses the latest one;
+equal losses do not reset `patience`. This retains gradient progress even when
+a large constant offset rounds successive loss values to the same number.
+Reasons include
 `gradient_tol`, `ftol`, `patience`, `maxiter`, `invalid_objective`, and
 `linesearch_failed`. A failed search retains a finite nonincreasing candidate
 when available and stops; it does not silently continue with bad curvature.
