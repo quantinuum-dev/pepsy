@@ -325,8 +325,12 @@ def _local_trace_data(cores):
 
 def _region_trace_data(cores, regions):
     """Log-scaled Pauli coefficient panels for arbitrary MPO site sets."""
-    def normalize(value):
-        norm = _float(_norm(value))
+    def normalize(value, *, final=False):
+        # Intermediate panels need only bounded entries to avoid underflow.
+        # Max scaling avoids a redundant Euclidean norm at every site.
+        # Retain final Frobenius scaling for the guard's
+        # common physical reference and public diagnostic tolerances.
+        norm = _float(_norm(value) if final else ar.do("max", ar.do("abs", value)))
         return (value / norm, math.log(norm)) if norm else (value, -math.inf)
 
     n = len(cores)
@@ -361,7 +365,7 @@ def _region_trace_data(cores, regions):
                 v = v @ core[:, :, 0]
             v, log = normalize(v)
             log_scale += log
-        v, log = normalize(v @ right[stop][0])
+        v, log = normalize(v @ right[stop][0], final=True)
         panels.append((_reshape(v, (-1,)), log_scale + log + right[stop][1]))
     return panels
 
@@ -663,7 +667,12 @@ class _PauliDMTWorkspace:
             dl, dr, _ = a.shape
             q, r = _qr(_reshape(_transpose(a, (0, 2, 1)), (dl * 4, dr)))
             self.cores[i] = _transpose(_reshape(q, (dl, 4, q.shape[1])), (0, 2, 1))
-            self.cores[i + 1] = _einsum("ab,bcp->acp", r, self.cores[i + 1])
+            # Fuse spectator legs so the gauge contraction uses backend GEMM
+            # rather than a general einsum (costly for long, high-rank chains).
+            neighbor = self.cores[i + 1]
+            self.cores[i + 1] = _reshape(
+                r @ _reshape(neighbor, (dr, -1)), (r.shape[0], neighbor.shape[1], 4),
+            )
             self.environments.invalidate(i, i + 2)
             self.center += 1
         while self.center > target:
@@ -675,7 +684,11 @@ class _PauliDMTWorkspace:
                 method="qr", absorb="left", cutoff=0.0,
             )
             self.cores[i] = _transpose(_reshape(right, (right.shape[0], 4, dr)), (0, 2, 1))
-            self.cores[i - 1] = _einsum("abp,bc->acp", self.cores[i - 1], left)
+            neighbor = self.cores[i - 1]
+            matrix = _reshape(_transpose(neighbor, (0, 2, 1)), (-1, dl)) @ left
+            self.cores[i - 1] = _transpose(
+                _reshape(matrix, (neighbor.shape[0], 4, left.shape[1])), (0, 2, 1),
+            )
             self.environments.invalidate(i - 1, i + 1)
             self.center -= 1
 

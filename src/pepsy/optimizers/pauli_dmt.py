@@ -25,7 +25,7 @@ __all__ = ["PauliDMT"]
 
 
 class PauliDMT:
-    """Persist canonical and trace environments across local DMT updates.
+    """DMT evolution of a Pauli MPO with 1D or physical-region protection.
 
     ``variant='density'`` with ``mode='conjugate'`` evolves a density matrix.
     ``variant='operator'`` with ``mode='heisenberg'`` evolves an observable,
@@ -33,7 +33,10 @@ class PauliDMT:
     :attr:`state` returns an independent snapshot. Reports cover the latest
     gate or final timestep; no unbounded trajectory history is retained.
 
-    Only adjacent increasing sites on an open chain are supported. An
+    Storage and gate positions always refer to an open 1D MPO. ``regions``
+    can protect physical 2D neighborhoods after mapping them to MPO positions;
+    it does not change the gate schedule or interpret lattice coordinates.
+    Only adjacent increasing gate sites are supported. An
     evolution call commits successful gates as it proceeds, so after a
     numerical exception the state can contain a completed partial timestep.
     ``trace_guard='auto'`` monitors per-gate relative trace defects for
@@ -82,7 +85,12 @@ class PauliDMT:
         self._workspace.reports.clear()
 
     def apply_gate(self, gate, where):
-        """Apply one two-qubit gate and protected split; return its report."""
+        """Update adjacent MPO positions; return a ``PauliDMTBondReport``.
+
+        ``where=(j, j+1)`` uses storage indices, even with lattice regions.
+        This mutates the live workspace without advancing :attr:`time`.
+        Read :attr:`state` for an independent PauliMPO snapshot.
+        """
         where = _normalize_where(where, len(self._workspace.cores))
         if len(where) != 2 or where[1] != where[0] + 1:
             raise ValueError("DMT gates require two adjacent sites in increasing order.")
@@ -95,7 +103,10 @@ class PauliDMT:
 
         Supply exactly ``L-1`` Hermitian 4-by-4 matrices in increasing bond
         order. Include onsite fields in these matrices without double counting.
-        Gates/transfers are prepared once per call with backend-native EIGH.
+        ``regions`` changes preservation constraints, not these chain bonds;
+        this method does not schedule all edges of a 2D Hamiltonian.
+        Gates/transfers are prepared once per call with backend-native EIGH,
+        or a matrix exponential for Torch Hamiltonians requiring gradients.
         Shared Hamiltonian objects reuse preparation within this call only.
         Parity layers sweep from the nearest end to carry the canonical
         centre across timesteps; this fixes the finite-bond compression order.
@@ -112,13 +123,13 @@ class PauliDMT:
         if len(hs) != n - 1:
             raise ValueError("supply exactly L-1 bond Hamiltonians.")
         sample = _complexify(self._workspace.cores[0])
-        transfers, eigensystems, prepared = [], {}, {}
+        transfers, hamiltonian_data, prepared = [], {}, {}
         for bond, h in enumerate(hs):
             # Shared Hamiltonian objects are common in uniform chains. Cache
             # only within this call: cross-call reuse could retain stale array
             # values or a consumed Torch autograd graph.
             key = id(h)
-            if key not in eigensystems:
+            if key not in hamiltonian_data:
                 if tuple(ar.shape(h)) != (4, 4):
                     raise ValueError("each bond Hamiltonian must have shape (4, 4).")
                 native_h = _array_like(h, sample)
@@ -130,11 +141,22 @@ class PauliDMT:
                     scaled, scaled.conj().T, rtol=tolerance, atol=tolerance,
                 ):
                     raise ValueError("bond Hamiltonians must be finite and Hermitian.")
-                eigensystems[key] = ar.do("linalg.eigh", native_h)
+                # Eigenvector backward divides by eigenvalue gaps, producing
+                # NaNs for common degenerate generators such as ZZ. The gate
+                # itself has a smooth derivative there; use native expm for
+                # trainable Torch inputs, without perturbing their spectrum.
+                differentiable = (ar.infer_backend(native_h) == "torch"
+                                  and native_h.requires_grad)
+                eigensystem = None if differentiable else ar.do("linalg.eigh", native_h)
+                hamiltonian_data[key] = native_h, eigensystem
             fraction = 0.5 if bond % 2 == 0 else 1.0
             if (key, fraction) not in prepared:
-                w, v = eigensystems[key]
-                gate = (v * ar.do("exp", (-1j * dt * fraction) * w)) @ _dag(v)
+                native_h, eigensystem = hamiltonian_data[key]
+                if eigensystem is None:
+                    gate = ar.do("linalg.expm", (-1j * dt * fraction) * native_h)
+                else:
+                    w, v = eigensystem
+                    gate = (v * ar.do("exp", (-1j * dt * fraction) * w)) @ _dag(v)
                 prepared[key, fraction] = _gate_transfer(gate, self._workspace.cores[0], self.mode)
             transfers.append(prepared[key, fraction])
         self._begin()

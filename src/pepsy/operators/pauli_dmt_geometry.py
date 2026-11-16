@@ -16,6 +16,7 @@ def square_lattice_dmt_regions(
     coordinates to those logical labels. Without ``site_order``, mapper labels
     are MPO positions. Only open lattice edges are generated; custom or
     periodic regions can be supplied directly as MPO site indices.
+    The result selects preservation constraints, not an evolution schedule.
     """
     from pepsy.tensors import OneDMap
 

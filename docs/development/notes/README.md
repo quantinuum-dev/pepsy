@@ -7,6 +7,10 @@ and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
+- [1D and lattice DMT API/performance](2026-11-16-dmt-performance.md) —
+  Reproducible compression/evolution profiles, protected-region checks and
+  measured CPU improvements.
+
 - [JAX QR and periodic direct boundary fixes](2026-10-21-qr-periodic-boundary-fixes.md)
   — Small/zero-pivot pullbacks, callable Quimb dispatch, and CPU/GPU regressions.
 

@@ -219,6 +219,71 @@ def test_geometric_gate_environments_follow_nonmonotonic_sweeps():
     assert any(b.input_rank > b.final_bond for b in reports)
 
 
+@pytest.mark.parametrize('variant,mode', [('density', 'conjugate'), ('operator', 'heisenberg')])
+def test_lattice_evolution_checks_each_gated_target_under_truncation(monkeypatch, variant, mode):
+    initial, _, _ = product_mixture(6, rank=24, dtype='complex128', strength=.5)
+    if variant == 'operator':
+        initial = initial - PauliMPO.identity(6, coefficient=1 / 64)
+    regions = square_lattice_dmt_regions(3, 2)
+    x, z, eye = _P[1], _P[3], _P[0]
+    hs = [np.kron(z, z) + (.2 + .03 * j) * np.kron(x, eye)
+          + .17 * np.kron(eye, x) for j in range(5)]
+    run = PauliDMT(initial, max_bond=24, regions=regions, variant=variant,
+                   mode=mode, diagnostics=True, cutoff='auto')
+    split_pair = run._workspace.split_pair
+    changes = []
+    dt = .07
+
+    def checked_split(bond, transfer=None, *, absorb='right'):
+        before = run.state.to_dense()
+        fraction = .5 if bond % 2 == 0 else 1.
+        gate = expm(-1j * dt * fraction * hs[bond])
+        gate = np.kron(np.kron(np.eye(2**bond), gate), np.eye(2**(4 - bond)))
+        target = (gate @ before @ gate.conj().T if mode == 'conjugate'
+                  else gate.conj().T @ before @ gate)
+        report = split_pair(bond, transfer, absorb=absorb)
+        actual = run.state.to_dense()
+        # Each oracle starts from the current compressed state: comparing to
+        # exact many-body evolution would mix accumulated truncation and
+        # Trotter errors with this split's preservation contract.
+        for region in regions:
+            np.testing.assert_allclose(dense_marginal(actual, 6, region),
+                                       dense_marginal(target, 6, region), atol=4e-12, rtol=4e-12)
+        np.testing.assert_allclose(np.trace(actual), np.trace(target), atol=4e-12)
+        changes.append(np.linalg.norm(actual - target))
+        return report
+
+    monkeypatch.setattr(run._workspace, 'split_pair', checked_split)
+    run.evolve(hs, dt=dt, steps=2)
+    result = run.evolve(hs, dt=dt)
+    assert len(changes) == 24
+    assert max(changes) > 1e-7
+    assert max(result.pauli_bond_dimensions) <= 24
+    assert run.time == pytest.approx(3 * dt)
+    assert len(run.report.bond_reports) == 8
+    assert run.report.max_constraint_error < 1e-12
+
+
+@pytest.mark.parametrize('geometric', [False, True])
+def test_rejected_persistent_gate_preserves_state_and_can_continue(geometric):
+    initial, _, _ = product_mixture(6, rank=24, strength=.5)
+    regions = square_lattice_dmt_regions(3, 2) if geometric else None
+    gate = expm(-.17j * (np.kron(_P[1], _P[3]) + .37 * np.kron(_P[3], _P[1])))
+    run = PauliDMT(initial, max_bond=4, regions=regions, diagnostics=True)
+    run.apply_gate(gate, (0, 1))
+    previous = run.state.to_dense()
+    with pytest.raises(ValueError, match='protected budget'):
+        run.apply_gate(gate, (2, 3))
+    np.testing.assert_allclose(run.state.to_dense(), previous, atol=3e-13, rtol=3e-13)
+    # A failed split can move the canonical centre before rejecting the
+    # target. Subsequent updates must still use consistent trace caches.
+    run.apply_gate(gate, (4, 5))
+    full_gate = np.kron(np.eye(16), gate)
+    np.testing.assert_allclose(run.state.to_dense(), full_gate @ previous @ full_gate.conj().T,
+                               atol=3e-13, rtol=3e-13)
+    assert len(run.report.bond_reports) == 1
+
+
 def test_reused_geometric_environments_match_fresh_contractions(monkeypatch):
     import pepsy.operators._pauli_dmt as dmt
 
@@ -271,6 +336,51 @@ def test_scaled_region_panels_match_independent_partial_trace(scale):
                 matrix += value * basis
         expected = operator.partial_trace(region, keep=True).to_dense()
         np.testing.assert_allclose(matrix / scale, expected / scale, atol=2e-12, rtol=2e-12)
+
+
+@pytest.mark.parametrize('backend', ['numpy', 'torch', 'jax'])
+@pytest.mark.parametrize('dtype', ['float32', 'complex64', 'float64', 'complex128'])
+@pytest.mark.parametrize('scale', [1e-25, 1., 1e25])
+def test_region_panels_with_extreme_virtual_scales(backend, dtype, scale, request):
+    from pepsy.operators._pauli_dmt import _region_trace_data
+
+    initial, weights, local = product_mixture(6, rank=12, dtype=dtype, strength=.5)
+    cores = list(initial.to_pauli_cores())
+    rng = np.random.default_rng(73)
+    for site in range(5):
+        gauge = np.full(cores[site].shape[1], 1e10 if site % 2 == 0 else 1e-10, dtype=dtype)
+        if dtype.startswith('complex'):
+            gauge *= np.exp(1j * rng.uniform(-3, 3, len(gauge))).astype(dtype)
+        cores[site] *= gauge[None, :, None]
+        cores[site + 1] /= gauge[:, None, None]
+    cores[0] *= np.asarray(scale, dtype=dtype)
+    if backend == 'torch':
+        torch = pytest.importorskip('torch')
+        cores = [torch.tensor(core) for core in cores]
+        host = lambda a: a.detach().cpu().numpy()
+    elif backend == 'jax':
+        jax = pytest.importorskip('jax')
+        previous_x64 = jax.config.x64_enabled
+        request.addfinalizer(lambda: jax.config.update('jax_enable_x64', previous_x64))
+        jax.config.update('jax_enable_x64', True)
+        import jax.numpy as jnp
+        cores = [jnp.asarray(core) for core in cores]
+        host = np.asarray
+    else:
+        host = np.asarray
+    regions = ((0,), (0, 3), (1, 3, 5), (0, 1, 4, 5))
+    tolerance = 3e-5 if dtype in ('float32', 'complex64') else 3e-13
+    for region, (panel, log_scale) in zip(regions, _region_trace_data(cores, regions)):
+        # Oracle uses only the original mixture, with no virtual gauges or
+        # contractions shared with the log-scaled verification algorithm.
+        expected = weights
+        for site in region:
+            factor = local[:, site].reshape((len(weights),) + (1,) * (expected.ndim - 1) + (4,))
+            expected = expected[..., None] * factor
+        expected = expected.sum(axis=0).reshape(-1)
+        actual = host(panel) * np.exp(log_scale - np.log(scale) + (6 - len(region)) * np.log(2.))
+        np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
+        np.testing.assert_allclose(np.linalg.norm(host(panel)), 1., atol=tolerance)
 
 
 def test_torch_geometric_gate_gradient_matches_finite_difference():

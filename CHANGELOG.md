@@ -8,6 +8,15 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **1D/lattice DMT performance and API:** use matrix products for canonical
+  gauge moves and cheaper intermediate region scaling while retaining all
+  preservation checks. Add a workflow guide and reproducible CPU profiling
+  example covering compression and persistent evolution.
+
+- **Pauli DMT gradients:** use native matrix exponentials for trainable Torch
+  Hamiltonians, avoiding NaN eigenvector gradients for degenerate generators
+  such as `ZZ` while retaining per-call gate reuse.
+
 - **Lattice Pauli DMT:** reuse normalized identity environments and use
   matrix multiplication for regional checks, reducing repeated contractions
   without disabling per-split preservation validation.

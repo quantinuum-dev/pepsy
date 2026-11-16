@@ -182,3 +182,43 @@ def test_shared_hamiltonian_cache_preserves_torch_parameter_gradient():
     assert abs(expected) > 1e-6
     assert np.isfinite(theta.grad.item())
     assert theta.grad.item() == pytest.approx(expected, rel=2e-4, abs=2e-7)
+
+
+@pytest.mark.parametrize('mode', ['conjugate', 'heisenberg'])
+@pytest.mark.parametrize('angle', [0., .23])
+@pytest.mark.parametrize('dtype', ['float64', 'complex128'])
+def test_degenerate_torch_hamiltonian_gradient_matches_dense_evolution(mode, angle, dtype):
+    torch = pytest.importorskip('torch')
+    rng = np.random.default_rng(107)
+    a = rng.normal(size=(8, 8)) + 1j * rng.normal(size=(8, 8))
+    dense = a @ a.conj().T
+    dense /= np.trace(dense)
+    initial = PauliMPO.from_dense(dense, max_qubits=3)
+    initial = PauliMPO.from_pauli_cores([
+        torch.tensor(np.asarray(core).real if dtype == 'float64' else core,
+                     dtype=getattr(torch, dtype)) for core in initial.to_pauli_cores()
+    ])
+    theta = torch.tensor(angle, dtype=torch.float64, requires_grad=True)
+    zz = torch.diag(torch.tensor([1., -1., -1., 1.], dtype=getattr(torch, dtype)))
+    h = theta * zz
+    # ZZ has repeated eigenvalues even away from theta=0. The derivative of
+    # its exponential is finite although individual eigenvectors have no
+    # well-defined derivative. Sharing h also exercises both cached fractions.
+    result = PauliDMT(initial, max_bond=16, mode=mode).evolve([h, h], dt=.07, steps=2)
+    probe = PauliMPO.from_terms(3, [(1., 'XII')])
+    loss = probe.inner(result).real
+    loss.backward()
+
+    parameter = torch.tensor(angle, dtype=torch.float64, requires_grad=True)
+    generator = torch.kron(zz, torch.eye(2, dtype=zz.dtype))
+    generator = generator + torch.kron(torch.eye(2, dtype=zz.dtype), zz)
+    unitary = torch.matrix_exp(-.14j * parameter * generator)
+    rho = torch.tensor(dense, dtype=torch.complex128)
+    target = (unitary @ rho @ unitary.conj().T if mode == 'conjugate'
+              else unitary.conj().T @ rho @ unitary)
+    reference = torch.trace(torch.tensor(probe.to_dense(), dtype=torch.complex128) @ target).real
+    reference.backward()
+    assert abs(parameter.grad.item()) > 1e-6
+    assert np.isfinite(theta.grad.item())
+    assert loss.item() == pytest.approx(reference.item(), abs=2e-12)
+    assert theta.grad.item() == pytest.approx(parameter.grad.item(), rel=2e-10, abs=2e-12)

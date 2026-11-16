@@ -132,6 +132,11 @@ results.
 
 ## Protected density matrix truncation (DMT)
 
+Start with the [1D and 2D DMT workflow guide](../optimizers/pauli_dmt.md)
+for API selection, complete examples and profiling. Both workflows use
+an open Pauli MPO; 2D regions change the protected data, while gate positions
+and `PauliDMT.evolve` still follow the 1D storage chain.
+
 `compress_dmt` preserves all partial traces on up to three contiguous sites
 through compression, to numerical precision. For a density matrix these are
 the local reduced density matrices; consequently compression preserves energy
@@ -269,8 +274,9 @@ cutoff, and the residual criterion is not a bound on later physical-observable
 error. When an already fitting operator has no room under the conservative
 protected-rank construction, it can be returned unchanged even with a cutoff.
 
-Up to four protected directions on each side reserve up to
-eight channels. If the conservative rank budget cannot accommodate them,
+With default **1D** protection, up to four protected directions on each side
+reserve up to eight channels. Explicit lattice regions can require many more.
+If the conservative rank budget cannot accommodate them,
 the operation raises rather than changing the constraints. An already fitting
 operator can pass through with a smaller cap. This conservative rejection
 does not prove no alternative lower-rank completion exists.
@@ -295,7 +301,9 @@ mixtures at cap 12 can fail this check; cap 24 recovers their exact rank.
 Neither floating-point arithmetic nor DMT guarantees preservation at an
 arbitrarily small bond dimension.
 
-The full marginal check applies to `compress_dmt` only. `apply_gate_dmt` and
+With default **1D** protection, the full marginal check applies to
+`compress_dmt` only. With explicit `regions`, every split also checks all
+selected reduced operators, including gated updates. `apply_gate_dmt` and
 `PauliDMT` also offer `trace_guard`, a per-gate comparison of the gated
 target's trace with the split result. It raises `FloatingPointError` if a
 single relative trace defect exceeds `32 * sqrt(machine_epsilon)`.
@@ -344,7 +352,8 @@ resolved numeric `cutoff` and `cutoff_mode`. Weights use the Pauli coefficient
 norm, equivalent to the normalized Hilbert-Schmidt norm. Protected ranks are
 reported as zero when an already-fitting bond takes a QR pass-through without
 computing the protected bases; zero then means **not computed**. Constraint residuals
-are collected only with `return_report=True`; `max_constraint_error` checks
+are collected with `return_report=True` on standalone methods or
+`diagnostics=True` on `PauliDMT`; `max_constraint_error` checks
 the original bond matrix and physical constraint vectors.
 `max_relative_constraint_error` divides each panel error by its target norm.
 This ratio can be large for nearly zero partial traces of traceless operators;
@@ -394,8 +403,11 @@ correlation = initial.inner(evolved, normalized=True)
 The Hamiltonian is exactly `sum_j bond_hamiltonians[j]`, with one Hermitian
 4-by-4 matrix per bond. Assign onsite fields to these matrices without double
 counting your intended Hamiltonian. Gates are prepared once per `evolve` call
-with backend-native Hermitian eigendecomposition. Shared Hamiltonian objects
-reuse that decomposition and their half/full-step transfers within the call.
+with backend-native Hermitian eigendecomposition. Torch Hamiltonians requiring
+gradients instead use the native matrix exponential: degenerate generators
+such as `ZZ` have smooth gate derivatives but undefined eigenvector derivatives.
+Shared Hamiltonian objects reuse gate preparation and their half/full-step
+transfers within the call.
 They are prepared again on the next call, allowing changed parameters and
 fresh autograd graphs. No process-global linear-algebra registration is
 performed. `run.state` is an

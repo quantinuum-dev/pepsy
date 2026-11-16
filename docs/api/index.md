@@ -37,6 +37,7 @@ in the [package map](package.md). The guides below explain behavior and options.
 - [MPS optimization](optimizers/mps.md)
 - [Gibbs purified MPS](optimizers/gibbs_mps.md)
 - [MPO optimization](optimizers/mpo.md)
+- [1D and 2D-region DMT](optimizers/pauli_dmt.md)
 - [PEPS optimization](optimizers/peps.md)
 - [Sweep optimization](optimizers/sweep.md)
 - [Global optimization](optimizers/global_opt.md)

@@ -18,6 +18,8 @@ The [examples directory](https://github.com/quantinuum-dev/pepsy/tree/develop/ex
 contains the MPS magnetization example:
 
 - [MPS magnetization notebook](https://github.com/quantinuum-dev/pepsy/blob/develop/examples/MpsMagnetization/mps_simulator.ipynb).
+- [1D/2D-region DMT benchmark](../examples/pauli_dmt_benchmark.py), with
+  [workflow and profiling instructions](api/optimizers/pauli_dmt.md).
 
 For operator construction, use the [API reference](api/index.md). For
 qMERA workflows, use the examples in the [qMERA API guide](api/optimizers/qmera.md).
