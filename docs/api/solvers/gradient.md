@@ -36,14 +36,16 @@ with a `RuntimeWarning`, rather than successful SciPy convergence. Scalar/real
 loss contract violations raise `ValueError`; they are not numerical penalties.
 These messages are solver-specific strings, rather than a fixed enumeration.
 Torch, JAX/Optax, and finite-difference Adam solvers pair each measured loss
-with the parameters at which it was evaluated. Their final update receives
-one extra loss evaluation, included in
+with the parameters at which it was evaluated. First-order solvers' final
+updates receive one extra loss evaluation, included in
 `n_evals`, so `final_loss` describes the returned parameters with either value
 of `restore_best`. An invalid final update cannot replace a finite best state.
 Torch terminal evaluations keep autograd enabled for objectives that contain
 derivative penalties. Native Torch/JAX solvers raise `FloatingPointError` on
 nonfinite gradients before accepting an update; JAX skips updates for nonfinite
-losses while applying the existing `bad_max` policy.
+losses while applying the existing `bad_max` policy for first-order methods.
+Native L-BFGS reuses the terminal line-search value and gradient and stops
+immediately on an invalid initial objective or an unsuccessful line search.
 `optimize_packed_params(...)` provides the function form, returning
 `(params, history)`.
 
@@ -99,7 +101,7 @@ criterion, not a projected-gradient criterion for constrained optima.
 default, then reports the completed chunk to Python. This avoids synchronizing
 the device after every update while preserving each Adam update and the full
 per-step loss history. Set `options={"scan_steps": 1}` for per-step reporting,
-or choose another positive integer to tune the chunk size. Other native JAX
+or choose another positive integer to tune the chunk size. Other first-order JAX
 Optax solvers retain one update per call by default; they also accept
 `scan_steps` when a multi-step scan is useful.
 
@@ -127,8 +129,8 @@ evaluation. NumPy/scalar conversion remains supported. Choose `lbfgs` or
 - SciPy L-BFGS-B uses Pepsy's `ftol=1e-9`, `gtol=1e-9`, and `maxls=40`.
   Other unspecified L-BFGS-B controls use SciPy's defaults.
 - NLopt uses `ftol_rel=1e-9`, `ftol_abs=1e-9`, and `xtol_rel=1e-9`.
-- Torch/JAX iterative solvers use Pepsy's default `lr=0.01`, with other
-  unspecified algorithm controls supplied by Torch/Optax.
+- Torch/JAX first-order solvers and Torch L-BFGS use Pepsy's default
+  `lr=0.01`, with other unspecified controls supplied by Torch/Optax.
 
 These are numerical defaults, not automatic tuning to a particular objective.
 Removing explicit tolerances or learning rates can change a run's stopping
@@ -149,3 +151,65 @@ NLopt rejects `max_step`: clipping a trial point inside its callback would
 return a value/gradient for a different point from the one requested by the
 solver. Use a solver with explicit update clipping when a step-norm limit is
 required. Bounds through `lower_bounds`/`upper_bounds` remain supported.
+
+## Native JAX L-BFGS
+
+```python
+import jax.numpy as jnp
+from pepsy.solvers import GradientOptimizer
+
+result = GradientOptimizer(
+    solver="jax-lbfgs", n_steps=100,
+    options={"gtol": 1e-6, "memory_size": 10},
+).run(
+    params_init={"x": jnp.array([3., -2.])},
+    loss_fn=lambda p: jnp.sum((p["x"] - .25) ** 2),
+)
+```
+
+`jax-lbfgs` uses **Optax L-BFGS with zoom line search**. The existing `lbfgs`
+alias continues to select SciPy. Parameters, quasi-Newton history, line-search
+trials, stopping decisions and best-state tracking stay on the JAX device.
+The runner JIT-compiles chunks of `scan_steps=50` updates and transfers only
+scalar diagnostics and history at chunk boundaries. `run()` is a synchronous
+Python entry point; it is not itself an outer-JIT-compatible or implicitly
+differentiable solve. Every call initializes a fresh optimizer state, including
+when targets or penalty multipliers change between calls. Compilation is local
+to a solve; reuse across separate `run()` calls is not guaranteed.
+
+Complex parameters use real/imaginary JAX coordinates. Each leaf retains its
+shape, dtype and device, including mixed real/complex mappings. Enable JAX x64
+before creating double-precision arrays. Losses must be JAX-compatible real
+scalars; the imaginary tolerance `1e-10` is checked inside line-search trials
+as well as at the initial point. Nonfinite trial objectives can be rejected by
+the search. A finite accepted objective with a nonfinite gradient raises
+`FloatingPointError`.
+
+| Option | Meaning/default |
+| --- | --- |
+| `memory_size` | Positive integer curvature-history length, default 10 |
+| `gtol` | Euclidean gradient norm stopping threshold, default `1e-6` |
+| `ftol` | Relative successive-loss threshold, default 0 (disabled) |
+| `lr` | Optional positive scaling before line search; omitted uses Optax's `None` default |
+| `scan_steps` | Positive integer compiled chunk size, default 50 |
+| `linesearch_options` | Keyword mapping for `optax.scale_by_zoom_linesearch`; defaults to 20 trials and `initial_guess_strategy="one"` |
+| `scale_init_precond` | Forwarded to Optax, default `True` |
+
+`n_steps` and `maxiter`/`maxeval`/`its_max` limit outer iterations, not trial
+evaluations. `n_evals` counts the initial objective/gradient and every
+line-search trial; accepted values/gradients are cached rather than recomputed.
+`history` records each visited pre-update loss, while `final_loss` describes
+the returned iterate, including the final accepted update. Reasons include
+`gradient_tol`, `ftol`, `patience`, `maxiter`, `invalid_objective`, and
+`linesearch_failed`. A failed search retains a finite nonincreasing candidate
+when available and stops; it does not silently continue with bad curvature.
+`restore_best`, `min_steps`, `patience`, `min_improve`, `assume_nonnegative`
+and `best_neg_tol` apply. An invalid initial objective stops immediately;
+`bad_max` and penalty substitution do not restart quasi-Newton history.
+Use `assume_nonnegative=False` (the default) for signed augmented-Lagrangian
+objectives. Bounds, angle wrapping, gradient clipping and update clipping are
+unsupported because they change the line-search problem.
+
+This adds an unconstrained solver for user-supplied objectives. Local-density
+constraints are not automatically added to an MPO loss; use
+[`compress_mpo_dmt`](../operators/mpo_dmt.md) for direct protected SVD.

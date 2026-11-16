@@ -8,6 +8,13 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Native JAX L-BFGS and ordinary MPO DMT:** add
+  `GradientOptimizer(solver="jax-lbfgs")` using Optax zoom line search,
+  compiled device-side iteration chunks, complex coordinates, cached values
+  and counted trial evaluations. Add `compress_mpo_dmt` for dense open
+  ket/bra MPOs, sharing protected SVD with Pauli DMT and preserving default
+  three-site or explicit-region reduced operators without a basis conversion.
+
 - **1D/lattice DMT performance and API:** use matrix products for canonical
   gauge moves and cheaper intermediate region scaling while retaining all
   preservation checks. Add a workflow guide and reproducible CPU profiling

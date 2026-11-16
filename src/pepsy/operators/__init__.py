@@ -162,6 +162,9 @@ _SYMBOL_MODULES["PauliCompressionReport"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliBondCompressionReport"] = ".pauli_mpo"
 _SYMBOL_MODULES["PauliDMTReport"] = "._pauli_dmt"
 _SYMBOL_MODULES["PauliDMTBondReport"] = "._pauli_dmt"
+_SYMBOL_MODULES.update({name: ".mpo_dmt" for name in (
+    "compress_mpo_dmt", "MPODMTReport", "MPODMTBondReport",
+)})
 _SUBMODULES = (
     "cluster",
     "cluster_plan",
@@ -215,6 +218,9 @@ __all__ = [
     "PauliBondCompressionReport",
     "PauliDMTReport",
     "PauliDMTBondReport",
+    "compress_mpo_dmt",
+    "MPODMTReport",
+    "MPODMTBondReport",
     "square_lattice_dmt_regions",
     *_SUBMODULES,
 ]

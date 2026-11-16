@@ -42,6 +42,7 @@ These are the names to use in new code.
 | Pauli operator algebra | `PauliMPO`, `decompose_pauli`, `PauliCompressionReport`, `PauliBondCompressionReport` | `operators.pauli_mpo` |
 | Pauli coefficient damping | `PauliDampingMPO` | `operators.pauli_damping` |
 | Protected Pauli compression | `PauliMPO.compress_dmt`, `PauliMPO.apply_gate_dmt`, `PauliDMTReport`, `square_lattice_dmt_regions` | `operators._pauli_dmt`, `operators.pauli_dmt_geometry` |
+| Protected ordinary MPO compression | `compress_mpo_dmt`, `MPODMTReport`, `MPODMTBondReport` | `operators.mpo_dmt`; shared trace-vector and protected split kernel in `operators._pauli_dmt` |
 | Exact MPO structural layer | `MPOAutomaton`, `MPOChannel`, `MPOTransition` | `operators.mpo_automaton` |
 | Native tree operators | `TreeMPO`, `TreePEPO`, `TreeSubPEPO`, `ham_tn.to_tree_mpo`, `ham_tn.to_tree_pepo` | `optimizers.tree`, `optimizers.tree_peps`, `operators.hamiltonians` |
 | Elementary gates/builders | gate constructors (`x`, `rx`, `cnot`, etc.), `gate`, `build_mpo_from_gates`, `build_pepo_from_gates` | `operators.gates` |

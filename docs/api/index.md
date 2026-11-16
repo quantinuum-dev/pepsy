@@ -23,6 +23,7 @@ in the [package map](package.md). The guides below explain behavior and options.
 - [MPO cluster expansion](operators/mpo_cluster.md)
 - [MPO delinearisation without SVD](operators/mpo_delinearize.md)
 - [Pauli-basis MPO](operators/pauli_mpo.md)
+- [Protected SVD for ordinary MPO tensors](operators/mpo_dmt.md)
 - [PEPO cluster expansion](operators/cluster_expansion.md)
 - [Unified MPO/PEPO exponential API](operators/exponentials.md)
 - [External circuit adapters](interop.md)

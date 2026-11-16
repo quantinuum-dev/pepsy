@@ -74,7 +74,7 @@ def test_supported_solvers_exports_expected_backends():
         "torch-adam", "torch-lbfgs", "torch-adamw", "torch-radam", "torch-nadam",
         "scipy", "nlopt",
         "fd-adam", "fd-scipy", "fd-nlopt",
-        "jax-adam", "jax-adamw", "jax-sgd", "jax-rmsprop",
+        "jax-adam", "jax-adamw", "jax-sgd", "jax-rmsprop", "jax-lbfgs",
     }
 
 

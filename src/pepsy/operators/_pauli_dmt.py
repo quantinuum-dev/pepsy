@@ -1,4 +1,4 @@
-"""Protected Pauli-MPO splitting, using Quimb decompositions and Autoray.
+"""Protected MPO splitting, using Quimb decompositions and Autoray.
 
 White et al., PRB 97, 035127 (2018), and the traceless-operator variant
 of Yi-Thomas et al., PRB 110 (2024), Appendix D. No Hilbert-space matrices
@@ -35,7 +35,10 @@ __all__ = ["PauliDMTBondReport", "PauliDMTReport"]
 
 @dataclass(frozen=True)
 class PauliDMTBondReport:
-    """One split; weights use the coefficient (normalized trace) norm.
+    """One split; weights use the input core basis norm.
+
+    Pauli cores use the coefficient (normalized trace) norm; the ordinary
+    MPO adapter reports physical Hilbert-Schmidt units.
 
     Protected ranks are zero when a fitting bond passes through without
     computing its protected bases; zero then means not computed.
@@ -105,7 +108,14 @@ def _unit(x):
     return x / safe
 
 
-def _trace_fraction(cores):
+def _traced(core, trace_vector=None):
+    """Contract the physical leg with its basis-specific trace covector."""
+    if trace_vector is None:
+        return core[:, :, 0]
+    return _reshape(_reshape(core, (-1, core.shape[2])) @ trace_vector, core.shape[:2])
+
+
+def _trace_fraction(cores, trace_vector=None):
     """Global identity coefficient relative to the canonical centre norm.
 
     Per-bond environments are normalized and lose their magnitude, so they
@@ -117,7 +127,7 @@ def _trace_fraction(cores):
     log_scale = ar.do("zeros_like", norm)
     nonzero = norm > 0
     for core in reversed(cores):
-        v = core[:, :, 0] @ v
+        v = _traced(core, trace_vector) @ v
         norm = _norm(v)
         nonzero = nonzero & (norm > 0)
         safe = ar.do("where", norm > 0, norm, ar.do("ones_like", norm))
@@ -291,7 +301,7 @@ def _constraints(left, right, matrix, lv, rv, *, return_normwise=False):
     return max(errors), relative
 
 
-def _local_trace_data(cores):
+def _local_trace_data(cores, trace_vector=None):
     """All three-site coefficient panels with log-scaled identity environments.
 
     Linear chain cost, no 2**L factors, and no underflow from long identity
@@ -308,7 +318,7 @@ def _local_trace_data(cores):
     right = [None] * (n + 1)
     right[n] = one, 0.
     for j in reversed(range(n)):
-        v, log = normalize(cores[j][:, :, 0] @ right[j + 1][0])
+        v, log = normalize(_traced(cores[j], trace_vector) @ right[j + 1][0])
         right[j] = v, log + right[j + 1][1]
     left, left_log, panels = one, 0., []
     for j in range(n - size + 1):
@@ -318,12 +328,12 @@ def _local_trace_data(cores):
         panel = panel @ right[j + size][0]
         panel, log = normalize(panel)
         panels.append((panel, log + left_log + right[j + size][1]))
-        left, log = normalize(left @ cores[j][:, :, 0])
+        left, log = normalize(left @ _traced(cores[j], trace_vector))
         left_log += log
     return panels
 
 
-def _region_trace_data(cores, regions):
+def _region_trace_data(cores, regions, trace_vector=None):
     """Log-scaled Pauli coefficient panels for arbitrary MPO site sets."""
     def normalize(value, *, final=False):
         # Intermediate panels need only bounded entries to avoid underflow.
@@ -339,12 +349,12 @@ def _region_trace_data(cores, regions):
     last_start = max(min(region) for region in regions)
     first_stop = min(max(region) + 1 for region in regions)
     for core in cores[:last_start]:
-        value, log = normalize(left[-1][0] @ core[:, :, 0])
+        value, log = normalize(left[-1][0] @ _traced(core, trace_vector))
         left.append((value, left[-1][1] + log))
     right = [None] * (n + 1)
     right[n] = one, 0.
     for j in range(n - 1, first_stop - 1, -1):
-        value, log = normalize(cores[j][:, :, 0] @ right[j + 1][0])
+        value, log = normalize(_traced(cores[j], trace_vector) @ right[j + 1][0])
         right[j] = value, right[j + 1][1] + log
 
     panels = []
@@ -358,11 +368,11 @@ def _region_trace_data(cores, regions):
             if j in sites:
                 # Fuse the outgoing bond and Pauli index for a matrix multiply;
                 # the final transpose restores Pauli-before-bond panel order.
-                v = v @ _reshape(core, (core.shape[0], core.shape[1] * 4))
-                v = _transpose(_reshape(v, (-1, core.shape[1], 4)), (0, 2, 1))
+                v = v @ _reshape(core, (core.shape[0], core.shape[1] * core.shape[2]))
+                v = _transpose(_reshape(v, (-1, core.shape[1], core.shape[2])), (0, 2, 1))
                 v = _reshape(v, (-1, core.shape[1]))
             else:
-                v = v @ core[:, :, 0]
+                v = v @ _traced(core, trace_vector)
             v, log = normalize(v)
             log_scale += log
         v, log = normalize(v @ right[stop][0], final=True)
@@ -370,7 +380,7 @@ def _region_trace_data(cores, regions):
     return panels
 
 
-def _region_patterns(regions, nsites):
+def _region_patterns(regions, nsites, physical_dim=4, *, identity_label=0):
     """Sufficient protected strings at each cut, with identity first."""
     plans = []
     for bond in range(nsites - 1):
@@ -381,8 +391,8 @@ def _region_patterns(regions, nsites):
             if not ls or not rs:
                 continue
             side, sites = (left, ls) if len(ls) <= len(rs) else (right, rs)
-            for labels in product(range(4), repeat=len(sites)):
-                pattern = tuple((s, p) for s, p in zip(sites, labels) if p)
+            for labels in product(range(physical_dim), repeat=len(sites)):
+                pattern = tuple((s, p) for s, p in zip(sites, labels) if p != identity_label)
                 side[pattern] = None
         plans.append((tuple(left), tuple(right)))
     return tuple(plans)
@@ -392,22 +402,36 @@ def _region_vectors(cores, bond, patterns, eye, environments):
     """Map physical strings to the active two-site virtual bases."""
     left_patterns, right_patterns = patterns
     left, right = [], []
+    trace_vector = environments.trace_vector
+
+    def physical(site, labels):
+        if site in labels:
+            return eye[:, labels[site]]
+        return eye[:, 0] if trace_vector is None else trace_vector
+
+    def transfer(site, labels):
+        if site in labels:
+            if trace_vector is None:
+                return cores[site][:, :, labels[site]]
+            return _traced(cores[site], eye[:, labels[site]])
+        return _traced(cores[site], trace_vector)
+
     environments.at(bond, bond + 2)
     for pattern in left_patterns:
         labels = dict(pattern)
         first = next((site for site, _ in pattern if site < bond), bond)
         v = environments.left[first]
         for j in range(first, bond):
-            v = _unit(v @ cores[j][:, :, labels.get(j, 0)])
-        v = _einsum("a,p->ap", ar.do("conj", v), eye[:, labels.get(bond, 0)])
+            v = _unit(v @ transfer(j, labels))
+        v = _einsum("a,p->ap", ar.do("conj", v), physical(bond, labels))
         left.append(_reshape(v, (-1,)))
     for pattern in right_patterns:
         labels = dict(pattern)
         last = max((site for site, _ in pattern if site > bond + 1), default=bond + 1)
         v = environments.right[last + 1]
         for j in range(last, bond + 1, -1):
-            v = _unit(cores[j][:, :, labels.get(j, 0)] @ v)
-        v = _einsum("p,b->pb", eye[:, labels.get(bond + 1, 0)], v)
+            v = _unit(transfer(j, labels) @ v)
+        v = _einsum("p,b->pb", physical(bond + 1, labels), v)
         right.append(_reshape(v, (-1,)))
     return ar.do("stack", left, axis=1), ar.do("stack", right, axis=1)
 
@@ -586,8 +610,9 @@ def _options(max_bond, cutoff, cutoff_mode, variant, dtype):
 class _TraceEnvironments:
     """Lazily valid normalized identity prefixes and suffixes; no state copy."""
 
-    def __init__(self, cores):
+    def __init__(self, cores, trace_vector=None):
         self.cores = cores
+        self.trace_vector = trace_vector
         self.left = [None] * (len(cores) + 1)
         self.right = [None] * (len(cores) + 1)
         one = _array_like(np.ones(1), cores[0])
@@ -600,26 +625,35 @@ class _TraceEnvironments:
 
     def at(self, start, stop):
         for i in range(self.left_valid, start):
-            self.left[i + 1] = _unit(self.left[i] @ self.cores[i][:, :, 0])
+            self.left[i + 1] = _unit(self.left[i] @ _traced(self.cores[i], self.trace_vector))
         self.left_valid = max(start, self.left_valid)
         for i in range(self.right_valid - 1, stop - 1, -1):
-            self.right[i] = _unit(self.cores[i][:, :, 0] @ self.right[i + 1])
+            self.right[i] = _unit(_traced(self.cores[i], self.trace_vector) @ self.right[i + 1])
         self.right_valid = min(stop, self.right_valid)
         return self.left[start], self.right[stop]
 
 
 class _PauliDMTWorkspace:
-    """Owned cores and persistent canonical/trace state for local sweeps."""
+    """Owned cores and persistent canonical/trace state for local sweeps.
 
-    def __init__(self, operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
-                 diagnostics=False, trace_guard="auto", regions=None):
+    The Pauli default traces physical label zero. The ordinary MPO adapter
+    supplies owned fused cores and their real matrix-unit trace covector.
+    """
+
+    def __init__(self, operator=None, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
+                 diagnostics=False, trace_guard="auto", regions=None,
+                 _cores=None, _trace_vector=None):
         if not (isinstance(trace_guard, bool) or trace_guard == "auto"):
             raise ValueError("trace_guard must be 'auto', True or False.")
-        if operator.boundary != "open":
+        if operator is not None and operator.boundary != "open":
             raise NotImplementedError("DMT currently requires an open PauliMPO.")
-        self.cores = list(operator.to_pauli_cores(copy=True))
+        self.cores = list(operator.to_pauli_cores(copy=True) if _cores is None else _cores)
+        self.trace_vector = _trace_vector
+        self.physical_dim = self.cores[0].shape[2]
+        self.pauli_units = _trace_vector is None
         self.regions = _normalize_regions(regions, len(self.cores))
-        self.region_patterns = (_region_patterns(self.regions, len(self.cores))
+        self.region_patterns = (_region_patterns(
+            self.regions, len(self.cores), self.physical_dim)
                                 if self.regions is not None else None)
         backends = {ar.infer_backend(a) for a in self.cores}
         if len(backends) != 1 or "symmray" in backends:
@@ -635,15 +669,26 @@ class _PauliDMTWorkspace:
         self.original_bonds = _core_bond_dimensions(self.cores)
         self.diagnostics = diagnostics
         self.reports = []
-        self.eye = _array_like(np.eye(4), self.cores[0])
+        self.eye = _array_like(np.eye(self.physical_dim), self.cores[0])
+        if not self.pauli_units:
+            # Householder columns span matrix units with the trace direction
+            # first. Appending trace to all matrix units instead is redundant:
+            # its exact zero singular value can poison SVD backward formulas.
+            # Rotate only protection vectors, never the stored MPO cores.
+            v = self.eye[:, 0] - _unit(_trace_vector)
+            denominator = ar.do("sum", ar.do("abs", v) ** 2)
+            safe = ar.do("where", denominator > 0, denominator,
+                         ar.do("ones_like", denominator))
+            self.eye = self.eye - 2 * _einsum("p,q->pq", v, ar.do("conj", v)) / safe
+        self.protected_physical = self.eye
         # One exact preparation, then move only as far as the next active pair.
         self.center = len(self.cores) - 1
-        self.environments = _TraceEnvironments(self.cores)
+        self.environments = _TraceEnvironments(self.cores, _trace_vector)
         self.move_center(0)
         if variant == "density":
             _, right = self.environments.at(0, 1)
             a = self.cores[0]
-            value = a[0, :, 0] @ right
+            value = _traced(a, _trace_vector)[0, :] @ right
             bound = _float(_norm(a)) * _float(_norm(right))
             if abs(_host_array(value).item()) <= 32 * max(a.shape) * _epsilon(a) * bound:
                 raise ValueError(
@@ -655,23 +700,24 @@ class _PauliDMTWorkspace:
             # A connected density calculation declares nonzero trace. For raw
             # operators, do not divide by a trace that is only roundoff noise.
             self.monitor_trace = variant == "density" or (
-                _trace_fraction(self.cores) > 8 * _epsilon(self.cores[0])
+                _trace_fraction(self.cores, _trace_vector) > 8 * _epsilon(self.cores[0])
             )
         else:
             self.monitor_trace = trace_guard
 
     def move_center(self, target):
+        p = self.physical_dim
         while self.center < target:
             i = self.center
             a = self.cores[i]
             dl, dr, _ = a.shape
-            q, r = _qr(_reshape(_transpose(a, (0, 2, 1)), (dl * 4, dr)))
-            self.cores[i] = _transpose(_reshape(q, (dl, 4, q.shape[1])), (0, 2, 1))
+            q, r = _qr(_reshape(_transpose(a, (0, 2, 1)), (dl * p, dr)))
+            self.cores[i] = _transpose(_reshape(q, (dl, p, q.shape[1])), (0, 2, 1))
             # Fuse spectator legs so the gauge contraction uses backend GEMM
             # rather than a general einsum (costly for long, high-rank chains).
             neighbor = self.cores[i + 1]
             self.cores[i + 1] = _reshape(
-                r @ _reshape(neighbor, (dr, -1)), (r.shape[0], neighbor.shape[1], 4),
+                r @ _reshape(neighbor, (dr, -1)), (r.shape[0], neighbor.shape[1], p),
             )
             self.environments.invalidate(i, i + 2)
             self.center += 1
@@ -680,19 +726,20 @@ class _PauliDMTWorkspace:
             a = self.cores[i]
             dl, dr, _ = a.shape
             left, _, right = array_split(
-                _reshape(_transpose(a, (0, 2, 1)), (dl, 4 * dr)),
+                _reshape(_transpose(a, (0, 2, 1)), (dl, p * dr)),
                 method="qr", absorb="left", cutoff=0.0,
             )
-            self.cores[i] = _transpose(_reshape(right, (right.shape[0], 4, dr)), (0, 2, 1))
+            self.cores[i] = _transpose(_reshape(right, (right.shape[0], p, dr)), (0, 2, 1))
             neighbor = self.cores[i - 1]
             matrix = _reshape(_transpose(neighbor, (0, 2, 1)), (-1, dl)) @ left
             self.cores[i - 1] = _transpose(
-                _reshape(matrix, (neighbor.shape[0], 4, left.shape[1])), (0, 2, 1),
+                _reshape(matrix, (neighbor.shape[0], p, left.shape[1])), (0, 2, 1),
             )
             self.environments.invalidate(i - 1, i + 1)
             self.center -= 1
 
     def split_pair(self, bond, transfer=None, *, absorb="right"):
+        p = self.physical_dim
         if not bond <= self.center <= bond + 1:
             self.move_center(bond if self.center < bond else bond + 1)
         a, b = self.cores[bond:bond + 2]
@@ -701,8 +748,8 @@ class _PauliDMTWorkspace:
         if transfer is None:
             # Reuse the canonical pair's existing bond, avoiding an enlarged
             # (4 chi)-square SVD when no physical gate increased its rank.
-            am = _reshape(_transpose(a, (0, 2, 1)), (dl * 4, a.shape[1]))
-            bm = _reshape(_transpose(b, (0, 2, 1)), (b.shape[0], dr * 4))
+            am = _reshape(_transpose(a, (0, 2, 1)), (dl * p, a.shape[1]))
+            bm = _reshape(_transpose(b, (0, 2, 1)), (b.shape[0], dr * p))
             if self.center == bond:
                 left_map, matrix = _qr(am)
                 right_map = bm
@@ -711,13 +758,13 @@ class _PauliDMTWorkspace:
                 left_map = am
         else:
             theta = _einsum("abp,bcq->apqc", a, b)
-            theta = _einsum("PQpq,apqb->aPQb", _reshape(transfer, (4, 4, 4, 4)), theta)
-            matrix = _reshape(theta, (4 * dl, 4 * dr))
+            theta = _einsum("PQpq,apqb->aPQb", _reshape(transfer, (p, p, p, p)), theta)
+            matrix = _reshape(theta, (p * dl, p * dr))
         if self.regions is None:
             left_env, right_env = self.environments.at(bond, bond + 2)
-            eye = self.eye
-            lv = _reshape(_einsum("a,pm->apm", ar.do("conj", left_env), eye), (dl * 4, 4))
-            rv = _reshape(_einsum("pm,b->pbm", eye, right_env), (dr * 4, 4))
+            eye = self.protected_physical
+            lv = _reshape(_einsum("a,pm->apm", ar.do("conj", left_env), eye), (dl * p, eye.shape[1]))
+            rv = _reshape(_einsum("pm,b->pbm", eye, right_env), (dr * p, eye.shape[1]))
         else:
             lv, rv = _region_vectors(self.cores, bond, self.region_patterns[bond], self.eye,
                                      self.environments)
@@ -725,14 +772,15 @@ class _PauliDMTWorkspace:
             if transfer is not None:
                 exact_left, exact_right = _qr(matrix)
                 exact_rank = exact_left.shape[1]
-                target_cores[bond] = _transpose(_reshape(exact_left, (dl, 4, exact_rank)), (0, 2, 1))
-                target_cores[bond + 1] = _transpose(_reshape(exact_right, (exact_rank, 4, dr)), (0, 2, 1))
-            before_regions = _region_trace_data(target_cores, self.regions)
+                target_cores[bond] = _transpose(_reshape(exact_left, (dl, p, exact_rank)), (0, 2, 1))
+                target_cores[bond + 1] = _transpose(_reshape(exact_right, (exact_rank, p, dr)), (0, 2, 1))
+            before_regions = _region_trace_data(target_cores, self.regions, self.trace_vector)
         if left_map is not None:
             lv, rv = _dag(left_map) @ lv, right_map @ rv
         left, right, report = _split(
             matrix, lv, rv, max_bond=self.max_bond, cutoff=self.cutoff,
-            cutoff_mode=self.cutoff_mode, nsites=len(self.cores), variant=self.variant,
+            cutoff_mode=self.cutoff_mode, nsites=len(self.cores) if self.pauli_units else 0,
+            variant=self.variant,
             absorb=absorb, bond=bond, diagnostics=self.diagnostics,
             monitor_trace=self.monitor_trace and transfer is not None,
             # At an open boundary the corresponding trace environment is
@@ -743,12 +791,12 @@ class _PauliDMTWorkspace:
         if left_map is not None:
             left, right = left_map @ left, right @ right_map
         rank = left.shape[1]
-        new_left = _transpose(_reshape(left, (dl, 4, rank)), (0, 2, 1))
-        new_right = _transpose(_reshape(right, (rank, 4, dr)), (0, 2, 1))
+        new_left = _transpose(_reshape(left, (dl, p, rank)), (0, 2, 1))
+        new_right = _transpose(_reshape(right, (rank, p, dr)), (0, 2, 1))
         if self.regions is not None:
             candidate = list(self.cores)
             candidate[bond], candidate[bond + 1] = new_left, new_right
-            _check_local_trace_data(before_regions, _region_trace_data(candidate, self.regions),
+            _check_local_trace_data(before_regions, _region_trace_data(candidate, self.regions, self.trace_vector),
                                     norm=_float(_norm(matrix)), epsilon=_epsilon(matrix),
                                     n=len(self.cores))
         self.cores[bond], self.cores[bond + 1] = new_left, new_right

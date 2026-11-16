@@ -41,6 +41,7 @@ SUPPORTED_SOLVERS = (
     "jax-adamw",
     "jax-sgd",
     "jax-rmsprop",
+    "jax-lbfgs",
 )
 
 _TORCH_SOLVERS = {}
@@ -54,7 +55,7 @@ if torch is not None:
     }
 
 _JAX_SOLVER_NAMES = frozenset(
-    {"jax-adam", "jax-adamw", "jax-sgd", "jax-rmsprop"}
+    {"jax-adam", "jax-adamw", "jax-sgd", "jax-rmsprop", "jax-lbfgs"}
 )
 
 _FD_SOLVER_MODULE = None
@@ -2324,6 +2325,14 @@ def _optimize_dispatch(
 
     # JAX path: no torch needed, no torch-flavoured param specs.
     if solver_name in _JAX_SOLVER_NAMES:
+        if solver_name == "jax-lbfgs":
+            from ._jax_lbfgs import run_jax_lbfgs
+
+            return run_jax_lbfgs(
+                params_init, loss_fn, lr=lr if "lr" in (solver_options or {}) else None,
+                solver_options=options, n_steps=n_steps, log_every=log_every,
+                progress=progress, opt_desc=opt_desc, progress_callback=progress_callback,
+            )
         return _run_jax_solver(
             params_init,
             loss_fn,

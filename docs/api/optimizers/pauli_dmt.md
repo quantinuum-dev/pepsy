@@ -1,6 +1,8 @@
 # DMT for 1D chains and 2D lattice regions
 
-Use native `PauliMPO` tensors for both workflows. **1D** protects every
+Use `PauliMPO` for native coefficient storage and repeated gate evolution,
+or [`compress_mpo_dmt`](../operators/mpo_dmt.md) for ordinary ket/bra MPO
+compression with the same protected SVD kernel. **1D** protects every
 contiguous three-site reduced operator by default. **2D** protects explicit
 physical neighborhoods mapped into the same open MPO chain. This is a
 geometry-aware MPO method; storage, gate positions and chain evolution retain
@@ -13,6 +15,7 @@ cores on an open chain.
 | Task | API | Result and mutation |
 | --- | --- | --- |
 | Compress an existing operator | `rho.compress_dmt(max_bond=..., regions=...)` | New `PauliMPO`; `inplace=True` commits after success |
+| Compress ordinary MPO tensors | `compress_mpo_dmt(mpo, max_bond=..., regions=...)` | New Quimb MPO; optional transactional `inplace=True` |
 | Apply one adjacent gate | `rho.apply_gate_dmt(U, (j, j+1), max_bond=..., regions=...)` | New `PauliMPO`; optional `inplace=True` |
 | Reuse environments across adjacent gates | `run = PauliDMT(rho, max_bond=..., regions=...)`; `run.apply_gate(U, (j, j+1))` | Updates `run`; returns one `PauliDMTBondReport` |
 | Evolve a nearest-neighbor chain | `run.evolve(bond_hamiltonians, dt=..., steps=...)` | Updates `run` and `run.time`; returns an independent `PauliMPO` |
