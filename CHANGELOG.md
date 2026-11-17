@@ -8,6 +8,13 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Optional DMT refinement:** add `truncation="optimized"` for guarded
+  compatible-border SVD and equality-constrained alternating bond refinement,
+  accepting only feasible improvements over the paper seed. Add
+  `region_selection="min_cover"` to share physical-string protection across
+  overlapping mapped regions. Expose both in ordinary/Pauli MPO compression,
+  Pauli gate evolution and ordinary MPO replay; retain the fast defaults.
+
 - **MPO DMT replay:** add `MpoOptimizer(mode="dmt")`, `compress_dmt` and
   optional per-gate reports for computational-basis MPOs and mapped 2D regions.
   Build exact gate targets before protected truncation, retain transactional

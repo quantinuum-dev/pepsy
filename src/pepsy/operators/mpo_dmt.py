@@ -70,7 +70,8 @@ def _extract_cores(mpo):
 
 
 def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
-                     variant="density", regions=None, inplace=False, return_report=False):
+                     variant="density", regions=None, inplace=False, return_report=False,
+                     truncation="paper", max_refinement_sweeps=8, region_selection="smallest"):
     """Compress a dense, ordinary MPO while preserving local partial traces.
 
     The default protects every contiguous window of up to three sites.
@@ -79,6 +80,10 @@ def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
     ``delta[ket, bra]``: no Pauli conversion or dense global matrix is used.
     Both cutoff controls default to ``'auto'``: dtype-dependent residual
     tolerance with relative singular-value thresholding. Explicit zero opts out.
+    ``truncation='optimized'`` adds guarded Schur/alternating bond refinement;
+    ``max_refinement_sweeps=0`` tries only feasible SVD seeds. Cutoffs apply
+    to seeds; refinement may reuse rank up to the cap. ``region_selection``
+    can be ``'min_cover'`` to share physical protection across regions.
 
     Uniform square local dimensions, NumPy, Torch and JAX floating/complex
     arrays are supported. Cutoffs and discarded norms use physical
@@ -94,12 +99,15 @@ def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
     result, report, _ = _compress_mpo_dmt(
         mpo, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode,
         variant=variant, regions=regions, inplace=inplace, return_report=return_report,
+        truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+        region_selection=region_selection,
     )
     return (result, report) if return_report else result
 
 
 def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
-                      variant, regions, inplace, return_report):
+                      variant, regions, inplace, return_report, truncation="paper",
+                      max_refinement_sweeps=8, region_selection="smallest"):
     """Full protected sweep, retaining owned canonical state for replay."""
     cores, layouts, d = _extract_cores(mpo)
     max_bond, cutoff, cutoff_mode, variant = _options(
@@ -119,6 +127,8 @@ def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
         max_bond=max_bond, cutoff=working_cutoff, cutoff_mode=cutoff_mode, variant=variant,
         diagnostics=return_report, trace_guard=False, regions=regions,
         _cores=cores, _trace_vector=trace_vector,
+        truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+        region_selection=region_selection,
     )
 
     def panels(values):
@@ -293,7 +303,9 @@ def _gate_mpo_dmt_routed(mpo, previous, gate, bra_gate, where):
         workspace.regions = tuple(tuple(sorted(positions[s] for s in r)) for r in regions)
         # Only this cut is split before the next permutation changes regions.
         workspace.region_patterns = [None] * (n - 1)
-        workspace.region_patterns[bond] = _region_pattern(workspace.regions, bond, p)
+        workspace.region_patterns[bond] = _region_pattern(
+            workspace.regions, bond, p, selection=workspace.region_selection,
+        )
         return positions
 
     for bond in range(a, b - 1):

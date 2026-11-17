@@ -14,6 +14,11 @@ For ordinary MPO gate-stream replay, use
 [`MpoOptimizer(mode="dmt")`](mpo.md#dmt-gate-stream-replay), which applies each
 gate exactly before protected compression.
 
+Optional `truncation="optimized"` adds guarded fixed-border SVD and constrained
+bond refinement; `region_selection="min_cover"` shares protection strings
+across overlapping regions. Both retain the original defaults. See the
+[controls and optimality limits](../operators/mpo_dmt.md#optional-improved-bond-truncation).
+
 ## Choose an operation
 
 | Task | API | Result and mutation |

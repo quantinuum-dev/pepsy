@@ -49,10 +49,15 @@ class PauliDMT:
     ``regions`` replaces contiguous three-site protection with complete
     reduced-operator constraints on the given MPO-site sequences. Geometry-
     selected splits check those regions before committing each update.
+    ``truncation='optimized'`` optionally refines each fixed-border bond;
+    ``max_refinement_sweeps`` bounds alternating updates (zero for SVD seeds
+    only). ``region_selection='min_cover'`` shares physical strings across
+    overlapping regions. The original fast rules remain the defaults.
     """
 
     def __init__(self, operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
-                 mode="conjugate", diagnostics=False, trace_guard="auto", regions=None):
+                 mode="conjugate", diagnostics=False, trace_guard="auto", regions=None,
+                 truncation="paper", max_refinement_sweeps=8, region_selection="smallest"):
         if not isinstance(operator, PauliMPO):
             raise TypeError("operator must be a PauliMPO.")
         if mode not in {"conjugate", "heisenberg"}:
@@ -62,6 +67,8 @@ class PauliDMT:
         self._workspace = _PauliDMTWorkspace(
             operator, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
             diagnostics=diagnostics, trace_guard=trace_guard, regions=regions,
+            truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+            region_selection=region_selection,
         )
 
     @property

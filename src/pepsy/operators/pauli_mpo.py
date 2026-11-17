@@ -1743,13 +1743,20 @@ class PauliMPO:
 
     def compress_dmt(
         self, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density", inplace=False,
-        return_report=False, regions=None,
+        return_report=False, regions=None, truncation="paper", max_refinement_sweeps=8,
+        region_selection="smallest",
     ):
         """Compress while preserving partial traces on protected regions.
 
         ``regions`` is an iterable of nonempty MPO-site index sequences; each
         specifies a complete reduced operator to preserve. ``None`` preserves
         all contiguous three-site partial traces, as in the original 1D DMT.
+
+        ``truncation='optimized'`` adds guarded fixed-border refinement with
+        at most ``max_refinement_sweeps`` alternating updates. Zero tries
+        only SVD seeds. ``region_selection='min_cover'`` shares protected
+        physical strings across regions; the defaults retain paper DMT.
+        Cutoffs control SVD seeds; refinement may reuse rank up to the cap.
 
         ``variant='density'`` truncates connected correlations and requires
         nonzero trace. ``'operator'`` uses the raw-block DMT variant, including
@@ -1765,11 +1772,14 @@ class PauliMPO:
         return compress_dmt(
             self, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
             inplace=inplace, return_report=return_report, regions=regions,
+            truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+            region_selection=region_selection,
         )
 
     def apply_gate_dmt(
         self, gate, where, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
         mode="conjugate", inplace=False, return_report=False, trace_guard="auto", regions=None,
+        truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
     ):
         """Apply a two-qubit gate locally, then DMT-split the acted-on bond.
 
@@ -1782,6 +1792,8 @@ class PauliMPO:
         trace roundoff. This guard does not certify all local marginals.
         ``regions`` selects complete protected reduced operators by MPO site
         indices; ``None`` uses the original contiguous three-site regions.
+        ``truncation``, ``max_refinement_sweeps`` and ``region_selection``
+        have the same meaning as in :meth:`compress_dmt`.
         """
         from ._pauli_dmt import gate_dmt
 
@@ -1789,6 +1801,8 @@ class PauliMPO:
             self, gate, where, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode,
             variant=variant, mode=mode, inplace=inplace,
             return_report=return_report, trace_guard=trace_guard, regions=regions,
+            truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+            region_selection=region_selection,
         )
 
     def apply_damping(self, damping, *, inplace=False):

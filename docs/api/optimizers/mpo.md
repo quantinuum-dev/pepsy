@@ -24,6 +24,12 @@ queue on that updated MPO. The operator retains its absolute scale.
 
 ## DMT gate-stream replay
 
+Optional `run(dmt_truncation="optimized", dmt_max_refinement_sweeps=8,
+dmt_region_selection="min_cover")` enables improved bond approximation and
+shared region protection. Manual `compress_dmt` uses the same names without
+the `dmt_` prefix. The fast paper method and smaller-half selection remain
+the defaults; see [mathematics and limits](../operators/mpo_dmt.md#optional-improved-bond-truncation).
+
 ```python
 import numpy as np
 import quimb.tensor as qtn

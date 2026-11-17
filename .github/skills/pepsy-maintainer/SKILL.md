@@ -50,6 +50,7 @@ contracts when a domain skill does not repeat them.
 ## Domain routing
 
 - MPS replay, layouts, or canonicalization → [`mps-optimizer`](../mps-optimizer/SKILL.md)
+- MPO DMT, protected density compression, local marginals, or DMT replay → [`mpo-dmt`](../mpo-dmt/SKILL.md)
 - FIT sweeps, variational compression, active rank growth, or FIT profiling → [`tensor-fitting`](../tensor-fitting/SKILL.md)
 - Tree replay, TTN layout, trajectories, or measurement → [`tree-optimizer`](../tree-optimizer/SKILL.md)
 - Stabilizer tensor networks → [`stabilizer-tensor-networks`](../stabilizer-tensor-networks/SKILL.md)
@@ -61,8 +62,8 @@ contracts when a domain skill does not repeat them.
 - Fermion operators, Symmray charges, or fermionic gates → [`pepsy-fermion-operators`](../pepsy-fermion-operators/SKILL.md)
 - qMERA energy optimization → [`qmera-energy-optimizer`](../qmera-energy-optimizer/SKILL.md)
 
-For backends, boundary contraction, general operators, or MPO work without a
-dedicated skill, start from the owning module's API documentation and tests.
+For backends, boundary contraction, general operators, or other MPO work
+without a dedicated skill, start from the owning module's API documentation and tests.
 Compose the fitting, MPS, or fermion skill only for the parts that apply; do
 not infer that MPS state rules cover every MPO or PEPS path. For direct PEPS
 sampling use `peps-sampler`; for `PepsBpSampler` use belief propagation and,

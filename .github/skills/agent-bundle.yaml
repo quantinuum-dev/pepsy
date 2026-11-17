@@ -51,6 +51,10 @@ skills:
     path: .github/skills/stabilizer-tensor-networks
     role: domain
     upload: [SKILL.md, references/**]
+  - name: mpo-dmt
+    path: .github/skills/mpo-dmt
+    role: domain
+    upload: [SKILL.md, references/**, scripts/**]
   - name: tree-stabilizer-optimizer
     path: .github/skills/tree-stabilizer-optimizer
     role: domain

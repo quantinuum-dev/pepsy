@@ -4393,6 +4393,9 @@ class MpoOptimizer:
         dmt_regions=None,
         dmt_variant="density",
         dmt_diagnostics=False,
+        dmt_truncation="paper",
+        dmt_max_refinement_sweeps=8,
+        dmt_region_selection="smallest",
         fidelity_samples=10,
         k_2q_batch=1,
         fit_block_size=2,
@@ -4508,6 +4511,12 @@ class MpoOptimizer:
             Connected density construction or raw-operator protected SVD.
         dmt_diagnostics : bool, default=False
             Retain detailed per-gate reports in :meth:`get_dmt_reports`.
+        dmt_truncation : {"paper", "optimized"}, default="paper"
+            Optional compatible-border SVD and constrained bond refinement.
+        dmt_max_refinement_sweeps : int, default=8
+            Alternating refinement limit; zero tries only feasible SVD seeds.
+        dmt_region_selection : {"smallest", "min_cover"}, default="smallest"
+            Choose protection strings independently or jointly across regions.
         fit_min_iter : int | None, default=2
             Minimum FIT sweeps before ``fit_rtol`` can stop a DMRG update.
         fit_rtol : float | {"auto"} | None, default="auto"
@@ -4598,13 +4607,18 @@ class MpoOptimizer:
 
         if self.mode == "dmt":
             from .dmt import validate_replay
+            from ...operators._pauli_dmt import _refinement_options
+
+            _refinement_options(dmt_truncation, dmt_max_refinement_sweeps, dmt_region_selection)
 
             dmt_regions = validate_replay(
                 self, dmt_regions, dmt_variant, target_cutoff=target_cutoff,
                 submpo_method=submpo_method, compression_seed=compression_seed,
                 fit_fallback=fit_fallback, layout=layout,
             )
-        elif dmt_regions is not None or dmt_variant != "density" or dmt_diagnostics:
+        elif (dmt_regions is not None or dmt_variant != "density" or dmt_diagnostics
+              or dmt_truncation != "paper" or dmt_max_refinement_sweeps != 8
+              or dmt_region_selection != "smallest"):
             raise ValueError("dmt_* options require mode='dmt'")
 
         compression_method = self._resolve_mpo_method(submpo_method)
@@ -4784,7 +4798,9 @@ class MpoOptimizer:
                 mpo_method_override=mpo_method_override,
                 compression_seed=compression_seed, compression_opts=compression_opts,
                 **(dict(dmt_regions=dmt_regions, dmt_variant=dmt_variant,
-                        dmt_diagnostics=dmt_diagnostics) if self.mode == "dmt" else {}),
+                        dmt_diagnostics=dmt_diagnostics, dmt_truncation=dmt_truncation,
+                        dmt_max_refinement_sweeps=dmt_max_refinement_sweeps,
+                        dmt_region_selection=dmt_region_selection) if self.mode == "dmt" else {}),
             )
 
         supported = ", ".join(sorted(self._ALLOWED_MODES))
@@ -5027,6 +5043,7 @@ class MpoOptimizer:
         fidelity_samples, finite_check, fit_target_strategy,
         mpo_method_override, compression_seed, compression_opts,
         dmt_regions=None, dmt_variant="density", dmt_diagnostics=False,
+        dmt_truncation="paper", dmt_max_refinement_sweeps=8, dmt_region_selection="smallest",
     ):
         """Execute direct/SVD replay with one success and rollback boundary."""
         # Generic layer compression loses native charge-sector metadata.
@@ -5048,6 +5065,8 @@ class MpoOptimizer:
                 replay_options.update(
                     regions=dmt_regions, variant=dmt_variant,
                     diagnostics=bool(dmt_diagnostics),
+                    truncation=dmt_truncation, max_refinement_sweeps=dmt_max_refinement_sweeps,
+                    region_selection=dmt_region_selection,
                 )
             elif use_svd:
                 stage = "svd.replay"
@@ -5274,11 +5293,15 @@ class MpoOptimizer:
         return replay(self, gates, wheres, **options)
 
     def compress_dmt(self, *, cutoff="auto", cutoff_mode="auto", variant="density",
-                     regions=None, return_report=False):
+                     regions=None, return_report=False, truncation="paper",
+                     max_refinement_sweeps=8, region_selection="smallest"):
         """Protect local reduced operators while compressing the live MPO to chi.
 
         ``regions`` are physical storage positions, including noncontiguous
         regions for mapped lattices. The default protects contiguous triples.
+        ``truncation='optimized'`` adds fixed-border SVD/alternating refinement
+        with ``max_refinement_sweeps`` updates (zero tries only SVD seeds).
+        ``region_selection='min_cover'`` shares strings across regions.
         Auto cutoff uses the state dtype; auto mode thresholds the free
         residual spectrum relatively, leaving protected directions intact.
         Return the current MPO, or ``(MPO, MPODMTReport)`` when requested.
@@ -5291,6 +5314,8 @@ class MpoOptimizer:
             return compress_current(
                 self, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
                 regions=regions, return_report=return_report,
+                truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+                region_selection=region_selection,
             )
 
     def get_dmt_reports(self):

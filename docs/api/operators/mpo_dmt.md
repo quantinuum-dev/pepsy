@@ -94,6 +94,61 @@ use [`MpoOptimizer(mode="dmt")`](../optimizers/mpo.md#dmt-gate-stream-replay),
 or call its `compress_dmt` method for the current state. Neither entry point
 implements a constrained variational fitter.
 
+## Optional improved bond truncation
+
+The existing fast method remains `truncation="paper"`. To spend more work
+reducing the error at each cut, use:
+
+```python
+rho_small = compress_mpo_dmt(
+    rho, max_bond=16, truncation="optimized", max_refinement_sweeps=8,
+    regions=[(0, 1, 3, 4), (1, 2, 4, 5)], region_selection="min_cover",
+)
+```
+
+In orthonormal protected/free coordinates, the candidate has the form
+
+$$
+{\color{purple}A(X)}=
+\begin{pmatrix}{\color{blue}P}&{\color{blue}B}\\
+{\color{blue}C}&X\end{pmatrix},\qquad
+\min_{\operatorname{rank}A(X)\le\chi}\|X-D_0\|_F^2.
+$$
+
+The blue border is fixed. The optimized route keeps the paper candidate,
+tries a generalized Schur SVD only when numerical range/conditioning checks
+pass, then performs equality-constrained alternating factor updates. Each
+accepted update preserves the original trace maps and cannot increase the
+one-cut error, up to floating-point roundoff. `max_refinement_sweeps=0`
+tries the SVD seeds only. A well-conditioned compatible corner gives the
+full one-cut optimum at zero cutoff; incompatible corners use local
+refinement without a global optimum certificate. A sweep is not a globally
+optimal MPO fit, and comparing complete sweeps does not inherit the one-cut
+nonincrease guarantee because their intermediate targets differ.
+
+Cutoffs govern the seed residual SVDs. Refinement can reuse the available
+rank up to `max_bond`; it does not impose a final spectral cutoff or discard
+protected data afterward. This is an optional accuracy tradeoff and can be
+slower than paper DMT. Reports add `truncation_method` (`paper`, `schur`, or
+either followed by `+als`) and `refinement_sweeps`; `residual_rank=None`
+denotes optimized splits, where there is no unique paper residual rank.
+`discarded_weight` is then the measured one-cut Frobenius error.
+
+For explicit regions, `region_selection="min_cover"` minimizes the total
+number of protected physical strings using a bipartite vertex cover. Every
+requested cross-cut observable has at least one protected endpoint. Trace
+directions remain on both sides. This shares protection across overlapping
+plaquettes rather than choosing each smaller half independently. It does
+**not** minimize state-dependent virtual ranks or guarantee a faster sweep;
+the default `"smallest"` retains the original rule. Large requested regions
+still require exponentially many physical strings.
+
+These options also work on `PauliMPO.compress_dmt`, `apply_gate_dmt`, the
+persistent `PauliDMT` constructor, and `MpoOptimizer.compress_dmt`. Replay
+uses the names `dmt_truncation`, `dmt_max_refinement_sweeps` and
+`dmt_region_selection` in `MpoOptimizer.run`.
+See the [derivation and validation](../../development/notes/2026-11-17-dmt-refinement.md).
+
 ## Larger mapped squares
 
 Use plaquette regions with a snake ordering and check the protected bond

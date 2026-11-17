@@ -10,7 +10,8 @@ cross-cutting task. The repository-level
 Maintainer Workspace Agent; it separates stable references, core skills, and
 optional domain skills. Keep the skill directories flat and upload
 `SKILL.md` plus any `references/**`; `agents/openai.yaml` is local UI metadata,
-not ordinary agent context.
+not ordinary agent context. Include `scripts/**` when the selected package's
+upload entry provides executable checks.
 
 Read [`SKILL_POLICY.md`](SKILL_POLICY.md) before adding, renaming, merging,
 deprecating, or removing a skill. It defines the selection workflow, package
@@ -41,6 +42,8 @@ the existing router instead of adding a duplicate writing skill.
 
 ## Domain workflows
 
+- [MPO DMT](mpo-dmt/SKILL.md): protected density-matrix truncation, local-density
+  constraints, connected-residual SVD, and ordinary/Pauli MPO replay.
 - [Belief propagation](belief-propagation/SKILL.md)
 - [Direct PEPS sampling](peps-sampler/SKILL.md)
 - [Fermion operators](pepsy-fermion-operators/SKILL.md)

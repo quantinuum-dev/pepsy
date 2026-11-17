@@ -132,6 +132,10 @@ results.
 
 ## Protected density matrix truncation (DMT)
 
+`truncation="optimized"` optionally improves the fixed-border approximation;
+`region_selection="min_cover"` jointly chooses region protection strings.
+See [controls, cutoffs and guarantees](mpo_dmt.md#optional-improved-bond-truncation).
+
 Start with the [1D and 2D DMT workflow guide](../optimizers/pauli_dmt.md)
 for API selection, complete examples and profiling. Both workflows use
 an open Pauli MPO; 2D regions change the protected data, while gate positions
