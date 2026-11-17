@@ -33,12 +33,18 @@ def options(values=None):
               'refine_scope': 'strip', 'refine_solver': 'quimb',
               'refine_balance': False,
               'refine_max_matrix_size': 1024,
+              'random_restarts': 0, 'restart_seed': 0,
               'accumulate_local_infidelity': True}
     values = dict(values or {})
     unknown = values.keys() - result.keys()
     if unknown:
         raise ValueError(f'Unknown full_update_kwargs: {sorted(unknown)}')
     result.update(values)
+    from ...bp._als_restarts import validate_restarts
+
+    validate_restarts(result['random_restarts'], result['restart_seed'])
+    if result['random_restarts'] and (result['solver'] == 'lbfgs' or result['tensor_mode'] == 'full'):
+        raise ValueError('random_restarts requires reduced ALS, not L-BFGS or full tensors')
     if result['refine_scope'] not in ('strip', 'layer'):
         raise ValueError('full update refine_scope must be strip or layer')
     if result['refine_solver'] not in ('quimb', 'pinv'):
@@ -517,6 +523,11 @@ class ReducedPair:
         residual_converged = tolerance > 0 and history[-1] <= tolerance
         reason = ('residual_tolerance' if residual_converged else
                   solution.termination_reason if accepted else 'solver_candidate_rejected')
+        restarts = solution.solver_report.get('restarts')
+        if restarts:
+            restarts = {**restarts, 'trials': [dict(t) for t in restarts['trials']]}
+            restarts['trials'][0]['initialization'] = (
+                'svd' if self.initial_factors is None else 'warmstart')
         report.update(backend='full-update', success=True, tensor_mode=self.tensor_mode,
                       converged=bool(residual_converged or (accepted and solution.converged)),
                       warmstart_loss=baseline_loss,
@@ -527,6 +538,7 @@ class ReducedPair:
                       termination_reason=reason,
                       solver_converged=solution.converged,
                       solver_termination_reason=solution.termination_reason,
+                      als_restarts=restarts,
                       stopping_rule=('normalized residual or L-BFGS stopping criteria'
                                      if solution.solver == 'lbfgs' else
                                      'normalized residual or complete-sweep cost change'),
@@ -559,6 +571,8 @@ class ReducedPair:
             tol=tolerance, rcond=rcond, solver=controls['solver'],
             monitor_convergence=True,
             initial_factors=(left, transpose(right, (0, 2, 1))),
+            random_restarts=controls.get('random_restarts', 0),
+            restart_seed=controls.get('restart_seed', 0),
             # Quimb's automatic large-tensor route uses a SciPy LinearOperator,
             # which cannot consume native Torch/CuPy dtypes. These reduced
             # environments are already dense; keep their solves native too.

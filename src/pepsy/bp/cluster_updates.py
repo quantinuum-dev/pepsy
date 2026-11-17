@@ -1,6 +1,7 @@
 """Scalar diagnostics retained across ordered local cluster gate updates."""
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 import math
 
 
@@ -55,6 +56,7 @@ class LoopClusterUpdateTracker:
                    which=result.problem.which, solver=solution.solver,
                    iterations=solution.iterations, converged=solution.converged,
                    termination_reason=solution.termination_reason,
+                   als_restarts=deepcopy(solution.solver_report.get('restarts')),
                    bond=int(solution.left.shape[-1]), local_fidelity=fidelity,
                    local_infidelity=solution.local_infidelity,
                    fidelity_status=solution.fidelity_status,

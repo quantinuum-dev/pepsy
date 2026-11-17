@@ -1,7 +1,6 @@
 # Cluster PEPO backend and downstream optimization status
 
-Updated 2026-11-10 for configurable prepared patches and gate-dependent
-PEPO QR/LQ grouping on `develop`.
+Updated 2026-11-17 for optional ALS random restarts on `develop`.
 The earlier published `develop` → `main` merge was `bf83def` on 2026-10-12.
 This page owns the current capability and validation routes. Detailed earlier
 updates are preserved in the [archived ledger](notes/2026-10-12-cluster-status-archive.md).
@@ -12,6 +11,13 @@ For CUDA diagnostic batching, SU warm-start compatibility and the measured
 10×10 source-slice cache comparison, see [the FU scheduling note](notes/2026-11-11-fu-cuda-scheduling.md).
 
 ## Current capabilities
+
+The optional [ALS restart controls](../api/bp.md#dense-torch-als-and-local-fidelity)
+add a seeded random trial alongside the usual start for dense loop-cluster,
+prepared/batched replay and reduced `PepsOptimizer` full update. Both fits
+share the target/environment and select by actual residual; one trial remains
+the default. See the [implementation handoff](../../history/2026-11-17-als-random-restarts.md)
+for scoped validation.
 
 | Area | Supported scope | Owning guide |
 | --- | --- | --- |

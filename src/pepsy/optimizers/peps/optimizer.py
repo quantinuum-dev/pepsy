@@ -397,6 +397,10 @@ class PepsOptimizer(SweepFitMixin, PepoFitMixin):  # pylint: disable=too-many-in
         Dense Torch/CuPy nearest-neighbor two-site fitting controls for
         ``mode="full-update"``: ``max_iterations=20``, ``rtol="auto"``,
         dtype-dependent ``rcond=None``, ``gauge=False``, and ``solver="auto"``.
+        ``random_restarts=1`` fits the usual start plus one seeded random
+        start in the same environment, keeping the lower residual. The
+        default zero keeps a single trial; ``restart_seed=0`` controls draws.
+        This option requires reduced ALS. Exact-SVD shortcuts remain exact.
         With ``gauge=True``, ``gauge_qr="qr:auto"`` opts into Quimb's adaptive
         Cholesky QR for the two environment gauges; ``gauge_qr="qr"`` keeps
         the existing QR path. This does not alter reduction or ALS QR policies.

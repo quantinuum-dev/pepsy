@@ -65,21 +65,46 @@ def _balance(left, right):
     return left.reshape(count, a, p, rank), right_q.mH.reshape(count, rank, q, b)
 
 
-def solve(problems, *, max_bond, max_iterations, tol, measure_fidelity, rcond=1e-12):
+def solve(problems, *, max_bond, max_iterations, tol, measure_fidelity, rcond=1e-12,
+          random_restarts=0, restart_seed=0, initial_factors=None):
     """Fit compatible retained environments with independent complete-sweep stops."""
     import autoray as ar
     import torch
     from ._reduced_torch import _left_equations, _objective, _right_equations, _weighted_target
     from .reduced_update import ReducedALSSolution, _reduced_als_stop, _validated_local_fidelity
+    from ._als_restarts import random_factors, select_best, validate_restarts
+
+    validate_restarts(random_restarts, restart_seed)
 
     target = torch.stack([p.target for p in problems])
     environment = torch.stack([p.environment.data for p in problems])
     count, a, p, q, b = target.shape
-    u, singular, vh = ar.do('linalg.svd', target.reshape(count, a*p, q*b))
-    rank = min(max_bond, singular.shape[-1])
-    root = singular[:, :rank].sqrt()
-    left = (u[:, :, :rank]*root[:, None, :]).reshape(count, a, p, rank)
-    right = (root[:, :, None]*vh[:, :rank]).reshape(count, rank, q, b)
+    if initial_factors is None:
+        u, singular, vh = ar.do('linalg.svd', target.reshape(count, a*p, q*b))
+        rank = min(max_bond, singular.shape[-1])
+        root = singular[:, :rank].sqrt()
+        left = (u[:, :, :rank]*root[:, None, :]).reshape(count, a, p, rank)
+        right = (root[:, :, None]*vh[:, :rank]).reshape(count, rank, q, b)
+    else:
+        left = torch.stack([f[0] for f in initial_factors])
+        right = torch.stack([f[1] for f in initial_factors])
+        rank = left.shape[-1]
+    if random_restarts:
+        initial = tuple((left[i], right[i]) for i in range(count))
+
+        def trial(factors):
+            return solve(problems, max_bond=max_bond, max_iterations=max_iterations,
+                         tol=tol, measure_fidelity=measure_fidelity, rcond=rcond,
+                         initial_factors=factors)
+
+        trials = [trial(initial)]
+        trials.extend(trial(tuple(random_factors(f, restart_seed+i) for f in initial))
+                      for i in range(random_restarts))
+        # Keep the batch kernels for every trial, but select per member:
+        # independent patches need not prefer the same initialization.
+        return tuple(select_best([t[i] for t in trials], lambda s: problem.cost(s.theta()),
+                                 restart_seed=restart_seed, initial_name='svd')
+                     for i, problem in enumerate(problems))
     weighted = _weighted_target(environment, target)
     norms = (target.conj()*weighted).sum((-4, -3, -2, -1)).real.detach().cpu().tolist()
     if any(not math.isfinite(x) or x <= 0 for x in norms):

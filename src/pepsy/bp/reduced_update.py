@@ -1411,6 +1411,8 @@ class ReducedALSSolution:
     supplies ``iterations``, ``converged`` and ``termination_reason``.
     ``target_norm`` retains the scalar computed by the solver when available;
     it describes the solved problem, not subsequent mutations of its arrays.
+    With random restarts these fields describe the selected trial; per-trial
+    errors and total work are recorded in ``solver_report['restarts']``.
     """
 
     left: Any
@@ -3298,6 +3300,8 @@ def solve_reduced_als(
     initial_factors: tuple[Any, Any] | None = None,
     measure_fidelity: bool = False,
     torch_backend: str | None = None,
+    random_restarts: int = 0,
+    restart_seed: int = 0,
 ) -> ReducedALSSolution:
     """Solve a reduced two-site projection by alternating least squares.
 
@@ -3325,6 +3329,13 @@ def solve_reduced_als(
     ``(rank, physical_right, right_dim)``. The fit retains that rank, at most
     ``max_bond``. Native symmetry and autodiff routes require the default SVD.
 
+    ``random_restarts=1`` additionally fits one random initialization and
+    retains the lower actual residual in the same frozen environment. Trial
+    zero uses the normal SVD or supplied factors. ``restart_seed`` controls
+    independent factor draws without changing global random streams. Details
+    and total iteration work are in ``solver_report['restarts']``. This option
+    requires dense ALS; native symmetry and autodiff retain their own routes.
+
     ``solver="torch"`` opts into dense Torch contractions with physical
     indices batched as RHS columns and guarded Cholesky local solves. An
     uncertified matrix retains the reference relative spectral floor via
@@ -3341,6 +3352,9 @@ def solve_reduced_als(
     Nonfinite, nonpositive or unphysical metrics give ``None``. This is a
     local approximation diagnostic, not global state/operator fidelity.
     """
+    from ._als_restarts import random_factors, select_best, validate_restarts
+
+    validate_restarts(random_restarts, restart_seed)
     if not isinstance(max_iterations, int) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
     if not (0.0 <= rcond < 1.0):
@@ -3392,6 +3406,29 @@ def solve_reduced_als(
         if not all(_all_finite(value) for value in initial_factors):
             raise ValueError('initial_factors must be finite')
         max_bond = rank
+
+    if random_restarts:
+        if is_symmray_array(problem.target) or solver == 'autodiff':
+            raise NotImplementedError('random_restarts requires dense ALS')
+        initial = (_svd_initial_factors(problem.target, max_bond)
+                   if initial_factors is None else initial_factors)
+
+        def trial(factors):
+            return solve_reduced_als(
+                problem, max_bond=max_bond, max_iterations=max_iterations,
+                rcond=rcond, tol=tol, regularization=regularization, solver=solver,
+                quimb_opts=quimb_opts, autodiff_opts=autodiff_opts,
+                monitor_convergence=monitor_convergence, initial_factors=factors,
+                measure_fidelity=measure_fidelity, torch_backend=torch_backend,
+            )
+
+        solutions = [trial(initial)]
+        solutions.extend(trial(random_factors(initial, restart_seed+i))
+                         for i in range(random_restarts))
+        return select_best(solutions, lambda s: problem.cost(s.theta()),
+                           restart_seed=restart_seed,
+                           initial_name='svd' if initial_factors is None else 'supplied',
+                           target_norm=problem.target_norm)
 
     if monitor_convergence and (is_symmray_array(problem.target) or solver == 'autodiff'):
         raise ValueError('monitor_convergence is supported only for dense Quimb/Torch/QR/normal ALS')

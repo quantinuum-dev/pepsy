@@ -8,6 +8,12 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **ALS random restarts:** opt into SVD plus random trials with
+  `random_restarts=1, restart_seed=...` in reduced loop-cluster ALS,
+  prepared replay (including batches), and `PepsOptimizer` full-update
+  controls. Select by the actual residual in the same frozen environment;
+  report per-trial outcomes and total iterations. Defaults retain one trial.
+
 - **MPO DMT replay:** add `MpoOptimizer(mode="dmt")`, `compress_dmt` and
   optional per-gate reports for computational-basis MPOs and mapped 2D regions.
   Build exact gate targets before protected truncation, retain transactional

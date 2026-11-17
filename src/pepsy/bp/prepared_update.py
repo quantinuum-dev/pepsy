@@ -100,18 +100,27 @@ class PreparedLoopClusterUpdate:
     stopping decisions, original callback order and apply boundaries are kept.
     ``batch_size='auto'`` discovers independent ready patches with bounded
     lookahead and sizes their batches from topology, shapes and workspace.
+
+    ``random_restarts=1`` fits SVD and random starts in the same environment
+    and retains the lower residual per pair, including in batches. The default
+    zero preserves a single trial; ``restart_seed`` controls each local draw.
     """
 
     def __init__(self, network, schedule, *, max_bond=6, max_iterations=10,
                  tol=1e-8, psd_project=False, torch_backend=None, optimize=None,
                  max_peak_memory_log2=None, max_flops_log10=None,
                  max_programs=512, batch_size=1, cluster_mode='loopunion',
-                 base_radius=4, fillin=True, fuse_pepo_legs=False):
+                 base_radius=4, fillin=True, fuse_pepo_legs=False,
+                 random_restarts=0, restart_seed=0):
         import torch
         import quimb.tensor as qtn
         from ._compression_utils import ContractionPlanCache, validate_cost_options
         from .reduced_update import _single_tid
         from ..tensors import build_optimizer
+        from ._als_restarts import validate_restarts
+
+        validate_restarts(random_restarts, restart_seed)
+        self.random_restarts, self.restart_seed = random_restarts, restart_seed
 
         for name, value in (('max_bond', max_bond), ('max_iterations', max_iterations),
                             ('max_programs', max_programs)):
@@ -235,6 +244,7 @@ class PreparedLoopClusterUpdate:
                     cluster_mode=self.cluster_mode, base_radius=self.base_radius, fillin=self.fillin,
                     physical_reduction='acted leg retained; untouched leg on Q',
                     fuse_pepo_legs=self.fuse_pepo_legs,
+                    random_restarts=self.random_restarts, restart_seed=self.restart_seed,
                     contraction_programs=len(self._programs), batch_size=self.batch_size,
                     auto_batch_limit=self._auto_batch_limit,
                     auto_workspace_bytes=self._auto_workspace_bytes,
@@ -437,7 +447,8 @@ class PreparedLoopClusterUpdate:
                     for n, (k, pair, prepared) in enumerate(selected)]
         solutions = solve(problems, max_bond=self.max_bond,
                           max_iterations=self.max_iterations, tol=self.tol,
-                          measure_fidelity=measure_fidelity)
+                          measure_fidelity=measure_fidelity,
+                          random_restarts=self.random_restarts, restart_seed=self.restart_seed)
         self._counts['cluster_batches'] += 1
         self._counts['batched_pair_updates'] += len(selected)
         self._counts['largest_batch'] = max(self._counts['largest_batch'], len(selected))
@@ -549,6 +560,7 @@ class PreparedLoopClusterUpdate:
                     work, gauges, pair, problem, max_bond=self.max_bond,
                     als_opts=dict(solver='torch', max_iterations=self.max_iterations,
                                   tol=self.tol, monitor_convergence=True,
+                                  random_restarts=self.random_restarts, restart_seed=self.restart_seed,
                                   measure_fidelity=tracker is not None, torch_backend=self.torch_backend),
                     regauge_opts={}, inplace=True, result_type=ReducedLoopClusterGateResult,
                     solution=solution, materialize_physical=materialize_physical)

@@ -653,6 +653,22 @@ by a bond-sized SVD, without reconstructing and decomposing the larger pair.
 The explicit environment-gauge path retains its full final SVD. These are
 exact factor rearrangements at the existing rank cap, not approximate SVDs.
 
+To fit from the usual SVD start and one independent random start, opt into:
+
+```python
+full_update_kwargs={"random_restarts": 1, "restart_seed": 7}
+```
+
+Each trial uses the same frozen target and positive environment, rank, solver
+and iteration budget. The lower actual weighted residual wins; zero restarts
+is the default. Existing SU/supplied warm starts remain the first trial when
+selected. The nonnegative integer seed is reset per local fit without changing
+global random streams. Exact-SVD shortcuts still skip unnecessary ALS.
+This option requires reduced ALS, and rejects L-BFGS/full-tensor modes.
+`optimizer_result["als_restarts"]` reports the selected zero-based trial,
+per-trial errors/convergence and `total_iterations`; ordinary iteration and
+fidelity fields describe the selected fit. Outer SVD fallback still applies.
+
 Native Torch/CuPy local ALS uses dense backend solves even above Quimb's
 automatic size threshold, avoiding its incompatible SciPy LinearOperator
 route. Pair reports include `norm_matrix_dimension`, the size of the reduced

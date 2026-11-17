@@ -179,7 +179,8 @@ def test_batch_workspace_budget_is_checked_before_any_update():
 
 
 @pytest.mark.parametrize('stabilized', [False, True])
-def test_batch_gate_and_gauge_gradients_match_sequential_and_finite_differences(stabilized):
+@pytest.mark.parametrize('random_restarts', [0, 1])
+def test_batch_gate_and_gauge_gradients_match_sequential_and_finite_differences(stabilized, random_restarts):
     state, schedule = setup()
     probe = torch.tensor(.17, dtype=torch.float64, requires_grad=True)
 
@@ -188,7 +189,8 @@ def test_batch_gate_and_gauge_gradients_match_sequential_and_finite_differences(
         index = state.bond((0, 0), (0, 1))
         gauges[index] = torch.stack((value+.5, value*0+1.3))
         plan = PreparedLoopClusterUpdate(state, schedule, max_bond=2, max_iterations=2,
-                                         tol=0., optimize='greedy', batch_size=size)
+                                         tol=0., optimize='greedy', batch_size=size,
+                                         random_restarts=random_restarts, restart_seed=4)
         with TorchLinalgConfig(stabilized=stabilized).activated():
             out = plan.apply(state.copy(), matrices(value, state), gauges=gauges)
         # A local core norm omits the detached RMS scale in the network

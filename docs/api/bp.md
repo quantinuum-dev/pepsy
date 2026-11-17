@@ -361,6 +361,26 @@ the retained open environment; explicit dense metric/linear overrides,
 regularization and other solver-specific options are rejected.
 The default `solver="auto"` still selects Quimb.
 
+Set `als_opts={"random_restarts": 1, "restart_seed": 7}` in
+`gate_loop_cluster`, `apply_reduced_loop_cluster_gate`, or
+`compress_reduced_loop_cluster` for **two ALS trials**: the usual SVD start
+and one independent random factor pair. Supplied `initial_factors` replace
+the first start. Each trial uses the same target, environment, rank, solver
+and iteration budget; retain the lowest finite actual weighted residual.
+The default `random_restarts=0` keeps the single-start path. The nonnegative
+integer `restart_seed` is reset for each local fit without changing global
+random streams. Additional restarts increase fitting work; the environment
+is constructed once. Dense Quimb, Torch, QR and normal ALS support this
+option; native Symmray and autodiff reject it rather than changing solvers.
+
+`solution.solver_report["restarts"]` records the selected zero-based trial,
+per-trial costs and convergence, and `total_iterations` across trials when
+iteration counts are available. Unmonitored solvers can report `None`.
+The solution's regular iteration/fidelity fields describe the selected fit.
+`LoopClusterUpdateTracker` retains this metadata as `als_restarts` per row.
+These trials check initialization sensitivity within the selected local
+environment; they do not certify its accuracy or global optimality.
+
 `torch_backend="aot_eager"` inside `als_opts` optionally captures contraction
 kernels and their backward, using the same version-sensitive Torch AOT
 interface as prepared simple update. Shapes/devices/gradient/autocast signatures have
@@ -529,6 +549,12 @@ core = plan.apply(core, gate_bank, gauges=gauges, start=first_slice_end,
                   tracker=tracker)
 counts = plan.info
 ```
+
+Pass `random_restarts=1, restart_seed=7` to the constructor for SVD plus
+random ALS trials. This also works with integer or automatic cluster batches:
+each trial retains the batch kernels, and each member selects its own winner.
+The target/environment is shared across trials; recorded local fidelity and
+gauge extraction use only the selected factors.
 
 The package default retains the six-site loop-union patch. Pass
 `cluster_mode="graphdistance", base_radius=1, fillin=True` to prepare the
