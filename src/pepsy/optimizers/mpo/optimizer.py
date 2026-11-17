@@ -4396,6 +4396,9 @@ class MpoOptimizer:
         dmt_truncation="paper",
         dmt_max_refinement_sweeps=8,
         dmt_region_selection="smallest",
+        dmt_constraint_mode="strict",
+        dmt_constraint_weight=100.,
+        dmt_check_regions=True,
         fidelity_samples=10,
         k_2q_batch=1,
         fit_block_size=2,
@@ -4515,8 +4518,14 @@ class MpoOptimizer:
             Optional compatible-border SVD and constrained bond refinement.
         dmt_max_refinement_sweeps : int, default=8
             Alternating refinement limit; zero tries only feasible SVD seeds.
-        dmt_region_selection : {"smallest", "min_cover"}, default="smallest"
+        dmt_region_selection : {"smallest", "min_cover", "rank_aware"}, default="smallest"
             Choose protection strings independently or jointly across regions.
+        dmt_constraint_mode : {"strict", "relaxed"}, default="strict"
+            Allow a trace-preserving approximate fallback for insufficient bonds.
+        dmt_constraint_weight : float, default=100
+            Weight for protected directions in the relaxed fallback.
+        dmt_check_regions : bool, default=True
+            Contract physical regions to verify and measure density defects.
         fit_min_iter : int | None, default=2
             Minimum FIT sweeps before ``fit_rtol`` can stop a DMRG update.
         fit_rtol : float | {"auto"} | None, default="auto"
@@ -4609,7 +4618,10 @@ class MpoOptimizer:
             from .dmt import validate_replay
             from ...operators._pauli_dmt import _refinement_options
 
-            _refinement_options(dmt_truncation, dmt_max_refinement_sweeps, dmt_region_selection)
+            _refinement_options(dmt_truncation, dmt_max_refinement_sweeps, dmt_region_selection,
+                                dmt_constraint_mode, dmt_constraint_weight)
+            if not isinstance(dmt_check_regions, bool):
+                raise ValueError("dmt_check_regions must be True or False.")
 
             dmt_regions = validate_replay(
                 self, dmt_regions, dmt_variant, target_cutoff=target_cutoff,
@@ -4618,7 +4630,8 @@ class MpoOptimizer:
             )
         elif (dmt_regions is not None or dmt_variant != "density" or dmt_diagnostics
               or dmt_truncation != "paper" or dmt_max_refinement_sweeps != 8
-              or dmt_region_selection != "smallest"):
+              or dmt_region_selection != "smallest" or dmt_constraint_mode != "strict"
+              or dmt_constraint_weight != 100. or dmt_check_regions is not True):
             raise ValueError("dmt_* options require mode='dmt'")
 
         compression_method = self._resolve_mpo_method(submpo_method)
@@ -4800,7 +4813,10 @@ class MpoOptimizer:
                 **(dict(dmt_regions=dmt_regions, dmt_variant=dmt_variant,
                         dmt_diagnostics=dmt_diagnostics, dmt_truncation=dmt_truncation,
                         dmt_max_refinement_sweeps=dmt_max_refinement_sweeps,
-                        dmt_region_selection=dmt_region_selection) if self.mode == "dmt" else {}),
+                        dmt_region_selection=dmt_region_selection,
+                        dmt_constraint_mode=dmt_constraint_mode,
+                        dmt_constraint_weight=dmt_constraint_weight,
+                        dmt_check_regions=dmt_check_regions) if self.mode == "dmt" else {}),
             )
 
         supported = ", ".join(sorted(self._ALLOWED_MODES))
@@ -5044,6 +5060,8 @@ class MpoOptimizer:
         mpo_method_override, compression_seed, compression_opts,
         dmt_regions=None, dmt_variant="density", dmt_diagnostics=False,
         dmt_truncation="paper", dmt_max_refinement_sweeps=8, dmt_region_selection="smallest",
+        dmt_constraint_mode="strict", dmt_constraint_weight=100.,
+        dmt_check_regions=True,
     ):
         """Execute direct/SVD replay with one success and rollback boundary."""
         # Generic layer compression loses native charge-sector metadata.
@@ -5067,6 +5085,8 @@ class MpoOptimizer:
                     diagnostics=bool(dmt_diagnostics),
                     truncation=dmt_truncation, max_refinement_sweeps=dmt_max_refinement_sweeps,
                     region_selection=dmt_region_selection,
+                    constraint_mode=dmt_constraint_mode, constraint_weight=dmt_constraint_weight,
+                    check_regions=dmt_check_regions,
                 )
             elif use_svd:
                 stage = "svd.replay"
@@ -5294,7 +5314,8 @@ class MpoOptimizer:
 
     def compress_dmt(self, *, cutoff="auto", cutoff_mode="auto", variant="density",
                      regions=None, return_report=False, truncation="paper",
-                     max_refinement_sweeps=8, region_selection="smallest"):
+                     max_refinement_sweeps=8, region_selection="smallest",
+                     constraint_mode="strict", constraint_weight=100., check_regions=True):
         """Protect local reduced operators while compressing the live MPO to chi.
 
         ``regions`` are physical storage positions, including noncontiguous
@@ -5316,6 +5337,8 @@ class MpoOptimizer:
                 regions=regions, return_report=return_report,
                 truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
                 region_selection=region_selection,
+                constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+                check_regions=check_regions,
             )
 
     def get_dmt_reports(self):

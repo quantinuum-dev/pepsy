@@ -8,6 +8,10 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **DMT region and small-bond options:** add rank-aware protection-cover
+  selection, reuse maximal-region contractions for contained regions, and an
+  explicit trace-preserving relaxed fallback with density-error reporting.
+
 - **Optional DMT refinement:** add `truncation="optimized"` for guarded
   compatible-border SVD and equality-constrained alternating bond refinement,
   accepting only feasible improvements over the paper seed. Add

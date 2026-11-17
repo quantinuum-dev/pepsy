@@ -10,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from itertools import product
 import math
-from numbers import Integral
+from numbers import Integral, Real
+import warnings
 
 import autoray as ar
 import numpy as np
@@ -28,7 +29,7 @@ from .pauli_mpo import (
     _reshape,
     _transpose,
 )
-from .pauli_dmt_geometry import _normalize_regions
+from .pauli_dmt_geometry import _maximal_regions, _normalize_regions
 
 __all__ = ["PauliDMTBondReport", "PauliDMTReport"]
 
@@ -70,6 +71,8 @@ class PauliDMTBondReport:
     relative_constraint_error: float | None = None
     truncation_method: str = "paper"
     refinement_sweeps: int = 0
+    constraints_relaxed: bool = False
+    relative_density_error: float | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,18 @@ class PauliDMTReport:
     final_bond_dimensions: tuple
     bond_reports: tuple
     cutoff_mode: str = "rel"
+    constraint_mode: str = "strict"
+    relative_density_error: float | None = None
+
+    @property
+    def relaxed_bonds(self):
+        return tuple(b.bond for b in self.bond_reports if b.constraints_relaxed)
+
+    @property
+    def max_relative_density_error(self):
+        values = [b.relative_density_error for b in self.bond_reports
+                  if b.relative_density_error is not None]
+        return max(values, default=None)
 
     @property
     def max_constraint_error(self):
@@ -237,7 +252,8 @@ def _scaled_cutoff(cutoff, mode, scale, nsites):
 def _split(matrix, left_vectors, right_vectors, *, max_bond, cutoff,
            variant, absorb, bond, diagnostics, cutoff_mode="rel", nsites=0,
            monitor_trace=False, _fully_protected=False, _strict_basis=False,
-           truncation="paper", max_refinement_sweeps=8):
+           truncation="paper", max_refinement_sweeps=8, constraint_mode="strict",
+           constraint_weight=100.):
     # The canonical centre may be exponentially small for a normalized
     # density matrix. Scaling is algebraically neutral and avoids underflow
     # in connected correlations, SVD diagnostics and residual projections.
@@ -248,12 +264,34 @@ def _split(matrix, left_vectors, right_vectors, *, max_bond, cutoff,
         raise FloatingPointError(f"DMT bond {bond} has a nonfinite active matrix.")
     value = value if value > 0 else 1.0
     working_cutoff = _scaled_cutoff(cutoff, cutoff_mode, value, nsites)
-    left, right, report = _split_scaled(
-        matrix / safe, left_vectors, right_vectors, max_bond=max_bond,
-        cutoff=working_cutoff, cutoff_mode=cutoff_mode, variant=variant, absorb=absorb, bond=bond,
-        diagnostics=diagnostics, _fully_protected=_fully_protected, _strict_basis=_strict_basis,
-        truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
-    )
+    def relaxed():
+        from ._dmt_relax import relaxed_split
+
+        return relaxed_split(matrix / safe, left_vectors, right_vectors,
+                             max_bond=max_bond, absorb=absorb, bond=bond, weight=constraint_weight)
+
+    def exact(method):
+        return _split_scaled(
+            matrix / safe, left_vectors, right_vectors, max_bond=max_bond,
+            cutoff=working_cutoff, cutoff_mode=cutoff_mode, variant=variant, absorb=absorb, bond=bond,
+            diagnostics=diagnostics, _fully_protected=_fully_protected, _strict_basis=_strict_basis,
+            truncation=method, max_refinement_sweeps=max_refinement_sweeps,
+        )
+
+    try:
+        left, right, report = exact(truncation)
+    except _ProtectedBudgetError:
+        if constraint_mode == "strict":
+            raise
+        # A paper-budget rejection is not mathematical infeasibility. Try
+        # compatible rank sharing before sacrificing any local constraints.
+        if truncation == "paper":
+            try:
+                left, right, report = exact("optimized")
+            except _ProtectedBudgetError:
+                left, right, report = relaxed()
+        else:
+            left, right, report = relaxed()
     # Check the original matrix, not only the reconstructed Schmidt support.
     # Small absolute coefficient errors can be physically large on long chains.
     violation, relative, normwise = _constraints(
@@ -265,13 +303,19 @@ def _split(matrix, left_vectors, right_vectors, *, max_bond, cutoff,
     # Relative residuals there measure roundoff divided by roundoff. Use a
     # normwise backward-error guard locally; verify physical marginals over
     # the complete standalone sweep separately below.
-    if not np.isfinite(normwise) or normwise > tolerance:
+    if (np.isfinite(normwise) and normwise > tolerance
+            and constraint_mode == "relaxed" and not report.constraints_relaxed):
+        left, right, report = relaxed()
+        violation, relative, normwise = _constraints(
+            left, right, matrix / safe, left_vectors, right_vectors, return_normwise=True,
+        )
+    if not np.isfinite(normwise) or (normwise > tolerance and not report.constraints_relaxed):
         raise FloatingPointError(
             f"DMT bond {bond} cannot preserve local trace data at this precision "
             f"(relative defect {normwise:.3g} > {tolerance:.3g}). "
             "Increase max_bond; for single precision, try float64/complex128."
         )
-    if monitor_trace:
+    if monitor_trace or (report.constraints_relaxed and variant == "density"):
         # Normwise checks can hide a large relative change to the trace when
         # it is tiny compared with the bond. Check the actual gated target;
         # this is a warning threshold, not a certificate for all marginals.
@@ -296,8 +340,8 @@ def _split(matrix, left_vectors, right_vectors, *, max_bond, cutoff,
     report = replace(
         report, discarded_weight=report.discarded_weight * value,
         support_discarded_weight=report.support_discarded_weight * value,
-        constraint_error=violation * value if diagnostics else None,
-        relative_constraint_error=relative if diagnostics else None,
+        constraint_error=violation * value if diagnostics or report.constraints_relaxed else None,
+        relative_constraint_error=relative if diagnostics or report.constraints_relaxed else None,
     )
     return left, right, report
 
@@ -319,6 +363,25 @@ def _constraints(left, right, matrix, lv, rv, *, return_normwise=False):
                        for error, target in zip(errors, denominators))
         return max(errors), relative, normwise
     return max(errors), relative
+
+
+def _relative_density_defect(before, after):
+    """Largest relative RDM Frobenius defect; common basis scales cancel.
+
+    A zero reference and nonzero output has infinite relative error. Logs
+    avoid dividing exponentially small many-site coefficient magnitudes.
+    """
+    largest = 0.
+    for (target, tlog), (actual, alog) in zip(before, after):
+        scale = max(tlog, alog)
+        if scale == -math.inf:
+            continue
+        error = _float(_norm(actual * math.exp(alog-scale) - target * math.exp(tlog-scale)))
+        if not error:
+            continue
+        exponent = math.log(error) + scale - tlog
+        largest = max(largest, math.exp(exponent) if exponent < 709. else math.inf)
+    return largest
 
 
 def _local_trace_data(cores, trace_vector=None):
@@ -361,6 +424,28 @@ def _region_trace_data(cores, regions, trace_vector=None):
     one-sided p**3-by-bond intermediate before its final site. The join is
     exact and both halves retain independent logarithmic scale factors.
     """
+    maximal = _maximal_regions(regions)
+    if len(maximal) < len(regions):
+        parents = dict(zip(maximal, _region_trace_data(cores, maximal, trace_vector)))
+        panels = []
+        physical_dim = cores[0].shape[2]
+        for region in regions:
+            parent = next(r for r in maximal if set(region) <= set(r))
+            panel, log_scale = parents[parent]
+            panel = _reshape(panel, (physical_dim,) * len(parent))
+            for axis in reversed(range(len(parent))):
+                if parent[axis] not in region:
+                    if trace_vector is None:
+                        index = (slice(None),) * axis + (0,)
+                        panel = panel[index]
+                    else:
+                        panel = ar.do("tensordot", panel, trace_vector, axes=((axis,), (0,)))
+            panel = _reshape(panel, (-1,))
+            norm = _float(_norm(panel))
+            panels.append((panel / norm, log_scale + math.log(norm)) if norm
+                          else (panel, -math.inf))
+        return panels
+
     def normalize(value, *, final=False):
         # Intermediate panels need only bounded entries to avoid underflow.
         # Max scaling avoids a redundant Euclidean norm at every site.
@@ -420,6 +505,7 @@ def _region_trace_data(cores, regions, trace_vector=None):
 
 def _region_patterns(regions, nsites, physical_dim=4, *, identity_label=0, selection="smallest"):
     """Sufficient protected strings at each cut, with identity first."""
+    regions = _maximal_regions(regions)
     return tuple(_region_pattern(regions, bond, physical_dim, identity_label=identity_label,
                                  selection=selection)
                  for bond in range(nsites - 1))
@@ -427,7 +513,8 @@ def _region_patterns(regions, nsites, physical_dim=4, *, identity_label=0, selec
 
 def _region_pattern(regions, bond, physical_dim=4, *, identity_label=0, selection="smallest"):
     """One cut's plan; routed updates need only their currently active cut."""
-    if selection == "min_cover":
+    regions = _maximal_regions(regions)
+    if selection in {"min_cover", "rank_aware"}:
         return _region_cover(regions, bond, physical_dim, identity_label)
     left, right = {(): None}, {(): None}
     for region in regions:
@@ -442,7 +529,7 @@ def _region_pattern(regions, bond, physical_dim=4, *, identity_label=0, selectio
     return tuple(left), tuple(right)
 
 
-def _region_cover(regions, bond, physical_dim, identity_label):
+def _region_cover(regions, bond, physical_dim, identity_label, *, reverse=False):
     """Minimum physical-string cover of all requested cross-cut operators.
 
     Each edge is a product of one left and one right string. Protecting
@@ -472,6 +559,9 @@ def _region_cover(regions, bond, physical_dim, identity_label):
     rows, cols = zip(*sorted(edges))
     graph = csr_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)),
                        shape=(len(left), len(right)))
+    if reverse:
+        graph = graph.T.tocsr()
+        left, right = right, left
     matching = maximum_bipartite_matching(graph, perm_type="column")
     inverse = {int(r): l for l, r in enumerate(matching) if r >= 0}
     # Alternating paths from unmatched left vertices: (L\reachable) union
@@ -488,8 +578,9 @@ def _region_cover(regions, bond, physical_dim, identity_label):
             if r in inverse and inverse[r] not in reached_l:
                 reached_l.add(inverse[r])
                 pending.append(inverse[r])
-    return (((),) + tuple(s for s, i in left.items() if i not in reached_l),
-            ((),) + tuple(s for s, i in right.items() if i in reached_r))
+    result = (((),) + tuple(s for s, i in left.items() if i not in reached_l),
+              ((),) + tuple(s for s, i in right.items() if i in reached_r))
+    return result[::-1] if reverse else result
 
 
 def _region_vectors(cores, bond, patterns, eye, environments):
@@ -757,14 +848,20 @@ class _TraceEnvironments:
         return self.left[start], self.right[stop]
 
 
-def _refinement_options(truncation, max_refinement_sweeps, region_selection):
+def _refinement_options(truncation, max_refinement_sweeps, region_selection,
+                        constraint_mode="strict", constraint_weight=100.):
     if truncation not in {"paper", "optimized"}:
         raise ValueError("truncation must be 'paper' or 'optimized'.")
     if (isinstance(max_refinement_sweeps, bool) or not isinstance(max_refinement_sweeps, Integral)
             or max_refinement_sweeps < 0):
         raise ValueError("max_refinement_sweeps must be a nonnegative integer.")
-    if region_selection not in {"smallest", "min_cover"}:
-        raise ValueError("region_selection must be 'smallest' or 'min_cover'.")
+    if region_selection not in {"smallest", "min_cover", "rank_aware"}:
+        raise ValueError("region_selection must be 'smallest', 'min_cover' or 'rank_aware'.")
+    if constraint_mode not in {"strict", "relaxed"}:
+        raise ValueError("constraint_mode must be 'strict' or 'relaxed'.")
+    if (isinstance(constraint_weight, bool) or not isinstance(constraint_weight, Real)
+            or not np.isfinite(constraint_weight) or constraint_weight < 0):
+        raise ValueError("constraint_weight must be a finite nonnegative number.")
 
 
 class _PauliDMTWorkspace:
@@ -777,10 +874,18 @@ class _PauliDMTWorkspace:
     def __init__(self, operator=None, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
                  diagnostics=False, trace_guard="auto", regions=None,
                  _cores=None, _trace_vector=None, truncation="paper", max_refinement_sweeps=8,
-                 region_selection="smallest"):
-        _refinement_options(truncation, max_refinement_sweeps, region_selection)
+                 region_selection="smallest", constraint_mode="strict", constraint_weight=100.,
+                 check_regions=True):
+        if not isinstance(check_regions, bool):
+            raise ValueError("check_regions must be True or False.")
+        self.check_regions = check_regions
+        _refinement_options(truncation, max_refinement_sweeps, region_selection,
+                            constraint_mode, constraint_weight)
         self.truncation, self.max_refinement_sweeps = truncation, int(max_refinement_sweeps)
         self.region_selection = region_selection
+        self.constraint_mode, self.constraint_weight = constraint_mode, float(constraint_weight)
+        self.relative_density_error = None
+        self.relaxation_warned = False
         if not (isinstance(trace_guard, bool) or trace_guard == "auto"):
             raise ValueError("trace_guard must be 'auto', True or False.")
         if operator is not None and operator.boundary != "open":
@@ -805,7 +910,7 @@ class _PauliDMTWorkspace:
             max_bond, cutoff, cutoff_mode, variant, ar.get_dtype_name(self.cores[0]),
         )
         self.original_bonds = _core_bond_dimensions(self.cores)
-        self.diagnostics = diagnostics
+        self.diagnostics = diagnostics or constraint_mode == "relaxed"
         self.reports = []
         self.eye = _array_like(np.eye(self.physical_dim), self.cores[0])
         if not self.pauli_units:
@@ -903,13 +1008,21 @@ class _PauliDMTWorkspace:
             eye = self.protected_physical
             lv = _reshape(_einsum("a,pm->apm", ar.do("conj", left_env), eye), (dl * p, eye.shape[1]))
             rv = _reshape(_einsum("pm,b->pbm", eye, right_env), (dr * p, eye.shape[1]))
+        elif self.region_selection == "rank_aware":
+            from ._dmt_region_selection import rank_aware_vectors
+
+            lv, rv = rank_aware_vectors(
+                self.cores, bond, self.regions, self.eye, self.environments,
+                matrix, left_map, right_map,
+            )
         else:
             lv, rv = _region_vectors(self.cores, bond, self.region_patterns[bond], self.eye,
                                      self.environments)
         # Ordinary-MPO replay retains the standalone sweep's global marginal
         # guard, including the default contiguous triples. Explicit regions
         # already require it for both basis adapters.
-        check_regions = self.regions is not None or (transfer is not None and not self.pauli_units)
+        check_regions = self.check_regions and (self.regions is not None or self.constraint_mode == "relaxed"
+                         or (transfer is not None and not self.pauli_units))
         if check_regions:
             def panels(cores):
                 return (_local_trace_data(cores, self.trace_vector) if self.regions is None
@@ -922,7 +1035,7 @@ class _PauliDMTWorkspace:
                 target_cores[bond] = _transpose(_reshape(exact_left, (dl, p, exact_rank)), (0, 2, 1))
                 target_cores[bond + 1] = _transpose(_reshape(exact_right, (exact_rank, p, dr)), (0, 2, 1))
             before_regions = panels(target_cores)
-        if left_map is not None:
+        if left_map is not None and not (self.regions is not None and self.region_selection == "rank_aware"):
             lv, rv = _dag(left_map) @ lv, right_map @ rv
         left, right, report = _split(
             matrix, lv, rv, max_bond=self.max_bond, cutoff=self.cutoff,
@@ -930,6 +1043,7 @@ class _PauliDMTWorkspace:
             variant=self.variant,
             absorb=absorb, bond=bond, diagnostics=self.diagnostics,
             truncation=self.truncation, max_refinement_sweeps=self.max_refinement_sweeps,
+            constraint_mode=self.constraint_mode, constraint_weight=self.constraint_weight,
             monitor_trace=self.monitor_trace and transfer is not None,
             # At an open boundary the corresponding trace environment is
             # scalar, so the four physical directions span that entire side.
@@ -944,9 +1058,20 @@ class _PauliDMTWorkspace:
         if check_regions:
             candidate = list(self.cores)
             candidate[bond], candidate[bond + 1] = new_left, new_right
-            _check_local_trace_data(before_regions, panels(candidate),
-                                    norm=_float(_norm(matrix)), epsilon=_epsilon(matrix),
-                                    n=len(self.cores))
+            after_regions = panels(candidate)
+            if self.constraint_mode == "strict":
+                _check_local_trace_data(before_regions, after_regions,
+                                        norm=_float(_norm(matrix)), epsilon=_epsilon(matrix),
+                                        n=len(self.cores))
+            else:
+                self.relative_density_error = _relative_density_defect(before_regions, after_regions)
+                report = replace(report, relative_density_error=self.relative_density_error)
+        if report.constraints_relaxed and not self.relaxation_warned:
+            warnings.warn(
+                "DMT local-density constraints were relaxed to respect max_bond; "
+                "inspect the compression report for density errors.", RuntimeWarning, stacklevel=3,
+            )
+            self.relaxation_warned = True
         self.cores[bond], self.cores[bond + 1] = new_left, new_right
         self.environments.invalidate(bond, bond + 2)
         self.center = bond + (absorb == "right")
@@ -957,6 +1082,7 @@ class _PauliDMTWorkspace:
         return PauliDMTReport(
             self.variant, self.max_bond, self.cutoff, self.original_bonds,
             _core_bond_dimensions(self.cores), tuple(self.reports), self.cutoff_mode,
+            self.constraint_mode, self.relative_density_error,
         )
 
 
@@ -986,7 +1112,8 @@ def _gate_transfer(gate, like, mode):
 
 def compress_dmt(operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
                  inplace=False, return_report=False, regions=None, truncation="paper",
-                 max_refinement_sweeps=8, region_selection="smallest"):
+                 max_refinement_sweeps=8, region_selection="smallest", constraint_mode="strict",
+                 constraint_weight=100., check_regions=True):
     workspace = _PauliDMTWorkspace(
         operator, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
         # A standalone sweep has its own complete marginal check and never
@@ -994,17 +1121,22 @@ def compress_dmt(operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="
         diagnostics=return_report, trace_guard=False, regions=regions,
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
+        constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+        check_regions=check_regions,
     )
-    before = (_local_trace_data(operator.to_pauli_cores(copy=False)) if workspace.regions is None
-              else _region_trace_data(operator.to_pauli_cores(copy=False), workspace.regions))
+    before = ((_local_trace_data(operator.to_pauli_cores(copy=False)) if workspace.regions is None
+               else _region_trace_data(operator.to_pauli_cores(copy=False), workspace.regions))
+              if check_regions else None)
     norm = _float(_norm(workspace.cores[0]))
     for bond in range(operator.nsites - 1):
         workspace.split_pair(bond)
-    _check_local_trace_data(
-        before, (_local_trace_data(workspace.cores) if workspace.regions is None
-                 else _region_trace_data(workspace.cores, workspace.regions)), norm=norm,
-        epsilon=_epsilon(workspace.cores[0]), n=operator.nsites,
-    )
+    after = ((_local_trace_data(workspace.cores) if workspace.regions is None
+              else _region_trace_data(workspace.cores, workspace.regions)) if check_regions else None)
+    if constraint_mode == "strict" and check_regions:
+        _check_local_trace_data(before, after, norm=norm,
+                                epsilon=_epsilon(workspace.cores[0]), n=operator.nsites)
+    elif check_regions:
+        workspace.relative_density_error = _relative_density_defect(before, after)
     return _finish(operator, workspace, inplace, return_report)
 
 
@@ -1021,7 +1153,8 @@ def _finish(operator, workspace, inplace, return_report):
 
 def gate_dmt(operator, gate, where, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
              mode="conjugate", inplace=False, return_report=False, trace_guard="auto", regions=None,
-             truncation="paper", max_refinement_sweeps=8, region_selection="smallest"):
+             truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
+             constraint_mode="strict", constraint_weight=100., check_regions=True):
     where = _normalize_where(where, operator.nsites)
     if len(where) != 2 or where[1] != where[0] + 1:
         raise ValueError("DMT gates require two adjacent sites in increasing order.")
@@ -1030,6 +1163,8 @@ def gate_dmt(operator, gate, where, *, max_bond, cutoff=0.0, cutoff_mode="rel", 
         diagnostics=return_report, trace_guard=trace_guard, regions=regions,
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
+        constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+        check_regions=check_regions,
     )
     transfer = _gate_transfer(gate, workspace.cores[0], mode)
     workspace.split_pair(where[0], transfer)

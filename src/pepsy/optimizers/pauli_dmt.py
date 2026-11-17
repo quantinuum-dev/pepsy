@@ -57,7 +57,8 @@ class PauliDMT:
 
     def __init__(self, operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
                  mode="conjugate", diagnostics=False, trace_guard="auto", regions=None,
-                 truncation="paper", max_refinement_sweeps=8, region_selection="smallest"):
+                 truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
+                 constraint_mode="strict", constraint_weight=100., check_regions=True):
         if not isinstance(operator, PauliMPO):
             raise TypeError("operator must be a PauliMPO.")
         if mode not in {"conjugate", "heisenberg"}:
@@ -69,6 +70,8 @@ class PauliDMT:
             diagnostics=diagnostics, trace_guard=trace_guard, regions=regions,
             truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
             region_selection=region_selection,
+            constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+            check_regions=check_regions,
         )
 
     @property
@@ -90,6 +93,7 @@ class PauliDMT:
     def _begin(self):
         self._workspace.original_bonds = _core_bond_dimensions(self._workspace.cores)
         self._workspace.reports.clear()
+        self._workspace.relative_density_error = None
 
     def apply_gate(self, gate, where):
         """Update adjacent MPO positions; return a ``PauliDMTBondReport``.
@@ -190,4 +194,7 @@ class PauliDMT:
             # Bound diagnostic memory by one timestep, independent of steps.
             if _ + 1 != steps:
                 self._workspace.reports.clear()
+        # Different evolved targets occur within a timestep. Per-split
+        # errors are meaningful; the latest one is not a trajectory error.
+        self._workspace.relative_density_error = None
         return self.state

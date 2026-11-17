@@ -79,3 +79,15 @@ def _normalize_regions(regions, nsites):
             raise ValueError("region sites must be unique integer MPO indices in range.")
         normalized.add(tuple(sorted(int(s) for s in sites)))
     return tuple(sorted(normalized))
+
+
+def _maximal_regions(regions):
+    """Remove contained requests: their densities follow by partial tracing."""
+    ordered = sorted(set(regions), key=lambda r: (-len(r), r))
+    kept, sets = [], []
+    for region in ordered:
+        sites = set(region)
+        if not any(sites <= parent for parent in sets):
+            kept.append(region)
+            sets.append(sites)
+    return tuple(sorted(kept))

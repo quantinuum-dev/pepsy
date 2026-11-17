@@ -1744,7 +1744,7 @@ class PauliMPO:
     def compress_dmt(
         self, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density", inplace=False,
         return_report=False, regions=None, truncation="paper", max_refinement_sweeps=8,
-        region_selection="smallest",
+        region_selection="smallest", constraint_mode="strict", constraint_weight=100., check_regions=True,
     ):
         """Compress while preserving partial traces on protected regions.
 
@@ -1774,12 +1774,15 @@ class PauliMPO:
             inplace=inplace, return_report=return_report, regions=regions,
             truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
             region_selection=region_selection,
+            constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+            check_regions=check_regions,
         )
 
     def apply_gate_dmt(
         self, gate, where, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
         mode="conjugate", inplace=False, return_report=False, trace_guard="auto", regions=None,
         truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
+        constraint_mode="strict", constraint_weight=100., check_regions=True,
     ):
         """Apply a two-qubit gate locally, then DMT-split the acted-on bond.
 
@@ -1803,6 +1806,8 @@ class PauliMPO:
             return_report=return_report, trace_guard=trace_guard, regions=regions,
             truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
             region_selection=region_selection,
+            constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+            check_regions=check_regions,
         )
 
     def apply_damping(self, damping, *, inplace=False):

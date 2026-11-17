@@ -96,6 +96,43 @@ implements a constrained variational fitter.
 
 ## Optional improved bond truncation
 
+`region_selection="rank_aware"` compares several valid covers using their
+state-dependent protected ranks. Contained region requests are derived from
+their parent regions. This is a bounded search, not a global rank optimum.
+
+For small bond caps, `constraint_mode="relaxed"` first tries exact DMT and
+the compatible-border solution. If these cannot fit, a weighted SVD fallback
+keeps the trace while allowing local-density errors. `constraint_weight`
+controls the weight on protected directions (default 100); it is not a direct
+plaquette-error penalty. Inspect `report.relaxed_bonds`,
+`report.relative_density_error` for the whole compression, and
+`report.max_relative_density_error` for individual splits. Relaxed replay
+retains reports even without diagnostic collection. `check_regions=False`
+skips repeated full-region checks while retaining bond and trace checks;
+in that mode density-error report fields are `None`. Use
+`dmt_check_regions=False` for `MpoOptimizer.run`. Routed gates still contract
+regions for their trace and routing bookkeeping.
+
+```python
+rho_small, report = compress_mpo_dmt(
+    rho, max_bond=8, regions=regions, region_selection="rank_aware",
+    constraint_mode="relaxed", check_regions=False, return_report=True,
+)
+print(report.relaxed_bonds)  # density errors are not measured in fast mode
+```
+
+The same options work with `PauliMPO.compress_dmt`, `PauliMPO.apply_gate_dmt`,
+`PauliDMT`, and `MpoOptimizer.compress_dmt`. For gate replay use
+`dmt_region_selection`, `dmt_constraint_mode`, `dmt_constraint_weight`, and
+`dmt_check_regions`. Fast checks do not certify a full physical-region
+contraction at every step. Enable full checks for accuracy investigations.
+
+At fixed χ, exact preservation refers to the current post-gate approximate
+state. Discarded longer-range correlations can affect future local densities;
+compare trajectories at increasing χ to assess long-time accuracy. The
+compressor does not guarantee global positivity. CuPy execution has not been
+validated in the current environment.
+
 The existing fast method remains `truncation="paper"`. To spend more work
 reducing the error at each cut, use:
 

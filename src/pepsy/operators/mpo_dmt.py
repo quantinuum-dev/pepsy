@@ -23,6 +23,7 @@ from ._pauli_dmt import (
     _options,
     _qr,
     _region_pattern,
+    _relative_density_defect,
     _region_trace_data,
 )
 from .pauli_mpo import _array_like, _copy_array, _core_bond_dimensions, _einsum, _reshape, _transpose
@@ -71,7 +72,8 @@ def _extract_cores(mpo):
 
 def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
                      variant="density", regions=None, inplace=False, return_report=False,
-                     truncation="paper", max_refinement_sweeps=8, region_selection="smallest"):
+                     truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
+                     constraint_mode="strict", constraint_weight=100., check_regions=True):
     """Compress a dense, ordinary MPO while preserving local partial traces.
 
     The default protects every contiguous window of up to three sites.
@@ -101,13 +103,16 @@ def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
         variant=variant, regions=regions, inplace=inplace, return_report=return_report,
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
+        constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+        check_regions=check_regions,
     )
     return (result, report) if return_report else result
 
 
 def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
                       variant, regions, inplace, return_report, truncation="paper",
-                      max_refinement_sweeps=8, region_selection="smallest"):
+                      max_refinement_sweeps=8, region_selection="smallest",
+                      constraint_mode="strict", constraint_weight=100., check_regions=True):
     """Full protected sweep, retaining owned canonical state for replay."""
     cores, layouts, d = _extract_cores(mpo)
     max_bond, cutoff, cutoff_mode, variant = _options(
@@ -129,6 +134,8 @@ def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
         _cores=cores, _trace_vector=trace_vector,
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
+        constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+        check_regions=check_regions,
     )
 
     def panels(values):
@@ -138,18 +145,24 @@ def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
 
     # Extracted cores are owned; canonicalization replaced entries rather than
     # changing their arrays, so the original copy remains the exact reference.
-    before = panels(cores)
+    before = panels(cores) if check_regions else None
     norm = _float(_norm(workspace.cores[0]))
     for bond in range(mpo.L - 1):
         workspace.split_pair(bond)
-    _check_local_trace_data(before, panels(workspace.cores), norm=norm,
-                            epsilon=_epsilon(workspace.cores[0]), n=mpo.L)
+    after = panels(workspace.cores) if check_regions else None
+    if constraint_mode == "strict" and check_regions:
+        _check_local_trace_data(before, after, norm=norm,
+                                epsilon=_epsilon(workspace.cores[0]), n=mpo.L)
+    elif check_regions:
+        workspace.relative_density_error = _relative_density_defect(before, after)
     workspace.mpo_layouts = layouts
     workspace.mpo_dimension = d
     workspace.mpo_log_scale = log_scale
     workspace.mpo_cutoff = cutoff
-    report = _physical_report(workspace) if return_report else None
+    report = _physical_report(workspace) if return_report or constraint_mode == "relaxed" else None
     result = _write_workspace(mpo if inplace else mpo.copy(), workspace)
+    if report is not None:
+        result.compression_report = report
     return result, report, workspace
 
 
@@ -190,6 +203,8 @@ def _write_workspace(result, workspace):
     for name in ("pepsy_first_degree", "pepsy_block_plan", "pepsy_pauli_mpo"):
         if hasattr(result, name):
             setattr(result, name, None)
+    if workspace.constraint_mode == "relaxed":
+        result.compression_report = _physical_report(workspace)
     return result
 
 
@@ -216,6 +231,7 @@ def _copy_workspace(previous):
     workspace.environments.right = list(previous.environments.right)
     workspace.original_bonds = _core_bond_dimensions(workspace.cores)
     workspace.reports = []
+    workspace.relative_density_error = None
     return workspace
 
 
@@ -313,15 +329,15 @@ def _gate_mpo_dmt_routed(mpo, previous, gate, bra_gate, where):
         order[bond], order[bond + 1] = order[bond + 1], order[bond]
     positions = remap(b - 1)
     _apply_pair_exact(workspace, b - 1, transfer)
-    before = _region_trace_data(workspace.cores, workspace.regions, workspace.trace_vector)
-    # Panels enumerate physical indices in temporary storage order. Restore
-    # their original order before the final all-region preservation check.
     reference = []
-    for region, (panel, log_scale) in zip(regions, before):
-        temporary = sorted(region, key=positions.__getitem__)
-        axes = tuple(temporary.index(site) for site in region)
-        panel = _reshape(_transpose(_reshape(panel, (p,) * len(region)), axes), (-1,))
-        reference.append((panel, log_scale))
+    if workspace.check_regions:
+        before = _region_trace_data(workspace.cores, workspace.regions, workspace.trace_vector)
+        # Restore the original physical order for the final region check.
+        for region, (panel, log_scale) in zip(regions, before):
+            temporary = sorted(region, key=positions.__getitem__)
+            axes = tuple(temporary.index(site) for site in region)
+            panel = _reshape(_transpose(_reshape(panel, (p,) * len(region)), axes), (-1,))
+            reference.append((panel, log_scale))
     norm = _float(_norm(workspace.cores[workspace.center]))
     temporary_split(b - 1)
     swap = _array_like(np.eye(p * p).reshape(p, p, p, p).transpose(1, 0, 2, 3), workspace.cores[0])
@@ -333,7 +349,9 @@ def _gate_mpo_dmt_routed(mpo, previous, gate, bra_gate, where):
     for bond in range(a, b):
         if workspace.cores[bond].shape[1] > workspace.max_bond:
             workspace.split_pair(bond)
-    after = _region_trace_data(workspace.cores, regions, workspace.trace_vector)
+    after = (_region_trace_data(workspace.cores, regions if workspace.check_regions else regions[:1],
+                                workspace.trace_vector)
+             if workspace.check_regions or trace_reference is not None else None)
     if trace_reference is not None:
         target_trace, target_log = trace_reference
         actual_trace = _trace_panel(after[0][0], workspace.trace_vector)
@@ -349,11 +367,13 @@ def _gate_mpo_dmt_routed(mpo, previous, gate, bra_gate, where):
         center = workspace.center
         workspace.cores[center] = workspace.cores[center] * correction
         workspace.environments.invalidate(center, center + 1)
-        after = _region_trace_data(workspace.cores, regions, workspace.trace_vector)
-    _check_local_trace_data(
-        reference, after,
-        norm=norm, epsilon=_epsilon(workspace.cores[0]), n=n,
-    )
+        if workspace.check_regions:
+            after = _region_trace_data(workspace.cores, regions, workspace.trace_vector)
+    if workspace.constraint_mode == "strict" and workspace.check_regions:
+        _check_local_trace_data(reference, after,
+                                norm=norm, epsilon=_epsilon(workspace.cores[0]), n=n)
+    elif workspace.check_regions:
+        workspace.relative_density_error = _relative_density_defect(reference, after)
     report = _physical_report(workspace) if workspace.diagnostics else None
     return _write_workspace(mpo, workspace), report, workspace
 

@@ -18,6 +18,9 @@ Optional `truncation="optimized"` adds guarded fixed-border SVD and constrained
 bond refinement; `region_selection="min_cover"` shares protection strings
 across overlapping regions. Both retain the original defaults. See the
 [controls and optimality limits](../operators/mpo_dmt.md#optional-improved-bond-truncation).
+`region_selection="rank_aware"`, `constraint_mode="relaxed"`, and
+`check_regions=False` have the same meaning for this persistent driver and
+ordinary MPO compression; see the same guide for reporting limitations.
 
 ## Choose an operation
 
