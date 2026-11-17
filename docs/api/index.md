@@ -40,6 +40,7 @@ in the [package map](package.md). The guides below explain behavior and options.
 - [MPO optimization](optimizers/mpo.md)
 - [1D and 2D-region DMT](optimizers/pauli_dmt.md)
 - [PEPS optimization](optimizers/peps.md)
+- [PEPO density-operator optimization](optimizers/pepo.md)
 - [Sweep optimization](optimizers/sweep.md)
 - [Global optimization](optimizers/global_opt.md)
 - [Energy optimization](optimizers/energy.md)

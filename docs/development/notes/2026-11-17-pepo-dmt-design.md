@@ -1,6 +1,11 @@
 # Proposed protected truncation for native PEPOs
 
-Status: **design discussion**, not an implemented PEPO DMT mode. The existing
+Status: **experimental prototype** for NumPy PEPOs, with exact and direct or
+variational boundary-MPS maps. Matrix-free scalable environments and broader
+backend support remain design work. The new
+[`PepoOptimizer`](../../api/optimizers/pepo.md) supplies gate replay with
+local SVD, simple update, boundary-MPS full update, and a guarded regional
+feasibility/refinement solver using single-layer maps. The existing
 [`PepsOptimizer`](../../api/optimizers/peps.md#native-pepo-full-update) accepts
 native PEPOs and has reduced two-site full updates, ALS/L-BFGS, and a
 simple-update warm start. [`gate_loop_cluster`](../../api/operators/gates.md#local-six-site-cluster-updates)

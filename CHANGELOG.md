@@ -8,6 +8,11 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **PEPO density gate replay:** add `PepoOptimizer` with local SVD,
+  simple-update and boundary-MPS full-update modes. Experimental small-system
+  DMT uses exact or boundary-MPS single-layer regional maps for NumPy PEPOs,
+  with bounded per-run map reuse and exterior-update invalidation.
+
 - **DMT precision and API guidance:** reject relaxed-mode weights whose metric
   cannot be represented in the tensor dtype, and clarify cutoffs, optional
   region checks and the scope of bond-local variational refinement.
