@@ -21,6 +21,28 @@ preserve those reduced operators. Region entries are **MPO positions**;
 builds physical neighborhoods for a 2D lattice mapped to an MPO.
 Larger regions can require much larger protected bond budgets.
 
+The original-paper path is `variant="density"`, `truncation="paper"`,
+and `constraint_mode="strict"`. At a canonical cut, it protects the boundary
+trace maps, subtracts the disconnected density baseline, and truncates the
+remaining free connected block by SVD. The resulting MPO preserves each
+selected reduced operator relative to the **input to that compression**.
+[White et al., Sec. III](https://arxiv.org/pdf/1707.01506) describes the
+one-dimensional construction.
+
+| Entry point | Default cutoff | Default cutoff mode |
+| --- | --- | --- |
+| `compress_mpo_dmt`, `MpoOptimizer.compress_dmt`, DMT replay | `"auto"` | `"auto"` (`"rel"`) |
+| `PauliMPO.compress_dmt`, `apply_gate_dmt`, `PauliDMT` | `0.0` | `"rel"` |
+
+Pass `cutoff="auto", cutoff_mode="auto"` explicitly to the Pauli entry
+points to use the same dtype-aware threshold as the ordinary MPO entry points.
+Explicit `cutoff=0.0` requests zero-cutoff behavior in either basis.
+
+For a single adjacent Pauli gate, `apply_gate_dmt` and `PauliDMT.apply_gate`
+cap only the acted-on bond. First compress the input if every bond must
+already obey `max_bond`. In contrast, the first gate in
+`MpoOptimizer(mode="dmt")` performs a full protected sweep to cap all bonds.
+
 ## Trace protection without a Pauli basis
 
 For matrix units $E_{st}=|s\rangle\langle t|$, the local trace is
@@ -57,7 +79,8 @@ need not produce identical tensors across bases.
   useful when global Hermiticity must be maintained through such cuts.
 - `max_bond` must accommodate the protected subspaces. An insufficient
   conservative budget raises `ValueError`; insufficient working precision
-  raises `FloatingPointError`. Marginal checks remain active without reports.
+  raises `FloatingPointError`. With `check_regions=True`, marginal checks
+  remain active even when reports are not requested.
 - `cutoff="auto"` and `cutoff_mode="auto"` are the defaults, matching MPO
   DMT replay and `MpoOptimizer.compress_dmt`. Auto cutoff is `1e-12` for
   float64/complex128 and `1e-6` for float32/complex64. Auto mode chooses
@@ -68,6 +91,9 @@ need not produce identical tensors across bases.
   `rel`, `abs`, `sum1`, `rsum1`, `sum2`, and `rsum2` policies act only on the
   free residual spectrum. Absolute cutoffs use physical Hilbert–Schmidt units,
   including Quimb's external exponent; squared-sum cutoffs use squared units.
+  If the explicit relaxed fallback is used, its weighted and ordinary SVD
+  seeds use `max_bond` with zero cutoff; the free-residual cutoff has no
+  direct equivalent in that fallback.
 - Returns a new MPO by default. `inplace=True` writes only after preservation
   checks succeed. Tensor/index order, tags, external exponent, array backend,
   dtype and device are retained. Exact Pepsy construction-history attachments
@@ -91,8 +117,9 @@ For repeated Pauli-basis gate evolution, the persistent
 [`PauliDMT`](../optimizers/pauli_dmt.md) driver remains available. This ordinary
 MPO entry point performs one compression sweep. For gate-stream evolution,
 use [`MpoOptimizer(mode="dmt")`](../optimizers/mpo.md#dmt-gate-stream-replay),
-or call its `compress_dmt` method for the current state. Neither entry point
-implements a constrained variational fitter.
+or call its `compress_dmt` method for the current state. The optional
+`truncation="optimized"` refines individual bonds; these entry points do not
+provide a full-MPO constrained variational fitter.
 
 ## Optional improved bond truncation
 
@@ -112,6 +139,8 @@ skips repeated full-region checks while retaining bond and trace checks;
 in that mode density-error report fields are `None`. Use
 `dmt_check_regions=False` for `MpoOptimizer.run`. Routed gates still contract
 regions for their trace and routing bookkeeping.
+Very large weights that cannot be represented safely in the tensor dtype are
+rejected before compression; use a smaller weight or higher precision.
 
 ```python
 rho_small, report = compress_mpo_dmt(

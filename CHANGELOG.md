@@ -8,6 +8,10 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **DMT precision and API guidance:** reject relaxed-mode weights whose metric
+  cannot be represented in the tensor dtype, and clarify cutoffs, optional
+  region checks and the scope of bond-local variational refinement.
+
 - **DMT region and small-bond options:** add rank-aware protection-cover
   selection, reuse maximal-region contractions for contained regions, and an
   explicit trace-preserving relaxed fallback with density-error reporting.

@@ -145,6 +145,8 @@ and `PauliDMT.evolve` still follow the 1D storage chain.
 through compression, to numerical precision. For a density matrix these are
 the local reduced density matrices; consequently compression preserves energy
 when every Hamiltonian term fits inside such a region.
+This is the default strict mode; `constraint_mode="relaxed"` can change
+those marginals when the requested cap cannot fit the protected construction.
 
 ```python
 rho = PauliMPO.from_terms(8, [

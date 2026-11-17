@@ -1746,7 +1746,7 @@ class PauliMPO:
         return_report=False, regions=None, truncation="paper", max_refinement_sweeps=8,
         region_selection="smallest", constraint_mode="strict", constraint_weight=100., check_regions=True,
     ):
-        """Compress while preserving partial traces on protected regions.
+        """Compress with strict local protection or an explicit relaxed fallback.
 
         ``regions`` is an iterable of nonempty MPO-site index sequences; each
         specifies a complete reduced operator to preserve. ``None`` preserves
@@ -1764,8 +1764,12 @@ class PauliMPO:
         apply only to the unprotected spectrum; protected factors are never
         renormalized. ``cutoff='auto'`` uses Pepsy's dtype-aware policy.
         Only open chains with dense floating/complex cores are supported.
-        A log-scaled check of all local marginals raises FloatingPointError
-        if the sweep cannot preserve them at the working precision.
+        With strict protection and ``check_regions=True``, a log-scaled check
+        raises FloatingPointError when local marginals cannot be preserved.
+        ``check_regions=False`` omits that full-region check. Relaxed fallback
+        may change the marginals, keeps the trace, and reports their error
+        when checks are enabled. Its SVD seeds use the bond cap and do not
+        apply the free-residual cutoff.
         """
         from ._pauli_dmt import compress_dmt
 
@@ -1788,6 +1792,8 @@ class PauliMPO:
 
         Sites must be adjacent and increasing. The target is formed exactly
         before protected compression; no global gate MPO is constructed.
+        Only the acted-on bond is capped; compress an oversized input first
+        if every bond must satisfy ``max_bond``.
         For repeated evolution use ``pepsy.optimizers.PauliDMT`` to reuse
         the canonical centre and trace environments between gates.
         ``trace_guard='auto'`` checks resolved nonzero traces; set it to

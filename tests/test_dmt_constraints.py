@@ -212,6 +212,9 @@ def test_pauli_small_cap_gate_and_long_sequence():
             report = run.apply_gate(gate(i), (2,3))
             assert report.final_bond == 1 and report.relative_density_error >= 0
     np.testing.assert_allclose(run.state.trace(),rho.trace(),atol=2e-12)
+    # Persistent adjacent-gate updates cap only the acted-on bond. An input
+    # that was already oversized retains its untouched bond dimensions.
+    assert max(run.state.pauli_bond_dimensions) > 1
 
 
 def test_exact_plaquette_protection_does_not_certify_future_local_dynamics():
@@ -243,6 +246,16 @@ def test_invalid_modes_do_not_mutate_input(options):
     before = dense(rho)
     with pytest.raises(ValueError):
         compress_mpo_dmt(rho,max_bond=1,inplace=True,**options)
+    np.testing.assert_array_equal(dense(rho),before)
+
+
+@pytest.mark.parametrize('dtype,weight', [('complex64',1e100), ('complex128',1e308)])
+def test_extreme_weight_is_rejected_before_mutation(dtype,weight):
+    rho,_,_ = mixture(6,rank=16,dtype=dtype)
+    before = dense(rho)
+    with pytest.raises(ValueError, match='constraint_weight is too large'):
+        compress_mpo_dmt(rho,max_bond=1,constraint_mode='relaxed',
+                         constraint_weight=weight,inplace=True)
     np.testing.assert_array_equal(dense(rho),before)
 
 

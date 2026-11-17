@@ -102,7 +102,8 @@ exactness guarantee for the entire untruncated circuit trajectory.
   the [physical-unit contract](../operators/mpo_dmt.md#contract).
 - `dmt_diagnostics=True` collects reports returned by `get_dmt_reports()` for
   the latest DMT operation. The default avoids extra split diagnostics;
-  marginal checks remain mandatory. Manual `compress_dmt(return_report=True)`
+  full marginal checks are on by default and may be disabled with
+  `dmt_check_regions=False`. Manual `compress_dmt(return_report=True)`
   returns and retains one report. A full-sweep report contains all visited
   bonds; a local-update report contains one bond. Workspace updates report
   pre-gate source bond dimensions. Routed reports include temporary-order

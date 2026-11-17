@@ -906,6 +906,18 @@ class _PauliDMTWorkspace:
             raise TypeError("DMT requires floating-point or complex coefficient cores.")
         if len({ar.get_dtype_name(a) for a in self.cores}) != 1:
             raise TypeError("DMT requires homogeneous core dtypes.")
+        if constraint_mode == "relaxed":
+            dtype = ar.get_dtype_name(self.cores[0])
+            real_dtype = np.float32 if dtype in {"float32", "complex64"} else np.float64
+            # The relaxed metric and its inverse must both be representable
+            # on the native backend; otherwise a finite Python scalar can
+            # become zero/infinity after conversion to a lower-precision dtype.
+            maximum = 1. / float(np.finfo(real_dtype).tiny) - 1.
+            if float(constraint_weight) > maximum:
+                raise ValueError(
+                    f"constraint_weight is too large for {dtype}; "
+                    f"use a value no larger than {maximum:.3g}."
+                )
         self.max_bond, self.cutoff, self.cutoff_mode, self.variant = _options(
             max_bond, cutoff, cutoff_mode, variant, ar.get_dtype_name(self.cores[0]),
         )

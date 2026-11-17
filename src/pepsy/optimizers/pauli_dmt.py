@@ -37,6 +37,8 @@ class PauliDMT:
     can protect physical 2D neighborhoods after mapping them to MPO positions;
     it does not change the gate schedule or interpret lattice coordinates.
     Only adjacent increasing gate sites are supported. An
+    adjacent gate caps only its updated bond; compress an oversized input
+    before constructing the driver if all bonds must obey ``max_bond``. An
     evolution call commits successful gates as it proceeds, so after a
     numerical exception the state can contain a completed partial timestep.
     ``trace_guard='auto'`` monitors per-gate relative trace defects for
@@ -44,11 +46,14 @@ class PauliDMT:
     ``trace_guard=True`` forces it and ``False`` disables it; inspect
     :attr:`trace_guard_active` for the resolved choice. This guard does not
     certify all local marginals; monitor observables and convergence.
-    ``cutoff='auto'`` uses Pepsy's dtype-aware cutoff; ``cutoff_mode``
-    follows Quimb and applies only to the unprotected residual.
+    ``cutoff='auto'`` uses Pepsy's dtype-aware cutoff. In paper mode,
+    ``cutoff_mode`` follows Quimb and applies to the unprotected residual;
+    optimized refinement can reuse rank after its SVD seeds.
     ``regions`` replaces contiguous three-site protection with complete
     reduced-operator constraints on the given MPO-site sequences. Geometry-
-    selected splits check those regions before committing each update.
+    selected splits check those regions before committing each update when
+    ``check_regions=True``. ``constraint_mode='relaxed'`` permits local-density
+    changes when the protected construction cannot meet the bond cap.
     ``truncation='optimized'`` optionally refines each fixed-border bond;
     ``max_refinement_sweeps`` bounds alternating updates (zero for SVD seeds
     only). ``region_selection='min_cover'`` shares physical strings across
