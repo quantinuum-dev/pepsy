@@ -8,6 +8,23 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **MPO DMT replay:** add `MpoOptimizer(mode="dmt")`, `compress_dmt` and
+  optional per-gate reports for computational-basis MPOs and mapped 2D regions.
+  Build exact gate targets before protected truncation, retain transactional
+  updates and suppress inapplicable norm-survival fidelity estimates. Add
+  dense/product-mixture references and 2D CPU benchmarks. Correct legacy
+  Autoray backend-string namespace collisions with a capability-gated shim.
+  Default ordinary-MPO compression cutoffs to dtype-aware `"auto"`; reuse
+  canonical cores and trace environments for adjacent gate updates after
+  the initial protected sweep, retaining mandatory marginal checks.
+  Reduce large-square checking costs with balanced log-scaled region
+  contractions, strided trace reductions and per-pair projection reuse;
+  add fixed-input 6×6/8×8 chi sweeps with explicit budget rejections.
+  Route later nonlocal MPO gates with exact forward swaps and protected
+  return swaps, checking mapped physical regions and restoring the final cap.
+  Bound density-routing trace roundoff against the actual gate target and
+  retain native gradients without forcing unit trace.
+
 - **JAX L-BFGS precision and restoration:** keep internal coordinates and
   line-search buffers in a common precision while preserving objective input
   and result dtypes. Fix mixed-precision compilation failures, rounded loss

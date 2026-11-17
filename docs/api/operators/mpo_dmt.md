@@ -58,7 +58,13 @@ need not produce identical tensors across bases.
 - `max_bond` must accommodate the protected subspaces. An insufficient
   conservative budget raises `ValueError`; insufficient working precision
   raises `FloatingPointError`. Marginal checks remain active without reports.
-- `cutoff=0.0` is the default. `"auto"` uses Pepsy's dtype policy. Quimb's
+- `cutoff="auto"` and `cutoff_mode="auto"` are the defaults, matching MPO
+  DMT replay and `MpoOptimizer.compress_dmt`. Auto cutoff is `1e-12` for
+  float64/complex128 and `1e-6` for float32/complex64. Auto mode chooses
+  `"rel"`: a dtype-scale threshold relative to the **free residual's**
+  largest singular value. It does not use the much larger protected part
+  to judge small correlations. Explicit `cutoff=0.` retains zero-cutoff
+  behavior. Quimb's
   `rel`, `abs`, `sum1`, `rsum1`, `sum2`, and `rsum2` policies act only on the
   free residual spectrum. Absolute cutoffs use physical Hilbert–Schmidt units,
   including Quimb's external exponent; squared-sum cutoffs use squared units.
@@ -83,5 +89,34 @@ policy, rank changes and degenerate truncation boundaries remain limitations.
 
 For repeated Pauli-basis gate evolution, the persistent
 [`PauliDMT`](../optimizers/pauli_dmt.md) driver remains available. This ordinary
-MPO entry point performs one compression sweep; it does not add a new replay
-mode or a constrained variational fitter.
+MPO entry point performs one compression sweep. For gate-stream evolution,
+use [`MpoOptimizer(mode="dmt")`](../optimizers/mpo.md#dmt-gate-stream-replay),
+or call its `compress_dmt` method for the current state. Neither entry point
+implements a constrained variational fitter.
+
+## Larger mapped squares
+
+Use plaquette regions with a snake ordering and check the protected bond
+budget at each chosen `chi`. The budget depends on both the state and region
+inventory; a value that works on 4×4 need not work on 6×6 or 8×8. DMT rejects
+an insufficient conservative budget and keeps the requested cap unchanged.
+
+Region checks contract the kept sites from both ends with logarithmic scale
+tracking. Overlapping protection patterns reuse local projections within
+each active pair. These exact contractions reduce time and temporary storage
+while retaining every marginal check and the native dtype/device.
+
+Run a reproducible CPU sweep with a fixed rank-136 input across χ values:
+
+```bash
+python examples/mpo_dmt_benchmark.py --square 6 8 --chis 64 96 128 \
+    --initial-rank 136 --operation compress --methods dmt --repeats 3
+```
+
+For interior gate replay use `--operation replay --schedule center`; set
+`--initial-rank` to select the starting state complexity. The four-gate center
+schedule includes long MPO spans; `--schedule layer` covers every lattice edge.
+JSON rows include explicit numerical/budget rejections, actual bond cap,
+density/trace defects, state storage and cumulative process peak RSS.
+See the [large-square measurements](../../development/notes/2026-11-16-mpo-dmt-large-squares.md)
+for tested inputs, precision limits and the remaining distant-gate cost.

@@ -91,6 +91,47 @@ if legacy:
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_explicit_backend_namespace_keys_are_isolated_and_capability_gated(legacy):
+    script = r'''
+import sys
+import importlib
+import numpy as np
+import autoray as ar
+import autoray.autoray as core
+from pepsy.backends.config import _patch_backend_string_namespace_key
+
+cache = {}
+legacy = sys.argv[1] == "True"
+def original(like=None, device=None, dtype=None, submodule=None):
+    key = (str if legacy and isinstance(like, str) else like, device, dtype, submodule)
+    if key not in cache:
+        cache[key] = core.AutoNamespace(like, device, dtype, submodule)
+    return cache[key]
+
+core.get_namespace = ar.get_namespace = original
+modules = [importlib.import_module(n) for n in ("quimb.tensor.decomp", "quimb.tensor.array_ops", "cotengra.contract")]
+for module in modules:
+    module.get_namespace = original
+_patch_backend_string_namespace_key()
+if not legacy:
+    assert ar.get_namespace is original
+installed = ar.get_namespace
+_patch_backend_string_namespace_key()
+assert ar.get_namespace is installed
+for factory in [ar.get_namespace, core.get_namespace, *(m.get_namespace for m in modules)]:
+    assert factory("numpy") is not factory("torch")
+    assert factory("numpy") is factory("numpy")
+    assert isinstance(factory("numpy").zeros((2,)), np.ndarray)
+'''
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(root / "src")
+    result = subprocess.run([sys.executable, "-c", script, str(legacy)], cwd=root,
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_cupy_namespace_creation_on_available_device():
     """Exercise actual CUDA device injection when CuPy and a GPU are present."""
     cp = pytest.importorskip("cupy")

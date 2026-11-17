@@ -322,6 +322,51 @@ def _patch_unhashable_device_namespace_key():
     ar_core._pepsy_unhashable_device_patch = True
 
 
+def _patch_backend_string_namespace_key():
+    """Keep explicit backend names distinct on legacy Autoray releases.
+
+    Some releases key all string requests by ``str`` rather than their value,
+    causing a NumPy contraction to select Torch operations, or vice versa.
+    Only the affected string-dispatch cache is replaced; array dispatch and
+    modern implementations retain their existing behavior.
+    """
+    import sys
+    import autoray
+    import autoray.autoray as core
+
+    if getattr(core, "_pepsy_backend_string_namespace_patch", False):
+        return
+    original = core.get_namespace
+    # Namespace objects load numerical functions lazily: this does not import
+    # Torch, and the two backend names cannot intentionally share dispatch.
+    if original(like="numpy") is not original(like="torch"):
+        return
+    cache = {}
+
+    def get_namespace(like=None, device=None, dtype=None, submodule=None):
+        if not isinstance(like, str):
+            return original(like=like, device=device, dtype=dtype, submodule=submodule)
+        key = (like, device, dtype, submodule)
+        try:
+            hash(key)
+        except TypeError:
+            # Preserve the existing unhashable-device capability check/shim.
+            return original(like=like, device=device, dtype=dtype, submodule=submodule)
+        if key not in cache:
+            cache[key] = core.AutoNamespace(like, device, dtype, submodule)
+        return cache[key]
+
+    core.get_namespace = autoray.get_namespace = get_namespace
+    # These modules import the function directly, so updating Autoray alone
+    # would leave their contraction/decomposition dispatch on the old cache.
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith(("quimb.", "cotengra.")):
+            factory = getattr(module, "get_namespace", None)
+            if factory is original or getattr(factory, "__module__", None) == "autoray.autoray":
+                module.get_namespace = get_namespace
+    core._pepsy_backend_string_namespace_patch = True
+
+
 def _validate_backend_callable(name, fn):
     if fn is not None and not callable(fn):
         raise TypeError(f"{name} must be callable or None")

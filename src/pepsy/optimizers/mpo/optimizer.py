@@ -113,7 +113,8 @@ def _replay_policy(method):
                     "synchronize devices; use finite_check=False to avoid it.",
                     RuntimeWarning, stacklevel=2,
                 )
-            return method(self, *args, **kwargs)
+            with self._dmt_backend_context(mode=kwargs.get("mode")):
+                return method(self, *args, **kwargs)
         finally:
             self._finite_check_enabled = previous_check
             self._replay_rank_cache = previous_cache
@@ -382,6 +383,8 @@ class MpoOptimizer:
         for ``"quimb-src"``. The dense Quimb path supports arbitrary
         one-dimensional gate supports; ``"svd"`` and ``"dmrg"`` retain
         their one- and two-site update paths.
+        ``"dmt"`` applies dense one-/two-site gates without truncation and
+        compresses each target while protecting selected reduced operators.
     ind_id_k : str, default="k{}"
         Site-index format string for the ket physical leg family.
     ind_id_b : str, default="b{}"
@@ -415,6 +418,7 @@ class MpoOptimizer:
             "dmrg2",
             "dmrg3",
             "svd",
+            "dmt",
             "mpo",
             "quimb",
         }
@@ -590,6 +594,9 @@ class MpoOptimizer:
                     "or MpoOptimizer(mpo, chi) for an empty gate queue."
                 )
 
+        from ...backends.config import _patch_backend_string_namespace_key
+
+        _patch_backend_string_namespace_key()
         self.inplace = bool(inplace)
         self._finite_check_enabled = False
         self._replay_rank_cache = None
@@ -619,6 +626,8 @@ class MpoOptimizer:
         self.losses = [1.0]
         self.norm_events = []
         self._norm_log_survival = 0.0
+        self._dmt_compression_seen = False
+        self._dmt_reports = []
         self.fit_diagnostics = []
         self._last_dmrg_fit_diagnostics = None
         self.last_run_timing = None
@@ -949,7 +958,8 @@ class MpoOptimizer:
         """Put ``self.p`` into mixed-canonical form with center at ``L // 2``."""
         center = self.p.L // 2
         self.info_c = {}
-        self.p.canonicalize_([center], cur_orthog="calc", info=self.info_c)
+        with self._dmt_backend_context():
+            self.p.canonicalize_([center], cur_orthog="calc", info=self.info_c)
         self._current_orthog(self.p)
 
     def _prepare_dmrg_state(self, fit_block_size=1):
@@ -979,6 +989,8 @@ class MpoOptimizer:
         self.losses = [1.0]
         self.norm_events = []
         self._norm_log_survival = 0.0
+        self._dmt_compression_seen = False
+        self._dmt_reports = []
         self.fit_diagnostics = []
         self._last_dmrg_fit_diagnostics = None
         self.last_run_timing = None
@@ -1199,8 +1211,20 @@ class MpoOptimizer:
         Working in log-mantissa form keeps the proxy stable for very long
         gate streams where ``<O|O>`` can over- or under-flow.
         """
-        mantissa, exponent = tn_norm(p, contraction_opt=self.contraction_opt, strip_exponent=True)
+        with self._dmt_backend_context(p):
+            mantissa, exponent = tn_norm(p, contraction_opt=self.contraction_opt, strip_exponent=True)
         return self._real_float(mantissa), float(exponent)
+
+    def _dmt_backend_context(self, p=None, mode=None):
+        """Bind dense DMT contractions to their native backend, locally."""
+        from contextlib import nullcontext
+
+        if str(self.mode if mode is None else mode).strip().lower() != "dmt":
+            return nullcontext()
+        from quimb.tensor import contract_backend
+
+        state = self.p if p is None else p
+        return contract_backend(ar.infer_backend(state[0].data))
 
     def _normalize_norm(self, norm_val):
         """Convert a ``(mantissa, exponent)`` squared-norm into the relative MPO norm.
@@ -1421,10 +1445,14 @@ class MpoOptimizer:
 
     def _cumulative_fidelity(self):
         """Return cumulative fidelity measured from retained norms."""
+        if self._dmt_compression_seen:
+            return None
         return self._exp_from_log(self._norm_log_survival)
 
     def _cumulative_infidelity(self):
         """Return cumulative infidelity using stable ``expm1``."""
+        if self._dmt_compression_seen:
+            return None
         if self._norm_log_survival == -math.inf:
             return 1.0
         if not math.isfinite(self._norm_log_survival):
@@ -1441,7 +1469,10 @@ class MpoOptimizer:
         cumulative fidelity fields are ratios of expected and observed norms,
         so this scale cancels without being discarded from the diagnostics.
         """
-        valid = [event for event in self.norm_events if event["valid"]]
+        # DMT is not an orthogonal projection: norm survival is not a fidelity
+        # estimate for any stream containing it. Historical events stay intact.
+        valid = ([] if self._dmt_compression_seen else
+                 [event for event in self.norm_events if event["valid"]])
         cumulative_fidelity = (
             None if not valid else self._cumulative_fidelity()
         )
@@ -1792,6 +1823,8 @@ class MpoOptimizer:
         bra_gate,
         cutoff,
         cutoff_mode="rsum2",
+        *,
+        gate_cutoff=None,
     ):
         """Build an uncapped regular MPO target for one gate pair."""
         p_g = p.copy()
@@ -1817,6 +1850,7 @@ class MpoOptimizer:
             cutoff_mode=cutoff_mode,
             layer_order="upper_lower",
             max_bond=None,
+            **({"gate_cutoff": gate_cutoff} if gate_cutoff is not None else {}),
         )
 
     def _can_use_native_gate_sandwich(self, p, gate, bra_gate, where, method):
@@ -1875,6 +1909,7 @@ class MpoOptimizer:
         max_bond=None,
         method="direct",
         seed=None,
+        gate_cutoff=None,
     ):
         """Apply and compress both physical MPO layers in a chosen order."""
         method = self._normalize_submpo_method(method)
@@ -1906,6 +1941,8 @@ class MpoOptimizer:
                 max_bond=max_bond,
                 seed=seed,
             )
+            if gate_cutoff is not None:
+                compress_options["gate_cutoff"] = gate_cutoff
             p = run_seeded_quimb(
                 compress_options.pop("seed", None),
                 gate_nonlocal_opt,
@@ -3188,6 +3225,8 @@ class MpoOptimizer:
             "losses": list(self.losses),
             "norm_events": list(self.norm_events),
             "norm_log_survival": self._norm_log_survival,
+            "dmt_compression_seen": self._dmt_compression_seen,
+            "dmt_reports": list(self._dmt_reports),
             # Committed records are append-only; only their list containers
             # need snapshots. Public accessors keep defensive deep copies.
             "fit_diagnostics": list(self.fit_diagnostics),
@@ -3205,12 +3244,15 @@ class MpoOptimizer:
         self.losses = snapshot["losses"]
         self.norm_events = snapshot["norm_events"]
         self._norm_log_survival = snapshot["norm_log_survival"]
+        self._dmt_compression_seen = snapshot["dmt_compression_seen"]
+        self._dmt_reports = snapshot["dmt_reports"]
         self.fit_diagnostics = snapshot["fit_diagnostics"]
         self._last_dmrg_fit_diagnostics = snapshot["last_fit"]
         self.channel_events = snapshot["channel_events"]
         self.fallback_events = snapshot["fallback_events"]
         self.trace_events = snapshot["trace_events"]
         self._dmrg1_one_site_locked = snapshot["dmrg1_one_site_locked"]
+        self.backend_info()
 
     def _record_fit_failure(self, exc, *, where, block_size, step):
         """Retain a failed FIT attempt in the public per-update history."""
@@ -4348,6 +4390,9 @@ class MpoOptimizer:
         progbar=False,
         cutoff="auto",
         cutoff_mode="auto",
+        dmt_regions=None,
+        dmt_variant="density",
+        dmt_diagnostics=False,
         fidelity_samples=10,
         k_2q_batch=1,
         fit_block_size=2,
@@ -4387,8 +4432,9 @@ class MpoOptimizer:
         n_iter : int, default=8
             Inner iterations for DMRG ``FIT`` updates on two-site gates. With
             adaptive block fitting, the initial block phase hands the
-            remaining sweeps to one-site refinement. Ignored by ``svd`` mode.
-        mode : {"direct", "dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "quimb-<method>"} | None, default=None
+            remaining sweeps to one-site refinement. Ignored by ``svd`` and
+            ``dmt`` modes.
+        mode : {"direct", "dmrg", "dmrg1", "dmrg2", "dmrg3", "svd", "dmt", "quimb-<method>"} | None, default=None
             Optional mode override for this run. Bare Quimb method names
             such as ``"src"`` are accepted as aliases for ``"quimb-src"``.
         compression_seed : int | None, default=None
@@ -4455,6 +4501,13 @@ class MpoOptimizer:
         target_cutoff : float, default=0.0
             ``dmrg`` mode only: cutoff used while constructing the target
             MPO. The output FIT SVD remains controlled by ``cutoff``.
+        dmt_regions : iterable[iterable[int]] | None, default=None
+            ``dmt`` mode: MPO storage-position sets whose reduced operators
+            must survive each compression. None protects contiguous triples.
+        dmt_variant : {"density", "operator"}, default="density"
+            Connected density construction or raw-operator protected SVD.
+        dmt_diagnostics : bool, default=False
+            Retain detailed per-gate reports in :meth:`get_dmt_reports`.
         fit_min_iter : int | None, default=2
             Minimum FIT sweeps before ``fit_rtol`` can stop a DMRG update.
         fit_rtol : float | {"auto"} | None, default="auto"
@@ -4543,6 +4596,17 @@ class MpoOptimizer:
 
         fit_finite_check = finite_check
 
+        if self.mode == "dmt":
+            from .dmt import validate_replay
+
+            dmt_regions = validate_replay(
+                self, dmt_regions, dmt_variant, target_cutoff=target_cutoff,
+                submpo_method=submpo_method, compression_seed=compression_seed,
+                fit_fallback=fit_fallback, layout=layout,
+            )
+        elif dmt_regions is not None or dmt_variant != "density" or dmt_diagnostics:
+            raise ValueError("dmt_* options require mode='dmt'")
+
         compression_method = self._resolve_mpo_method(submpo_method)
         compression_opts = quimb_compression_options(compression_method, compression_opts)
         if mpo_factorization not in {"qr", "projector"}:
@@ -4571,7 +4635,7 @@ class MpoOptimizer:
         cutoff = self._resolve_cutoff(cutoff, self.p)
         if cutoff_mode is None or cutoff_mode == "auto":
             method = self._resolve_mpo_method(submpo_method)
-            cutoff_mode = "rsum1" if (
+            cutoff_mode = "rel" if self.mode == "dmt" else "rsum1" if (
                 self._is_mpo_mode(self.mode)
                 and method == "dm"
                 and not self._has_symmray_data(self.p)
@@ -4711,7 +4775,7 @@ class MpoOptimizer:
                 fallback_event_count=fallback_event_count,
             )
 
-        if self.mode == "svd" or self._is_mpo_mode(self.mode):
+        if self.mode in {"svd", "dmt"} or self._is_mpo_mode(self.mode):
             return self._run_compression_replay(
                 G_seq, where_seq, snapshot=snapshot,
                 progbar=progbar, cutoff=cutoff, cutoff_mode=cutoff_mode,
@@ -4719,6 +4783,8 @@ class MpoOptimizer:
                 fit_target_strategy=fit_target_strategy,
                 mpo_method_override=mpo_method_override,
                 compression_seed=compression_seed, compression_opts=compression_opts,
+                **(dict(dmt_regions=dmt_regions, dmt_variant=dmt_variant,
+                        dmt_diagnostics=dmt_diagnostics) if self.mode == "dmt" else {}),
             )
 
         supported = ", ".join(sorted(self._ALLOWED_MODES))
@@ -4960,6 +5026,7 @@ class MpoOptimizer:
         self, G_seq, where_seq, *, snapshot, progbar, cutoff, cutoff_mode,
         fidelity_samples, finite_check, fit_target_strategy,
         mpo_method_override, compression_seed, compression_opts,
+        dmt_regions=None, dmt_variant="density", dmt_diagnostics=False,
     ):
         """Execute direct/SVD replay with one success and rollback boundary."""
         # Generic layer compression loses native charge-sector metadata.
@@ -4974,7 +5041,15 @@ class MpoOptimizer:
                 finite_check=finite_check,
                 fit_target_strategy=fit_target_strategy,
             )
-            if use_svd:
+            if self.mode == "dmt":
+                stage = "dmt.replay"
+                runner = self._run_dmt
+                replay_options.pop("fit_target_strategy")
+                replay_options.update(
+                    regions=dmt_regions, variant=dmt_variant,
+                    diagnostics=bool(dmt_diagnostics),
+                )
+            elif use_svd:
                 stage = "svd.replay"
                 runner = self._run_svd
             else:
@@ -5192,6 +5267,35 @@ class MpoOptimizer:
     def get_run_timing(self):
         """Return the latest opt-in MPO replay timing record."""
         return deepcopy(self.last_run_timing)
+
+    def _run_dmt(self, gates, wheres, **options):
+        from .dmt import replay
+
+        return replay(self, gates, wheres, **options)
+
+    def compress_dmt(self, *, cutoff="auto", cutoff_mode="auto", variant="density",
+                     regions=None, return_report=False):
+        """Protect local reduced operators while compressing the live MPO to chi.
+
+        ``regions`` are physical storage positions, including noncontiguous
+        regions for mapped lattices. The default protects contiguous triples.
+        Auto cutoff uses the state dtype; auto mode thresholds the free
+        residual spectrum relatively, leaving protected directions intact.
+        Return the current MPO, or ``(MPO, MPODMTReport)`` when requested.
+        This invalidates norm-survival fidelity estimates until ``set_mpo``;
+        DMT reports and the absolute norm remain available independently.
+        """
+        from .dmt import compress_current
+
+        with self._dmt_backend_context(mode="dmt"):
+            return compress_current(
+                self, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
+                regions=regions, return_report=return_report,
+            )
+
+    def get_dmt_reports(self):
+        """Return immutable reports from the latest diagnostic DMT operation."""
+        return tuple(self._dmt_reports)
 
     def compress(self, *, cutoff=1e-12, cutoff_mode="rsum2"):
         """Compress the current MPO to ``chi`` while preserving its backend.

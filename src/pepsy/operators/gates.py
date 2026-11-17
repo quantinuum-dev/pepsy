@@ -4331,6 +4331,7 @@ def gate_nonlocal_opt(
     ind_id_k="k{}",
     ind_id_b="b{}",
     mpo_factorization="qr",
+    gate_cutoff=None,
     **compress_opts,
 ):
     """Apply a nonlocal gate (dense operator) to an MPO layer via sub-MPO compression.
@@ -4374,6 +4375,10 @@ def gate_nonlocal_opt(
         Use paired factors in gate construction, canonicalization and direct
         compression. Projector mode has the same derivative-chart limits as
         :func:`gate_with_submpo` and does not change global QR/SVD drivers.
+    gate_cutoff : float | None, optional
+        Cutoff when splitting the dense gate into an MPO, separate from output
+        compression. None retains Quimb's default; use zero for an untruncated
+        target, as required by DMT.
 
     Returns
     -------
@@ -4382,7 +4387,7 @@ def gate_nonlocal_opt(
     """
     if dims is None:
         dims = tuple(p.phys_dim(i) for i in where)
-    split_opts = {}
+    split_opts = {} if gate_cutoff is None else {"cutoff": gate_cutoff}
     if mpo_factorization == "projector":
         from ._mpo_factorization import projector_method
 

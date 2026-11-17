@@ -1,8 +1,8 @@
 # `pepsy.optimizers.mpo.optimizer`
 
-For native Pauli-coefficient evolution with protected local partial traces,
-use [`PauliDMT`](pauli_dmt.md), including physical 2D-region protection.
-It implements DMT compression separately from the ordinary MPO replay below.
+Use `mode="dmt"` for protected SVD replay on ordinary ket/bra MPO tensors,
+including mapped 2D regions. For native Pauli-coefficient storage and persistent
+adjacent-gate environments, use [`PauliDMT`](pauli_dmt.md).
 
 ## Minimal replay and option groups
 
@@ -21,6 +21,113 @@ result = opt.run(cutoff=0.0)
 
 `run()` updates the current MPO and returns it. Another call replays the same
 queue on that updated MPO. The operator retains its absolute scale.
+
+## DMT gate-stream replay
+
+```python
+import numpy as np
+import quimb.tensor as qtn
+from scipy.linalg import expm
+from pepsy.operators import square_lattice_dmt_regions
+from pepsy.optimizers import MpoOptimizer
+from pepsy.tensors import OneDMap
+
+mapper = OneDMap(3, 3, mode="snake-row-major")
+_, sites = mapper.build()
+regions = square_lattice_dmt_regions(3, 3, mapper=mapper)
+rho = qtn.MPO_product_operator([np.array([[.65, .1], [.1, .35]])] * 9)
+X = np.array([[0., 1.], [1., 0.]])
+Z = np.diag([1., -1.])
+U = expm(-.05j * (np.kron(Z, Z) + .3 * np.kron(X, np.eye(2))))
+edges = [((0, 0), (1, 0)), ((0, 1), (1, 1)), ((1, 0), (2, 0))]
+# Existing MPO payload convention: U.T gives the physical action U rho U†.
+gates = [(U.T, (sites[a], sites[b])) for a, b in edges]
+opt = MpoOptimizer(rho, gates, chi=40, mode="dmt", contraction_opt="greedy")
+rho_t = opt.run(dmt_regions=regions, dmt_diagnostics=True)
+rho_t = opt.run(dmt_regions=regions)
+
+# Compress the current state without replaying its queue:
+rho_t, report = opt.compress_dmt(regions=regions, return_report=True)
+```
+
+Each gate is applied **without target truncation**, followed by protected
+SVD compression. The first gate uses a full target and protected sweep to
+cap every bond. Later gates on adjacent MPO sites reuse canonical cores and
+trace environments, splitting only the acted-on bond. Later distant gates
+use **exact forward SWAPs**, apply the gate, then protect the correspondingly
+permuted regions during return SWAPs. Temporary protected ranks may exceed
+`chi`; any enlarged bonds are capped after restoring the original order.
+The first gate, one-site gates, dtype changes and failed routed checks use
+the full-target route, which refreshes the workspace. Gate-MPO factorization and intermediate target
+construction use zero cutoff. DMT alone applies
+`chi` and the requested residual cutoff. One- and two-site gates accept distant
+or reversed supports, explicit ket/bra pairs and ket-only/bra-only payloads;
+they retain the existing [MPO matrix convention](#gate-conventions).
+
+The preservation condition for every requested region is
+
+$$
+\operatorname{Tr}_{\bar R}{\color{purple}\rho_{j+1}}
+=\operatorname{Tr}_{\bar R}{\color{blue}\mathcal G_j(\rho_j)}.
+$$
+
+Here $\rho_j$ is the **current compressed** MPO. Future gates can move
+previously discarded information into local observables, so this is not an
+exactness guarantee for the entire untruncated circuit trajectory.
+
+- `dmt_regions=None` protects contiguous three-site reduced operators;
+  explicit regions are **storage positions**, including noncontiguous lattice
+  neighborhoods. Install a persistent layout before replay, then generate
+  regions with `site_order=opt.logical_order`. Gate queues retain logical labels.
+  DMT options apply per call; pass `dmt_regions` again on subsequent runs.
+- `dmt_variant="density"` requires resolved nonzero trace;
+  `"operator"` also supports traceless/non-Hermitian operators. Positivity and
+  global Hermiticity are not guaranteed by ordinary complex-basis truncation.
+  Density routing removes bounded trace roundoff relative to the gate's
+  computed two-site target, including nonunitary trace changes; it does not
+  force trace one. Physical marginal checks run again after this correction.
+- `run` and `compress_dmt` default to `cutoff="auto"`,
+  `cutoff_mode="auto"`: `1e-12` for double precision, `1e-6` for single
+  precision, with `"rel"` applied only to the free residual spectrum.
+  The protected directions are retained regardless of cutoff.
+  Set `cutoff=0.` explicitly for zero-cutoff compression. Absolute policies retain
+  the [physical-unit contract](../operators/mpo_dmt.md#contract).
+- `dmt_diagnostics=True` collects reports returned by `get_dmt_reports()` for
+  the latest DMT operation. The default avoids extra split diagnostics;
+  marginal checks remain mandatory. Manual `compress_dmt(return_report=True)`
+  returns and retains one report. A full-sweep report contains all visited
+  bonds; a local-update report contains one bond. Workspace updates report
+  pre-gate source bond dimensions. Routed reports include temporary-order
+  splits and any final cap-restoration splits; intermediate reported ranks
+  may exceed the requested final `chi`. `info_c` records the actual final center.
+- DMT is not an orthogonal projection. Norm-survival fidelity estimates become
+  `None` after DMT until `set_mpo()` starts a new reference interval. Absolute
+  norms, legacy norm proxies and historical ordinary norm events remain
+  available; use DMT reports for preservation diagnostics.
+- Targets and compression are disposable until each step succeeds.
+  `atomic=True` restores the pre-run optimizer state on failure;
+  `atomic=False` retains completed gates. No ordinary-compression fallback is
+  allowed because it could drop protected data.
+- Supported replay uses dense open MPOs on NumPy/Torch/JAX. Real states are
+  promoted when complex gates require it. Native Symmray, cyclic MPOs,
+  channel-sum events and gates of arity above two are explicitly rejected.
+  `layout=` during DMT replay, nonzero `target_cutoff`, ordinary compressor
+  overrides and fallback selection are also rejected.
+- Torch differentiation through full replay needs the explicit stabilized
+  policy `TorchLinalgConfig(stabilized=True, quimb_split_drivers=True)`.
+  Adaptive ranks and degenerate truncation boundaries remain limitations.
+
+For square lattices, a snake ordering makes many physical edges adjacent in
+MPO storage and eligible for local updates. Distant gates use protected
+routing after the first sweep, avoiding a full enlarged gate-MPO target when
+that route passes its guards. These update schedules change the approximation trajectory
+relative to resweeping every bond; both enforce the same per-step marginal
+constraints. `timing=True` separates `dmt.local`, `dmt.routed`, `dmt.target` and
+`dmt.compress` costs. A routed attempt followed by full-target stages indicates
+a fallback. Long spans, target bond growth, SVDs and region-panel
+checks can still dominate 2D cost. This is MPO storage, not native PEPO
+evolution or a fully JIT-compiled algorithm. Use the reproducible
+[CPU benchmark](../../../examples/mpo_dmt_benchmark.py) for measured costs.
 
 | Purpose | Controls | What to keep in mind |
 | --- | --- | --- |
@@ -192,6 +299,8 @@ for native Symmray MPOs, while `mode="dmrg"` and the named DMRG schedules use
 native block-aware FIT; the
 optimizer does not require a dense conversion of the input MPO.
 
+<a id="gate-conventions"></a>
+
 For dense Quimb gate payloads, the public MPO convention is output/input
 ordering. Internally the effective ket operator is therefore `G.T`. The exact
 dense mappings are:
@@ -336,8 +445,8 @@ measured.
 Replay defaults match MPS: `n_iter=8`, dtype-aware `cutoff="auto"`,
 `cutoff_mode="auto"`, `fit_min_iter=2`, `fit_rtol="auto"`, and
 `fit_patience=2`. Set `fit_rtol=None` for a fixed sweep budget. Auto cutoff
-mode selects `rsum1` for dense density-matrix compression and `rsum2` for
-SVD-based routes. MPO rank ceilings count both physical legs: a qubit
+mode selects `rsum1` for the dense Quimb `dm` compressor, `rsum2` for
+ordinary SVD-based routes, and `rel` for DMT. MPO rank ceilings count both physical legs: a qubit
 operator site has effective dimension four, so a four-site MPO has ceilings
 `(4, 16, 4)` before applying `chi` and exterior-window rank limits.
 

@@ -62,6 +62,11 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `normalization.py`: empty compatibility import path with no numerical
     imports; internal normalization execution is in `_norm.py`.
 - `mpo/`: MPO gate-stream optimization.
+  - `dmt.py`: disposable exact gate targets, canonical-workspace reuse for
+    adjacent updates and protected nonlocal routing after the first sweep,
+    ordinary-MPO protected SVD,
+    native dtype alignment and per-step commit for `mode="dmt"`. The public
+    methods and state/snapshot ownership stay on `MpoOptimizer`.
   - `optimizer.py`: `MpoOptimizer`. Public `run()` prepares options and the
     replay snapshot; `_run_dmrg_replay` owns FIT scheduling, failure records,
     and fallback; `_run_compression_replay` shares direct/SVD success and

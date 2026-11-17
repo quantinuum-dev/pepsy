@@ -33,6 +33,17 @@ from .pauli_dmt_geometry import _normalize_regions
 __all__ = ["PauliDMTBondReport", "PauliDMTReport"]
 
 
+class _ProtectedBudgetError(ValueError):
+    """A conservative construction bound, with data for temporary routing."""
+
+    def __init__(self, bond, left, right, max_bond):
+        self.required_bond = left + right
+        super().__init__(
+            f"DMT bond {bond} needs a protected budget of {left + right} "
+            f"({left} left, {right} right), exceeding max_bond={max_bond}."
+        )
+
+
 @dataclass(frozen=True)
 class PauliDMTBondReport:
     """One split; weights use the input core basis norm.
@@ -112,7 +123,9 @@ def _traced(core, trace_vector=None):
     """Contract the physical leg with its basis-specific trace covector."""
     if trace_vector is None:
         return core[:, :, 0]
-    return _reshape(_reshape(core, (-1, core.shape[2])) @ trace_vector, core.shape[:2])
+    # Canonical cores often have physical-before-bond storage strides. Fusing
+    # their virtual indices would copy the full tensor for this tiny reduction.
+    return _einsum("abp,p->ab", core, trace_vector)
 
 
 def _trace_fraction(cores, trace_vector=None):
@@ -334,7 +347,13 @@ def _local_trace_data(cores, trace_vector=None):
 
 
 def _region_trace_data(cores, regions, trace_vector=None):
-    """Log-scaled Pauli coefficient panels for arbitrary MPO site sets."""
+    """Log-scaled panels, contracting kept indices from both ends.
+
+    Splitting the kept sites balances the open physical dimensions. For a
+    plaquette each half carries at most p**2 entries per bond, avoiding the
+    one-sided p**3-by-bond intermediate before its final site. The join is
+    exact and both halves retain independent logarithmic scale factors.
+    """
     def normalize(value, *, final=False):
         # Intermediate panels need only bounded entries to avoid underflow.
         # Max scaling avoids a redundant Euclidean norm at every site.
@@ -344,26 +363,29 @@ def _region_trace_data(cores, regions, trace_vector=None):
         return (value / norm, math.log(norm)) if norm else (value, -math.inf)
 
     n = len(cores)
+    traced = [_traced(core, trace_vector) for core in cores]
     one = _array_like(np.ones(1), cores[0])
     left = [(one, 0.)]
     last_start = max(min(region) for region in regions)
     first_stop = min(max(region) + 1 for region in regions)
-    for core in cores[:last_start]:
-        value, log = normalize(left[-1][0] @ _traced(core, trace_vector))
+    for j in range(last_start):
+        value, log = normalize(left[-1][0] @ traced[j])
         left.append((value, left[-1][1] + log))
     right = [None] * (n + 1)
     right[n] = one, 0.
     for j in range(n - 1, first_stop - 1, -1):
-        value, log = normalize(_traced(cores[j], trace_vector) @ right[j + 1][0])
+        value, log = normalize(traced[j] @ right[j + 1][0])
         right[j] = value, right[j + 1][1] + log
 
     panels = []
     for region in regions:
         sites = set(region)
         start, stop = min(region), max(region) + 1
+        cut = sorted(region)[len(region) // 2]
         v = _reshape(left[start][0], (1, -1))
-        log_scale = left[start][1]
-        for j in range(start, stop):
+        w = _reshape(right[stop][0], (-1, 1))
+        log_scale = left[start][1] + right[stop][1]
+        for j in range(start, cut):
             core = cores[j]
             if j in sites:
                 # Fuse the outgoing bond and Pauli index for a matrix multiply;
@@ -372,30 +394,42 @@ def _region_trace_data(cores, regions, trace_vector=None):
                 v = _transpose(_reshape(v, (-1, core.shape[1], core.shape[2])), (0, 2, 1))
                 v = _reshape(v, (-1, core.shape[1]))
             else:
-                v = v @ _traced(core, trace_vector)
+                v = v @ traced[j]
             v, log = normalize(v)
             log_scale += log
-        v, log = normalize(v @ right[stop][0], final=True)
-        panels.append((_reshape(v, (-1,)), log_scale + log + right[stop][1]))
+        for j in range(stop - 1, cut - 1, -1):
+            core = cores[j]
+            if j in sites:
+                matrix = _reshape(_transpose(core, (0, 2, 1)), (-1, core.shape[1]))
+                w = _reshape(matrix @ w, (core.shape[0], -1))
+            else:
+                w = traced[j] @ w
+            w, log = normalize(w)
+            log_scale += log
+        panel, log = normalize(v @ w, final=True)
+        panels.append((_reshape(panel, (-1,)), log_scale + log))
     return panels
 
 
 def _region_patterns(regions, nsites, physical_dim=4, *, identity_label=0):
     """Sufficient protected strings at each cut, with identity first."""
-    plans = []
-    for bond in range(nsites - 1):
-        left, right = {(): None}, {(): None}
-        for region in regions:
-            ls = tuple(s for s in region if s <= bond)
-            rs = tuple(s for s in region if s > bond)
-            if not ls or not rs:
-                continue
-            side, sites = (left, ls) if len(ls) <= len(rs) else (right, rs)
-            for labels in product(range(physical_dim), repeat=len(sites)):
-                pattern = tuple((s, p) for s, p in zip(sites, labels) if p != identity_label)
-                side[pattern] = None
-        plans.append((tuple(left), tuple(right)))
-    return tuple(plans)
+    return tuple(_region_pattern(regions, bond, physical_dim, identity_label=identity_label)
+                 for bond in range(nsites - 1))
+
+
+def _region_pattern(regions, bond, physical_dim=4, *, identity_label=0):
+    """One cut's plan; routed updates need only their currently active cut."""
+    left, right = {(): None}, {(): None}
+    for region in regions:
+        ls = tuple(s for s in region if s <= bond)
+        rs = tuple(s for s in region if s > bond)
+        if not ls or not rs:
+            continue
+        side, sites = (left, ls) if len(ls) <= len(rs) else (right, rs)
+        for labels in product(range(physical_dim), repeat=len(sites)):
+            pattern = tuple((s, p) for s, p in zip(sites, labels) if p != identity_label)
+            side[pattern] = None
+    return tuple(left), tuple(right)
 
 
 def _region_vectors(cores, bond, patterns, eye, environments):
@@ -403,6 +437,7 @@ def _region_vectors(cores, bond, patterns, eye, environments):
     left_patterns, right_patterns = patterns
     left, right = [], []
     trace_vector = environments.trace_vector
+    transfers = {}
 
     def physical(site, labels):
         if site in labels:
@@ -410,11 +445,16 @@ def _region_vectors(cores, bond, patterns, eye, environments):
         return eye[:, 0] if trace_vector is None else trace_vector
 
     def transfer(site, labels):
-        if site in labels:
-            if trace_vector is None:
-                return cores[site][:, :, labels[site]]
-            return _traced(cores[site], eye[:, labels[site]])
-        return _traced(cores[site], trace_vector)
+        label = labels.get(site)
+        if trace_vector is None:
+            return cores[site][:, :, 0 if label is None else label]
+        # Overlapping plaquettes reuse the same one-site projections many
+        # times. Cache only within this active pair: no value survives a core
+        # write or gauge move, and the native arrays/gradient graph are kept.
+        key = site, label
+        if key not in transfers:
+            transfers[key] = _traced(cores[site], trace_vector if label is None else eye[:, label])
+        return transfers[key]
 
     environments.at(bond, bond + 2)
     for pattern in left_patterns:
@@ -531,10 +571,7 @@ def _split_scaled(matrix, left_vectors, right_vectors, *, max_bond, cutoff,
             )
         # This is a conservative construction bound, not a proof that no
         # lower-rank matrix completion satisfying the constraints exists.
-        raise ValueError(
-            f"DMT bond {bond} needs a protected budget of {p + q} "
-            f"({p} left, {q} right), exceeding max_bond={max_bond}."
-        )
+        raise _ProtectedBudgetError(bond, p, q, max_bond)
     c = m
     if variant == "density":
         c = m - (m @ b) @ ((_dag(a) @ m) / tau)
@@ -768,13 +805,22 @@ class _PauliDMTWorkspace:
         else:
             lv, rv = _region_vectors(self.cores, bond, self.region_patterns[bond], self.eye,
                                      self.environments)
+        # Ordinary-MPO replay retains the standalone sweep's global marginal
+        # guard, including the default contiguous triples. Explicit regions
+        # already require it for both basis adapters.
+        check_regions = self.regions is not None or (transfer is not None and not self.pauli_units)
+        if check_regions:
+            def panels(cores):
+                return (_local_trace_data(cores, self.trace_vector) if self.regions is None
+                        else _region_trace_data(cores, self.regions, self.trace_vector))
+
             target_cores = list(self.cores)
             if transfer is not None:
                 exact_left, exact_right = _qr(matrix)
                 exact_rank = exact_left.shape[1]
                 target_cores[bond] = _transpose(_reshape(exact_left, (dl, p, exact_rank)), (0, 2, 1))
                 target_cores[bond + 1] = _transpose(_reshape(exact_right, (exact_rank, p, dr)), (0, 2, 1))
-            before_regions = _region_trace_data(target_cores, self.regions, self.trace_vector)
+            before_regions = panels(target_cores)
         if left_map is not None:
             lv, rv = _dag(left_map) @ lv, right_map @ rv
         left, right, report = _split(
@@ -793,10 +839,10 @@ class _PauliDMTWorkspace:
         rank = left.shape[1]
         new_left = _transpose(_reshape(left, (dl, p, rank)), (0, 2, 1))
         new_right = _transpose(_reshape(right, (rank, p, dr)), (0, 2, 1))
-        if self.regions is not None:
+        if check_regions:
             candidate = list(self.cores)
             candidate[bond], candidate[bond + 1] = new_left, new_right
-            _check_local_trace_data(before_regions, _region_trace_data(candidate, self.regions, self.trace_vector),
+            _check_local_trace_data(before_regions, panels(candidate),
                                     norm=_float(_norm(matrix)), epsilon=_epsilon(matrix),
                                     n=len(self.cores))
         self.cores[bond], self.cores[bond + 1] = new_left, new_right

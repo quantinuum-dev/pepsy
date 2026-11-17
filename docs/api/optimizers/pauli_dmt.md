@@ -10,6 +10,10 @@ their 1D meaning.
 Supported storage uses dense `float32`, `float64`, `complex64` or `complex128`
 cores on an open chain.
 
+For ordinary MPO gate-stream replay, use
+[`MpoOptimizer(mode="dmt")`](mpo.md#dmt-gate-stream-replay), which applies each
+gate exactly before protected compression.
+
 ## Choose an operation
 
 | Task | API | Result and mutation |
