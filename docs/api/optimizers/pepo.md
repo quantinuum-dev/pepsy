@@ -55,6 +55,62 @@ refinement. The problem is nonconvex: it does not certify the global optimum,
 and failure to find a feasible pair does not prove that none exists. On
 failure, the run raises and retains the input state.
 
+`dmt_refine=False` skips the optional local-objective refinement after a
+feasible pair is found; hard regional residual checks remain enabled. This can
+avoid a costly dense constrained solve, but may increase the local pair error.
+If the feasibility solver stops with a residual above tolerance and has
+evaluation budget left, it retries with stricter stopping thresholds. Records
+include the retry flag and the number of feasibility evaluations used.
+
+`dmt_refine_method="als"` selects experimental equality-constrained
+alternating least squares instead of the default `"slsqp"` refinement. Each
+half-sweep uses an SVD to choose an orthonormal factor space and solves a
+constrained least-squares problem for the other factor. Only finite updates
+that retain all regional constraints and lower the local pair error are
+accepted; `dmt_refine_sweeps` caps the number of sweeps (default 4). Records
+include the feasible seed error, final pair error and accepted ALS updates.
+Neither refinement proves a global optimum, and lowering pair error does not
+necessarily reduce error in the full PEPO or a later trajectory. See the
+[4×5 comparison](../../development/notes/2026-11-17-pepo-als-investigation.md).
+
+### Weighted regional objective
+
+Keep the `regions` constraints hard and optionally replace the pair error by
+an absolute weighted sum of other regional errors:
+
+```python
+opt = PepoOptimizer(
+    rho, gates, chi=4, mode="dmt", regions="L", boundary_chi=8,
+    dmt_refine_method="als",
+    dmt_objective_regions=[
+        (((0, 0), (0, 1)), 1.0),
+        (((1, 1), (1, 2), (2, 1), (2, 2)), 2.0),
+    ],
+)
+```
+
+Each item is `(region, weight)` with a finite nonnegative weight. A mapping
+from coordinate tuples to weights is also accepted. Duplicate weights sum;
+zero weights are ignored. The objective is the **sum**, with no normalization
+by region size or target norm. Protected and weighted regions share maps when
+identical. All maps are frozen single-layer contractions in the chosen
+environment, and the map budget includes both sets of regions.
+
+The result is a feasible-seed local search; it does not guarantee the global
+minimum. ALS uses a constrained nullspace least-squares update and SLSQP uses
+the weighted objective with hard constraints. Unmeasured directions can be
+poorly controlled, so accepted weighted updates default to a pair-error guard
+`dmt_objective_max_pair_growth=2.0`: the final gauge-dependent pair error
+must not exceed twice the seed error. Set a different factor (at least one),
+or `None` to disable this safeguard. The guard changes the explored feasible
+set and does not make the pair error a physical global error.
+
+Records report `seed_objective`, `objective_value`, and `objective_exponent`.
+The first two use the PEPO mantissa; multiply by `10**(2*objective_exponent)`
+to obtain the corresponding absolute squared cost when representable. See
+the [weighted 4×5 investigation](../../development/notes/2026-11-17-pepo-weighted-dmt.md)
+for an independent comparison and its limitations.
+
 Reports contain the maximum scaled regional residual, local pair error, and
 whether objective refinement improved the feasible seed. Each residual is
 scaled by the larger of the target reduced-operator norm and a small map-based

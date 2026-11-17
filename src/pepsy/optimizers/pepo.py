@@ -1,6 +1,7 @@
 """Gate-stream evolution of density operators stored as PEPOs."""
 
 import math
+from collections.abc import Mapping
 from numbers import Integral
 
 import autoray as ar
@@ -26,7 +27,9 @@ class PepoOptimizer:
                  boundary_kwargs=None, full_update_kwargs=None,
                  regions="L", dmt_tolerance=1e-8, dmt_max_nfev=200,
                  dmt_max_map_elements=1000000, dmt_cache=True,
-                 dmt_cache_max_elements=1000000):
+                 dmt_cache_max_elements=1000000, dmt_refine=True,
+                 dmt_refine_method="slsqp", dmt_refine_sweeps=4,
+                 dmt_objective_regions=None, dmt_objective_max_pair_growth=2.):
         if not all(hasattr(state, name) for name in ("upper_ind", "lower_ind", "Lx", "Ly")):
             raise TypeError("state must be a two-dimensional PEPO")
         if uses_symmray_arrays(state):
@@ -51,10 +54,33 @@ class PepoOptimizer:
         self.dmt_max_map_elements = int(dmt_max_map_elements)
         if not isinstance(dmt_cache, bool):
             raise TypeError("dmt_cache must be a bool")
+        if not isinstance(dmt_refine, bool):
+            raise TypeError("dmt_refine must be a bool")
+        if dmt_refine_method not in {"slsqp", "als"}:
+            raise ValueError("dmt_refine_method must be 'slsqp' or 'als'")
+        if (isinstance(dmt_refine_sweeps, bool) or not isinstance(dmt_refine_sweeps, Integral)
+                or dmt_refine_sweeps < 1):
+            raise ValueError("dmt_refine_sweeps must be a positive integer")
         if (isinstance(dmt_cache_max_elements, bool) or not isinstance(dmt_cache_max_elements, Integral)
                 or dmt_cache_max_elements < 1):
             raise ValueError("dmt_cache_max_elements must be a positive integer")
         self.dmt_cache = dmt_cache
+        self.dmt_refine = dmt_refine
+        self.dmt_refine_method = dmt_refine_method
+        self.dmt_refine_sweeps = int(dmt_refine_sweeps)
+        if dmt_objective_regions is not None and (mode != "dmt" or not dmt_refine):
+            raise ValueError("dmt_objective_regions requires mode='dmt' and dmt_refine=True")
+        if isinstance(dmt_objective_regions, Mapping):
+            dmt_objective_regions = dmt_objective_regions.items()
+        self.dmt_objective_regions = (None if dmt_objective_regions is None
+                                      else list(dmt_objective_regions))
+        if dmt_objective_max_pair_growth is not None:
+            if (isinstance(dmt_objective_max_pair_growth, bool)
+                    or not math.isfinite(float(dmt_objective_max_pair_growth))
+                    or float(dmt_objective_max_pair_growth) < 1.):
+                raise ValueError("dmt_objective_max_pair_growth must be at least 1 or None")
+            dmt_objective_max_pair_growth = float(dmt_objective_max_pair_growth)
+        self.dmt_objective_max_pair_growth = dmt_objective_max_pair_growth
         self.dmt_cache_max_elements = int(dmt_cache_max_elements)
         if mode == "dmt":
             import numpy as np
@@ -129,6 +155,21 @@ class PepoOptimizer:
                    for region in regions):
                 raise ValueError("DMT regions must contain distinct lattice sites")
             regions = list(dict.fromkeys(tuple(sorted(region)) for region in regions))
+            weighted = None
+            if self.dmt_objective_regions is not None:
+                weights = {}
+                for region, weight in self.dmt_objective_regions:
+                    region = tuple(tuple(s) for s in region)
+                    if not region or len(set(region)) != len(region) or not set(region) <= valid_sites:
+                        raise ValueError("DMT objective regions must contain distinct lattice sites")
+                    weight = float(weight)
+                    if not math.isfinite(weight) or weight < 0:
+                        raise ValueError("DMT objective weights must be finite and nonnegative")
+                    key = tuple(sorted(region))
+                    weights[key] = weights.get(key, 0.) + weight
+                    if not math.isfinite(weights[key]):
+                        raise ValueError("DMT combined objective weight must be finite")
+                weighted = [(r, w) for r, w in weights.items() if w > 0]
             work, records = self.state.copy(), []
             cache = RegionalMapCache(self.dmt_cache_max_elements) if self.dmt_cache else None
             for g, sites in entries:
@@ -143,7 +184,10 @@ class PepoOptimizer:
                         boundary_chi=self.boundary_chi, boundary_method=self.fit_mode,
                         boundary_cutoff=float(self.boundary_kwargs.get("cutoff", 0.)),
                         boundary_max_iterations=int(self.boundary_kwargs.get("n_iter", 10)),
-                        map_cache=cache)
+                        map_cache=cache, refine=self.dmt_refine,
+                        refine_method=self.dmt_refine_method, refine_sweeps=self.dmt_refine_sweeps,
+                        objective_regions=weighted,
+                        objective_max_pair_growth=self.dmt_objective_max_pair_growth)
                     records.append(record)
                 if cache is not None:
                     cache.invalidate(sites)

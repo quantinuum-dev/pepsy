@@ -8,6 +8,16 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Experimental PEPO weighted DMT:** minimize weighted regional errors using
+  single-layer maps while retaining the selected hard regional constraints.
+
+- **Experimental PEPO DMT ALS:** add guarded equality-constrained alternating
+  factor refinement, with SVD factor bases and per-region feasibility checks.
+
+- **PEPO DMT feasibility:** retry early gradient stops when regional residuals
+  exceed tolerance, preflight map allocation, and allow optional objective
+  refinement to be skipped for lower-cost constrained replay.
+
 - **PEPO density gate replay:** add `PepoOptimizer` with local SVD,
   simple-update and boundary-MPS full-update modes. Experimental small-system
   DMT uses exact or boundary-MPS single-layer regional maps for NumPy PEPOs,

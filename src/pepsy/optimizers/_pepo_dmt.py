@@ -6,6 +6,7 @@ from collections import OrderedDict
 import numpy as np
 import quimb.tensor as qtn
 from scipy.optimize import least_squares, minimize
+from scipy.sparse.linalg import LinearOperator, lsmr
 
 
 class RegionalMapCache:
@@ -72,6 +73,140 @@ def _factor_jacobian(operator, a, b):
     jb = np.einsum("mij,ik->mkj", tensor, a, optimize=True).reshape(len(operator), -1)
     jac = np.concatenate((ja, jb), axis=1)
     return np.block([[jac.real, -jac.imag], [jac.imag, jac.real]])
+
+
+def _als_refine(matrix, operator, rhs, a, b, region_sizes, tol, max_sweeps):
+    """Improve a feasible pair with equality-constrained least-squares updates."""
+    k = a.shape[1]
+    sizes = np.cumsum(region_sizes)[:-1]
+
+    def acceptable(candidate, old_error):
+        if not np.isfinite(candidate).all():
+            return False
+        residual = operator @ candidate.ravel() - rhs
+        regional = np.split(residual, sizes)
+        if any(not np.isfinite(v).all() or np.linalg.norm(v) > tol for v in regional):
+            return False
+        return np.linalg.norm(candidate - matrix) < old_error
+
+    sweeps = 0
+    updates = 0
+    shaped = operator.reshape(-1, *matrix.shape)
+    for _ in range(max_sweeps):
+        before = updates
+        try:
+            # Work in orthonormal row space: the objective in the free left
+            # factor is ordinary Euclidean distance to M @ Q†.
+            _, _, q = np.linalg.svd(b, full_matrices=False)
+            left = matrix @ q.conj().T
+            left_map = np.einsum("mij,kj->mik", shaped, q, optimize=True).reshape(len(operator), -1)
+            correction = np.linalg.lstsq(left_map, left_map @ left.ravel() - rhs, rcond=None)[0]
+            new_left = left - correction.reshape(left.shape)
+            candidate = new_left @ q
+            if acceptable(candidate, np.linalg.norm(a @ b - matrix)):
+                a, b = new_left, q
+                updates += 1
+
+            # Mirror the same projection in an orthonormal column space.
+            q, _, _ = np.linalg.svd(a, full_matrices=False)
+            q = q[:, :k]
+            right = q.conj().T @ matrix
+            right_map = np.einsum("mij,ik->mkj", shaped, q, optimize=True).reshape(len(operator), -1)
+            correction = np.linalg.lstsq(right_map, right_map @ right.ravel() - rhs, rcond=None)[0]
+            new_right = right - correction.reshape(right.shape)
+            candidate = q @ new_right
+            if acceptable(candidate, np.linalg.norm(a @ b - matrix)):
+                a, b = q, new_right
+                updates += 1
+        except np.linalg.LinAlgError:
+            break
+        sweeps += 1
+        if before == updates:
+            break
+    return a, b, sweeps, updates
+
+
+def _weighted_als_refine(matrix, hard, hard_rhs, soft, a, b, region_sizes, tol, max_sweeps,
+                         max_pair_error):
+    """Minimize weighted regional error in the nullspace of hard constraints."""
+    shape = matrix.shape
+    hard_tensor, soft_tensor = hard.reshape(-1, *shape), soft.reshape(-1, *shape)
+    borders = np.cumsum(region_sizes)[:-1]
+
+    def cost(pair):
+        residual = soft @ (pair - matrix).ravel()
+        return float(np.vdot(residual, residual).real)
+
+    def step(h, w, current, rebuild):
+        # A thin SVD builds only the row-space projector, not an n-by-n
+        # nullspace matrix. Corrections therefore preserve the feasible seed.
+        _, singular, vh = np.linalg.svd(h, full_matrices=False)
+        threshold = (singular[0] * max(h.shape) * np.finfo(float).eps) if singular.size else 0.
+        basis = vh[singular > threshold]
+
+        def project(v):
+            return v - basis.conj().T @ (basis @ v)
+
+        def mv(v):
+            return w @ project(v)
+
+        def rmv(v):
+            return project(w.conj().T @ v)
+
+        linear = LinearOperator(w.shape, matvec=mv, rmatvec=rmv, dtype=np.complex128)
+        residual = soft @ (matrix - rebuild(current)).ravel()
+        delta = project(lsmr(linear, residual, atol=1e-11, btol=1e-11,
+                             conlim=1e5, maxiter=200)[0])
+        return rebuild(current + delta.reshape(current.shape))
+
+    def acceptable(candidate, old):
+        if not np.isfinite(candidate).all():
+            return False
+        if max_pair_error is not None and np.linalg.norm(candidate - matrix) > max_pair_error:
+            return False
+        residual = hard @ candidate.ravel() - hard_rhs
+        if any(not np.isfinite(x).all() or np.linalg.norm(x) > tol
+               for x in np.split(residual, borders)):
+            return False
+        new_cost = cost(candidate)
+        return np.isfinite(new_cost) and new_cost < old
+
+    def guarded_update(base, proposal, old_cost):
+        for exponent in range(31):
+            candidate = base + (proposal - base) * (0.5 ** exponent)
+            if acceptable(candidate, old_cost):
+                return candidate
+        return None
+
+    sweeps = updates = 0
+    for _ in range(max_sweeps):
+        before = updates
+        try:
+            _, _, q = np.linalg.svd(b, full_matrices=False)
+            current = (a @ b) @ q.conj().T
+            h = np.einsum("mij,kj->mik", hard_tensor, q, optimize=True).reshape(len(hard), -1)
+            w = np.einsum("mij,kj->mik", soft_tensor, q, optimize=True).reshape(len(soft), -1)
+            proposal = step(h, w, current, lambda z: z @ q)
+            candidate = guarded_update(current @ q, proposal, cost(a @ b))
+            if candidate is not None:
+                a, b = candidate @ q.conj().T, q
+                updates += 1
+
+            q, _, _ = np.linalg.svd(a, full_matrices=False)
+            current = q.conj().T @ (a @ b)
+            h = np.einsum("mij,ik->mkj", hard_tensor, q, optimize=True).reshape(len(hard), -1)
+            w = np.einsum("mij,ik->mkj", soft_tensor, q, optimize=True).reshape(len(soft), -1)
+            proposal = step(h, w, current, lambda z: q @ z)
+            candidate = guarded_update(q @ current, proposal, cost(a @ b))
+            if candidate is not None:
+                a, b = q, q.conj().T @ candidate
+                updates += 1
+        except np.linalg.LinAlgError:
+            break
+        sweeps += 1
+        if updates == before:
+            break
+    return a, b, sweeps, updates
 
 
 def _map(state, sites, pair_inds, pair_shape, region, optimize):
@@ -143,7 +278,9 @@ def _boundary_map(state, sites, pair_inds, pair_shape, region, optimize, *, chi,
 
 def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, max_map_elements,
                   boundary_chi=None, boundary_method="direct", boundary_cutoff=0.,
-                  boundary_max_iterations=10, map_cache=None):
+                  boundary_max_iterations=10, map_cache=None, refine=True,
+                  refine_method="slsqp", refine_sweeps=4, objective_regions=None,
+                  objective_max_pair_growth=2.):
     """Build frozen maps and seek a feasible rank-capped pair; do not mutate input."""
     left, right = (state[s] for s in sites)
     bonds = tuple(left.bonds(right))
@@ -169,14 +306,14 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
     k = min(chi, len(singular))
     left0 = u[:, :k] * np.sqrt(singular[:k])
     right0 = np.sqrt(singular[:k])[:, None] * vh[:k, :]
-    maps = []
-    total_elements = 0
-    for region in regions:
-        dim = math.prod(state[s].ind_size(state.upper_ind(*s)) * state[s].ind_size(state.lower_ind(*s))
-                        for s in region)
-        total_elements += dim * matrix.size
-        if total_elements > max_map_elements:
-            raise ValueError("DMT regional maps exceed max_map_elements; use fewer regions or a smaller system")
+    all_regions = list(dict.fromkeys(regions + [r for r, _ in (objective_regions or [])]))
+    region_maps = {}
+    total_elements = sum(math.prod(state[s].ind_size(state.upper_ind(*s))
+                                   * state[s].ind_size(state.lower_ind(*s)) for s in region)
+                         * matrix.size for region in all_regions)
+    if total_elements > max_map_elements:
+        raise ValueError("DMT regional maps exceed max_map_elements; use fewer regions or a smaller system")
+    for region in all_regions:
         key = (frozenset(sites), tuple(sites), pair_inds, tuple(shape), tuple(region),
                boundary_chi, boundary_method, boundary_cutoff, boundary_max_iterations)
         cached = map_cache.get(key) if map_cache is not None else None
@@ -189,9 +326,17 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
                             max_iterations=boundary_max_iterations)
             if map_cache is not None:
                 map_cache.put(key, cached)
-        maps.append(cached)
-        if not np.isfinite(maps[-1]).all():
+        region_maps[region] = cached
+        if not np.isfinite(cached).all():
             raise ValueError("PEPO DMT environment contains nonfinite values")
+    maps = [region_maps[region] for region in regions]
+    if objective_regions is None:
+        soft = None
+    else:
+        weighted = [np.sqrt(weight) * region_maps[region] for region, weight in objective_regions if weight > 0]
+        soft = np.concatenate(weighted) if weighted else np.zeros((0, matrix.size), dtype=complex)
+        if not np.isfinite(soft).all():
+            raise ValueError("weighted PEPO DMT objective contains nonfinite values")
     # Stacking captures all requested equations; scaling keeps their residuals
     # comparable without changing their common zero set.
     targets = [op @ matrix.ravel() for op in maps]
@@ -220,22 +365,77 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
         return _factor_jacobian(operator, a, b)
 
     x = pack(left0, right0)
+    evaluations = 0
+    retried = False
     if np.linalg.norm(residual(x)) > tol:
         result = least_squares(residual, x, jac=residual_jac, max_nfev=max_nfev, ftol=tol * 0.1,
                                xtol=tol * 0.1, gtol=tol * 0.1)
         x = result.x
+        evaluations = result.nfev
     a, b = unpack(x)
     candidate = a @ b
     errors = [float(np.linalg.norm(op @ candidate.ravel() - target) / scale)
               for op, target, scale in zip(maps, targets, scales)]
+    # A small gradient does not imply that every hard constraint meets tol.
+    # Retry with tighter solver stopping thresholds using only the remaining
+    # evaluation budget; the original per-region acceptance check still applies.
+    if (np.isfinite(errors).all() and max(errors, default=0.0) > tol
+            and evaluations and evaluations < max_nfev):
+        stop = max(10 * np.finfo(float).eps, min(1e-13, tol * 1e-5))
+        result = least_squares(residual, x, jac=residual_jac,
+                               max_nfev=max_nfev - evaluations,
+                               ftol=stop, xtol=stop, gtol=stop)
+        x = result.x
+        evaluations += result.nfev
+        retried = True
+        a, b = unpack(x)
+        candidate = a @ b
+        errors = [float(np.linalg.norm(op @ candidate.ravel() - target) / scale)
+                  for op, target, scale in zip(maps, targets, scales)]
     if not np.isfinite(candidate).all() or not np.isfinite(errors).all() or max(errors, default=0.0) > tol:
         raise ValueError(f"PEPO DMT could not satisfy constraints at chi={chi}; "
                          f"largest relative residual {max(errors):.3g}")
     # Compress redundant complex equations before attempting to minimize the
     # local objective. Always keep the feasible seed if refinement fails.
+    seed_pair_error = float(np.linalg.norm(candidate - matrix))
+    max_pair_error = (None if soft is None or objective_max_pair_growth is None else
+                      objective_max_pair_growth * max(seed_pair_error,
+                                                      np.finfo(float).eps * np.linalg.norm(matrix)))
+    def objective_value(pair):
+        delta = pair - matrix
+        value = delta.ravel() if soft is None else soft @ delta.ravel()
+        return float(np.vdot(value, value).real)
+
+    seed_objective = objective_value(candidate)
     refined = False
+    als_sweeps = als_updates = 0
     lower_bound = np.linalg.norm(singular[k:])
-    if np.linalg.norm(candidate - matrix) <= lower_bound + tol * max(np.linalg.norm(matrix), 1e-300):
+    at_lower_bound = (np.linalg.norm(candidate - matrix) <= lower_bound + tol * max(np.linalg.norm(matrix), 1e-300)
+                      if soft is None else seed_objective <= (
+                          32 * np.finfo(float).eps * np.linalg.norm(soft) * np.linalg.norm(matrix)
+                      ) ** 2)
+    if refine and not at_lower_bound and refine_method == "als":
+        if soft is None:
+            new_a, new_b, als_sweeps, als_updates = _als_refine(
+                matrix, operator, rhs, a, b, [len(op) for op in maps], tol, refine_sweeps,
+            )
+        else:
+            new_a, new_b, als_sweeps, als_updates = _weighted_als_refine(
+                matrix, operator, rhs, soft, a, b, [len(op) for op in maps], tol, refine_sweeps,
+                max_pair_error,
+            )
+        new_candidate = new_a @ new_b
+        new_errors = [float(np.linalg.norm(op @ new_candidate.ravel() - target) / scale)
+                      for op, target, scale in zip(maps, targets, scales)]
+        if (als_updates and np.isfinite(new_candidate).all() and np.isfinite(new_errors).all()
+                and max(new_errors, default=0.0) <= tol
+                and (max_pair_error is None or np.linalg.norm(new_candidate - matrix) <= max_pair_error)
+                and objective_value(new_candidate) < seed_objective):
+            a, b, candidate, errors = new_a, new_b, new_candidate, new_errors
+            refined = True
+        else:
+            als_updates = 0
+    if not refine or at_lower_bound or refine_method == "als":
         rank = 0  # The feasible seed already achieves the unconstrained SVD bound.
     else:
         _, spectrum, vh_map = np.linalg.svd(operator, full_matrices=False)
@@ -254,13 +454,14 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
 
         def objective(v):
             la, rb = unpack(v)
-            return float(np.linalg.norm(la @ rb - matrix)**2)
+            return objective_value(la @ rb)
 
         def objective_jac(v):
             la, rb = unpack(v)
             delta = la @ rb - matrix
-            grad_a = 2 * delta @ rb.conj().T
-            grad_b = 2 * la.conj().T @ delta
+            grad = delta if soft is None else (soft.conj().T @ (soft @ delta.ravel())).reshape(matrix.shape)
+            grad_a = 2 * grad @ rb.conj().T
+            grad_b = 2 * la.conj().T @ grad
             return pack(grad_a, grad_b)
 
         result = minimize(objective, x, jac=objective_jac, method="SLSQP",
@@ -272,7 +473,8 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
                       for op, target, scale in zip(maps, targets, scales)]
         if (np.isfinite(new_candidate).all() and np.isfinite(new_errors).all()
                 and max(new_errors, default=0.0) <= tol
-                and np.linalg.norm(new_candidate - matrix) < np.linalg.norm(candidate - matrix)):
+                and (max_pair_error is None or np.linalg.norm(new_candidate - matrix) <= max_pair_error)
+                and objective_value(new_candidate) < seed_objective):
             a, b, candidate, errors = new_a, new_b, new_candidate, new_errors
             refined = True
     work = state.copy()
@@ -283,5 +485,13 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
                   "boundary_chi": boundary_chi,
                   "boundary_method": boundary_method if boundary_chi is not None else None,
                   "max_density_residual": max(errors, default=0.0),
-                  "pair_error": float(np.linalg.norm(candidate - matrix)), "bond_dimension": k,
-                  "objective_refined": refined}
+                  "pair_error": float(np.linalg.norm(candidate - matrix)),
+                  "seed_pair_error": seed_pair_error, "bond_dimension": k,
+                  "objective": "pair" if soft is None else "weighted_regions",
+                  "seed_objective": seed_objective, "objective_value": objective_value(candidate),
+                  "objective_max_pair_error": max_pair_error,
+                  "objective_exponent": float(state.exponent),
+                  "objective_refined": refined, "feasibility_evaluations": evaluations,
+                  "feasibility_retried": retried, "refinement_enabled": refine,
+                  "refinement_method": refine_method if refine else None,
+                  "als_sweeps": als_sweeps, "als_updates": als_updates}

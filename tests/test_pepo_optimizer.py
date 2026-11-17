@@ -227,6 +227,128 @@ def test_factor_jacobian_matches_complex_finite_differences():
                                atol=2e-8, rtol=1e-8)
 
 
+def test_constrained_als_improves_feasible_complex_pair():
+    from pepsy.optimizers._pepo_dmt import _als_refine
+
+    rng = np.random.default_rng(84)
+    rand = lambda shape: rng.normal(size=shape) + 1j * rng.normal(size=shape)
+    target = rand((5, 6))
+    a, b = rand((5, 2)), rand((2, 6))
+    delta = (a @ b - target).ravel()
+    operator = rand((3, 30))
+    operator -= ((operator @ delta) / np.vdot(delta, delta))[:, None] * delta.conj()[None, :]
+    rhs = operator @ target.ravel()
+    initial_error = np.linalg.norm(a @ b - target)
+    aa, bb, sweeps, updates = _als_refine(target, operator, rhs, a, b, [1, 1, 1], 1e-10, 6)
+    result = aa @ bb
+    assert np.linalg.norm(result - target) < 0.3 * initial_error
+    np.testing.assert_allclose(operator @ result.ravel(), rhs, atol=1e-10)
+    assert np.linalg.matrix_rank(result) <= 2
+    assert sweeps and updates
+
+
+def test_als_refines_real_lossy_pepo_gate_without_losing_constraint():
+    rho = np.array([[0.7, 0.13j], [-0.13j, 0.3]], dtype=complex)
+    state = qtn.PEPO_product_operator([[rho] * 3, [rho] * 3])
+    rng = np.random.default_rng(19)
+    gate = np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))[0]
+    region = ((0, 0), (0, 1), (1, 0))
+    options = dict(chi=1, mode="dmt", regions=[region])
+    seed = PepoOptimizer(state, [(gate, ((0, 2), (1, 2)))], dmt_refine=False, **options)
+    refined = PepoOptimizer(state, [(gate, ((0, 2), (1, 2)))], dmt_refine_method="als", **options)
+    seed_out, refined_out = seed.run(), refined.run()
+    first, second = seed.get_step_records()[0], refined.get_step_records()[0]
+    assert second["als_updates"] > 0
+    assert second["pair_error"] < first["pair_error"]
+    assert second["max_density_residual"] <= 1e-8
+    np.testing.assert_allclose(_density_on_region(refined_out, region),
+                               _density_on_region(seed_out, region), atol=1e-9)
+
+
+@pytest.mark.parametrize("method", ["als", "slsqp"])
+def test_weighted_regions_improve_without_relaxing_protected_density(method):
+    from pepsy.operators.gates import gate_simple
+
+    rho = np.array([[0.7, 0.13j], [-0.13j, 0.3]], dtype=complex)
+    state = qtn.PEPO_product_operator([[rho] * 3, [rho] * 3])
+    rng = np.random.default_rng(19)
+    gate = np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))[0]
+    where = ((0, 2), (1, 2))
+    hard = ((0, 0), (0, 1), (1, 0))
+    first, second = ((0, 2),), ((1, 2),)
+    weights = [(first, 3.), (second, .2)]
+    target, gauges = state.copy(), {}
+    gate_simple(target, gate, where=where, gauges=gauges, max_bond=16,
+                cutoff=0., renorm=False)
+    target.gauge_simple_insert(gauges)
+    opt = PepoOptimizer(state, [(gate, where)], chi=1, mode="dmt", regions=[hard],
+                        dmt_objective_regions=weights, dmt_refine_method=method)
+    result = opt.run()
+    record = opt.get_step_records()[0]
+    independent_cost = sum(weight * np.linalg.norm(_density_on_region(result, region)
+                           - _density_on_region(target, region)) ** 2 for region, weight in weights)
+    assert record["objective"] == "weighted_regions"
+    assert record["objective_value"] < record["seed_objective"]
+    assert record["pair_error"] <= record["objective_max_pair_error"]
+    assert record["max_density_residual"] <= 1e-8
+    assert result[where[0]].bonds_size(result[where[1]]) <= 1
+    assert independent_cost == pytest.approx(record["objective_value"], abs=1e-12)
+    np.testing.assert_allclose(_density_on_region(result, hard),
+                               _density_on_region(target, hard), atol=1e-9)
+
+
+def test_weighted_region_validation_and_no_silent_unoptimized_mode():
+    state = qtn.PEPO.rand(2, 2, bond_dim=1, phys_dim=2, dtype="complex128", seed=4)
+    with pytest.raises(ValueError, match="requires mode='dmt'"):
+        PepoOptimizer(state, [], chi=2, mode="dmt", dmt_refine=False,
+                      dmt_objective_regions=[(((0, 0),), 1.)])
+    opt = PepoOptimizer(state, [(np.eye(4), ((0, 0), (0, 1)))], chi=2, mode="dmt",
+                        dmt_objective_regions=[(((0, 0),), -1.)])
+    with pytest.raises(ValueError, match="nonnegative"):
+        opt.run()
+
+
+def test_weighted_single_site_is_stabilized_and_guard_can_be_configured():
+    rho = np.array([[0.7, 0.13j], [-0.13j, 0.3]], dtype=complex)
+    state = qtn.PEPO_product_operator([[rho] * 3, [rho] * 3])
+    rng = np.random.default_rng(19)
+    gate = np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))[0]
+    opt = PepoOptimizer(state, [(gate, ((0, 2), (1, 2)))], chi=1, mode="dmt",
+                        regions=[((0, 0), (0, 1), (1, 0))], dmt_refine_method="als",
+                        dmt_objective_regions=[(((0, 2),), 1.)], dmt_objective_max_pair_growth=2.)
+    opt.run()
+    record = opt.get_step_records()[0]
+    assert record["objective_value"] < record["seed_objective"] * 1e-6
+    assert record["pair_error"] <= 2 * record["seed_pair_error"]
+    assert record["max_density_residual"] <= 1e-8
+
+
+def test_protected_region_reused_when_also_weighted():
+    state = qtn.PEPO.rand(2, 2, bond_dim=1, phys_dim=2, dtype="complex128", seed=4)
+    region = ((0, 0), (0, 1), (1, 0))
+    opt = PepoOptimizer(state, [(np.eye(4), ((0, 0), (0, 1)))], chi=4, mode="dmt",
+                        regions=[region], dmt_objective_regions=[(region, 1.), (region, 2.)])
+    opt.run()
+    record = opt.get_step_records()[0]
+    assert record["map_cache"]["misses"] == 1
+    assert record["objective_value"] < 1e-20
+
+
+def test_weighted_objective_preflights_unique_region_maps(monkeypatch):
+    import pepsy.optimizers._pepo_dmt as dmt
+
+    def forbid(*args, **kwargs):
+        pytest.fail("objective maps were allocated before the budget check")
+
+    monkeypatch.setattr(dmt, "_map", forbid)
+    state = qtn.PEPO.rand(2, 2, bond_dim=1, phys_dim=2, dtype="complex128", seed=2)
+    opt = PepoOptimizer(state, [(np.eye(4), ((0, 0), (0, 1)))], chi=4, mode="dmt",
+                        regions=[((0, 0),)], dmt_objective_regions=[(((0, 1),), 1.)],
+                        dmt_max_map_elements=100)
+    with pytest.raises(ValueError, match="regional maps exceed"):
+        opt.run()
+
+
 def test_dmt_rejects_nonfinite_gate_without_updating_state():
     state = qtn.PEPO.rand(2, 2, bond_dim=1, phys_dim=2, dtype="complex128", seed=7)
     before = state.to_dense().copy()
@@ -236,6 +358,66 @@ def test_dmt_rejects_nonfinite_gate_without_updating_state():
     with pytest.raises(ValueError, match="nonfinite"):
         opt.run()
     np.testing.assert_allclose(opt.state.to_dense(), before)
+
+
+def test_dmt_retries_when_feasibility_stops_before_constraint_tolerance(monkeypatch):
+    import pepsy.optimizers._pepo_dmt as dmt
+
+    rho = np.array([[0.7, 0.13j], [-0.13j, 0.3]], dtype=complex)
+    state = qtn.PEPO_product_operator([[rho] * 3, [rho] * 3])
+    rng = np.random.default_rng(19)
+    gate = np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))[0]
+    original = dmt.least_squares
+    calls = []
+
+    def stop_early_once(*args, **kwargs):
+        calls.append(kwargs["max_nfev"])
+        if len(calls) == 1:
+            kwargs["max_nfev"] = 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dmt, "least_squares", stop_early_once)
+    opt = PepoOptimizer(state, [(gate, ((0, 2), (1, 2)))], chi=1, mode="dmt",
+                        regions=[((0, 0), (0, 1), (1, 0))], dmt_max_nfev=150)
+    opt.run()
+    assert len(calls) == 2
+    record = opt.get_step_records()[0]
+    assert record["feasibility_retried"]
+    assert record["feasibility_evaluations"] <= 150
+    assert record["max_density_residual"] <= 1e-8
+
+
+def test_dmt_map_budget_checked_before_building_environments(monkeypatch):
+    import pepsy.optimizers._pepo_dmt as dmt
+
+    def forbid_map(*args, **kwargs):
+        pytest.fail("map was built before the complete budget check")
+
+    monkeypatch.setattr(dmt, "_map", forbid_map)
+    state = qtn.PEPO.rand(2, 2, bond_dim=1, phys_dim=2, dtype="complex128", seed=2)
+    opt = PepoOptimizer(state, [(np.eye(4), ((0, 0), (0, 1)))], chi=4,
+                        mode="dmt", dmt_max_map_elements=2000)
+    with pytest.raises(ValueError, match="regional maps exceed"):
+        opt.run()
+
+
+def test_dmt_can_skip_objective_refinement_after_feasible_split(monkeypatch):
+    import pepsy.optimizers._pepo_dmt as dmt
+
+    def forbid_refinement(*args, **kwargs):
+        pytest.fail("objective refinement was disabled")
+
+    monkeypatch.setattr(dmt, "minimize", forbid_refinement)
+    rho = np.array([[0.7, 0.13j], [-0.13j, 0.3]], dtype=complex)
+    state = qtn.PEPO_product_operator([[rho] * 3, [rho] * 3])
+    rng = np.random.default_rng(19)
+    gate = np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))[0]
+    opt = PepoOptimizer(state, [(gate, ((0, 2), (1, 2)))], chi=1, mode="dmt",
+                        regions=[((0, 0), (0, 1), (1, 0))], dmt_refine=False)
+    opt.run()
+    record = opt.get_step_records()[0]
+    assert not record["refinement_enabled"]
+    assert record["max_density_residual"] <= 1e-8
 
 
 def test_direct_dmt_boundary_uses_quimb_1d_direct(monkeypatch):
