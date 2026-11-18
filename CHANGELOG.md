@@ -8,6 +8,9 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Experimental PEPO mixed SVD seeds:** optionally combine discarded singular
+  directions with feasible factors and accept only protected objective improvements.
+
 - **Experimental PEPO weighted DMT:** minimize weighted regional errors using
   single-layer maps while retaining the selected hard regional constraints.
 
@@ -264,6 +267,12 @@ patch versions remain compatible.
 - **Full Haar vectors:** allow an explicit `L_max>20` with a positive
   `max_dense_bytes` preallocation budget. The historical default size guard
   and seeded complex Haar distribution remain unchanged.
+
+- **Native JAX MPS sampling:** add device-resident dense `MpsSampler` draws,
+  probability/amplitude queries, integer or JAX-key seeding, scale-safe cached
+  environments, and opt-in sampled-probability/amplitude derivatives. Native
+  detection and explicit `backend="jax"` support nonuniform open chains;
+  NumPy result conversion remains explicit.
 
 - **Torch SVD backward:** allow `TorchLinalgConfig.svd_gap_rtol` to select
   the relative stabilized gap threshold while preserving the `1e-6` default.

@@ -29,7 +29,8 @@ class PepoOptimizer:
                  dmt_max_map_elements=1000000, dmt_cache=True,
                  dmt_cache_max_elements=1000000, dmt_refine=True,
                  dmt_refine_method="slsqp", dmt_refine_sweeps=4,
-                 dmt_objective_regions=None, dmt_objective_max_pair_growth=2.):
+                 dmt_objective_regions=None, dmt_objective_max_pair_growth=2.,
+                 dmt_svd_mix_seeds=0):
         if not all(hasattr(state, name) for name in ("upper_ind", "lower_ind", "Lx", "Ly")):
             raise TypeError("state must be a two-dimensional PEPO")
         if uses_symmray_arrays(state):
@@ -81,6 +82,12 @@ class PepoOptimizer:
                 raise ValueError("dmt_objective_max_pair_growth must be at least 1 or None")
             dmt_objective_max_pair_growth = float(dmt_objective_max_pair_growth)
         self.dmt_objective_max_pair_growth = dmt_objective_max_pair_growth
+        if (isinstance(dmt_svd_mix_seeds, bool) or not isinstance(dmt_svd_mix_seeds, Integral)
+                or not 0 <= dmt_svd_mix_seeds <= 8):
+            raise ValueError("dmt_svd_mix_seeds must be an integer from 0 to 8")
+        if dmt_svd_mix_seeds and (self.dmt_objective_regions is None or not dmt_refine):
+            raise ValueError("dmt_svd_mix_seeds requires a weighted regional objective and refinement")
+        self.dmt_svd_mix_seeds = int(dmt_svd_mix_seeds)
         self.dmt_cache_max_elements = int(dmt_cache_max_elements)
         if mode == "dmt":
             import numpy as np
@@ -187,7 +194,8 @@ class PepoOptimizer:
                         map_cache=cache, refine=self.dmt_refine,
                         refine_method=self.dmt_refine_method, refine_sweeps=self.dmt_refine_sweeps,
                         objective_regions=weighted,
-                        objective_max_pair_growth=self.dmt_objective_max_pair_growth)
+                        objective_max_pair_growth=self.dmt_objective_max_pair_growth,
+                        svd_mix_seeds=self.dmt_svd_mix_seeds)
                     records.append(record)
                 if cache is not None:
                     cache.invalidate(sites)

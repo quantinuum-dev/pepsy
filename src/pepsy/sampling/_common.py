@@ -45,6 +45,8 @@ def _mps_array_backend(array):
         return "torch"
     if module == "cupy":
         return "cupy"
+    if module in {"jax", "jaxlib"}:
+        return "jax"
     if isinstance(array, np.ndarray):
         return "numpy"
     if hasattr(array, "blocks"):

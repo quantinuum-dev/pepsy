@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from numbers import Integral
+from typing import Any
 import warnings
 import autoray as ar
 import numpy as np
@@ -39,6 +40,7 @@ def _normalize_mps_sampler_backend(backend):
         "np": "numpy",
         "torch": "torch",
         "pytorch": "torch",
+        "jax": "jax",
         "cupy": "cupy",
         "cp": "cupy",
         "symmray": "symmray",
@@ -197,7 +199,7 @@ class MpsSampler:
 
     The legacy ``backend="quimb"`` path handles GPU→CPU conversion and calls
     quimb's canonical-form sampler. ``backend="native"`` keeps dense NumPy,
-    Torch, or CuPy MPS arrays on their current device, builds right
+    Torch, CuPy, or JAX MPS arrays on their current device, builds right
     environments once, and draws all requested samples with batched conditional
     contractions.
 
@@ -209,11 +211,11 @@ class MpsSampler:
         Mapping from 1D site index to (x, y) lattice coordinate. When omitted,
         a trivial single-row 1D layout ``{i: (i, 0)}`` inferred from the MPS
         length is used, so a plain 1D chain can be sampled without a 2D map.
-        backend : {"quimb", "native", "auto", "numpy", "torch", "cupy", "symmray"}
+    backend : {"quimb", "native", "auto", "numpy", "torch", "cupy", "jax", "symmray"}
         Sampling implementation. ``"quimb"`` preserves the historical CPU
         behavior for dense MPSs. Symmray-backed MPSs are detected and use the
         native block-sparse sampler rather than being densified. ``"native"``
-        accepts dense NumPy/Torch/CuPy tensors and Symmray tensors, while
+        accepts dense NumPy/Torch/CuPy/JAX tensors and Symmray tensors, while
         ``"symmray"`` requires a Symmray MPS explicitly. ``"auto"`` tries a
         native sampler and falls back to ``"quimb"`` when the MPS layout is
         unsupported.
@@ -261,7 +263,13 @@ class MpsSampler:
     degeneracy greater than one (for example spinful fermionic Z2 or U1).
     Call :meth:`refresh` after changing the source MPS; otherwise the sampler
     continues to represent its previous tensor data.
+    JAX supports dense open chains with float32/64 or complex64/128 tensors
+    sharing one device and dtype. Compiled conditionals receive current tensor
+    values as arguments; refreshing equal shapes reuses compiled code. JAX is
+    imported only when that backend is selected.
     """
+
+    native_backends = ('numpy', 'torch', 'cupy', 'jax')
 
     def __init__(
         self,
@@ -422,7 +430,7 @@ class MpsSampler:
             try:
                 native_backend, native_arrays = self._prepare_native_arrays(psi)
                 if (
-                    self.backend in {"numpy", "torch", "cupy"}
+                    self.backend in self.native_backends
                     and native_backend != self.backend
                 ):
                     raise ValueError(
@@ -508,6 +516,12 @@ class MpsSampler:
         return self._evaluation_backend, self._evaluation_arrays
 
     def _get_native_site_ops(self, *, track_grad=True):
+        if self.resolved_backend == "jax" and not track_grad:
+            if self._native_inference_site_ops is None:
+                import jax
+                arrays = tuple(jax.lax.stop_gradient(array) for array in self._native_arrays)
+                self._native_inference_site_ops = self._prepare_site_ops('jax', arrays)
+            return 'jax', self._native_inference_site_ops
         if self.resolved_backend == "torch" and not track_grad:
             if self._native_inference_site_ops is None:
                 import torch  # pylint: disable=import-outside-toplevel
@@ -562,11 +576,14 @@ class MpsSampler:
         if len(backends) != 1:
             raise ValueError(f"MPS tensors use mixed backends {sorted(backends)!r}.")
         backend = next(iter(backends))
-        if backend not in {"numpy", "torch", "cupy"}:
+        if backend not in self.native_backends:
             raise ValueError(
                 "backend-native MPS sampling currently supports dense NumPy, "
-                f"Torch, or CuPy arrays, not {backend!r}."
+                f"Torch, CuPy, or JAX arrays, not {backend!r}."
             )
+        if backend == 'jax':
+            from ._mps_jax import validate_arrays
+            validate_arrays(arrays)
         return backend, arrays
 
     @staticmethod
@@ -2005,6 +2022,9 @@ class MpsSampler:
 
     @staticmethod
     def _prepare_site_ops(backend, arrays):
+        if backend == 'jax':
+            from ._mps_jax import prepare
+            return prepare(arrays)
         if backend == "torch":
             return MpsSampler._torch_site_ops(arrays)
         return MpsSampler._array_namespace_site_ops(arrays, backend=backend)
@@ -2081,6 +2101,8 @@ class MpsSampler:
 
     def _get_native_amplitude_site_ops(self, *, track_grad=False):
         """Return amplitude-only site data, caching only inference data."""
+        if self.resolved_backend == 'jax':
+            return self._get_native_site_ops(track_grad=track_grad)
         if not track_grad and self._native_amplitude_site_ops is not None:
             return self.resolved_backend, self._native_amplitude_site_ops
 
@@ -2256,6 +2278,16 @@ class MpsSampler:
 
     def _native_sample_arrays(self, n_samples, seed, *, to_numpy, track_grad):
         backend, site_data = self._get_native_site_ops(track_grad=track_grad)
+        if backend == 'jax':
+            from ._mps_jax import draw, key, require
+            configs, probs, valid = draw(site_data, key(seed, site_data[0][0]), n_samples)
+            require(valid, 'JAX MPS conditional probabilities have a zero or non-finite norm.')
+            if not track_grad:
+                import jax
+                configs, probs = jax.lax.stop_gradient((configs, probs))
+            if to_numpy:
+                return self._to_numpy_backend_array(configs, backend), self._to_numpy_backend_array(probs, backend)
+            return configs, probs
         if backend == "torch":
             if seed is None and not to_numpy:
                 compiled = self._compiled_torch_sample(
@@ -2437,12 +2469,13 @@ class MpsSampler:
     ):
         """Return batched MPS amplitudes for ``configs``.
 
-        ``configs`` should have shape ``(batch, L)``. Dense NumPy, Torch, and
-        CuPy MPS tensors are contracted in one batched backend-native pass.
+        ``configs`` should have shape ``(batch, L)``. Dense NumPy, Torch, CuPy,
+        and JAX MPS tensors are contracted in one batched backend-native pass.
         Symmray MPSs use block-sparse contractions on the underlying NumPy,
-        Torch, or CuPy backend. Set ``to_numpy=False`` to keep Torch/CuPy
-        outputs on their device. Measurement calls default to inference mode;
-        pass ``track_grad=True`` to retain a Torch autograd graph.
+        Torch, or CuPy backend. Set ``to_numpy=False`` to keep native
+        outputs on their device. Measurement calls
+        default to inference mode; pass ``track_grad=True`` to retain Torch
+        or JAX derivatives.
         """
         if self._symmray_state is not None:
             out = self._symmray_amplitudes(configs)
@@ -2455,7 +2488,10 @@ class MpsSampler:
             backend, site_data = self._get_native_amplitude_site_ops(
                 track_grad=bool(track_grad)
             )
-        if backend == "torch":
+        if backend == 'jax':
+            from ._mps_jax import amplitudes, configs as jax_configs
+            out = amplitudes(site_data, jax_configs(configs, site_data[0]))
+        elif backend == "torch":
             if track_grad:
                 out = self._torch_amplitudes(site_data, configs, L=self._L)
             else:
@@ -2498,6 +2534,8 @@ class MpsSampler:
             raise NotImplementedError(
                 "single-site flip ratios require a dense native MPS sampler."
             )
+        if self.resolved_backend == 'jax':
+            raise NotImplementedError('single-site flip ratios are not implemented for JAX')
 
         backend, _site_data = self._get_native_amplitude_site_ops(
             track_grad=False
@@ -2705,7 +2743,7 @@ class MpsSampler:
 
         This follows the same conditional-probability sweep as sampling, but
         with user-supplied physical indices. Dense MPSs avoid looping over
-        configurations and run on Torch/CuPy when the tensors do. Symmray MPSs
+        configurations and run on Torch/CuPy/JAX when the tensors do. Symmray MPSs
         use charge-aware block-sparse conditionals without densifying state
         tensors.
         """
@@ -2715,7 +2753,11 @@ class MpsSampler:
             return self._to_numpy_backend_array(out, backend) if to_numpy else out
 
         backend, site_data = self._get_evaluation_site_ops()
-        if backend == "torch":
+        if backend == 'jax':
+            from ._mps_jax import configs as jax_configs, probabilities, require
+            out, valid = probabilities(site_data, jax_configs(configs, site_data[0]))
+            require(valid, 'JAX MPS conditional probabilities have a zero or non-finite norm.')
+        elif backend == "torch":
             out = self._torch_probabilities(site_data, configs, L=self._L)
         else:
             out = self._array_namespace_probabilities(
@@ -2729,7 +2771,7 @@ class MpsSampler:
     def sample_arrays(
         self,
         n_samples: int = 1,
-        seed: int | None = None,
+        seed: Any = None,
         *,
         to_numpy: bool = False,
         track_grad: bool = False,
@@ -2737,14 +2779,18 @@ class MpsSampler:
         """Draw samples and return raw ``(configs, probs)`` arrays.
 
         With ``backend="native"`` or ``backend="symmray"``, this returns
-        backend-native arrays by default: Torch tensors stay on Torch and CuPy
-        arrays stay on CuPy. Symmray inputs retain block-sparse state tensors;
+        backend-native arrays by default: Torch, CuPy, and JAX arrays stay on
+        their source device. Symmray inputs retain block-sparse state tensors;
         only the returned discrete configurations and probabilities are dense.
         The returned ``configs`` have shape ``(n_samples, L)`` and ``probs``
         has shape ``(n_samples,)``. Set ``to_numpy=True`` to force CPU NumPy
         arrays, matching the legacy :meth:`sample` result conversion.
         Sampling is inference-only by default; set ``track_grad=True`` to
-        retain a Torch autograd graph for the sampled Born probabilities.
+        retain Torch or JAX derivatives of the sampled Born probabilities.
+        Discrete draws are not differentiable. JAX ``seed`` accepts an integer
+        or a typed/legacy PRNG key; pass a key as a runtime argument under
+        ``jax.jit``. Sample count and tensor shapes are static compilation
+        inputs. Unseeded eager calls use fresh Python entropy.
         """
         if int(n_samples) < 1:
             raise ValueError("n_samples must be a positive integer.")
@@ -2808,7 +2854,7 @@ class MpsSampler:
     def sample_batch(
         self,
         n_samples: int = 1,
-        seed: int | None = None,
+        seed: Any = None,
         *,
         to_numpy: bool = False,
         track_grad: bool = False,
@@ -2817,7 +2863,7 @@ class MpsSampler:
         """Draw samples and return a named batched result.
 
         This is the preferred API for fast downstream workflows. With
-        ``backend="native"`` and ``to_numpy=False``, Torch/CuPy arrays stay on
+        ``backend="native"`` and ``to_numpy=False``, Torch/CuPy/JAX arrays stay on
         their current device. Use :meth:`sample_arrays` when tuple unpacking is
         more convenient, or :meth:`sample` when the legacy Python-list/grid
         result is needed. Pass ``fermion=...`` for a Symmray fermionic MPS to
@@ -2859,7 +2905,7 @@ class MpsSampler:
     def sample(
         self,
         n_samples: int = 1,
-        seed: int | None = None,
+        seed: Any = None,
         *,
         track_grad: bool = False,
     ) -> MpsSampleResult:

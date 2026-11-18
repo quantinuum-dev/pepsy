@@ -6,6 +6,7 @@ state representation; the direct PEPS and BP proposal algorithms are distinct.
 | Module | Responsibility |
 | --- | --- |
 | `mps.py` | `MpsSampler`, dense/native conditional sampling, symmetric prefix environments |
+| `_mps_jax.py` | Lazy dense JAX preparation, scale-safe conditionals, draws and normalized queries; compiled functions take numerical tensors at runtime |
 | `vector.py` | `VecSampler`, computational/Pauli bases, dense categorical sampling |
 | `peps.py` | `PepsSampler`, exact conditionals and conditioned boundary-MPS proposals |
 | `bp.py` | `PepsBpSampler`, BP proposal probabilities and original-state amplitudes |
