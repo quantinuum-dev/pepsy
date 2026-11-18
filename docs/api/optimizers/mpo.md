@@ -24,6 +24,14 @@ queue on that updated MPO. The operator retains its absolute scale.
 
 ## DMT gate-stream replay
 
+Optional `run(dmt_truncation="optimized", dmt_max_refinement_sweeps=8,
+dmt_region_selection="min_cover")` enables improved bond approximation and
+shared region protection. Manual `compress_dmt` uses the same names without
+the `dmt_` prefix. The fast paper method and smaller-half selection remain
+the defaults; see [mathematics and limits](../operators/mpo_dmt.md#optional-improved-bond-truncation).
+For small χ and fast checking, use `dmt_constraint_mode="relaxed"` and
+`dmt_check_regions=False`; reports then do not measure full-region errors.
+
 ```python
 import numpy as np
 import quimb.tensor as qtn
@@ -94,7 +102,8 @@ exactness guarantee for the entire untruncated circuit trajectory.
   the [physical-unit contract](../operators/mpo_dmt.md#contract).
 - `dmt_diagnostics=True` collects reports returned by `get_dmt_reports()` for
   the latest DMT operation. The default avoids extra split diagnostics;
-  marginal checks remain mandatory. Manual `compress_dmt(return_report=True)`
+  full marginal checks are on by default and may be disabled with
+  `dmt_check_regions=False`. Manual `compress_dmt(return_report=True)`
   returns and retains one report. A full-sweep report contains all visited
   bonds; a local-update report contains one bond. Workspace updates report
   pre-gate source bond dimensions. Routed reports include temporary-order

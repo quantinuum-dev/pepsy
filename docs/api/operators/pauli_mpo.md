@@ -132,6 +132,10 @@ results.
 
 ## Protected density matrix truncation (DMT)
 
+`truncation="optimized"` optionally improves the fixed-border approximation;
+`region_selection="min_cover"` jointly chooses region protection strings.
+See [controls, cutoffs and guarantees](mpo_dmt.md#optional-improved-bond-truncation).
+
 Start with the [1D and 2D DMT workflow guide](../optimizers/pauli_dmt.md)
 for API selection, complete examples and profiling. Both workflows use
 an open Pauli MPO; 2D regions change the protected data, while gate positions
@@ -141,6 +145,8 @@ and `PauliDMT.evolve` still follow the 1D storage chain.
 through compression, to numerical precision. For a density matrix these are
 the local reduced density matrices; consequently compression preserves energy
 when every Hamiltonian term fits inside such a region.
+This is the default strict mode; `constraint_mode="relaxed"` can change
+those marginals when the requested cap cannot fit the protected construction.
 
 ```python
 rho = PauliMPO.from_terms(8, [

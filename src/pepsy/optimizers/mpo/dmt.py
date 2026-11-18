@@ -60,7 +60,9 @@ def _promote(p, gates=()):
     return tuple(None if g is None else convert(g) for g in gates)
 
 
-def _compress(opt, candidate, *, cutoff, cutoff_mode, variant, regions, diagnostics):
+def _compress(opt, candidate, *, cutoff, cutoff_mode, variant, regions, diagnostics,
+              truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
+              constraint_mode="strict", constraint_weight=100., check_regions=True):
     # The kernel writes only after its complete marginal check. This candidate
     # owns tensor wrappers and is never the currently committed operator.
     _promote(candidate)
@@ -68,6 +70,10 @@ def _compress(opt, candidate, *, cutoff, cutoff_mode, variant, regions, diagnost
         "dmt.compress", _compress_mpo_dmt, candidate, max_bond=opt.chi,
         cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant, regions=regions,
         inplace=True, return_report=diagnostics,
+        truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+        region_selection=region_selection,
+        constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+        check_regions=check_regions,
     )
     return result
 
@@ -94,20 +100,28 @@ def _commit(opt, candidate, *, center=None):
     opt._dmt_compression_seen = True
 
 
-def compress_current(opt, *, cutoff, cutoff_mode, variant, regions, return_report):
+def compress_current(opt, *, cutoff, cutoff_mode, variant, regions, return_report,
+                     truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
+                     constraint_mode="strict", constraint_weight=100., check_regions=True):
     regions = validate_state(opt, regions, variant)
     candidate, report, _ = _compress(
         opt, opt.p.copy(), cutoff=cutoff, cutoff_mode=cutoff_mode,
         variant=variant, regions=regions, diagnostics=return_report,
+        truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+        region_selection=region_selection,
+        constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+        check_regions=check_regions,
     )
     _commit(opt, candidate)
-    opt._dmt_reports = [report] if return_report else []
+    opt._dmt_reports = [report] if report is not None else []
     opt._append_norm_proxy_sample(opt.p)
     return (opt.p, report) if return_report else opt.p
 
 
 def replay(opt, gates, wheres, *, progbar, cutoff, cutoff_mode,
-           fidelity_samples, finite_check, regions, variant, diagnostics):
+           fidelity_samples, finite_check, regions, variant, diagnostics,
+           truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
+           constraint_mode="strict", constraint_weight=100., check_regions=True):
     from tqdm.auto import tqdm
 
     opt._dmt_reports = []
@@ -147,6 +161,10 @@ def replay(opt, gates, wheres, *, progbar, cutoff, cutoff_mode,
                 candidate, report, next_workspace = _compress(
                     opt, target, cutoff=cutoff, cutoff_mode=cutoff_mode,
                     variant=variant, regions=regions, diagnostics=diagnostics,
+                    truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+                    region_selection=region_selection,
+                    constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+                    check_regions=check_regions,
                 )
             opt._check_finite(finite_check, candidate)
             _commit(opt, candidate, center=next_workspace.center)

@@ -14,6 +14,36 @@ patch versions remain compatible.
   controls. Select by the actual residual in the same frozen environment;
   report per-trial outcomes and total iterations. Defaults retain one trial.
 
+- **Experimental PEPO weighted DMT:** minimize weighted regional errors using
+  single-layer maps while retaining the selected hard regional constraints.
+
+- **Experimental PEPO DMT ALS:** add guarded equality-constrained alternating
+  factor refinement, with SVD factor bases and per-region feasibility checks.
+
+- **PEPO DMT feasibility:** retry early gradient stops when regional residuals
+  exceed tolerance, preflight map allocation, and allow optional objective
+  refinement to be skipped for lower-cost constrained replay.
+
+- **PEPO density gate replay:** add `PepoOptimizer` with local SVD,
+  simple-update and boundary-MPS full-update modes. Experimental small-system
+  DMT uses exact or boundary-MPS single-layer regional maps for NumPy PEPOs,
+  with bounded per-run map reuse and exterior-update invalidation.
+
+- **DMT precision and API guidance:** reject relaxed-mode weights whose metric
+  cannot be represented in the tensor dtype, and clarify cutoffs, optional
+  region checks and the scope of bond-local variational refinement.
+
+- **DMT region and small-bond options:** add rank-aware protection-cover
+  selection, reuse maximal-region contractions for contained regions, and an
+  explicit trace-preserving relaxed fallback with density-error reporting.
+
+- **Optional DMT refinement:** add `truncation="optimized"` for guarded
+  compatible-border SVD and equality-constrained alternating bond refinement,
+  accepting only feasible improvements over the paper seed. Add
+  `region_selection="min_cover"` to share physical-string protection across
+  overlapping mapped regions. Expose both in ordinary/Pauli MPO compression,
+  Pauli gate evolution and ordinary MPO replay; retain the fast defaults.
+
 - **MPO DMT replay:** add `MpoOptimizer(mode="dmt")`, `compress_dmt` and
   optional per-gate reports for computational-basis MPOs and mapped 2D regions.
   Build exact gate targets before protected truncation, retain transactional

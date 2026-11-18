@@ -14,6 +14,14 @@ For ordinary MPO gate-stream replay, use
 [`MpoOptimizer(mode="dmt")`](mpo.md#dmt-gate-stream-replay), which applies each
 gate exactly before protected compression.
 
+Optional `truncation="optimized"` adds guarded fixed-border SVD and constrained
+bond refinement; `region_selection="min_cover"` shares protection strings
+across overlapping regions. Both retain the original defaults. See the
+[controls and optimality limits](../operators/mpo_dmt.md#optional-improved-bond-truncation).
+`region_selection="rank_aware"`, `constraint_mode="relaxed"`, and
+`check_regions=False` have the same meaning for this persistent driver and
+ordinary MPO compression; see the same guide for reporting limitations.
+
 ## Choose an operation
 
 | Task | API | Result and mutation |
@@ -31,6 +39,11 @@ Standalone methods accept `return_report=True` to return `(operator, report)`.
 The persistent driver uses `diagnostics=True` and `run.report`; reports retain
 the latest gate or final timestep. These flags collect extra diagnostics;
 preservation checks remain active without them.
+
+`apply_gate_dmt` and `PauliDMT.apply_gate` cap only the updated bond; they do
+not compress other bonds of an initially oversized operator. If a global cap
+is required, start with `rho.compress_dmt(max_bond=...)` before applying
+gates. `MpoOptimizer(mode="dmt")` instead caps all bonds on its first gate.
 
 ## 1D evolution
 
@@ -124,7 +137,7 @@ region; it does not eliminate Trotter or accumulated evolution error.
 | Control or cost | Practical meaning |
 | --- | --- |
 | `max_bond` | Conservative protected budget plus unprotected residual rank; a small cap can be rejected |
-| `cutoff`, `cutoff_mode` | Applied only to the residual; no renormalization of protected data |
+| `cutoff`, `cutoff_mode` | Paper mode applies these only to the free residual; optimized refinement can reuse rank after its SVD seeds; relaxed fallback uses zero-cutoff seeds |
 | `cutoff="auto"` | `1e-12` in double precision, `1e-6` in single precision; a rank heuristic |
 | 1D protection | At most four protected directions per side; local support/SVD costs grow with bond size |
 | Explicit regions | More protected directions, full `4**k` output panels for `k` sites, and contractions along their MPO spans |
@@ -135,7 +148,8 @@ Keep double precision for difficult long-chain problems. Guards can reject
 unresolved traces or excessive marginal errors. Default 1D standalone sweeps
 check every three-site marginal; gated updates use local constraints and the
 resolved trace guard. Explicit-region paths additionally check every selected
-region at each split. Positivity and accurate long-time dynamics require
+region at each split when `check_regions=True`. With `check_regions=False`,
+the bond guards remain but full-region defects are not measured. Positivity and accurate long-time dynamics require
 separate convergence checks. Successful persistent gates survive a later
 failure, which can leave a partial timestep.
 

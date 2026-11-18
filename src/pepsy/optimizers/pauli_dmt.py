@@ -37,6 +37,8 @@ class PauliDMT:
     can protect physical 2D neighborhoods after mapping them to MPO positions;
     it does not change the gate schedule or interpret lattice coordinates.
     Only adjacent increasing gate sites are supported. An
+    adjacent gate caps only its updated bond; compress an oversized input
+    before constructing the driver if all bonds must obey ``max_bond``. An
     evolution call commits successful gates as it proceeds, so after a
     numerical exception the state can contain a completed partial timestep.
     ``trace_guard='auto'`` monitors per-gate relative trace defects for
@@ -44,15 +46,24 @@ class PauliDMT:
     ``trace_guard=True`` forces it and ``False`` disables it; inspect
     :attr:`trace_guard_active` for the resolved choice. This guard does not
     certify all local marginals; monitor observables and convergence.
-    ``cutoff='auto'`` uses Pepsy's dtype-aware cutoff; ``cutoff_mode``
-    follows Quimb and applies only to the unprotected residual.
+    ``cutoff='auto'`` uses Pepsy's dtype-aware cutoff. In paper mode,
+    ``cutoff_mode`` follows Quimb and applies to the unprotected residual;
+    optimized refinement can reuse rank after its SVD seeds.
     ``regions`` replaces contiguous three-site protection with complete
     reduced-operator constraints on the given MPO-site sequences. Geometry-
-    selected splits check those regions before committing each update.
+    selected splits check those regions before committing each update when
+    ``check_regions=True``. ``constraint_mode='relaxed'`` permits local-density
+    changes when the protected construction cannot meet the bond cap.
+    ``truncation='optimized'`` optionally refines each fixed-border bond;
+    ``max_refinement_sweeps`` bounds alternating updates (zero for SVD seeds
+    only). ``region_selection='min_cover'`` shares physical strings across
+    overlapping regions. The original fast rules remain the defaults.
     """
 
     def __init__(self, operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
-                 mode="conjugate", diagnostics=False, trace_guard="auto", regions=None):
+                 mode="conjugate", diagnostics=False, trace_guard="auto", regions=None,
+                 truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
+                 constraint_mode="strict", constraint_weight=100., check_regions=True):
         if not isinstance(operator, PauliMPO):
             raise TypeError("operator must be a PauliMPO.")
         if mode not in {"conjugate", "heisenberg"}:
@@ -62,6 +73,10 @@ class PauliDMT:
         self._workspace = _PauliDMTWorkspace(
             operator, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
             diagnostics=diagnostics, trace_guard=trace_guard, regions=regions,
+            truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+            region_selection=region_selection,
+            constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+            check_regions=check_regions,
         )
 
     @property
@@ -83,6 +98,7 @@ class PauliDMT:
     def _begin(self):
         self._workspace.original_bonds = _core_bond_dimensions(self._workspace.cores)
         self._workspace.reports.clear()
+        self._workspace.relative_density_error = None
 
     def apply_gate(self, gate, where):
         """Update adjacent MPO positions; return a ``PauliDMTBondReport``.
@@ -183,4 +199,7 @@ class PauliDMT:
             # Bound diagnostic memory by one timestep, independent of steps.
             if _ + 1 != steps:
                 self._workspace.reports.clear()
+        # Different evolved targets occur within a timestep. Per-split
+        # errors are meaningful; the latest one is not a trajectory error.
+        self._workspace.relative_density_error = None
         return self.state

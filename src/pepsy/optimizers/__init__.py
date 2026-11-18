@@ -44,6 +44,7 @@ _SYMBOL_MODULES = {
     "SimulatorPlanner": ".planning",
     "recommend_simulator": ".planning",
     "PepsOptimizer": ".peps",
+    "PepoOptimizer": ".pepo",
     "SimpleUpdateGen": ".peps",
     "SymDMRG2": ".sym_dmrg",
     "SweepOptimizer": ".sweep",
