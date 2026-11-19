@@ -38,7 +38,28 @@ repeated snapshots inside a gate loop add allocation and copy costs.
 Standalone methods accept `return_report=True` to return `(operator, report)`.
 The persistent driver uses `diagnostics=True` and `run.report`; reports retain
 the latest gate or final timestep. These flags collect extra diagnostics;
-preservation checks remain active without them.
+preservation checks remain active without them under the default policy.
+Replay defaults to `check_regions=False`: bond and resolved trace checks
+remain active, while full-region scans are opt-in. Set `check_regions=True`
+to verify all regions after each gate, including default contiguous triples.
+Standalone `compress_dmt` instead defaults to a full input/output sweep check.
+
+Use `preservation_check="warn"` to continue after finite verification errors:
+
+```python
+run = PauliDMT(rho, max_bond=16, preservation_check="warn")
+run.apply_gate(U, (0, 1))
+errors = run.report.preservation_errors
+trace_error = run.report.max_relative_trace_error
+```
+
+Record each report inside the gate loop to retain a trajectory log.
+`preservation_check="off"` skips outer bond, trace and full marginal
+verification; it keeps the protected truncation construction. The library
+default remains `"raise"`. See the
+[policy contract](../operators/mpo_dmt.md#preservation-verification-policy)
+for cost, diagnostics and computational failures that can still raise.
+`run.report.check_regions` records the resolved full-check setting.
 
 `apply_gate_dmt` and `PauliDMT.apply_gate` cap only the updated bond; they do
 not compress other bonds of an initially oversized operator. If a global cap
@@ -78,6 +99,38 @@ observable, use `variant="operator", mode="heisenberg"` for `U† O U`.
 `variant` selects the protected truncation rule; `mode` selects gate direction.
 Hamiltonian preparation retains the source backend and precision. Trainable
 Torch Hamiltonians use native matrix exponentials to handle degeneracies.
+
+## Protect four or five contiguous sites
+
+An explicit region inventory also extends chain protection beyond three sites:
+
+```python
+width = 5
+regions = [tuple(range(j, j + width)) for j in range(rho.nsites - width + 1)]
+run = PauliDMT(
+    rho, max_bond=128, regions=regions,
+    truncation="optimized", max_refinement_sweeps=0,
+    preservation_check="warn",
+)
+```
+
+This example tests feasible SVD seeds without alternating refinement.
+The default `check_regions=False` omits full-region verification while keeping
+the protected construction and bond/trace checks. Set it to `True` to verify
+all requested regions inside the driver.
+
+At a generic interior qubit cut, the default smaller-half cover uses
+protected rank sums up to 8, 20 and 32 for contiguous windows of size 3, 4
+and 5. Actual ranks depend on the state and boundaries. Paper truncation
+leaves residual budget `chi - p - q`: a five-site choice at chi=32 can spend
+the whole cap on protection. More protection therefore need not improve
+future local accuracy at a fixed cap. `truncation="optimized"` tests other
+feasible completions; it does not guarantee monotonic trajectory accuracy.
+
+The [larger-window benchmark](../../../examples/dmt_window_scaling.py)
+checks all protected windows against independent product-mixture oracles,
+compares short pure-state dynamics to exact statevectors, and profiles
+larger chains/bonds. See the [measured tradeoffs](../../development/notes/2026-11-19-dmt-window-scaling.md).
 
 ## 2D regions and physically local gates
 
@@ -147,9 +200,12 @@ region; it does not eliminate Trotter or accumulated evolution error.
 Keep double precision for difficult long-chain problems. Guards can reject
 unresolved traces or excessive marginal errors. Default 1D standalone sweeps
 check every three-site marginal; gated updates use local constraints and the
-resolved trace guard. Explicit-region paths additionally check every selected
-region at each split when `check_regions=True`. With `check_regions=False`,
-the bond guards remain but full-region defects are not measured. Positivity and accurate long-time dynamics require
+resolved trace guard. Gated updates check every selected region when
+`check_regions=True`; strict standalone sweeps compare original/final regions
+once. With `check_regions=False`, bond/trace guards remain but full-region
+defects are not measured. The
+`preservation_check` policy controls whether finite verification failures
+raise, warn and continue, or go unmeasured. Positivity and accurate long-time dynamics require
 separate convergence checks. Successful persistent gates survive a later
 failure, which can leave a partial timestep.
 
@@ -170,3 +226,25 @@ oracle for compression.
 Use profiles to separate centre movement, SVD/protected splitting, and region
 verification. See [measured bottlenecks](../../development/notes/2026-11-16-dmt-performance.md)
 and the [full numerical contract](../operators/pauli_mpo.md#protected-density-matrix-truncation-dmt).
+
+For an accuracy comparison with `MpsOptimizer`, run
+[`dmt_ising_dynamics.py`](../../../examples/dmt_ising_dynamics.py). It evolves
+an L=16 transverse/tilted Ising chain with identical symmetric-sweep gates,
+compares against exact Hamiltonian and exact gate-stream state vectors, and
+audits three-site densities against each compression's own gated input.
+`--audit-all` checks every DMT gate. `pauli-dmt-real` uses real coefficients
+for Hermitian densities; `pauli-dmt` retains complex coefficient storage.
+Neither local preservation nor real storage guarantees positivity or exact
+long-time local dynamics. Equal MPS/MPO bond caps do not imply equal memory
+or computational cost. See the
+[measured comparison](../../development/notes/2026-11-19-dmt-ising-dynamics.md).
+Use `--backend torch` for CPU Torch complex128 gates and complex storage;
+the explicitly selected real-Pauli method retains float64 coefficients.
+The [precision/positivity follow-up](../../development/notes/2026-11-19-dmt-complex128-positivity.md)
+includes first-negativity traces, the paper's energy Fourier observable,
+and separately documented failures and normalization limits.
+For a direct comparison with the published energy curves, use
+[`dmt_white_figures.py`](../../../examples/dmt_white_figures.py) and its
+[Fig. 7/8 protocol](../../development/notes/2026-11-19-dmt-white-figures.md).
+`--initial near-y-figure` in the Ising example selects the state inferred
+from the published figure data; the default retains the printed-equation state.

@@ -79,8 +79,9 @@ need not produce identical tensors across bases.
   useful when global Hermiticity must be maintained through such cuts.
 - `max_bond` must accommodate the protected subspaces. An insufficient
   conservative budget raises `ValueError`; insufficient working precision
-  raises `FloatingPointError`. With `check_regions=True`, marginal checks
-  remain active even when reports are not requested.
+  raises `FloatingPointError` under the default verification policy. With
+  `check_regions=True`, marginal checks remain active even when reports are
+  not requested, unless `preservation_check="off"`.
 - `cutoff="auto"` and `cutoff_mode="auto"` are the defaults, matching MPO
   DMT replay and `MpoOptimizer.compress_dmt`. Auto cutoff is `1e-12` for
   float64/complex128 and `1e-6` for float32/complex64. Auto mode chooses
@@ -94,14 +95,70 @@ need not produce identical tensors across bases.
   If the explicit relaxed fallback is used, its weighted and ordinary SVD
   seeds use `max_bond` with zero cutoff; the free-residual cutoff has no
   direct equivalent in that fallback.
-- Returns a new MPO by default. `inplace=True` writes only after preservation
-  checks succeed. Tensor/index order, tags, external exponent, array backend,
+- Returns a new MPO by default. `inplace=True` writes only after the selected
+  verification policy accepts the candidate. Tensor/index order, tags, external exponent, array backend,
   dtype and device are retained. Exact Pepsy construction-history attachments
   are invalidated after numerical compression.
 - `return_report=True` returns `(mpo, MPODMTReport)`. `MPODMTReport` and
-  `MPODMTBondReport` share the existing Pauli diagnostic schema. Here,
-  discarded weights and absolute constraint errors are in physical
-  Hilbert–Schmidt units; Pauli reports use coefficient units.
+  `MPODMTBondReport` share the Pauli schema. Ordinary MPO discarded weights
+  and absolute constraint errors use physical Hilbert–Schmidt units;
+  Pauli reports use coefficient units.
+
+## Preservation verification policy
+
+`preservation_check` controls post-compression verification in both ordinary
+and Pauli MPO APIs. The protected constraints and requested bond cap remain
+part of the truncation in every mode.
+
+| Operation | Full-region check default | When full checks run |
+| --- | --- | --- |
+| Standalone compression, including `MpoOptimizer.compress_dmt` | `check_regions=True` | Original/final sweep comparison in strict mode |
+| `PauliDMT` and `PauliMPO.apply_gate_dmt` | `check_regions=False` | After each gate when explicitly enabled |
+| `MpoOptimizer.run(mode="dmt")` | `dmt_check_regions=False` | After each gate when explicitly enabled |
+
+Replay uses cheap bond checks and relative density-trace checks by default.
+Setting the full-check flag to `True` verifies every requested region,
+including default contiguous triples. Strict standalone compression keeps
+one full check against the original input and avoids rescanning all regions
+after each bond. Relaxed full checks retain per-bond scans to measure their
+requested density-error diagnostics. Protected truncation is unchanged.
+
+| Value | Finite preservation defect above tolerance | Verification cost |
+| --- | --- | --- |
+| `"raise"` (default) | Raise before committing this candidate | Bond checks and enabled marginal checks |
+| `"warn"` | Commit, warn once per check kind per workspace, record every failure | Same checks as `"raise"` |
+| `"off"` | Not measured by these checks | Skip outer bond/trace checks and full marginal verification |
+
+For gate-stream replay the option is `run(dmt_preservation_check="warn")`.
+Read `report.preservation_errors` for measured failures, including their bond
+or window and tolerance. Warning reports are retained in
+`MpoOptimizer.get_dmt_reports()` even with `dmt_diagnostics=False`; standalone
+outputs retain them in `compression_report`. Reports cover the latest call,
+so aggregate them during a trajectory when a complete error log is needed.
+`report.max_relative_trace_error` is `None` when no trace comparison was made.
+`report.check_regions` records the resolved full-check setting. Density
+standalone compression also retains scalar trace checks when full-region
+verification is disabled. Raw standalone operator compression does not
+classify a trace; Pauli operator evolution retains its `trace_guard` control.
+
+`check_regions=False` skips only the full marginal verification and keeps
+bond checks. `preservation_check="off"` also disables the gated trace monitor,
+overriding `trace_guard`. Requested `diagnostics=True`/`return_report=True`
+can still compute residuals for reporting. Support factorizations, adaptive
+protected-basis construction, and guards needed to perform valid divisions
+remain active; invalid inputs, unresolved density denominators, nonfinite
+active matrices and insufficient protected budgets can still raise.
+Changing verification policy does not improve numerical conditioning.
+
+For lower-cost replay that records finite preservation failures:
+
+```python
+rho_t = opt.run(dmt_preservation_check="warn")
+errors = [error for report in opt.get_dmt_reports()
+          for error in report.preservation_errors]
+# Opt into full-region verification for a validation run:
+rho_t = opt.run(dmt_preservation_check="warn", dmt_check_regions=True)
+```
 
 The SVD optimizes the **free residual at one canonical bond** for the chosen
 protected construction and rank budget. It is not a globally optimal MPO fit
@@ -137,7 +194,8 @@ plaquette-error penalty. Inspect `report.relaxed_bonds`,
 retains reports even without diagnostic collection. `check_regions=False`
 skips repeated full-region checks while retaining bond and trace checks;
 in that mode density-error report fields are `None`. Use
-`dmt_check_regions=False` for `MpoOptimizer.run`. Routed gates still contract
+`dmt_check_regions=True` to enable those measurements in `MpoOptimizer.run`.
+Routed gates still contract
 regions for their trace and routing bookkeeping.
 Very large weights that cannot be represented safely in the tensor dtype are
 rejected before compression; use a smaller weight or higher precision.

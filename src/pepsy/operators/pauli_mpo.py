@@ -1745,6 +1745,7 @@ class PauliMPO:
         self, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density", inplace=False,
         return_report=False, regions=None, truncation="paper", max_refinement_sweeps=8,
         region_selection="smallest", constraint_mode="strict", constraint_weight=100., check_regions=True,
+        preservation_check="raise",
     ):
         """Compress with strict local protection or an explicit relaxed fallback.
 
@@ -1765,7 +1766,10 @@ class PauliMPO:
         renormalized. ``cutoff='auto'`` uses Pepsy's dtype-aware policy.
         Only open chains with dense floating/complex cores are supported.
         With strict protection and ``check_regions=True``, a log-scaled check
-        raises FloatingPointError when local marginals cannot be preserved.
+        raises FloatingPointError when local marginals cannot be preserved
+        under the default ``preservation_check='raise'`` policy. ``'warn'``
+        continues and records failures in ``compression_report``;
+        ``'off'`` skips outer verification, retaining protected truncation.
         ``check_regions=False`` omits that full-region check. Relaxed fallback
         may change the marginals, keeps the trace, and reports their error
         when checks are enabled. Its SVD seeds use the bond cap and do not
@@ -1779,14 +1783,15 @@ class PauliMPO:
             truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
             region_selection=region_selection,
             constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-            check_regions=check_regions,
+            check_regions=check_regions, preservation_check=preservation_check,
         )
 
     def apply_gate_dmt(
         self, gate, where, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
         mode="conjugate", inplace=False, return_report=False, trace_guard="auto", regions=None,
         truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-        constraint_mode="strict", constraint_weight=100., check_regions=True,
+        constraint_mode="strict", constraint_weight=100., check_regions=False,
+        preservation_check="raise",
     ):
         """Apply a two-qubit gate locally, then DMT-split the acted-on bond.
 
@@ -1803,6 +1808,11 @@ class PauliMPO:
         indices; ``None`` uses the original contiguous three-site regions.
         ``truncation``, ``max_refinement_sweeps`` and ``region_selection``
         have the same meaning as in :meth:`compress_dmt`.
+        ``preservation_check='warn'`` continues after finite verification
+        failures and records them; ``'off'`` skips outer checks, including
+        the trace guard. The library default remains ``'raise'``.
+        ``check_regions=False`` defaults to cheap bond/trace checks. Set it
+        to ``True`` for full-region verification, including default triples.
         """
         from ._pauli_dmt import gate_dmt
 
@@ -1813,7 +1823,7 @@ class PauliMPO:
             truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
             region_selection=region_selection,
             constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-            check_regions=check_regions,
+            check_regions=check_regions, preservation_check=preservation_check,
         )
 
     def apply_damping(self, damping, *, inplace=False):

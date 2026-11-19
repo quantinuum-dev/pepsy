@@ -192,9 +192,11 @@ def test_2d_fixed_small_cap_replay_records_every_gate_error():
         return True
 
     opt = MpoOptimizer(rho,queue,chi=2,mode='dmt',contraction_opt='greedy')
+    # These assertions measure full-region errors; fast replay omits them.
     with pytest.warns(RuntimeWarning):
         opt.run(dmt_regions=regions,dmt_region_selection='rank_aware',
-                dmt_constraint_mode='relaxed',finite_check=check,fidelity_samples=0)
+                dmt_constraint_mode='relaxed',dmt_check_regions=True,
+                finite_check=check,fidelity_samples=0)
     reports = opt.get_dmt_reports()  # retained without dmt_diagnostics=True
     assert len(reports) == len(queue) and any(r.relaxed_bonds for r in reports)
     assert np.trace(reference).real < .9
@@ -206,7 +208,7 @@ def test_2d_fixed_small_cap_replay_records_every_gate_error():
 def test_pauli_small_cap_gate_and_long_sequence():
     rho = _density()
     regions = square_lattice_dmt_regions(3,2)
-    run = PauliDMT(rho,max_bond=1,regions=regions,constraint_mode='relaxed')
+    run = PauliDMT(rho,max_bond=1,regions=regions,constraint_mode='relaxed',check_regions=True)
     with pytest.warns(RuntimeWarning,match='constraints were relaxed'):
         for i in range(12):
             report = run.apply_gate(gate(i), (2,3))

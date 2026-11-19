@@ -139,6 +139,10 @@ bond for two-site gates, then performs the requested Quimb state compression.
 It avoids a separate value-dependent operator-SVD rank choice. Canonicalization
 establishes the center with a full sweep instead of inspecting backend tensor
 values in Python. JAX runtime zero-norm errors remain checked through a callback.
+NumPy `direct` replay with `cutoff=0` also keeps the two-site gate exact:
+Quimb's independent default gate-MPO factorization cutoff is bypassed before
+applying the requested state bond cap. NumPy unitary norm tracking does not
+require an Autoray stop-gradient registration.
 Gaugy's prepared global MPSEngine evaluator configures these policies itself.
 
 Adaptive Torch QR also supports FX capture of its first-order VJP with

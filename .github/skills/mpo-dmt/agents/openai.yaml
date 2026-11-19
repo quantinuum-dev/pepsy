@@ -1,4 +1,4 @@
 interface:
   display_name: "Pepsy MPO DMT"
-  short_description: "Derive and maintain protected MPO compression"
-  default_prompt: "Use $mpo-dmt to explain or review Pepsy DMT compression, local-density constraints, and the paper's protected-SVD optimality scope."
+  short_description: "Maintain protected MPO truncation and fast checks"
+  default_prompt: "Use $mpo-dmt to maintain Pepsy protected MPO compression, select verification controls, and validate accuracy and timing."

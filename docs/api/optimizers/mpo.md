@@ -29,8 +29,16 @@ dmt_region_selection="min_cover")` enables improved bond approximation and
 shared region protection. Manual `compress_dmt` uses the same names without
 the `dmt_` prefix. The fast paper method and smaller-half selection remain
 the defaults; see [mathematics and limits](../operators/mpo_dmt.md#optional-improved-bond-truncation).
-For small χ and fast checking, use `dmt_constraint_mode="relaxed"` and
-`dmt_check_regions=False`; reports then do not measure full-region errors.
+Replay defaults to `dmt_check_regions=False`, retaining cheap bond and density
+trace checks. Set it to `True` for full-region verification and measurements.
+Use `dmt_constraint_mode="relaxed"` only when allowing local-density errors
+to fit a small cap; disabling expensive verification does not require relaxation.
+To continue and record finite preservation failures without relaxing the
+protected constraints, use `run(dmt_preservation_check="warn")` and read
+`get_dmt_reports()` after each call. `dmt_preservation_check="off"` skips
+outer bond/trace and full marginal verification. Manual `compress_dmt` takes
+`preservation_check` without the prefix. The library default is `"raise"`;
+see the [verification policy](../operators/mpo_dmt.md#preservation-verification-policy).
 
 ```python
 import numpy as np
@@ -93,7 +101,8 @@ exactness guarantee for the entire untruncated circuit trajectory.
   global Hermiticity are not guaranteed by ordinary complex-basis truncation.
   Density routing removes bounded trace roundoff relative to the gate's
   computed two-site target, including nonunitary trace changes; it does not
-  force trace one. Physical marginal checks run again after this correction.
+  force trace one. With `dmt_check_regions=True`, physical marginal checks run
+  again after this correction.
 - `run` and `compress_dmt` default to `cutoff="auto"`,
   `cutoff_mode="auto"`: `1e-12` for double precision, `1e-6` for single
   precision, with `"rel"` applied only to the free residual spectrum.
@@ -102,8 +111,9 @@ exactness guarantee for the entire untruncated circuit trajectory.
   the [physical-unit contract](../operators/mpo_dmt.md#contract).
 - `dmt_diagnostics=True` collects reports returned by `get_dmt_reports()` for
   the latest DMT operation. The default avoids extra split diagnostics;
-  full marginal checks are on by default and may be disabled with
-  `dmt_check_regions=False`. Manual `compress_dmt(return_report=True)`
+  full marginal checks are opt-in with `dmt_check_regions=True`. Cheap bond
+  and density trace checks stay active. `report.check_regions` records the
+  selected full-check mode. Manual `compress_dmt(return_report=True)`
   returns and retains one report. A full-sweep report contains all visited
   bonds; a local-update report contains one bond. Workspace updates report
   pre-gate source bond dimensions. Routed reports include temporary-order
@@ -137,6 +147,13 @@ a fallback. Long spans, target bond growth, SVDs and region-panel
 checks can still dominate 2D cost. This is MPO storage, not native PEPO
 evolution or a fully JIT-compiled algorithm. Use the reproducible
 [CPU benchmark](../../../examples/mpo_dmt_benchmark.py) for measured costs.
+
+For physical 2D dynamics, use the [exact-reference benchmark](../../../examples/dmt_2d_dynamics.py).
+It includes every square-lattice edge and separates continuous-time,
+uncompressed Trotter and compressed trajectories. The
+[finite-size results](../../development/notes/2026-11-19-dmt-2d-dynamics.md)
+compare DMT with unconstrained variational MPO compression; per-gate marginal
+preservation and energy accuracy alone do not certify long-time local accuracy.
 
 | Purpose | Controls | What to keep in mind |
 | --- | --- | --- |

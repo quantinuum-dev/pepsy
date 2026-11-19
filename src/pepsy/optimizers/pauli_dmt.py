@@ -46,13 +46,21 @@ class PauliDMT:
     ``trace_guard=True`` forces it and ``False`` disables it; inspect
     :attr:`trace_guard_active` for the resolved choice. This guard does not
     certify all local marginals; monitor observables and convergence.
+    ``preservation_check='raise'`` is the default verification policy.
+    ``'warn'`` continues after finite violations and records them in
+    ``report.preservation_errors``. ``'off'`` skips outer preservation
+    verification, including the trace guard, while keeping the protected
+    construction. Invalid numerical inputs and insufficient budgets still
+    raise. Reports cover the latest operation; collect them in the gate loop.
     ``cutoff='auto'`` uses Pepsy's dtype-aware cutoff. In paper mode,
     ``cutoff_mode`` follows Quimb and applies to the unprotected residual;
     optimized refinement can reuse rank after its SVD seeds.
     ``regions`` replaces contiguous three-site protection with complete
     reduced-operator constraints on the given MPO-site sequences. Geometry-
     selected splits check those regions before committing each update when
-    ``check_regions=True``. ``constraint_mode='relaxed'`` permits local-density
+    ``check_regions=True``. The default ``False`` retains bond/trace checks
+    without full-region scans; explicit ``True`` also checks default triples.
+    ``constraint_mode='relaxed'`` permits local-density
     changes when the protected construction cannot meet the bond cap.
     ``truncation='optimized'`` optionally refines each fixed-border bond;
     ``max_refinement_sweeps`` bounds alternating updates (zero for SVD seeds
@@ -63,7 +71,8 @@ class PauliDMT:
     def __init__(self, operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
                  mode="conjugate", diagnostics=False, trace_guard="auto", regions=None,
                  truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-                 constraint_mode="strict", constraint_weight=100., check_regions=True):
+                 constraint_mode="strict", constraint_weight=100., check_regions=False,
+                 preservation_check="raise"):
         if not isinstance(operator, PauliMPO):
             raise TypeError("operator must be a PauliMPO.")
         if mode not in {"conjugate", "heisenberg"}:
@@ -76,7 +85,7 @@ class PauliDMT:
             truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
             region_selection=region_selection,
             constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-            check_regions=check_regions,
+            check_regions=check_regions, preservation_check=preservation_check,
         )
 
     @property

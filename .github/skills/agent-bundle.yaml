@@ -54,7 +54,7 @@ skills:
   - name: mpo-dmt
     path: .github/skills/mpo-dmt
     role: domain
-    upload: [SKILL.md, references/**, scripts/**]
+    upload: [SKILL.md, references/mathematics.md, references/operations.md, scripts/**]
   - name: tree-stabilizer-optimizer
     path: .github/skills/tree-stabilizer-optimizer
     role: domain

@@ -8,6 +8,37 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **2D DMT accuracy benchmarks:** add complete square-lattice Ising gate
+  schedules with continuous-time and uncompressed-circuit references,
+  bond/timestep sweeps, ordinary variational MPO comparisons, independent
+  preservation audits and positivity diagnostics in complex128.
+
+- **DMT check costs and API:** replay now defaults to cheap bond/trace checks
+  (`check_regions=False`, or `dmt_check_regions=False`). Full-region replay
+  verification remains opt-in and now also covers Pauli's default triples.
+  Strict standalone sweeps retain one final full-region check while avoiding
+  redundant per-bond scans. Density trace checks stay active on all paths;
+  reports expose the resolved `check_regions` setting. Update the DMT skill
+  with verification, larger-window and independent benchmark workflows.
+
+- **Larger DMT windows:** index crossing regions once during workspace
+  preparation, preserving protection strings and cover ordering while avoiding
+  repeated full-inventory scans. Add complex128 four-/five-site preservation,
+  exact-dynamics accuracy and large-chain/bond profiling benchmarks.
+
+- **DMT verification policy:** add `preservation_check="warn"` to continue
+  after finite preservation errors and retain their measured defects, and
+  `"off"` to skip outer verification. The library default remains `"raise"`;
+  MPO replay uses `dmt_preservation_check`. Ising benchmark CLIs default to
+  warning mode and expose the supported Torch CPU SVD driver selection.
+
+- **MPS numerical references:** keep NumPy two-site gates exact before
+  zero-cutoff `direct` state compression, and avoid unavailable NumPy
+  stop-gradient dispatch in norm and overlap diagnostics. Add an L=16 Ising
+  DMT/MPS comparison with exact state-vector references and independent
+  protected-density audits, CPU Torch complex128 runs, positivity traces,
+  and direct comparisons with digitized White et al. Fig. 7/8 references.
+
 - **Experimental PEPO mixed SVD seeds:** optionally combine discarded singular
   directions with feasible factors and accept only protected objective improvements.
 

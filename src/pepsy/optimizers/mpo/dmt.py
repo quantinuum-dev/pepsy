@@ -62,9 +62,10 @@ def _promote(p, gates=()):
 
 def _compress(opt, candidate, *, cutoff, cutoff_mode, variant, regions, diagnostics,
               truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-              constraint_mode="strict", constraint_weight=100., check_regions=True):
-    # The kernel writes only after its complete marginal check. This candidate
-    # owns tensor wrappers and is never the currently committed operator.
+              constraint_mode="strict", constraint_weight=100., check_regions=True,
+              preservation_check="raise"):
+    # The kernel writes only after the selected verification policy accepts
+    # the candidate. Its wrappers are separate from the committed operator.
     _promote(candidate)
     result = opt._timed_call(
         "dmt.compress", _compress_mpo_dmt, candidate, max_bond=opt.chi,
@@ -73,7 +74,7 @@ def _compress(opt, candidate, *, cutoff, cutoff_mode, variant, regions, diagnost
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
         constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-        check_regions=check_regions,
+        check_regions=check_regions, preservation_check=preservation_check,
     )
     return result
 
@@ -87,6 +88,8 @@ def _commit(opt, candidate, *, center=None):
             opt.p.pop_tensor(tid)
         opt.p.add_tensor_network(candidate, virtual=False, check_collisions=False)
         opt.p.exponent = candidate.exponent
+        if hasattr(candidate, "compression_report") or hasattr(opt.p, "compression_report"):
+            opt.p.compression_report = getattr(candidate, "compression_report", None)
         for name in ("pepsy_first_degree", "pepsy_block_plan", "pepsy_pauli_mpo"):
             if hasattr(opt.p, name):
                 setattr(opt.p, name, None)
@@ -102,7 +105,8 @@ def _commit(opt, candidate, *, center=None):
 
 def compress_current(opt, *, cutoff, cutoff_mode, variant, regions, return_report,
                      truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-                     constraint_mode="strict", constraint_weight=100., check_regions=True):
+                     constraint_mode="strict", constraint_weight=100., check_regions=True,
+                     preservation_check="raise"):
     regions = validate_state(opt, regions, variant)
     candidate, report, _ = _compress(
         opt, opt.p.copy(), cutoff=cutoff, cutoff_mode=cutoff_mode,
@@ -110,7 +114,7 @@ def compress_current(opt, *, cutoff, cutoff_mode, variant, regions, return_repor
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
         constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-        check_regions=check_regions,
+        check_regions=check_regions, preservation_check=preservation_check,
     )
     _commit(opt, candidate)
     opt._dmt_reports = [report] if report is not None else []
@@ -121,7 +125,8 @@ def compress_current(opt, *, cutoff, cutoff_mode, variant, regions, return_repor
 def replay(opt, gates, wheres, *, progbar, cutoff, cutoff_mode,
            fidelity_samples, finite_check, regions, variant, diagnostics,
            truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-           constraint_mode="strict", constraint_weight=100., check_regions=True):
+           constraint_mode="strict", constraint_weight=100., check_regions=False,
+           preservation_check="raise"):
     from tqdm.auto import tqdm
 
     opt._dmt_reports = []
@@ -164,7 +169,7 @@ def replay(opt, gates, wheres, *, progbar, cutoff, cutoff_mode,
                     truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
                     region_selection=region_selection,
                     constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-                    check_regions=check_regions,
+                    check_regions=check_regions, preservation_check=preservation_check,
                 )
             opt._check_finite(finite_check, candidate)
             _commit(opt, candidate, center=next_workspace.center)

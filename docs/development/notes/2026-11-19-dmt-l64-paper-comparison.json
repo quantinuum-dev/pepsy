@@ -1,0 +1,61 @@
+{
+  "paper": "https://arxiv.org/pdf/1707.01506",
+  "figure": 7,
+  "length": 64,
+  "chi": 16,
+  "figure_dt": 0.0625,
+  "figure_final_time": 40.0,
+  "source": "https://arxiv.org/src/1707.01506v2",
+  "source_data_kind": "digitized PDF vector coordinates; not original raw simulation data",
+  "comparison_endpoint_alignment": "Only final exported x=39 point aligned to t=40; raw fixture unchanged.",
+  "ordinary_mpo_checks": "Full region verification skipped; bond checks retained.",
+  "energy": "Trace-normalized expectation, in recovered published-figure units; real and imaginary parts retained.",
+  "rows": [
+    {
+      "method": "Published DMT",
+      "initial_energy": 0.3038917749037879,
+      "final_energy_real": 0.3024817105098485,
+      "final_energy_imag": 0.0,
+      "max_real_energy_drift": 0.0016273484848484676,
+      "rmse_vs_corresponding_published_curve": null
+    },
+    {
+      "method": "Published MPS",
+      "initial_energy": 0.3038917749037879,
+      "final_energy_real": 1.3525267597522728,
+      "final_energy_imag": 0.0,
+      "max_real_energy_drift": 1.0486349848484848,
+      "rmse_vs_corresponding_published_curve": null
+    },
+    {
+      "method": "Pepsy MPS",
+      "initial_energy": 0.3038917753161452,
+      "final_energy_real": 1.3513677136504225,
+      "final_energy_imag": -1.8548022574969706e-16,
+      "max_real_energy_drift": 1.0474759383342773,
+      "rmse_vs_corresponding_published_curve": 0.00023813254039193886,
+      "max_difference_vs_corresponding_published_curve": 0.0011590461018502474,
+      "max_absolute_imaginary_energy": 2.1471289024581807e-16
+    },
+    {
+      "method": "Pepsy PauliMPO DMT",
+      "initial_energy": 0.30389177531614575,
+      "final_energy_real": 0.302482105961503,
+      "final_energy_imag": 0.0,
+      "max_real_energy_drift": 0.0016101847952219583,
+      "rmse_vs_corresponding_published_curve": 0.00011593404567061641,
+      "max_difference_vs_corresponding_published_curve": 0.00031669907924603,
+      "max_absolute_imaginary_energy": 0.0
+    },
+    {
+      "method": "Pepsy MpoOptimizer DMT",
+      "initial_energy": 0.3038917753161456,
+      "final_energy_real": 0.30249048684864305,
+      "final_energy_imag": -0.00011523956836974499,
+      "max_real_energy_drift": 0.001613408915811354,
+      "rmse_vs_corresponding_published_curve": 9.345587976165816e-05,
+      "max_difference_vs_corresponding_published_curve": 0.00024200080509245714,
+      "max_absolute_imaginary_energy": 0.00011523956836974499
+    }
+  ]
+}

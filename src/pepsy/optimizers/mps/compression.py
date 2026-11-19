@@ -258,11 +258,14 @@ def _apply_dense_gate_with_method(
         opts.update(compression_opts or {})
         quimb_seed = seed if method in _MPO_METHODS_USE_SEED else None
         if (method in {"direct", "dm", "zipup"} and cutoff == 0 and len(where) == 2
-                and ar.infer_backend(gate) in ("jax", "torch")):
+                and (ar.infer_backend(gate) in ("jax", "torch")
+                     or (method == "direct" and ar.infer_backend(gate) == "numpy"))):
             # An exact two-site MPO with a fixed operator bond. Unlike the
             # default gate_nonlocal decomposition this has no rank selection
             # (or derivatives of a rank-deficient operator SVD) before the
-            # requested state compression. Keep all operator entries.
+            # requested state compression. NumPy also needs this route:
+            # Quimb's separate default gate-MPO cutoff can discard small
+            # operator components even when state cutoff=0 is requested.
             d0, d1 = dims
             data = ar.do("reshape", gate, (d0, d1, d0, d1))
             if where[0] > where[1]:
