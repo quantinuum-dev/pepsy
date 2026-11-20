@@ -65,7 +65,9 @@ def _record_nonunitary_overlap(self, target, fitted, where, *, fit_norm=None):
             record["method"] = "target_overlap"
         # Diagnostics never retain the evolution's autograd graph. Conversion
         # to host scalars belongs to the explicit readout, not each GPU gate.
-        raw = ar.do("stop_gradient", raw)
+        # NumPy/Python values have no tape and may lack this Autoray dispatch.
+        if ar.infer_backend(raw) not in {"numpy", "builtins"}:
+            raw = ar.do("stop_gradient", raw)
         fidelity = ar.do("clip", raw, 0.0, 1.0)
         record.update(fidelity_raw=raw, local_fidelity=fidelity,
                       local_infidelity=1.0 - fidelity)
@@ -168,9 +170,11 @@ def _start_unitary_norm_tracking(self, p):
     # right edge to a one-site centre and read the raw centre norm instead
     # of contracting the full doubled MPS network once at stream start.
     current_span = self._current_orthog(p)
-    current_norm = ar.do("stop_gradient", ar.do(
-        "abs", self._canonical_span_norm(p, current_span)
-    ))
+    current_norm = ar.do("abs", self._canonical_span_norm(p, current_span))
+    # NumPy/Python scalars have no autograd history, and older Autoray
+    # versions do not register a NumPy stop_gradient operation.
+    if ar.infer_backend(current_norm) not in {"numpy", "builtins"}:
+        current_norm = ar.do("stop_gradient", current_norm)
     self._unitary_previous_norm = current_norm
 
 

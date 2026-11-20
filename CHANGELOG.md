@@ -8,6 +8,10 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Tensor-network error mitigation:** collect randomized Pauli shots from
+  noisy MPS gate streams and reuse a middle-out mitigation MPO across shot
+  batches and observables.
+
 - **Noisy MPO queues:** accept named unitary gates and local noise in the MPS
   tuple syntax. Fit dense two-site channels as exact local layers in DMRG,
   keeping the exterior MPO bonds compatible with the active fit window.
