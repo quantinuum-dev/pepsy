@@ -8,6 +8,16 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Noisy MPO queues:** accept named unitary gates and local noise in the MPS
+  tuple syntax. Fit dense two-site channels as exact local layers in DMRG,
+  keeping the exterior MPO bonds compatible with the active fit window.
+  Apply the same FIT initialization policy to gates and two-site channels,
+  with SRC as the default warm start.
+
+- **MPO channel diagnostics:** measure the exact Kraus target trace before
+  compression so trace lost to truncation is reported separately. Trace the
+  physical legs locally before planning the dense virtual contraction.
+
 - **ALS random restarts:** opt into SVD plus random trials with
   `random_restarts=1, restart_seed=...` in reduced loop-cluster ALS,
   prepared replay (including batches), and `PepsOptimizer` full-update

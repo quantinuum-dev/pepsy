@@ -544,6 +544,29 @@ opt = pepsy.MpoOptimizer(mpo, gates=[event], chi=32, mode="dmrg2")
 out = opt.run(progbar=False)
 ```
 
+Pass a density MPO as `mpo` to evolve a mixed state. Channel events can be
+interleaved with unitary gates in the same queue. `direct` compresses the
+complete Kraus sum. For dense MPOs, the DMRG modes fit a two-site channel
+as an exact layer on the ket and bra legs of the source MPO. The default
+`fit_init_strategy="guess-src"` compresses a disposable copy of that layer
+and source within the active window, using the existing exterior bonds.
+FIT then uses the untouched target and splits the updated blocks at the
+requested bond cap. One-site events use direct compression.
+
+The queue also accepts the [MPS named gate syntax](mps.md)
+and named local noise such as `depolarize1`, `depolarize2`, Pauli errors,
+and `amplitude_damping`. Named gates apply the corresponding physical
+unitary by conjugation. Named noise applies its entire channel. For Torch
+circuits with complex rotations, initialize the MPO in a complex dtype.
+
+```python
+gates = [("rx", 0.13, 0), ("rzz", 0.27, 0, 1), ("depolarize2", 0.01, 0, 1)]
+rho_t = pepsy.MpoOptimizer(rho0_mpo, gates, chi=32, mode="dmrg2").run()
+```
+
+See the [4×4 noisy TFIM example](../../../examples/noisy_mpo_tfim.py) for
+a circuit-level comparison with exact Pauli-basis observables.
+
 `semantics="sum"` is the only executable MPO meaning. Passing
 `semantics="sample"` raises a clear error: sampled branches are an MPS
 trajectory operation and require branch probabilities, branch normalization,

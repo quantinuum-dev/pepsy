@@ -683,6 +683,33 @@ def test_mpo_channel_event_uses_standard_kraus_orientation():
     np.testing.assert_allclose(out.to_dense(), expected, atol=1.0e-12)
 
 
+@pytest.mark.parametrize("mode", ["direct", "dmrg"])
+def test_mpo_channel_trace_diagnostics_measure_the_uncompressed_target(mode):
+    """A trace-preserving channel can lose trace during lossy compression."""
+    zero = np.diag([1.0, 0.0])
+    rho = qtn.MPO_product_operator([zero, zero])
+    rotation = np.eye(4)
+    a, b = np.sqrt(0.73), np.sqrt(0.27)
+    rotation[np.ix_([0, 3], [0, 3])] = [[a, -b], [b, a]]
+    event = py.MpoOptimizer.kraus_event(
+        (np.eye(4), rotation), (0, 1), weights=(0.08, 0.92)
+    )
+    opt = py.MpoOptimizer(rho, gates=[event], chi=1, mode=mode)
+
+    out = opt.run(cutoff=0.0, progbar=False, fidelity_samples=0)
+
+    assert out.max_bond() == 1
+    trace_event, = opt.get_trace_events()
+    observed_trace = np.trace(out.to_dense())
+    assert trace_event["input_trace"] == pytest.approx(1.0)
+    assert trace_event["target_trace"] == pytest.approx(1.0)
+    assert trace_event["observed_trace"] == pytest.approx(observed_trace)
+    assert trace_event["channel_trace_preserving"] is True
+    assert trace_event["target_trace_residual"] < 1.0e-12
+    assert abs(observed_trace - 1.0) > 0.1
+    assert trace_event["compression_trace_residual"] == pytest.approx(abs(observed_trace - 1.0))
+
+
 def test_mpo_optimizer_dmrg_handles_nonlocal_channel_sum():
     """A two-site Kraus sum remains executable through the DMRG backend."""
     identity = np.eye(4, dtype=np.complex128)
@@ -703,6 +730,90 @@ def test_mpo_optimizer_dmrg_handles_nonlocal_channel_sum():
     assert out.max_bond() <= 4
     assert opt.channel_diagnostics()["channel_events"][0]["backend"] == "dmrg"
     assert opt.channel_diagnostics()["trace_preserving"] is True
+
+
+@pytest.mark.parametrize("mode", ["direct", "dmrg2"])
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_mpo_named_gate_and_noise_queue_matches_dense_density_evolution(mode, backend):
+    zero = np.diag([1.0, 0.0]).astype(complex)
+    initial = qtn.MPO_product_operator([zero, zero])
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+        initial.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
+
+    theta, coupling, error_rate = 0.27, -0.41, 0.08
+    opt = py.MpoOptimizer(initial, [("RY", theta, 0)], chi=4, mode=mode)
+    assert opt.compile_gate_stream()["event_types"] == ("gate",)
+    opt.set_gates(("ry", theta, 0))
+    opt.add_gates([(("rzz", coupling), (0, 1)), ("depolarize2", error_rate, 0, 1)])
+    assert opt.compile_gate_stream()["event_types"] == ("gate", "gate", "channel_sum")
+    out = opt.run(cutoff=0.0, progbar=False)
+
+    # RY is nonsymmetric, so a misplaced transpose reverses this rotation.
+    rotation = np.array([[np.cos(theta / 2), -np.sin(theta / 2)],
+                         [np.sin(theta / 2), np.cos(theta / 2)]])
+    zz = np.diag(np.exp(-0.5j * coupling * np.array([1, -1, -1, 1])))
+    state = zz @ np.kron(rotation[:, 0], [1.0, 0.0])
+    mix = error_rate * 16 / 15
+    expected = (1 - mix) * np.outer(state, state.conj()) + mix * np.eye(4) / 4
+    assert opt.backend_info()["backend"] == backend
+    np.testing.assert_allclose(out.to_dense(), expected, atol=1e-11)
+
+
+@pytest.mark.parametrize("sites", [(1, 2), (3, 1)])
+def test_mpo_dmrg2_fits_layered_channel_on_interior_sites(sites, monkeypatch):
+    rng = np.random.default_rng(783)
+    factors = rng.normal(size=(32, 2)) + 1j * rng.normal(size=(32, 2))
+    rho = factors @ factors.conj().T
+    rho /= np.trace(rho)
+    initial = qtn.MatrixProductOperator.from_dense(rho, dims=(2,) * 5, cutoff=0.0)
+    matrix = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    unitary, _ = np.linalg.qr(matrix)
+    event = py.MpoOptimizer.kraus_event((np.eye(4), unitary), sites, weights=(0.73, 0.27))
+    opt = py.MpoOptimizer(initial, [event], chi=16, mode="dmrg2", contraction_opt="greedy")
+
+    def reject_materialization(*args, **kwargs):
+        pytest.fail("DMRG2 should use the layered channel target")
+
+    monkeypatch.setattr(opt, "_build_channel_target", reject_materialization)
+    out = opt.run(cutoff=0.0, n_iter=3, progbar=False)
+
+    order = sites + tuple(site for site in range(5) if site not in sites)
+    axes = order + tuple(site + 5 for site in order)
+    permuted = rho.reshape((2,) * 10).transpose(axes).reshape(32, 32)
+    operator = np.kron(unitary, np.eye(8))
+    target = 0.73 * permuted + 0.27 * operator @ permuted @ operator.conj().T
+    expected = target.reshape((2,) * 10).transpose(np.argsort(axes)).reshape(32, 32)
+    np.testing.assert_allclose(out.to_dense(), expected, atol=1e-11)
+    assert opt.get_trace_events()[0]["target_trace"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2"])
+def test_mpo_channel_default_src_guess_grows_rank_on_a_long_interval(mode):
+    zero = np.diag([1.0, 0.0]).astype(complex)
+    initial = qtn.MPO_product_operator([zero] * 8)
+    initial.exponent = -0.5
+    probability = 0.02
+    sites = (6, 1)
+    opt = py.MpoOptimizer(
+        initial, [("depolarize2", probability, *sites)], chi=2, mode=mode,
+    )
+
+    out = opt.run(n_iter=2, cutoff=1e-12)
+
+    replacement = [np.eye(2) / 2 if site in sites else zero for site in range(8)]
+    mixed = qtn.MPO_product_operator(replacement).to_dense()
+    alpha = 16 * probability / 15
+    expected = (1 - alpha) * initial.to_dense() + alpha * 10**initial.exponent * mixed
+    np.testing.assert_allclose(out.to_dense(), expected, atol=1e-12)
+    assert out.max_bond() == 2
+    history, = opt.get_fit_history()
+    assert history["fit_init_strategy"] == "guess_src"
+    assert history["guess_method"] == "src"
+    assert history["guess_used"]
+    trace, = opt.get_trace_events()
+    assert trace["target_trace"] == pytest.approx(10**initial.exponent)
+    assert trace["observed_trace"] == pytest.approx(trace["target_trace"])
 
 
 def test_mpo_optimizer_non_trace_preserving_channel_is_reported():
