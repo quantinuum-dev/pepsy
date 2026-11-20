@@ -126,6 +126,65 @@ def test_reuses_mitigation_map_for_new_observables_and_shots(monkeypatch):
     assert fits == [16, 16]
 
 
+@pytest.mark.parametrize("gate,dtype", [
+    (np.array([[1, 1], [1, -1]]) / np.sqrt(2), np.float32),
+    (np.asarray(qu.Rx(0.67)), np.complex64),
+])
+def test_explicit_single_precision_gates_respect_unitarity_at_input_precision(gate, dtype):
+    noise = ("amplitude_damping", 0.2, 0)
+    rounded_gate = gate.astype(dtype)
+    expected = MpoErrorMit([noise, (gate, 0)], chi=None).build_mpo().to_dense()
+    actual = MpoErrorMit([noise, (rounded_gate, 0)], chi=None).build_mpo().to_dense()
+    np.testing.assert_allclose(actual, expected, atol=2e-7, rtol=0)
+
+    with pytest.raises(ValueError, match="require unitary gates"):
+        MpoErrorMit([noise, (0.99 * rounded_gate, 0)])
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2"])
+def test_torch_mitigation_and_pauli_readout_match_numpy(device, mode, monkeypatch):
+    torch = pytest.importorskip("torch")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    from pepsy._internal.quimb import quimb_1d_compression_method_supports_seed
+    from pepsy.backends import backend_torch
+    from pepsy.operators import mpo_product
+
+    stream = [("ry", 0.62, 0), ("cnot", 0, 1), ("depolarize2", 0.12, 0, 1), ("rx", 0.31, 1)]
+    reference = MpoErrorMit(stream, chi=None)
+    tem = MpoErrorMit(stream, chi=16, mode=mode, to_backend=backend_torch(device, torch.float64))
+    state = qtn.MPS_computational_state("00")
+    state.apply_to_arrays(backend_torch(device, torch.complex64))
+    shots = tem.collect_shots(state, 24, seed=14, strategy="coalesced", mps_mode="perm")
+    assert shots.shots == 24
+
+    if not quimb_1d_compression_method_supports_seed("src"):
+        with pytest.raises(NotImplementedError, match="needs a newer build"):
+            tem.build_mpo()
+        return
+
+    compress = mpo_product.run_seeded_quimb
+    seeds = []
+
+    def record_src(seed, function, target, **kwargs):
+        assert kwargs["method"] == "src"
+        guess = compress(seed, function, target, **kwargs)
+        assert all(array.device.type == device for array in guess.arrays)
+        seeds.append(seed)
+        return guess
+
+    monkeypatch.setattr(mpo_product, "run_seeded_quimb", record_src)
+    mpo = tem.build_mpo()
+    assert seeds == [0, 1]
+    assert all(array.device.type == device for array in mpo.arrays)
+    np.testing.assert_allclose(mpo.to_dense().cpu().numpy(), reference.build_mpo().to_dense(), atol=1e-13)
+    expected = reference.estimate(["II", "ZI", "YZ"], shots, chunk_size=4)
+    actual = tem.estimate(expected, shots, chunk_size=4)
+    for word in expected:
+        assert vars(actual[word]) == pytest.approx(vars(expected[word]), abs=1e-13)
+
+
 def test_rejects_singular_channels_and_invalid_readouts():
     with pytest.raises(ValueError, match="singular"):
         MpoErrorMit([("depolarize1", 0.75, 0)])

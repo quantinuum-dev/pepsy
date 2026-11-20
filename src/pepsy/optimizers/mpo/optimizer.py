@@ -65,7 +65,7 @@ import autoray as ar
 import numpy as np
 from quimb.tensor import TensorNetwork, tensor_network_1d_compress
 
-from ..._internal.quimb import quimb_compression_options, quimb_fit_guess_method, run_seeded_quimb
+from ..._internal.quimb import quimb_compression_options, run_seeded_quimb
 from ..._internal.random import backend_random_array
 from ..._internal.quimb import (
     quimb_1d_compression_cutoff_mode,
@@ -2009,7 +2009,6 @@ class MpoOptimizer:
         start, while FIT still receives the uncapped target built by the DMRG
         target path.
         """
-        method = quimb_fit_guess_method(method, p)
         active = [site for where in batch_where for site in where]
         guess = self._copy_working_state(p, (min(active), max(active)))
         active_sites = []
@@ -2073,6 +2072,43 @@ class MpoOptimizer:
         )
         guess |= active
         return guess
+
+    def _build_native_src_fit_guess(self, target, start, stop, *, cutoff, cutoff_mode, seed):
+        """Compress the exact native target on a disposable copy of its active window."""
+        # The randomized sector split needs a local singular-value cutoff.
+        # Honor cumulative cutoff modes with the full native sector spectra.
+        cumulative_cutoff = cutoff > 0.0 and cutoff_mode in {
+            3, 4, 5, 6, "sum2", "rsum2", "sum1", "rsum1",
+        }
+        method = "svd" if cumulative_cutoff else "svd:rand"
+        split_options = {"method": method}
+        if not cumulative_cutoff:
+            split_options["max_bond_mode"] = "eager"
+        guess = target.copy(deep=True)
+        physical_inds = set(guess.outer_inds())
+        # Older Quimb routes long bonds by inserting dense identities. Move
+        # them during native canonization to preserve the graded bond spaces.
+        for site in range(stop, start, -1):
+            left, right = guess.site_tag(site - 1), guess.site_tag(site)
+            neighbors = set(guess[left].inds)
+            if site + 1 < guess.L:
+                neighbors.update(guess[site + 1].inds)
+            long_bonds = tuple(
+                index for index in guess[right].inds
+                if index not in neighbors and index not in physical_inds
+            )
+            guess.canonize_between(
+                right, left, swap_inds=long_bonds or None, create_bond=bool(long_bonds),
+            )
+        for site in range(start, stop):
+            if not cumulative_cutoff:
+                split_options["seed"] = int(seed) + site - start
+            guess.compress_between(
+                guess.site_tag(site + 1), guess.site_tag(site),
+                absorb="left", reduced="right", max_bond=self.chi,
+                cutoff=cutoff, cutoff_mode=cutoff_mode, **split_options,
+            )
+        return guess, method
 
     @staticmethod
     def _fit_random_data(data, shape, *, strength, rng):
@@ -2239,6 +2275,7 @@ class MpoOptimizer:
         cutoff_mode,
         layer_order="lower_upper",
         channel_target=None,
+        native_target=None,
     ):
         """Select a disposable FIT initial guess for an MPO update."""
         requested_strategy = self._validate_fit_init_strategy(strategy)
@@ -2258,17 +2295,9 @@ class MpoOptimizer:
             "guess_used": False,
             "svd_guess_used": False,
             "guess_backend": None,
+            "guess_layer_order": None,
             "random_initialization": random_info,
         }
-
-        # Symmray/fermionic MPOs must retain their native sectors. The native
-        # FIT kernel already grows and splits those sectors safely, so a dense
-        # Quimb source or random guess is not a valid substitution here.
-        if self._has_symmray_data(p) or any(
-            self._is_fermionic_array(tensor.data) for tensor in p
-        ):
-            random_info["reason"] = "native_sector_growth"
-            return result
 
         if requested_strategy == "auto":
             selected_strategy = _DEFAULT_FIT_INIT_STRATEGY
@@ -2286,6 +2315,30 @@ class MpoOptimizer:
             and raw_strategy in {"auto", _DEFAULT_FIT_INIT_STRATEGY, "guess-src"}
         ):
             selected_strategy = "direct"
+
+        if self._has_symmray_data(p) or any(self._is_fermionic_array(t.data) for t in p):
+            if selected_strategy != "guess_src":
+                random_info["reason"] = "native_sector_growth"
+                return result
+            target = native_target if channel_target is None else channel_target
+            start = min(site for where in wheres for site in where)
+            stop = max(site for where in wheres for site in where)
+            fit_guess, method = self._build_native_src_fit_guess(
+                target, start, stop, cutoff=cutoff, cutoff_mode=cutoff_mode, seed=seed,
+            )
+            result.update(
+                fit_guess=fit_guess,
+                strategy="guess_src",
+                guess_method="src",
+                guess_used=True,
+                svd_guess_used=True,
+                guess_backend=f"symmray-{method}",
+            )
+            random_info.update(
+                reason="native_src", method=method, seed=int(seed),
+                fallback_reason="cumulative_cutoff" if method == "svd" else None,
+            )
+            return result
 
         if selected_strategy == "svd_guess":
             guess_method = "direct"
@@ -2307,7 +2360,6 @@ class MpoOptimizer:
                     seed=seed,
                 )
             else:
-                guess_method = quimb_fit_guess_method(guess_method, p)
                 fit_guess = self._build_channel_fit_guess(
                     channel_target,
                     wheres[0],
@@ -2323,6 +2375,7 @@ class MpoOptimizer:
                 guess_used=True,
                 svd_guess_used=True,
                 guess_backend=f"quimb-{guess_method}",
+                guess_layer_order=layer_order if channel_target is None else None,
             )
             random_info["reason"] = selected_strategy
             return result
@@ -3509,6 +3562,7 @@ class MpoOptimizer:
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
             layer_order=fit_mpo_guess_order,
+            native_target=p_g,
         )
         fit_guess = fit_initialization["fit_guess"]
         fit = FIT(
@@ -3571,11 +3625,7 @@ class MpoOptimizer:
                 mpo_fit_guess_used=fit_initialization[
                     "svd_guess_used"
                 ],
-                mpo_fit_guess_order=(
-                    fit_mpo_guess_order
-                    if fit_initialization["svd_guess_used"]
-                    else None
-                ),
+                mpo_fit_guess_order=fit_initialization["guess_layer_order"],
                 fit_initialization=fit_initialization,
                 fit_overlap=fit_overlap,
                 fit_overlap_diagnostics=fit_overlap_diagnostics,
@@ -3683,6 +3733,7 @@ class MpoOptimizer:
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
             layer_order=fit_mpo_guess_order,
+            native_target=p_g,
         )
         fit_guess = fit_initialization["fit_guess"]
         fit = FIT(
@@ -3750,11 +3801,7 @@ class MpoOptimizer:
                 mpo_fit_guess_used=fit_initialization[
                     "svd_guess_used"
                 ],
-                mpo_fit_guess_order=(
-                    fit_mpo_guess_order
-                    if fit_initialization["svd_guess_used"]
-                    else None
-                ),
+                mpo_fit_guess_order=fit_initialization["guess_layer_order"],
                 fit_initialization=fit_initialization,
                 fit_overlap=fit_overlap,
                 fit_overlap_diagnostics=fit_overlap_diagnostics,
@@ -4726,8 +4773,10 @@ class MpoOptimizer:
             ``"random_expand"`` also seeds newly expanded active bonds, and
             ``"guess-<method>"`` uses a Quimb compressor such as
             ``"guess-src"`` on an isolated MPO replay. ``"auto"`` selects
-            ``"guess-src"``. Native Symmray/fermionic MPOs retain their
-            sector-preserving direct FIT warm start.
+            ``"guess-src"``. For Symmray/fermionic MPOs, ``"guess-src"``
+            compresses a copy of the native target with sector-preserving
+            randomized SVD. Positive cumulative cutoffs use full native
+            sector spectra.
         fit_init_rand_strength : float, default=0.0
             Noise scale used by the explicit ``"random"`` and
             ``"random_expand"`` initial-guess strategies.

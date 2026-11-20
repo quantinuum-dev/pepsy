@@ -46,6 +46,7 @@ def test_boundary_default_preserves_separate_layers_or_joint_fit(monkeypatch, fi
     state, gate, _ = fixture(shape=(3, 3))
     seen = []
     direct = fit_mode in ('direct', 'zipup')
+    fit_contraction_opt = 'auto-hq' if fit_mode == 'dmrg' else None
     method = '_compress_direct_target' if direct else '_run_fit_solver'
     original = getattr(CompBdy, method)
     expected_arrays = []
@@ -66,6 +67,8 @@ def test_boundary_default_preserves_separate_layers_or_joint_fit(monkeypatch, fi
             # FIT retags and reindexes the graph, preserving its layer arrays.
             assert [id(t.data) for t in target.tn] == expected_arrays
             assert target.tn.num_tensors >= 2 * target.L
+            assert comp.contraction_opt == 'greedy'
+            assert target.contraction_opt == (fit_contraction_opt or 'greedy')
             seen.append(('BRA', 'KET'))
         return original(comp, target, *args, **kwargs)
 
@@ -75,7 +78,7 @@ def test_boundary_default_preserves_separate_layers_or_joint_fit(monkeypatch, fi
     opt = PepsOptimizer(state, [(gate, ((1, 0), (1, 1)))], chi=2,
                         mode='full-update', fit_mode=fit_mode, boundary_chi=16,
                         contraction_opt='greedy', normalize_initial=False,
-                        boundary_kwargs={'cutoff': 0., 'n_iter': 2},
+                        boundary_kwargs={'cutoff': 0., 'n_iter': 2, 'fit_contraction_opt': fit_contraction_opt},
                         full_update_kwargs={'max_iterations': 2})
     out = opt.run(normalize_final=False, measure_infidelity=False,
                   measure_final_infidelity=False, accept_if_improved=False)

@@ -130,7 +130,7 @@ def boundary_strip(network, *, axis, coordinate, boundary, chi, contraction_opt,
                           expand_growth=not (block or kwargs.get('fit_mode') in _FIT_QUIMB_MODES))
     size = network.Ly if axis == 'y' else network.Lx
     n_iter = kwargs.pop('n_iter', 10)
-    allowed = ('fit_mode', 'fit_layer_mode', 'fit_layer_order', 'layer_tags',
+    allowed = ('fit_mode', 'fit_contraction_opt', 'fit_layer_mode', 'fit_layer_order', 'layer_tags',
                'fit_init_strategy', 'fit_init_seed', 'fit_block_size',
                'fit_adaptive_sweeps', 'fit_sweep_sequence', 'fit_cutoff_mode',
                'fit_compression_opts', 'fit_min_iter', 'fit_rtol', 'fit_patience')

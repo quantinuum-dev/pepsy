@@ -11,6 +11,9 @@ import quimb.tensor as qtn
 
 from ..._internal.quimb import run_seeded_quimb
 from ..._internal.validation import normalize_integer, normalize_integer_tuple
+from ...backends import reg_stop_gradient_torch
+from ...backends.config import _patch_backend_string_namespace_key
+from ...backends.convert import infer_backend_converter_from_sample
 from ...operators.mpo_product import _fit_lazy_mpo_target
 from ...operators.mpo_semantic import _resolve_compression_cutoff, _resolve_compression_cutoff_mode
 from ...sampling import MpsSampler, VecSampler
@@ -21,6 +24,7 @@ from ..noise import (
     TrajectoryChannel,
     TrajectoryEvent,
     _as_entries,
+    _is_unitary_matrix,
     _trajectory_event_from_stochastic_entry,
     compile_trajectory_stream,
     run_trajectory_shots,
@@ -133,12 +137,21 @@ def _check_support(where):
     return where
 
 
-def _matrix(value, where):
+def _matrix(value, where, *, require_unitary=False):
     dim = 2 ** len(where)
-    matrix = np.array(ar.to_numpy(value), dtype=complex, copy=True)
+    source = np.asarray(ar.to_numpy(value))
+    matrix = source.astype(complex, copy=True)
     if matrix.shape not in {(dim, dim), (2,) * (2 * len(where))} or not np.all(np.isfinite(matrix)):
         raise ValueError("TEM matrices must be finite qubit operators matching their support.")
-    return matrix.reshape(dim, dim)
+    matrix = matrix.reshape(dim, dim)
+    if require_unitary:
+        # Promotion improves the Gram calculation but retains input roundoff.
+        tolerance = 1e-10
+        if source.dtype.type in (np.float32, np.complex64):
+            tolerance = 8.0 * float(np.finfo(np.float32).eps)
+        if not _is_unitary_matrix(matrix, atol=tolerance):
+            raise ValueError("TEM unitary layers require unitary gates.")
+    return matrix
 
 
 def _transfer(operators, weights, where):
@@ -157,9 +170,7 @@ def _layer_events(gates, noise):
             raise ValueError("TEM unitary layers accept named gates or (matrix, where) entries.")
         matrix, where = resolved
         where = _check_support(where)
-        matrix = _matrix(matrix, where)
-        if not np.allclose(matrix.conj().T @ matrix, np.eye(len(matrix)), atol=1e-10, rtol=1e-10):
-            raise ValueError("TEM unitary layers require unitary gates.")
+        matrix = _matrix(matrix, where, require_unitary=True)
         yield (matrix, where), _transfer((matrix,), (1,), where), where, False
 
     events = (noise,) if isinstance(noise, TrajectoryEvent) else _as_entries(noise)
@@ -210,7 +221,7 @@ def _gate_transfer(target, matrix, where, index):
     # Factor only the local map, retaining its numerical Schmidt rank.
     qtn.tensor_network_gate_inds(
         target, matrix, inds, contract="split-gate" if len(where) == 2 else False,
-        cutoff=np.finfo(float).eps * 16, cutoff_mode="rel", inplace=True,
+        cutoff=np.finfo(ar.get_dtype_name(matrix)).eps * 16, cutoff_mode="rel", inplace=True,
     )
     for site, ind in zip(where, inds, strict=True):
         tid, = target.ind_map[ind]
@@ -245,9 +256,12 @@ def _trajectory_readouts(trajectories, thresholds, rng):
         bases = (uniforms > thresholds).sum(axis=-1)
         patterns, counts = np.unique(bases, axis=0, return_counts=True)
         vector_sampler = (
-            VecSampler(np.asarray(optimizer.to_dense()).ravel())
+            VecSampler(optimizer.to_dense().reshape(-1))
             if optimizer.mode in {"exact", "exact-batch"} else None
         )
+        if vector_sampler is None:
+            to_state = infer_backend_converter_from_sample(optimizer.p.arrays[0])
+            rotations = tuple(map(to_state, _READOUT_ROTATIONS))
         for pattern, multiplicity in zip(patterns, counts, strict=True):
             seed = int(rng.integers(2**32))
             if vector_sampler is None:
@@ -255,7 +269,7 @@ def _trajectory_readouts(trajectories, thresholds, rng):
                 for site, logical in enumerate(optimizer.logical_order):
                     axis = pattern[logical]
                     if axis < 2:
-                        rotated.gate_(_READOUT_ROTATIONS[axis], site, contract=True)
+                        rotated.gate_(rotations[axis], site, contract=True)
                 sample = MpsSampler(rotated, backend="auto").sample_batch(
                     int(multiplicity), seed=seed, to_numpy=True,
                 )
@@ -278,12 +292,13 @@ class MpoErrorMit:
     In a stream, a run of consecutive noise events closes the current layer.
     Noise events must be invertible maps.
     ``chi=None`` keeps the full mitigation MPO, for small exact references.
-    The dense PTM and the trajectory readout implementation use NumPy.
+    Local PTMs are prepared in NumPy. Supply ``to_backend`` to place the
+    mitigation MPO and shot-score contractions on a dense Torch device.
     """
 
     def __init__(
         self, gate_stream=None, *, layers=None, n_qubits=None, chi=32, mode="dmrg2", cutoff=1e-12,
-        cutoff_mode="auto", n_iter=2, fit_init_seed=0,
+        cutoff_mode="auto", n_iter=2, fit_init_seed=0, to_backend=None,
     ):
         if gate_stream is not None and layers is not None:
             raise ValueError("Pass gate_stream or layers.")
@@ -309,6 +324,9 @@ class MpoErrorMit:
         self._fit_init_seed = normalize_integer(fit_init_seed, name="fit_init_seed")
         if self._fit_init_seed < 0:
             raise ValueError("fit_init_seed must be nonnegative.")
+        if to_backend is not None and not callable(to_backend):
+            raise TypeError("to_backend must be callable or None.")
+        self._to_backend = np.asarray if to_backend is None else to_backend
         self._layers = tuple(
             tuple((matrix, where, is_noise) for _, matrix, where, is_noise in layer) for layer in compiled
         )
@@ -323,7 +341,10 @@ class MpoErrorMit:
 
     @cached_property
     def _mitigation(self):
-        mpo = qtn.MPO_product_operator([np.eye(4)] * self.n_qubits)
+        identity = self._to_backend(np.eye(4))
+        if ar.infer_backend(identity) == "torch":
+            _patch_backend_string_namespace_key()
+        mpo = qtn.MPO_product_operator([identity] * self.n_qubits)
         has_noise = False
         for step, layer in enumerate(self._layers):
             if not layer or (not has_noise and not any(is_noise for _, _, is_noise in layer)):
@@ -332,33 +353,39 @@ class MpoErrorMit:
             for matrix, where, is_noise in layer:
                 if is_noise:
                     # A gate on the lower legs right-multiplies by its transpose.
-                    _gate_transfer(target, matrix.T, where, target.lower_ind)
+                    _gate_transfer(target, self._to_backend(matrix.T), where, target.lower_ind)
                 elif has_noise:
                     # Before the first noise update the forward and inverse
                     # unitary layers cancel around the identity map.
+                    matrix = self._to_backend(matrix)
                     _gate_transfer(target, matrix, where, target.upper_ind)
                     _gate_transfer(target, matrix, where, target.lower_ind)
             has_noise = True
-            if self._chi is not None and self._block_size is not None and self.n_qubits > 1:
-                mpo, _ = _fit_lazy_mpo_target(
-                    target, chi=self._chi, block_size=min(self._block_size, self.n_qubits),
-                    cutoff=self._cutoff, cutoff_mode=self._cutoff_mode, guess_method="src",
-                    guess_seed=self._fit_init_seed + step, n_iter=self._n_iter,
-                )
-            else:
-                exact = self._chi is None or self.n_qubits == 1
-                method = "direct" if exact else self._method
-                options = MpoOptimizer._submpo_compress_options(
-                    method, cutoff=0.0 if exact else self._cutoff, cutoff_mode=self._cutoff_mode,
-                    max_bond=self._chi, seed=self._fit_init_seed + step,
-                )
-                if method == "fit-projector":
-                    options["canonize"] = False
-                mpo = run_seeded_quimb(
-                    options.pop("seed", None), qtn.tensor_network_1d_compress, target,
-                    method=method, permute_arrays=False, **options,
-                )
+            mpo = self._compress_layer(target, step)
         return mpo
+
+    def _compress_layer(self, target, step):
+        if self._chi is not None and self._block_size is not None and self.n_qubits > 1:
+            mpo, _ = _fit_lazy_mpo_target(
+                target, chi=self._chi, block_size=min(self._block_size, self.n_qubits),
+                cutoff=self._cutoff, cutoff_mode=self._cutoff_mode,
+                guess_method="src",
+                guess_seed=self._fit_init_seed + step, n_iter=self._n_iter,
+            )
+            return mpo
+
+        exact = self._chi is None or self.n_qubits == 1
+        method = "direct" if exact else self._method
+        options = MpoOptimizer._submpo_compress_options(
+            method, cutoff=0.0 if exact else self._cutoff, cutoff_mode=self._cutoff_mode,
+            max_bond=self._chi, seed=self._fit_init_seed + step,
+        )
+        if method == "fit-projector":
+            options["canonize"] = False
+        return run_seeded_quimb(
+            options.pop("seed", None), qtn.tensor_network_1d_compress, target,
+            method=method, permute_arrays=False, **options,
+        )
 
     def build_mpo(self):
         """Return an owned copy of the mitigation map in the I, X, Y, Z basis."""
@@ -380,14 +407,22 @@ class MpoErrorMit:
         strategy = str(strategy).strip().lower()
         if initial_mps.L != self.n_qubits or any(initial_mps.phys_dim(i) != 2 for i in range(initial_mps.L)):
             raise ValueError("initial_mps must contain one qubit per circuit site.")
-        if any(ar.infer_backend(array) != "numpy" for array in initial_mps.arrays):
-            raise TypeError("simulate_shots expects a dense NumPy MPS.")
+        backends = {ar.infer_backend(array) for array in initial_mps.arrays}
+        if backends not in ({"numpy"}, {"torch"}):
+            raise TypeError("collect_shots expects a dense NumPy or Torch MPS.")
         probs = _basis_probabilities(basis_probs, self.n_qubits)
         simulation_seed, measurement_seed = np.random.SeedSequence(seed).spawn(2)
         simulation_rng = np.random.default_rng(simulation_seed)
         rng = np.random.default_rng(measurement_seed)
         state = initial_mps.copy()
-        state.apply_to_arrays(lambda array: np.asarray(array, dtype=complex))
+        if backends == {"numpy"}:
+            state.apply_to_arrays(lambda array: np.asarray(array, dtype=complex))
+        else:
+            _patch_backend_string_namespace_key()
+            reg_stop_gradient_torch()
+            state.apply_to_arrays(lambda array: ar.astype(
+                array, "complex64" if ar.get_dtype_name(array) in {"float32", "complex64"} else "complex128"
+            ))
         branch_options = {} if max_branches is None else {"max_branches": max_branches}
         if strategy == "coalesced":
             batch_size = shots
@@ -422,11 +457,33 @@ class MpoErrorMit:
         for string in strings:
             if not isinstance(string, str) or len(string) != self.n_qubits or set(string) - set("IXYZ"):
                 raise ValueError("Use one I, X, Y, or Z per qubit in each observable string.")
-        cores = tuple(_ptm_cores(self._mitigation))
-        scale = 10.0**self._mitigation.exponent
-        n_readouts = len(shots.bases)
         total = shots.shots
         estimates = {}
+        for string, (raw, mitigated) in self._shot_values(strings, shots, chunk_size):
+            raw_mean, raw_error = _shot_stats(raw, shots.counts, total)
+            mean, error = _shot_stats(mitigated, shots.counts, total)
+            estimates[string] = TemEstimate(raw_mean, mean, raw_error, error)
+        return estimates
+
+    def _shot_values(self, strings, shots, chunk_size):
+        """Yield raw and mitigated values per readout for each Pauli string."""
+        cores = tuple(_ptm_cores(self._mitigation))
+        on_numpy = ar.infer_backend(cores[0]) == "numpy"
+        to_core = infer_backend_converter_from_sample(cores[0])
+        scale = 10.0**self._mitigation.exponent
+        n_readouts = len(shots.bases)
+        sites = np.arange(self.n_qubits)
+
+        def prepare_chunk(chunk):
+            bases = shots.bases[chunk]
+            weights = (1 - 2 * shots.bits[chunk]) / shots.basis_probs[sites, bases]
+            coefficients = None if on_numpy else to_core(
+                weights[..., None] * (bases[..., None] == np.arange(3))
+            )
+            return bases, weights, coefficients
+
+        # Reuse a device upload across observables when the readouts fit one chunk.
+        cached = prepare_chunk(slice(None)) if not on_numpy and n_readouts <= chunk_size else None
         for string in strings:
             axes = tuple("IXYZ".index(pauli) for pauli in string)
             rows = tuple(core[:, :, axis, :] for core, axis in zip(cores, axes, strict=True))
@@ -434,21 +491,20 @@ class MpoErrorMit:
             mitigated = np.empty(n_readouts)
             for start in range(0, n_readouts, chunk_size):
                 chunk = slice(start, start + chunk_size)
-                bases, bits = shots.bases[chunk], shots.bits[chunk]
-                weights = (1 - 2 * bits) / shots.basis_probs[np.arange(self.n_qubits), bases]
-                values = np.ones((len(bases), 1))
+                bases, local_weights, coefficients = cached if cached is not None else prepare_chunk(chunk)
+                values = to_core(np.ones((len(bases), 1)))
                 raw_values = np.ones(len(bases))
                 for site, (out, core) in enumerate(zip(axes, rows, strict=True)):
                     next_values = values @ core[:, :, 0]
                     for axis in range(3):
-                        keep = bases[:, site] == axis
-                        next_values[keep] += (values[keep] @ core[:, :, axis + 1]) * weights[keep, site, None]
+                        if on_numpy:
+                            keep = bases[:, site] == axis
+                            next_values[keep] += (values[keep] @ core[:, :, axis + 1]) * local_weights[keep, site, None]
+                        else:
+                            next_values += (values @ core[:, :, axis + 1]) * coefficients[:, site, axis, None]
                     values = next_values
                     if out:
-                        raw_values *= np.where(bases[:, site] == out - 1, weights[:, site], 0.0)
+                        raw_values *= np.where(bases[:, site] == out - 1, local_weights[:, site], 0.0)
                 raw[chunk] = raw_values
-                mitigated[chunk] = values[:, 0] * scale
-            raw_mean, raw_error = _shot_stats(raw, shots.counts, total)
-            mean, error = _shot_stats(mitigated, shots.counts, total)
-            estimates[string] = TemEstimate(raw_mean, mean, raw_error, error)
-        return estimates
+                mitigated[chunk] = ar.to_numpy(ar.do("real", values[:, 0])) * scale
+            yield string, (raw, mitigated)

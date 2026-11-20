@@ -8,7 +8,10 @@ import quimb as qu
 import quimb.tensor as qtn
 
 import pepsy as py
-from pepsy._internal.quimb import quimb_1d_compression_method_available
+from pepsy._internal.quimb import (
+    quimb_1d_compression_method_available,
+    quimb_1d_compression_method_supports_seed,
+)
 import pepsy.optimizers.mpo.optimizer as mpo_optimizer_module
 
 
@@ -747,6 +750,10 @@ def test_mpo_named_gate_and_noise_queue_matches_dense_density_evolution(mode, ba
     opt.set_gates(("ry", theta, 0))
     opt.add_gates([(("rzz", coupling), (0, 1)), ("depolarize2", error_rate, 0, 1)])
     assert opt.compile_gate_stream()["event_types"] == ("gate", "gate", "channel_sum")
+    if backend == "torch" and mode == "dmrg2" and not quimb_1d_compression_method_supports_seed("src"):
+        with pytest.raises(NotImplementedError, match="needs a newer build"):
+            opt.run(cutoff=0.0, progbar=False)
+        return
     out = opt.run(cutoff=0.0, progbar=False)
 
     # RY is nonsymmetric, so a misplaced transpose reverses this rotation.
@@ -758,6 +765,26 @@ def test_mpo_named_gate_and_noise_queue_matches_dense_density_evolution(mode, ba
     expected = (1 - mix) * np.outer(state, state.conj()) + mix * np.eye(4) / 4
     assert opt.backend_info()["backend"] == backend
     np.testing.assert_allclose(out.to_dense(), expected, atol=1e-11)
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "dmrg2"])
+def test_mpo_dense_torch_fit_requires_backend_native_src(mode):
+    torch = pytest.importorskip("torch")
+    zero = np.diag([1.0, 0.0]).astype(complex)
+    initial = qtn.MPO_product_operator([zero] * 5)
+    initial.apply_to_arrays(py.backend_torch(dtype=torch.complex128))
+    stream = [("ry", 0.27, 0), ("rzz", -0.41, 0, 4), ("depolarize2", 0.08, 0, 4)]
+    opt = py.MpoOptimizer(initial, stream, chi=4, mode=mode)
+
+    if not quimb_1d_compression_method_supports_seed("src"):
+        with pytest.raises(NotImplementedError, match="needs a newer build"):
+            opt.run(n_iter=2, cutoff=1e-12)
+        return
+
+    opt.run(n_iter=2, cutoff=1e-12)
+    history = opt.get_fit_history()
+    assert len(history) == 2
+    assert all(item["guess_method"] == "src" and item["guess_used"] for item in history)
 
 
 @pytest.mark.parametrize("sites", [(1, 2), (3, 1)])
@@ -1865,7 +1892,13 @@ def test_mpo_optimizer_replays_native_graded_mpo_without_dense_fallback(mode):
     assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in out)
 
 
-def test_mpo_optimizer_native_dmrg_uses_fit_controls(monkeypatch):
+@pytest.mark.parametrize(
+    "cutoff_mode, guess_backend, fallback_reason",
+    [("rel", "symmray-svd:rand", None), ("rsum2", "symmray-svd", "cumulative_cutoff")],
+)
+def test_mpo_optimizer_native_dmrg_uses_fit_controls(
+    monkeypatch, cutoff_mode, guess_backend, fallback_reason,
+):
     """Native Symmray MPO DMRG must use block-aware FIT, not direct SVD."""
     pytest.importorskip("symmray")
     calls = []
@@ -1885,15 +1918,16 @@ def test_mpo_optimizer_native_dmrg_uses_fit_controls(monkeypatch):
         U=2.0,
         mu=0.1,
     )
-    out = py.MpoOptimizer(
+    optimizer = py.MpoOptimizer(
         _native_u1u1_identity_mpo(),
         gates=gates,
         chi=8,
         mode="dmrg",
-    ).run(
+    )
+    out = optimizer.run(
         progbar=False,
         cutoff=2.0e-2,
-        cutoff_mode="rel",
+        cutoff_mode=cutoff_mode,
         target_cutoff=0.0,
         fit_block_size=3,
         fit_sweep_sequence="L",
@@ -1906,8 +1940,14 @@ def test_mpo_optimizer_native_dmrg_uses_fit_controls(monkeypatch):
     assert all(call["sweep_sequence"] == "L" for call in calls)
     assert all(call["max_bond"] == 8 for call in calls)
     assert all(call["cutoff"] == pytest.approx(2.0e-2) for call in calls)
-    assert all(call["cutoff_mode"] == "rel" for call in calls)
+    assert all(call["cutoff_mode"] == cutoff_mode for call in calls)
     assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in out)
+    history = optimizer.get_fit_history()
+    assert history
+    for update in history:
+        assert update["fit_init_strategy"] == "guess_src"
+        assert update["guess_backend"] == guess_backend
+        assert update["random_initialization"]["fallback_reason"] == fallback_reason
 
 
 @pytest.mark.parametrize(

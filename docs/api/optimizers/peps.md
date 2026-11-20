@@ -248,6 +248,11 @@ non-differentiable seed, preserving its represented state while opening the
 requested bond space. An early low-rank cut therefore cannot prevent later
 growth. Differentiable/unsupported starts and reduced caps retain fresh seeding.
 
+To select a planner for the variational boundary fit, pass
+`boundary_kwargs={"fit_contraction_opt": "auto-hq"}`. The default inherits
+`contraction_opt`, which also controls construction of the outer norm metric.
+The FIT planner participates in the boundary cache's policy key.
+
 For DMRG, explicit initialization and `boundary_kwargs['n_iter']` override these defaults,
 including when switching into full-update mode at `run()`. To reproduce older
 FU runs select `fit_init_strategy="guess-direct", boundary_kwargs={"n_iter": 2}`

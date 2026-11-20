@@ -26,17 +26,25 @@ patch versions remain compatible.
 
 - **Tensor-network error mitigation:** collect randomized Pauli shots from
   noisy MPS gate streams and reuse a middle-out mitigation MPO across shot
-  batches and observables.
+  batches and observables. Validate explicit single-precision gates with a
+  dtype-aware unitarity tolerance. Support dense Torch trajectory replay,
+  mitigation MPO compression, and shot scoring on CUDA.
+  Require backend-native SRC for CUDA MPO fits that use SRC warm starts.
 
 - **Noisy MPO queues:** accept named unitary gates and local noise in the MPS
   tuple syntax. Fit dense two-site channels as exact local layers in DMRG,
   keeping the exterior MPO bonds compatible with the active fit window.
   Apply the same FIT initialization policy to gates and two-site channels,
-  with SRC as the default warm start.
+  with SRC as the default warm start. Symmray MPOs use a seeded native
+  randomized SVD warm start, with full sector spectra for cumulative cutoffs.
 
 - **MPO channel diagnostics:** measure the exact Kraus target trace before
   compression so trace lost to truncation is reported separately. Trace the
   physical legs locally before planning the dense virtual contraction.
+
+- **Full-update boundary FIT:** forward `boundary_kwargs['fit_contraction_opt']`
+  to the variational boundary fit so its contraction planner can be selected
+  independently of the outer norm contraction.
 
 - **ALS random restarts:** opt into SVD plus random trials with
   `random_restarts=1, restart_seed=...` in reduced loop-cluster ALS,

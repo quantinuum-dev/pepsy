@@ -427,8 +427,8 @@ For `MpoOptimizer`, an under-capacity `dmrg1` window spanning at least three sit
 requires `n_iter >= 3` so its two growth sweeps have room for one-site
 refinement.
 
-For dense DMRG windows, FIT uses an isolated compressed MPO warm start by
-default. The policy is controlled by `fit_init_strategy`: `"direct"` uses the
+DMRG windows default to a disposable `"guess-src"` FIT warm start. For dense
+MPOs, `fit_init_strategy="direct"` uses the
 current MPO, `"guess-src"` (also written `"guess_src"`) uses Quimb's seeded
 source compressor, `"guess-<method>"` accepts any of the MPO compressor names,
 and `"random"` / `"random_expand"` provide deterministic dense random starts.
@@ -439,15 +439,18 @@ compatibility switch that disables the source guess for named
 `dmrg1`/`dmrg2`/`dmrg3` schedules; use the explicit random or direct strategy
 when that legacy switch is disabled.
 
-On older Quimb builds with NumPy-only SRC noise, non-NumPy FIT warm starts
-warn and use direct compression while retaining the exact target. Explicit
-non-NumPy SRC replay reports the missing capability; use direct replay or
-upgrade Quimb for backend-native random compression.
+SRC warm starts on Torch require a Quimb build with backend-native random
+compression, such as Quimb 1.16. An older build reports the missing capability.
 The replay order is controlled by `fit_mpo_guess_order`, which defaults to
 `"lower_upper"` (bra then ket); `"upper_lower"` (ket then bra) is also
 available. In this API the lower MPO layer is bra and the upper layer is ket.
-Native Symmray MPOs retain their block-aware FIT warm start rather than being
-converted to dense random or Quimb source guesses.
+For native Symmray and fermionic MPOs, `"guess-src"` compresses a separate
+copy of the exact target inside the active interval using Symmray's seeded
+randomized sector SVD. The same policy applies to gate batches and compatible
+two-site channel targets. Positive cumulative-error cutoffs use full native
+sector spectra and record `fallback_reason="cumulative_cutoff"`. Relative
+and absolute cutoffs use randomized splits. Both paths preserve the sector
+representation and the underlying array backend.
 
 The selected and requested initialization policies, compressor name, and
 randomization details are available in `get_fit_diagnostics()` and
@@ -687,9 +690,10 @@ $$
 The flat stream closes a layer after consecutive noise events and before
 the next gate. Pass `layers=[(gates, noise), ...]` to set compression
 boundaries directly. Pass `n_qubits` to include idle qubits beyond those
-in the stream. Channels must have invertible local PTMs. Named Pauli,
-depolarizing, amplitude-damping and custom one- or two-qubit
-`TrajectoryEvent` channels are supported subject to this rule.
+in the stream. Explicit `float32` and `complex64` gate matrices use a
+single-precision unitarity tolerance. Channels must have invertible local
+PTMs. Named Pauli, depolarizing, amplitude-damping and custom one- or
+two-qubit `TrajectoryEvent` channels are supported subject to this rule.
 [Middle-out algorithm and Pauli readout](https://arxiv.org/html/2307.11740)
 
 `mode` selects MPO compression independently of `mps_mode`, which selects
@@ -698,10 +702,16 @@ trajectory replay. The mitigation side supports `direct`/`svd`,
 compressors such as `dm`, `src`, and `zipup`. Use `chi=None` for small
 untruncated references. Shot collection takes `strategy="auto"`,
 `"coalesced"`, or `"independent"`, a separate `mps_chi`, and optional
-`mps_run_kwargs`. The trajectory simulator and PTM builder use dense
-NumPy arrays. The exact trajectory modes sample their dense vectors
-directly. Auto and independent replay bound the number of retained
-trajectories with `batch_size`.
+`mps_run_kwargs`. Trajectories and readouts follow the dense NumPy or
+Torch arrays of the initial MPS. The exact trajectory modes sample their
+dense vectors directly. Auto and independent replay bound the number of
+retained trajectories with `batch_size`.
+
+Local PTMs are assembled in NumPy. Pass `to_backend=backend_torch("cuda",
+torch.float64)` from `pepsy.backends` to build and score the mitigation
+MPO on CUDA. Use a Torch CUDA MPS to collect shots on the same device.
+`PauliShots` and the final estimates are returned on the host. DMRG modes use
+SRC warm starts and require a Quimb build with backend-native SRC for CUDA.
 
 For external readouts, construct
 `PauliShots(bases=["XZ", "YZ"], bits=["01", "00"], counts=[9, 7])`.
