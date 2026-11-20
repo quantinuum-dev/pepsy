@@ -617,6 +617,68 @@ To compress an existing MPO without replaying gates, use
 `MpoOptimizer(mpo, gates=[], chi=...).compress()`. Symmray may retain a small
 sector-multiplicity overshoot above the requested numeric bond cap.
 
+## Tensor-network error mitigation
+
+`MpoErrorMit` uses the same named gate and noise stream as
+`MpsOptimizer` trajectory replay. It collects randomized product-basis
+shots and builds the mitigation map from the same noise model.
+
+```python
+import quimb.tensor as qtn
+from pepsy.optimizers import MpoErrorMit, PauliShots
+
+stream = [
+    ("ry", 0.67, 0), ("rx", 0.25, 1), ("depolarize1", 0.11, 0),
+    ("ry", 0.54, 1), ("rzz", 0.73, 0, 1), ("depolarize2", 0.14, 0, 1),
+]
+mit = MpoErrorMit(stream, chi=16, mode="dmrg2")
+shots = mit.collect_shots(
+    qtn.MPS_computational_state("00"), 8192,
+    strategy="auto", mps_mode="direct", seed=7,
+)
+mpo = mit.build_mpo()
+estimate = mit.estimate(["ZI", "ZZ", "YZ"], shots)
+print(estimate["ZZ"].mitigated, estimate["ZZ"].mitigated_stderr)
+```
+
+The build starts with the identity map in the orthonormal Pauli basis,
+with four input and output components per site. Each update compresses
+the joint target.
+
+$$
+\mathcal M_\ell = \operatorname{compress}_\chi
+\bigl(\mathcal U_\ell \mathcal M_{\ell-1}\mathcal U_\ell^{-1}\mathcal N_\ell^{-1}\bigr)
+$$
+
+The flat stream closes a layer after consecutive noise events and before
+the next gate. Pass `layers=[(gates, noise), ...]` to set compression
+boundaries directly. Pass `n_qubits` to include idle qubits beyond those
+in the stream. Channels must have invertible local PTMs. Named Pauli,
+depolarizing, amplitude-damping and custom one- or two-qubit
+`TrajectoryEvent` channels are supported subject to this rule.
+[Middle-out algorithm and Pauli readout](https://arxiv.org/html/2307.11740)
+
+`mode` selects MPO compression independently of `mps_mode`, which selects
+trajectory replay. The mitigation side supports `direct`/`svd`,
+`dmrg`/`dmrg2`/`dmrg3` with SRC guesses, and installed Quimb MPO
+compressors such as `dm`, `src`, and `zipup`. Use `chi=None` for small
+untruncated references. Shot collection takes `strategy="auto"`,
+`"coalesced"`, or `"independent"`, a separate `mps_chi`, and optional
+`mps_run_kwargs`. The trajectory simulator and PTM builder use dense
+NumPy arrays. The exact trajectory modes sample their dense vectors
+directly. Auto and independent replay bound the number of retained
+trajectories with `batch_size`.
+
+For external readouts, construct
+`PauliShots(bases=["XZ", "YZ"], bits=["01", "00"], counts=[9, 7])`.
+Use logical qubit order and supply `basis_probs` for nonuniform X/Y/Z
+selection. The standard errors assume independent draws from this
+product-basis design. `estimate` caches the map on its first use, and
+`build_mpo` returns a copy of the same map. Reuse the instance for other
+shot batches and Pauli strings. A new bond cap, circuit, or noise model
+uses a new instance. Shot standard errors quantify sampling uncertainty.
+Compare bond caps on the same shots to assess compression bias.
+
 ## Parameterized higher-order MPO construction
 
 `MPOBasis` is the reusable API for a Hamiltonian whose couplings change during
