@@ -280,7 +280,7 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
                   boundary_chi=None, boundary_method="direct", boundary_cutoff=0.,
                   boundary_max_iterations=10, map_cache=None, refine=True,
                   refine_method="slsqp", refine_sweeps=4, objective_regions=None,
-                  objective_max_pair_growth=2.):
+                  objective_max_pair_growth=2., svd_mix_seeds=0):
     """Build frozen maps and seek a feasible rank-capped pair; do not mutate input."""
     left, right = (state[s] for s in sites)
     bonds = tuple(left.bonds(right))
@@ -408,10 +408,39 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
 
     seed_objective = objective_value(candidate)
     refined = False
+    mixed_seeds_accepted = 0
+    if soft is not None and svd_mix_seeds:
+        # Adding a discarded singular pair to an existing factor column creates
+        # cross terms. A loopy exterior can annihilate those terms, so the
+        # resulting rank-chi candidate may represent more of the target.
+        residual_u, residual_s, residual_vh = np.linalg.svd(matrix - candidate, full_matrices=False)
+        for i in range(min(svd_mix_seeds, len(residual_s))):
+            if residual_s[i] <= np.finfo(float).eps * max(matrix.shape) * np.linalg.norm(matrix):
+                break
+            base_u, base_s, base_vh = np.linalg.svd(candidate, full_matrices=False)
+            base_a = base_u[:, :k] * np.sqrt(base_s[:k])
+            base_b = np.sqrt(base_s[:k])[:, None] * base_vh[:k]
+            root = np.sqrt(residual_s[i])
+            for j in range(k):
+                trial_a, trial_b = base_a.copy(), base_b.copy()
+                trial_a[:, j] += root * residual_u[:, i]
+                trial_b[j, :] += root * residual_vh[i, :]
+                trial = trial_a @ trial_b
+                trial_errors = [float(np.linalg.norm(op @ trial.ravel() - target) / scale)
+                                for op, target, scale in zip(maps, targets, scales)]
+                if (np.isfinite(trial).all() and np.isfinite(trial_errors).all()
+                        and max(trial_errors, default=0.) <= tol
+                        and (max_pair_error is None or np.linalg.norm(trial - matrix) <= max_pair_error)
+                        and objective_value(trial) < objective_value(candidate)):
+                    a, b, candidate, errors = trial_a, trial_b, trial, trial_errors
+                    refined = True
+                    mixed_seeds_accepted += 1
+                    break
+        x = pack(a, b)
     als_sweeps = als_updates = 0
     lower_bound = np.linalg.norm(singular[k:])
     at_lower_bound = (np.linalg.norm(candidate - matrix) <= lower_bound + tol * max(np.linalg.norm(matrix), 1e-300)
-                      if soft is None else seed_objective <= (
+                      if soft is None else objective_value(candidate) <= (
                           32 * np.finfo(float).eps * np.linalg.norm(soft) * np.linalg.norm(matrix)
                       ) ** 2)
     if refine and not at_lower_bound and refine_method == "als":
@@ -430,7 +459,7 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
         if (als_updates and np.isfinite(new_candidate).all() and np.isfinite(new_errors).all()
                 and max(new_errors, default=0.0) <= tol
                 and (max_pair_error is None or np.linalg.norm(new_candidate - matrix) <= max_pair_error)
-                and objective_value(new_candidate) < seed_objective):
+                and objective_value(new_candidate) < objective_value(candidate)):
             a, b, candidate, errors = new_a, new_b, new_candidate, new_errors
             refined = True
         else:
@@ -474,7 +503,7 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
         if (np.isfinite(new_candidate).all() and np.isfinite(new_errors).all()
                 and max(new_errors, default=0.0) <= tol
                 and (max_pair_error is None or np.linalg.norm(new_candidate - matrix) <= max_pair_error)
-                and objective_value(new_candidate) < seed_objective):
+                and objective_value(new_candidate) < objective_value(candidate)):
             a, b, candidate, errors = new_a, new_b, new_candidate, new_errors
             refined = True
     work = state.copy()
@@ -491,6 +520,7 @@ def compress_pair(state, gate, sites, chi, regions, *, tol, max_nfev, optimize, 
                   "seed_objective": seed_objective, "objective_value": objective_value(candidate),
                   "objective_max_pair_error": max_pair_error,
                   "objective_exponent": float(state.exponent),
+                  "mixed_seeds_accepted": mixed_seeds_accepted,
                   "objective_refined": refined, "feasibility_evaluations": evaluations,
                   "feasibility_retried": retried, "refinement_enabled": refine,
                   "refinement_method": refine_method if refine else None,

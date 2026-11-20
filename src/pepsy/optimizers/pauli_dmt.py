@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import wraps
 from numbers import Integral
 
 import autoray as ar
@@ -24,6 +25,19 @@ from ..operators.pauli_mpo import (
 __all__ = ["PauliDMT"]
 
 
+def _tracks_canonical_info(method):
+    @wraps(method)
+    def updated(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            # A failing split may still have completed exact gauge moves.
+            # The owned workspace remains the source of truth on both exits.
+            self.info_c.clear()
+            self.info_c["cur_orthog"] = (self._workspace.center,) * 2
+    return updated
+
+
 class PauliDMT:
     """DMT evolution of a Pauli MPO with 1D or physical-region protection.
 
@@ -32,6 +46,9 @@ class PauliDMT:
     including traceless infinite-temperature perturbations. Input is copied;
     :attr:`state` returns an independent snapshot. Reports cover the latest
     gate or final timestep; no unbounded trajectory history is retained.
+    ``info_c['cur_orthog']`` mirrors the owned workspace center in a stable
+    dictionary, including partial failures. State snapshots own separate
+    canonical metadata, using the same convention as ``MpoOptimizer``.
 
     Storage and gate positions always refer to an open 1D MPO. ``regions``
     can protect physical 2D neighborhoods after mapping them to MPO positions;
@@ -46,13 +63,21 @@ class PauliDMT:
     ``trace_guard=True`` forces it and ``False`` disables it; inspect
     :attr:`trace_guard_active` for the resolved choice. This guard does not
     certify all local marginals; monitor observables and convergence.
+    ``preservation_check='raise'`` is the default verification policy.
+    ``'warn'`` continues after finite violations and records them in
+    ``report.preservation_errors``. ``'off'`` skips outer preservation
+    verification, including the trace guard, while keeping the protected
+    construction. Invalid numerical inputs and insufficient budgets still
+    raise. Reports cover the latest operation; collect them in the gate loop.
     ``cutoff='auto'`` uses Pepsy's dtype-aware cutoff. In paper mode,
     ``cutoff_mode`` follows Quimb and applies to the unprotected residual;
     optimized refinement can reuse rank after its SVD seeds.
     ``regions`` replaces contiguous three-site protection with complete
     reduced-operator constraints on the given MPO-site sequences. Geometry-
     selected splits check those regions before committing each update when
-    ``check_regions=True``. ``constraint_mode='relaxed'`` permits local-density
+    ``check_regions=True``. The default ``False`` retains bond/trace checks
+    without full-region scans; explicit ``True`` also checks default triples.
+    ``constraint_mode='relaxed'`` permits local-density
     changes when the protected construction cannot meet the bond cap.
     ``truncation='optimized'`` optionally refines each fixed-border bond;
     ``max_refinement_sweeps`` bounds alternating updates (zero for SVD seeds
@@ -63,7 +88,8 @@ class PauliDMT:
     def __init__(self, operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="density",
                  mode="conjugate", diagnostics=False, trace_guard="auto", regions=None,
                  truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-                 constraint_mode="strict", constraint_weight=100., check_regions=True):
+                 constraint_mode="strict", constraint_weight=100., check_regions=False,
+                 preservation_check="raise"):
         if not isinstance(operator, PauliMPO):
             raise TypeError("operator must be a PauliMPO.")
         if mode not in {"conjugate", "heisenberg"}:
@@ -76,14 +102,16 @@ class PauliDMT:
             truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
             region_selection=region_selection,
             constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-            check_regions=check_regions,
+            check_regions=check_regions, preservation_check=preservation_check,
         )
+        self.info_c = {"cur_orthog": (self._workspace.center,) * 2}
 
     @property
     def state(self):
         """An independent PauliMPO snapshot, retaining backend and gradients."""
         state = PauliMPO.from_pauli_cores(self._workspace.cores)
         state.compression_report = self.report
+        state._record_canonical_center(self._workspace.center)
         return state
 
     @property
@@ -100,6 +128,7 @@ class PauliDMT:
         self._workspace.reports.clear()
         self._workspace.relative_density_error = None
 
+    @_tracks_canonical_info
     def apply_gate(self, gate, where):
         """Update adjacent MPO positions; return a ``PauliDMTBondReport``.
 
@@ -114,6 +143,7 @@ class PauliDMT:
         self._begin()
         return self._workspace.split_pair(where[0], transfer)
 
+    @_tracks_canonical_info
     def evolve(self, bond_hamiltonians, *, dt, steps=1):
         """Second-order even/odd/even TEBD for ``H=sum_j h[j]``.
 
@@ -203,3 +233,27 @@ class PauliDMT:
         # errors are meaningful; the latest one is not a trajectory error.
         self._workspace.relative_density_error = None
         return self.state
+
+    @_tracks_canonical_info
+    def sync_canonicalization(self, site=None):
+        """Rebuild the owned gauge and return the common ``(site, site)`` span.
+
+        Public state snapshots are independent; synchronizing one never moves
+        this driver's center. This method acts on the live workspace only.
+        """
+        if site is None:
+            site = self._workspace.center
+        if not isinstance(site, Integral) or not 0 <= int(site) < len(self._workspace.cores):
+            raise ValueError("site must be an integer within the chain.")
+        workspace = self._workspace.copy()
+        # Gauge synchronization is exact and must retain the last DMT's
+        # diagnostic evidence, including warning-mode preservation failures.
+        workspace.original_bonds = self._workspace.original_bonds
+        workspace.reports = list(self._workspace.reports)
+        workspace.relative_density_error = self._workspace.relative_density_error
+        workspace.environments.invalidate(0, len(workspace.cores))
+        workspace._factor_interval(0, len(workspace.cores) - 1)
+        workspace.center = len(workspace.cores) - 1
+        workspace.move_center(int(site))
+        self._workspace = workspace
+        return (int(site),) * 2

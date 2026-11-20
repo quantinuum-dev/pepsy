@@ -1,0 +1,58 @@
+{
+  "n": 16,
+  "chi": 32,
+  "repeats": 5,
+  "seed": 217,
+  "runs": [
+    {
+      "update": "full",
+      "seconds": [
+        0.21472949999952107,
+        0.20363233299940475,
+        0.20784229200216942,
+        0.2178970830027538,
+        0.20365920800031745
+      ],
+      "median_seconds": 0.20784229200216942,
+      "stage_calls": {
+        "dmt.target": 80,
+        "dmt.compress": 80,
+        "dmt.replay": 5
+      },
+      "max_triple_oracle_error": 8.064928259679355e-15,
+      "trace_error": 1.6659335207741094e-14,
+      "max_bond": 32,
+      "dtype": "complex128",
+      "info_c_stable": true
+    },
+    {
+      "update": "canonical",
+      "seconds": [
+        0.019038624999666354,
+        0.01880654200067511,
+        0.018699624997680075,
+        0.018653041999641573,
+        0.018663124999875436
+      ],
+      "median_seconds": 0.018699624997680075,
+      "stage_calls": {
+        "dmt.single": 80,
+        "dmt.replay": 5
+      },
+      "max_triple_oracle_error": 1.1367994377725159e-15,
+      "trace_error": 2.224418014233807e-16,
+      "max_bond": 32,
+      "dtype": "complex128",
+      "info_c_stable": true
+    }
+  ],
+  "speedup": 11.114783961066324,
+  "versions": {
+    "quimb": "1.15.0",
+    "autoray": "0.8.4",
+    "numpy": "2.5.2",
+    "scipy": "1.18.0"
+  },
+  "accelerate_threads": "1",
+  "scope": "Onsite complex128 replay after untimed canonical preparation; not entangling dynamics."
+}

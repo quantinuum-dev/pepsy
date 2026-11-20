@@ -600,3 +600,295 @@ def test_local_updates_match_dense_ket_bra_and_actual_canonical_gauge(exponent, 
         matrix = _host_array(t.transpose(*(tuple(i for i in t.inds if i != bond) + (bond,))).data)
         matrix = matrix.reshape(-1, t.ind_size(bond))
         np.testing.assert_allclose(matrix.conj().T @ matrix, np.eye(matrix.shape[1]), atol=2e-12)
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_canonical_cache_survives_run_boundaries_and_one_site_actions(monkeypatch, inplace):
+    from pepsy.optimizers.mpo import dmt
+
+    initial, _, _ = mixture(6, rank=32)
+    opt = MpoOptimizer(initial, [(gate(), (0, 1))], chi=12, mode="dmt", inplace=inplace,
+                       contraction_opt="greedy")
+    info = opt.info_c
+    opt.run(cutoff=0., dmt_diagnostics=True, fidelity_samples=0)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("warm canonical replay rebuilt a full target/workspace")
+
+    monkeypatch.setattr(dmt, "_compress", forbidden)
+    monkeypatch.setattr(opt, "_build_mpo_target", forbidden)
+    monkeypatch.setattr(type(opt.p), "calc_current_orthog_center", forbidden)
+    z = np.diag([1., -1.])
+    one = expm(-.17j * np.array([[.4, 1.], [1., -.4]]))
+    actions = [(one, (4,)), ((np.diag([.7, 1.2]), None), (0,)),
+               (gate(12), (2, 1)), ((None, one), (3,)), (gate(13), (4, 5))]
+    for payload, where in actions:
+        before = dense(opt.p)
+        ket, bra = payload if isinstance(payload, tuple) else (payload, payload)
+        target = before
+        if ket is not None:
+            target = embed(ket.T, where, 6) @ target
+        if bra is not None:
+            target = target @ embed(bra.T, where, 6).conj().T
+        opt.set_gates([(payload, where)])
+        opt.run(cutoff=0., dmt_diagnostics=True, fidelity_samples=0)
+        assert opt.info_c is info
+        actual = dense(opt.p)
+        for j in range(4):
+            region = tuple(range(j, j + 3))
+            np.testing.assert_allclose(marginal(actual, 6, region), marginal(target, 6, region), atol=2e-12)
+        assert opt.p.max_bond() <= 12
+        assert abs(np.trace(actual) - np.trace(target)) < 1e-12
+        center = info["cur_orthog"][0]
+        for site in range(6):
+            if site == center:
+                assert opt.p[site].left_inds is None
+                continue
+            bond = opt.p.bond(site, site + 1) if site < center else opt.p.bond(site - 1, site)
+            t = opt.p[site]
+            data = _host_array(t.transpose(*(tuple(i for i in t.inds if i != bond) + (bond,))).data)
+            matrix = data.reshape(-1, t.ind_size(bond))
+            np.testing.assert_allclose(matrix.conj().T @ matrix, np.eye(matrix.shape[1]), atol=2e-12)
+        np.testing.assert_allclose(np.trace(marginal(actual, 6, (0,)) @ z),
+                                   np.trace(marginal(target, 6, (0,)) @ z), atol=1e-12)
+
+
+def test_full_dmt_update_remains_an_explicit_every_gate_reference():
+    initial, _, _ = mixture(4, rank=12)
+    queue = [(gate(), (0, 1)), (np.diag([1., 1j]), (3,)), (gate(16), (1, 2))]
+    opt = MpoOptimizer(initial, queue, chi=16, mode="dmt", contraction_opt="greedy")
+    info, expected = opt.info_c, dense(initial)
+    for _ in range(2):
+        for g, where in queue:
+            full = embed(g.T, where, 4)
+            expected = full @ expected @ full.conj().T
+        opt.run(cutoff=0., dmt_update="full", fidelity_samples=0, timing=True)
+        np.testing.assert_allclose(dense(opt.p), expected, atol=2e-13)
+        assert opt.info_c is info
+        assert opt.get_run_timing()["stages"]["dmt.compress"]["calls"] == len(queue)
+
+
+@pytest.mark.parametrize("change", ["array", "transpose", "state", "set_mpo", "canonize", "sync",
+                                    "buffer_and_sync", "mode", "chi", "chi_lower", "cutoff", "regions",
+                                    "truncation", "diagnostics", "checks", "exponent", "info"])
+def test_canonical_cache_rebuilds_after_state_or_policy_changes(monkeypatch, change):
+    from pepsy.optimizers.mpo import dmt
+
+    initial, _, _ = mixture(4, rank=12)
+    opt = MpoOptimizer(initial, [(gate(), (1, 2))], chi=16, mode="dmt", contraction_opt="greedy")
+    info = opt.info_c
+    opt.run(cutoff=0., fidelity_samples=0)
+    options = dict(cutoff=0., fidelity_samples=0)
+    if change == "array":
+        opt.p[0].modify(data=opt.p[0].data.copy() * 1.001)
+    elif change == "transpose":
+        opt.p[0].transpose_(*reversed(opt.p[0].inds))
+    elif change == "state":
+        opt.p = opt.p.copy()
+    elif change == "set_mpo":
+        opt.set_mpo(initial)
+    elif change == "canonize":
+        opt.canonize_mpo(opt.p, 0)
+    elif change == "sync":
+        opt.p.canonicalize_(0)
+        opt.sync_canonicalization()
+    elif change == "buffer_and_sync":
+        opt.p[0].data[...] *= 1.001
+        opt.sync_canonicalization()
+    elif change == "mode":
+        opt.set_mode("direct").set_mode("dmt")
+    elif change == "chi":
+        opt.chi = 32
+    elif change == "chi_lower":
+        opt.chi = 8
+    elif change == "cutoff":
+        options["cutoff"] = 1e-13
+    elif change == "regions":
+        options["dmt_regions"] = [(0, 1), (2, 3)]
+    elif change == "truncation":
+        options.update(dmt_truncation="optimized", dmt_max_refinement_sweeps=0)
+    elif change == "diagnostics":
+        options["dmt_diagnostics"] = True
+    elif change == "checks":
+        options["dmt_check_regions"] = True
+    elif change == "exponent":
+        opt.p.exponent += 1
+    else:
+        opt.info_c["cur_orthog"] = (0, opt.p.L - 1)
+    before = dense(opt.p)
+    target = embed(gate().T, (1, 2), 4)
+    calls, compress = [], dmt._compress
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return compress(*args, **kwargs)
+
+    monkeypatch.setattr(dmt, "_compress", counted)
+    opt.run(**options)
+    assert calls == [1]
+    assert opt.info_c is info
+    expected = target @ before @ target.conj().T
+    assert opt.p.max_bond() <= opt.chi
+    if change in {"cutoff", "chi_lower"}:
+        # A residual cutoff can change unprotected global data even at this
+        # cap; the contract remains preservation of each current target RDM.
+        for region in ((0, 1, 2), (1, 2, 3)):
+            np.testing.assert_allclose(marginal(dense(opt.p), 4, region),
+                                       marginal(expected, 4, region), atol=2e-12)
+    else:
+        np.testing.assert_allclose(dense(opt.p), expected, atol=2e-12)
+
+
+@pytest.mark.parametrize("atomic", [True, False])
+def test_canonical_cache_is_consistent_after_a_failed_warm_gate(atomic):
+    initial, _, _ = mixture(4, rank=12)
+    opt = MpoOptimizer(initial, [(gate(), (0, 1))], chi=16, mode="dmt", contraction_opt="greedy")
+    opt.run(cutoff=0., fidelity_samples=0)
+    info, before = opt.info_c, dense(opt.p)
+    good = gate(16)
+    opt.set_gates([(good, (2, 3)), (np.full((2, 2), np.nan + 0j), (0,))])
+    with pytest.raises(FloatingPointError, match="nonfinite"):
+        opt.run(cutoff=0., fidelity_samples=0, atomic=atomic)
+    assert opt.info_c is info
+    full = embed(good.T, (2, 3), 4)
+    expected = before if atomic else full @ before @ full.conj().T
+    np.testing.assert_allclose(dense(opt.p), expected, atol=2e-13)
+    opt.set_gates([(good, (0, 1))])
+    opt.run(cutoff=0., fidelity_samples=0)
+    full = embed(good.T, (0, 1), 4)
+    np.testing.assert_allclose(dense(opt.p), full @ expected @ full.conj().T, atol=2e-13)
+
+
+def test_torch_buffer_version_invalidates_canonical_cache(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from pepsy.optimizers.mpo import dmt
+
+    torch.set_num_threads(1)
+    initial, _, _ = mixture(4, rank=12)
+    initial.apply_to_arrays(lambda a: torch.tensor(a, dtype=torch.complex128))
+    opt = MpoOptimizer(initial, [(gate(), (1, 2))], chi=16, mode="dmt", contraction_opt="greedy")
+    opt.run(cutoff=0., fidelity_samples=0)
+    with torch.no_grad():
+        opt.p[0].data.mul_(1.001)
+    expected = dense(opt.p)
+    calls, compress = [], dmt._compress
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return compress(*args, **kwargs)
+
+    monkeypatch.setattr(dmt, "_compress", counted)
+    opt.run(cutoff=0., fidelity_samples=0)
+    full = embed(gate().T, (1, 2), 4)
+    np.testing.assert_allclose(dense(opt.p), full @ expected @ full.conj().T, atol=2e-13)
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("value", ["none", False])
+def test_dmt_update_option_is_validated_without_changing_state(value):
+    initial, _, _ = mixture(4, rank=12)
+    opt = MpoOptimizer(initial, [(gate(), (1, 2))], chi=16, mode="dmt", contraction_opt="greedy")
+    before = dense(opt.p)
+    with pytest.raises(ValueError, match="dmt_update"):
+        opt.run(dmt_update=value)
+    np.testing.assert_array_equal(dense(opt.p), before)
+
+
+def test_manual_compression_seeds_the_default_canonical_replay_cache(monkeypatch):
+    from pepsy.optimizers.mpo import dmt
+
+    initial, _, _ = mixture(4, rank=12)
+    opt = MpoOptimizer(initial, [(gate(), (0, 1))], chi=16, mode="dmt", contraction_opt="greedy")
+    opt.compress_dmt(cutoff=0., check_regions=False)
+    before = dense(opt.p)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("manual DMT preparation was discarded")
+
+    monkeypatch.setattr(dmt, "_compress", forbidden)
+    opt.run(cutoff=0., fidelity_samples=0)
+    full = embed(gate().T, (0, 1), 4)
+    np.testing.assert_allclose(dense(opt.p), full @ before @ full.conj().T, atol=2e-13)
+
+
+@pytest.mark.parametrize("variant", ["density", "operator"])
+def test_warm_one_site_zero_trace_respects_the_selected_variant(variant):
+    initial, _, _ = mixture(4, rank=12)
+    opt = MpoOptimizer(initial, [(gate(), (0, 1))], chi=16, mode="dmt", contraction_opt="greedy")
+    opt.run(cutoff=0., dmt_variant=variant, fidelity_samples=0)
+    before = dense(opt.p)
+    opt.set_gates([((np.zeros((2, 2)), None), (2,))])
+    if variant == "density":
+        with pytest.raises(ValueError, match="nonzero trace"):
+            opt.run(cutoff=0., dmt_variant=variant, fidelity_samples=0)
+        np.testing.assert_allclose(dense(opt.p), before, atol=1e-15)
+    else:
+        opt.run(cutoff=0., dmt_variant=variant, fidelity_samples=0)
+        assert np.linalg.norm(dense(opt.p)) == 0.
+
+
+def test_warm_torch_one_site_gate_retains_complex128_gradients():
+    torch = pytest.importorskip("torch")
+    torch.set_num_threads(1)
+    initial, _, _ = mixture(4, rank=12)
+    initial.apply_to_arrays(lambda a: torch.tensor(a, dtype=torch.complex128))
+    opt = MpoOptimizer(initial, [(gate(), (0, 1))], chi=16, mode="dmt", contraction_opt="greedy")
+    opt.run(cutoff=0., fidelity_samples=0)
+    before = torch.tensor(dense(opt.p), dtype=torch.complex128)
+    angle = torch.tensor(.21, dtype=torch.float64, requires_grad=True)
+    x = torch.tensor([[0., 1.], [1., 0.]], dtype=torch.complex128)
+    z = torch.diag(torch.tensor([1., -1.], dtype=torch.complex128))
+    unitary = torch.matrix_exp(-1j * angle * x)
+    opt.set_gates([(unitary.T, (1,))])
+    opt.run(cutoff=0., fidelity_samples=0)
+    value = torch.ones(1, dtype=torch.complex128)
+    for site in range(4):
+        bonds = (opt.p.bond(site - 1, site),) if site else ()
+        bonds += (opt.p.bond(site, site + 1),) if site < 3 else ()
+        t = opt.p[site].transpose(*(bonds + (opt.p.upper_ind(site), opt.p.lower_ind(site))))
+        core = t.data.reshape(value.shape[0], -1, 2, 2)
+        operator = z if site == 1 else torch.eye(2, dtype=torch.complex128)
+        value = torch.einsum("a,abij,ji->b", value, core, operator)
+    full = torch.kron(torch.eye(2, dtype=torch.complex128), torch.kron(unitary, torch.eye(4, dtype=torch.complex128)))
+    observable = torch.kron(torch.eye(2, dtype=torch.complex128), torch.kron(z, torch.eye(4, dtype=torch.complex128)))
+    exact = torch.trace(observable @ full @ before @ full.mH).real
+    actual_grad, = torch.autograd.grad(value[0].real, angle, retain_graph=True)
+    exact_grad, = torch.autograd.grad(exact, angle)
+    torch.testing.assert_close(value[0].real, exact, atol=2e-13, rtol=1e-12)
+    torch.testing.assert_close(actual_grad, exact_grad, atol=2e-13, rtol=1e-12)
+    assert all(t.data.dtype == torch.complex128 for t in opt.p)
+
+
+def test_warm_jax_one_site_gate_keeps_the_cached_center(monkeypatch):
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from pepsy.optimizers.mpo import dmt
+
+    with jax.enable_x64(True):
+        initial, _, _ = mixture(4, rank=12)
+        initial.apply_to_arrays(lambda a: jnp.asarray(a, dtype=jnp.complex128))
+        opt = MpoOptimizer(initial, [(gate(), (0, 1))], chi=16, mode="dmt", contraction_opt="greedy")
+        opt.run(cutoff=0., fidelity_samples=0)
+        before, info = dense(opt.p), opt.info_c
+        one = np.diag([1., 1j])
+        opt.set_gates([(one, (2,))])
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("JAX warm replay rebuilt its canonical workspace")
+
+        monkeypatch.setattr(dmt, "_compress", forbidden)
+        opt.run(cutoff=0., fidelity_samples=0)
+        full = embed(one.T, (2,), 4)
+        np.testing.assert_allclose(dense(opt.p), full @ before @ full.conj().T, atol=2e-13)
+        assert opt.info_c is info and info["cur_orthog"] == (2, 2)
+        assert all(t.data.dtype == jnp.complex128 for t in opt.p)
+
+
+@pytest.mark.parametrize("mode", ["direct", "svd", "dmrg"])
+def test_full_dmt_update_is_rejected_for_other_modes(mode):
+    initial, _, _ = mixture(4, rank=12)
+    opt = MpoOptimizer(initial, [(gate(), (0, 1))], chi=16, mode=mode, contraction_opt="greedy")
+    before = dense(opt.p)
+    with pytest.raises(ValueError, match="dmt_.*require"):
+        opt.run(dmt_update="full")
+    np.testing.assert_array_equal(dense(opt.p), before)

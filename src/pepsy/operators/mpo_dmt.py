@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import copy
 from dataclasses import replace
 import math
 
@@ -15,18 +14,19 @@ from ._pauli_dmt import (
     PauliDMTReport,
     _PauliDMTWorkspace,
     _ProtectedBudgetError,
-    _check_local_trace_data,
     _epsilon,
     _float,
     _local_trace_data,
     _norm,
     _options,
+    _preservation_failure,
     _qr,
     _region_pattern,
     _relative_density_defect,
     _region_trace_data,
+    _traced,
 )
-from .pauli_mpo import _array_like, _copy_array, _core_bond_dimensions, _einsum, _reshape, _transpose
+from .pauli_mpo import _array_like, _copy_array, _einsum, _host_array, _reshape, _transpose
 
 __all__ = ["compress_mpo_dmt", "MPODMTReport", "MPODMTBondReport"]
 
@@ -73,7 +73,8 @@ def _extract_cores(mpo):
 def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
                      variant="density", regions=None, inplace=False, return_report=False,
                      truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-                     constraint_mode="strict", constraint_weight=100., check_regions=True):
+                     constraint_mode="strict", constraint_weight=100., check_regions=True,
+                     preservation_check="raise"):
     """Compress a dense, ordinary MPO while preserving local partial traces.
 
     The default protects every contiguous window of up to three sites.
@@ -94,7 +95,15 @@ def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
     global Hermiticity are not guaranteed (complex degenerate cuts can break
     Hermiticity while preserving the protected reduced operators).
     An insufficient protected bond budget raises an error.
-    In-place writes occur only after all marginal checks succeed.
+    ``preservation_check='raise'`` rejects failed preservation checks;
+    ``'warn'`` commits finite candidates and records failures in
+    ``compression_report.preservation_errors``. ``'off'`` skips outer
+    verification, retaining the protected construction. Requested reports
+    still compute diagnostics. In-place writes follow this policy; invalid
+    numerical inputs and insufficient protected budgets still raise.
+    Strict standalone compression checks the complete input/output regions
+    once rather than after every bond. Density trace checks remain active
+    with ``check_regions=False``.
     For Torch autodiff through projected SVDs, use Pepsy's explicit
     ``TorchLinalgConfig(stabilized=True)`` policy.
     """
@@ -104,7 +113,7 @@ def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
         constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-        check_regions=check_regions,
+        check_regions=check_regions, preservation_check=preservation_check,
     )
     return (result, report) if return_report else result
 
@@ -112,7 +121,8 @@ def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
 def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
                       variant, regions, inplace, return_report, truncation="paper",
                       max_refinement_sweeps=8, region_selection="smallest",
-                      constraint_mode="strict", constraint_weight=100., check_regions=True):
+                      constraint_mode="strict", constraint_weight=100., check_regions=True,
+                      preservation_check="raise"):
     """Full protected sweep, retaining owned canonical state for replay."""
     cores, layouts, d = _extract_cores(mpo)
     max_bond, cutoff, cutoff_mode, variant = _options(
@@ -130,13 +140,14 @@ def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
     trace_vector = _array_like(np.eye(d).reshape(-1), cores[0])
     workspace = _PauliDMTWorkspace(
         max_bond=max_bond, cutoff=working_cutoff, cutoff_mode=cutoff_mode, variant=variant,
-        diagnostics=return_report, trace_guard=False, regions=regions,
+        diagnostics=return_report, trace_guard=variant == "density", regions=regions,
         _cores=cores, _trace_vector=trace_vector,
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
         constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-        check_regions=check_regions,
+        check_regions=check_regions, preservation_check=preservation_check,
     )
+    check_regions = workspace.check_regions
 
     def panels(values):
         if workspace.regions is None:
@@ -147,22 +158,18 @@ def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
     # changing their arrays, so the original copy remains the exact reference.
     before = panels(cores) if check_regions else None
     norm = _float(_norm(workspace.cores[0]))
-    for bond in range(mpo.L - 1):
-        workspace.split_pair(bond)
+    workspace.compress_sweep()
     after = panels(workspace.cores) if check_regions else None
     if constraint_mode == "strict" and check_regions:
-        _check_local_trace_data(before, after, norm=norm,
-                                epsilon=_epsilon(workspace.cores[0]), n=mpo.L)
+        workspace.check_marginals(before, after, norm=norm)
     elif check_regions:
         workspace.relative_density_error = _relative_density_defect(before, after)
     workspace.mpo_layouts = layouts
     workspace.mpo_dimension = d
     workspace.mpo_log_scale = log_scale
     workspace.mpo_cutoff = cutoff
-    report = _physical_report(workspace) if return_report or constraint_mode == "relaxed" else None
-    result = _write_workspace(mpo if inplace else mpo.copy(), workspace)
-    if report is not None:
-        result.compression_report = report
+    report = _physical_report(workspace) if return_report or _retain_report(workspace) else None
+    result = _write_workspace(mpo if inplace else mpo.copy(), workspace, report)
     return result, report, workspace
 
 
@@ -177,7 +184,13 @@ def _physical_report(workspace):
     ))
 
 
-def _write_workspace(result, workspace):
+def _retain_report(workspace):
+    """Keep warning evidence even when full diagnostics were not requested."""
+    return (workspace.constraint_mode == "relaxed"
+            or any(b.preservation_errors for b in workspace.reports))
+
+
+def _write_workspace(result, workspace, report=None):
     """Prepare every array before writing, and record the actual gauge."""
     d = workspace.mpo_dimension
     updated_arrays = []
@@ -203,8 +216,8 @@ def _write_workspace(result, workspace):
     for name in ("pepsy_first_degree", "pepsy_block_plan", "pepsy_pauli_mpo"):
         if hasattr(result, name):
             setattr(result, name, None)
-    if workspace.constraint_mode == "relaxed":
-        result.compression_report = _physical_report(workspace)
+    if report is not None or hasattr(result, "compression_report"):
+        result.compression_report = report
     return result
 
 
@@ -218,21 +231,46 @@ def _gate_mpo_dmt(mpo, previous, gate, bra_gate, where):
     workspace = _copy_workspace(previous)
     transfer = _mpo_gate_transfer(gate, bra_gate, where, workspace)
     workspace.split_pair(min(where), transfer)
-    report = _physical_report(workspace) if workspace.diagnostics else None
-    return _write_workspace(mpo, workspace), report, workspace
+    report = _physical_report(workspace) if workspace.diagnostics or _retain_report(workspace) else None
+    return _write_workspace(mpo, workspace, report), report, workspace
 
 
 def _copy_workspace(previous):
-    workspace = copy(previous)
-    workspace.cores = list(previous.cores)
-    workspace.environments = copy(previous.environments)
-    workspace.environments.cores = workspace.cores
-    workspace.environments.left = list(previous.environments.left)
-    workspace.environments.right = list(previous.environments.right)
-    workspace.original_bonds = _core_bond_dimensions(workspace.cores)
-    workspace.reports = []
-    workspace.relative_density_error = None
-    return workspace
+    return previous.copy()
+
+
+def _gate_mpo_dmt_single(mpo, previous, gate, bra_gate, where):
+    """Exact one-site action; only its canonical centre can lose isometry."""
+    workspace = previous.copy()
+    site, = where
+    d = workspace.mpo_dimension
+
+    def ordered(operator):
+        if operator is None:
+            return _array_like(np.eye(d), workspace.cores[0])
+        if tuple(operator.shape) != (d, d):
+            raise ValueError(f"One-site DMT gate must have shape {(d, d)}")
+        return _transpose(operator, (1, 0))
+
+    transfer = _reshape(_einsum("Aa,Cc->ACac", ordered(gate), ar.do("conj", ordered(bra_gate))),
+                        (d * d, d * d))
+    workspace.move_center(site)
+    value = _einsum("PQ,abQ->abP", transfer, workspace.cores[site])
+    value_norm = _float(_norm(value))
+    if not np.isfinite(value_norm):
+        raise FloatingPointError("DMT produced nonfinite one-site gate data.")
+    if workspace.variant == "density":
+        # Exact local gates need no truncation, but the density construction
+        # still requires a resolved nonzero trace for subsequent DMT steps.
+        left, right = workspace.environments.at(site, site + 1)
+        trace = left @ _traced(value, workspace.trace_vector) @ right
+        bound = _float(_norm(left)) * value_norm * _float(_norm(right))
+        if abs(_host_array(trace).item()) <= 32 * max(value.shape) * _epsilon(value) * bound:
+            raise ValueError("density DMT requires a numerically resolved nonzero trace.")
+    workspace.cores[site] = value
+    workspace.environments.invalidate(site, site + 1)
+    report = _physical_report(workspace) if workspace.diagnostics else None
+    return _write_workspace(mpo, workspace, report), report, workspace
 
 
 def _mpo_gate_transfer(gate, bra_gate, where, workspace):
@@ -289,7 +327,7 @@ def _gate_mpo_dmt_routed(mpo, previous, gate, bra_gate, where):
     a, b = sorted(where)
     transfer = _mpo_gate_transfer(gate, bra_gate, where, workspace)
     trace_reference = None
-    if workspace.variant == "density":
+    if workspace.variant == "density" and workspace.preservation_check != "off":
         # Obtain the physical target trace before any routing QR. This small
         # two-site density also handles nonunitary and one-sided payloads.
         panel, log_scale = _region_trace_data(
@@ -359,8 +397,18 @@ def _gate_mpo_dmt_routed(mpo, previous, gate, bra_gate, where):
             raise FloatingPointError("DMT routed trace is unresolved at this precision")
         correction = (target_trace / actual_trace) * math.exp(target_log - after[0][1])
         defect = _float(_norm(correction - 1))
-        if not math.isfinite(defect) or defect > 128 * n * _epsilon(workspace.cores[0]):
+        if not math.isfinite(defect):
             raise FloatingPointError("DMT routed trace drift exceeds roundoff at this precision")
+        if defect > 128 * n * _epsilon(workspace.cores[0]):
+            message = _preservation_failure(workspace.preservation_check, "routed trace",
+                f"DMT routed trace drift exceeds roundoff at this precision "
+                f"(defect {defect:.3g} > {128 * n * _epsilon(workspace.cores[0]):.3g}).",
+                workspace.warned_checks)
+            last = workspace.reports[-1]
+            workspace.reports[-1] = replace(last, preservation_errors=last.preservation_errors + (message,))
+            # A large trace correction would alter the protected targets.
+            # Warning mode keeps the actual candidate and reports its drift.
+            correction = correction * 0 + 1
         # Remove only bounded accumulated QR/projection roundoff. The target
         # is the gate's actual trace, not unity. Native numerator/denominator
         # retain gradients; panel log scales cancel their detached normalizers.
@@ -370,12 +418,11 @@ def _gate_mpo_dmt_routed(mpo, previous, gate, bra_gate, where):
         if workspace.check_regions:
             after = _region_trace_data(workspace.cores, regions, workspace.trace_vector)
     if workspace.constraint_mode == "strict" and workspace.check_regions:
-        _check_local_trace_data(reference, after,
-                                norm=norm, epsilon=_epsilon(workspace.cores[0]), n=n)
+        workspace.check_marginals(reference, after, norm=norm)
     elif workspace.check_regions:
         workspace.relative_density_error = _relative_density_defect(reference, after)
-    report = _physical_report(workspace) if workspace.diagnostics else None
-    return _write_workspace(mpo, workspace), report, workspace
+    report = _physical_report(workspace) if workspace.diagnostics or _retain_report(workspace) else None
+    return _write_workspace(mpo, workspace, report), report, workspace
 
 
 def _trace_panel(panel, trace_vector):

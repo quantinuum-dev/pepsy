@@ -8,6 +8,22 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Canonical metadata parity:** add independent, stable `info_c` dictionaries
+  to `PauliMPO` and `PauliDMT`, with the same center/synchronization convention
+  as `MpoOptimizer`. Reuse validated native gauges, record QR/SVD/DMT centers,
+  invalidate on managed changes and retain correct metadata after failures.
+
+- **Cached canonical DMT replay:** default to `dmt_update="canonical"`,
+  retaining owned cores and trace environments across run calls and exact
+  one-site actions. Keep `info_c` stable and invalidate caches on detected
+  tensor, metadata or option changes. `dmt_update="full"` remains an explicit
+  reference route; protected-SVD and dtype defaults stay unchanged.
+
+- **DMT interval prototype:** reuse canonical/trace workspaces for affected
+  transfer-MPO intervals; add real-Pauli 6×6 benchmarks, independent trace
+  guarding, chi/cost comparisons and explicit large-chi failure records.
+  Keep the protected splitting rule unchanged.
+
 - **Tensor-network error mitigation:** collect randomized Pauli shots from
   noisy MPS gate streams and reuse a middle-out mitigation MPO across shot
   batches and observables.
@@ -27,6 +43,42 @@ patch versions remain compatible.
   prepared replay (including batches), and `PepsOptimizer` full-update
   controls. Select by the actual residual in the same frozen environment;
   report per-trial outcomes and total iterations. Defaults retain one trial.
+
+- **2D DMT accuracy benchmarks:** add complete square-lattice Ising gate
+  schedules with continuous-time and uncompressed-circuit references,
+  bond/timestep sweeps, ordinary variational MPO comparisons, independent
+  preservation audits and positivity diagnostics in complex128.
+  Extend local exact references through 4×4 without global densities;
+  add t=20 shape/runtime comparisons and exact rank-two Ising target probes.
+
+- **DMT check costs and API:** replay now defaults to cheap bond/trace checks
+  (`check_regions=False`, or `dmt_check_regions=False`). Full-region replay
+  verification remains opt-in and now also covers Pauli's default triples.
+  Strict standalone sweeps retain one final full-region check while avoiding
+  redundant per-bond scans. Density trace checks stay active on all paths;
+  reports expose the resolved `check_regions` setting. Update the DMT skill
+  with verification, larger-window and independent benchmark workflows.
+
+- **Larger DMT windows:** index crossing regions once during workspace
+  preparation, preserving protection strings and cover ordering while avoiding
+  repeated full-inventory scans. Add complex128 four-/five-site preservation,
+  exact-dynamics accuracy and large-chain/bond profiling benchmarks.
+
+- **DMT verification policy:** add `preservation_check="warn"` to continue
+  after finite preservation errors and retain their measured defects, and
+  `"off"` to skip outer verification. The library default remains `"raise"`;
+  MPO replay uses `dmt_preservation_check`. Ising benchmark CLIs default to
+  warning mode and expose the supported Torch CPU SVD driver selection.
+
+- **MPS numerical references:** keep NumPy two-site gates exact before
+  zero-cutoff `direct` state compression, and avoid unavailable NumPy
+  stop-gradient dispatch in norm and overlap diagnostics. Add an L=16 Ising
+  DMT/MPS comparison with exact state-vector references and independent
+  protected-density audits, CPU Torch complex128 runs, positivity traces,
+  and direct comparisons with digitized White et al. Fig. 7/8 references.
+
+- **Experimental PEPO mixed SVD seeds:** optionally combine discarded singular
+  directions with feasible factors and accept only protected objective improvements.
 
 - **Experimental PEPO weighted DMT:** minimize weighted regional errors using
   single-layer maps while retaining the selected hard regional constraints.
@@ -284,6 +336,12 @@ patch versions remain compatible.
 - **Full Haar vectors:** allow an explicit `L_max>20` with a positive
   `max_dense_bytes` preallocation budget. The historical default size guard
   and seeded complex Haar distribution remain unchanged.
+
+- **Native JAX MPS sampling:** add device-resident dense `MpsSampler` draws,
+  probability/amplitude queries, integer or JAX-key seeding, scale-safe cached
+  environments, and opt-in sampled-probability/amplitude derivatives. Native
+  detection and explicit `backend="jax"` support nonuniform open chains;
+  NumPy result conversion remains explicit.
 
 - **Torch SVD backward:** allow `TorchLinalgConfig.svd_gap_rtol` to select
   the relative stabilized gap threshold while preserving the `1e-6` default.

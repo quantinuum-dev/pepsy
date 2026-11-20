@@ -146,6 +146,7 @@ _CORE_MODULES = frozenset(
         "test_peps_sampler.py",
         "test_prepare_boundary_inputs.py",
         "test_sampler.py",
+        "test_mps_sampler_jax.py",
         "test_simple_update_gen.py",
     }
 )
@@ -166,6 +167,7 @@ _OPTIONAL_MODULES = frozenset(
         "test_gradient_solver.py",
         "test_guppy_interop.py",
         "test_mpo_benchmarks.py",
+        "test_mps_sampler_jax.py",
         "test_native_fermion_pepo_2x3.py",
         "test_netket_flat_z2.py",
         "test_optimize_global.py",
@@ -204,6 +206,7 @@ _DOMAIN_BY_MODULE = {
     "test_mpo_trotter.py": "mpo",
     "test_mpo_automaton.py": "mpo",
     "test_mpo_benchmarks.py": "benchmarks",
+    "test_mps_sampler_jax.py": "sampling",
     "test_native_fermion_pepo_2x3.py": "fermions",
     "test_native_identity_pepo.py": "tensors",
     "test_netket_flat_z2.py": "vmc",

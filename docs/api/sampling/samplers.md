@@ -679,18 +679,64 @@ with optimizer construction options such as `chi` and `mode`. Set
 `disentangle=True` to use branch-local basis-updating measurements. The legacy
 `absorb_basis=True` keyword remains accepted as an alias.
 
-With dense Torch or CuPy MPS tensors, `backend="native"` keeps `configs` and
+With dense Torch, CuPy, or JAX MPS tensors, `backend="native"` keeps `configs` and
 `probs` on the tensor device. Use `batch.to_numpy()` to copy to CPU NumPy, or
 `batch.to_sample_result()` when the legacy list/grid `MpsSampleResult` is
 needed. `sample_arrays(...)` remains available for direct tuple unpacking, and
 `sample(...)` preserves the original `MpsSampleResult` behavior.
 The native path builds backend-native right environments once, so it does not
-require quimb to canonicalize Torch or CuPy tensors before sampling.
+require quimb to canonicalize device tensors before sampling.
 Complex right environments retain their bra-row/ket-column orientation when
 forming Born weights. This corrects the earlier transposed contraction, which
 could bias native sampling and probability evaluation for complex states.
 It caches those environments for the current MPS tensors: after modifying the
 MPS, call `sampler.refresh()` before sampling again.
+
+### Native JAX MPS sampling
+
+For dense, open-boundary JAX MPSs, use `backend="jax"` to require JAX or
+`backend="native"` / `"auto"` to detect it. All tensors must share one device
+and dtype: float32/64 or complex64/128. Physical and bond dimensions may vary
+by site. JAX remains optional and the sampler does not change its x64 setting.
+`MpsSampler.native_backends` lists the supported dense native backends.
+
+```python
+import jax
+from pepsy.sampling import MpsSampler
+
+sampler = MpsSampler(jax_psi, backend="jax")
+batch = sampler.sample_batch(4096, seed=jax.random.key(0))
+probabilities = sampler.probabilities(batch.configs, to_numpy=False)
+amplitudes = sampler.amplitudes(batch.configs, to_numpy=False)
+```
+
+Configurations are JAX int32 arrays; Born probabilities use the source's real
+dtype. Environments, conditional draws, and queries stay on the source device.
+Eager validity checks synchronize a scalar, without copying MPS tensors to
+NumPy. `to_numpy=True`, `batch.to_numpy()`, and legacy `sample()` explicitly
+transfer results to the host. Amplitudes and probabilities are normalized even
+when the source is unnormalized. Positive scale gauges stabilize long products
+without canonicalizing or modifying the source; finite precision still limits
+rare probabilities and raw probability outputs can underflow.
+
+`seed` accepts an integer, a typed JAX key, or a legacy uint32 key. Equal keys
+repeat draws for the same shapes and implementation; streams need not match
+other backends. Unseeded eager calls use fresh Python entropy. Under `jax.jit`,
+pass a key as a runtime argument and keep the sample count and tensor shapes
+static. Return the `sample_arrays()` tuple from an outer JIT; the Python batch
+record is not a registered JAX pytree. `seed=None` inside a traced function
+obtains entropy only while tracing.
+The compiled preparation/draw functions accept tensors as runtime arguments;
+`refresh()` invalidates numerical environments while allowing compiled code
+reuse for equal shapes. Construct samplers inside differentiated functions so
+their cached environments belong to the current values and trace.
+
+`probabilities(..., to_numpy=False)` retains derivatives. Amplitude and sample
+queries are inference-only by default; set `track_grad=True` for derivatives of
+amplitudes or the probabilities of the selected samples. Integer draws remain
+nondifferentiable; a sampled probability derivative is not a gradient of the
+sampling procedure. Single-site flip-ratio acceleration and JAX-backed Symmray
+sampling are unsupported.
 
 `sampler.entanglement_entropy(cut=None)` measures the captured source MPS at
 the requested bond (`None` selects the middle cut). It delegates to

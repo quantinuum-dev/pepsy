@@ -35,13 +35,13 @@ CASES = {
 }
 
 
-def _mixture(nsites, rank, dtype):
+def _mixture(nsites, rank, dtype, strength=.5):
     """Trace-one positive product mixture and independent local factors."""
     rng = np.random.default_rng(321)
     weights = rng.uniform(.2, 1., rank)
     weights /= weights.sum()
     bloch = rng.normal(size=(rank, nsites, 3))
-    bloch *= .5 / np.linalg.norm(bloch, axis=-1, keepdims=True)
+    bloch *= strength / np.linalg.norm(bloch, axis=-1, keepdims=True)
     local = np.concatenate((np.ones((rank, nsites, 1)), bloch), axis=-1) / 2
     cores = [(weights[:, None] * local[:, 0])[None, :, :]]
     for site in range(1, nsites - 1):

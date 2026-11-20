@@ -122,6 +122,87 @@ def test_dmt_lossy_split_preserves_all_l_shapes():
     assert opt.get_step_records()[0]["regions"] == 4
 
 
+@pytest.mark.parametrize("shape", [(2, 2), (2, 3)])
+def test_all_l_constraints_with_exact_global_density_objective(shape):
+    from pepsy.optimizers._pepo_dmt import l_regions
+
+    state = qtn.PEPO.rand(*shape, bond_dim=2, phys_dim=2, dtype="complex128", seed=5)
+    for site in state.gen_site_coos():
+        tensor = state[site]
+        upper, lower = state.upper_ind(*site), state.lower_ind(*site)
+        virtual = [i for i in tensor.inds if i not in (upper, lower)]
+        data = np.zeros(tensor.transpose(*virtual, upper, lower).shape, dtype=complex)
+        data[(0,) * len(virtual) + (slice(None), slice(None))] = np.eye(2) / 2
+        data[(1,) * len(virtual) + (slice(None), slice(None))] = (
+            (0.2 if site == (0, 0) else 1) * np.diag([1., -1.]) / 2
+        )
+        tensor.modify(data=data, inds=(*virtual, upper, lower))
+    target = state.to_dense()
+    all_sites = tuple(state.gen_site_coos())
+    pair = ((0, 0), (0, 1))
+    opt = PepoOptimizer(state, [(np.eye(4), pair)], chi=1, mode="dmt", regions="L",
+                        dmt_refine_method="als", dmt_refine_sweeps=2,
+                        dmt_objective_regions=[(all_sites, 1.)])
+    output = opt.run()
+    record = opt.get_step_records()[0]
+    actual_global_error = np.linalg.norm(output.to_dense() - target) ** 2
+    assert actual_global_error > 1e-8
+    assert record["objective_value"] == pytest.approx(actual_global_error, abs=1e-12)
+    assert record["regions"] == len(l_regions(shape))
+    for region in l_regions(shape):
+        np.testing.assert_allclose(_density_on_region(output, region),
+                                   _density_on_region(state, region), atol=1e-10)
+    mixed = PepoOptimizer(state, [(np.eye(4), pair)], chi=1, mode="dmt", regions="L",
+                          dmt_refine_method="als", dmt_objective_regions=[(all_sites, 1.)],
+                          dmt_svd_mix_seeds=1, dmt_objective_max_pair_growth=None)
+    recovered = mixed.run()
+    mixed_record = mixed.get_step_records()[0]
+    assert mixed_record["mixed_seeds_accepted"] == 1
+    assert np.linalg.norm(recovered.to_dense() - target) ** 2 < 1e-20
+    assert recovered[pair[0]].bonds_size(recovered[pair[1]]) == 1
+    for region in l_regions(shape):
+        np.testing.assert_allclose(_density_on_region(recovered, region),
+                                   _density_on_region(state, region), atol=1e-10)
+    guarded = PepoOptimizer(state, [(np.eye(4), pair)], chi=1, mode="dmt", regions="L",
+                            dmt_refine_method="als", dmt_objective_regions=[(all_sites, 1.)],
+                            dmt_svd_mix_seeds=1)
+    guarded.run()
+    guarded_record = guarded.get_step_records()[0]
+    assert guarded_record["mixed_seeds_accepted"] == 0
+    assert guarded_record["pair_error"] <= guarded_record["objective_max_pair_error"]
+
+
+def test_2x3_ising_timestep_with_all_l_regions_against_dense_state():
+    from scipy.linalg import expm
+    from pepsy.optimizers._pepo_dmt import l_regions
+
+    x = np.array([[0., 1.], [1., 0.]], dtype=complex)
+    z = np.diag([1., -1.]).astype(complex)
+    rho = (np.eye(2) + x) / 2
+    zz, xgate = expm(.05j * np.kron(z, z)), expm(.035j * x)
+    edges = [((i, j), (i, j + 1)) for i in range(2) for j in range(2)]
+    edges += [((0, j), (1, j)) for j in range(3)]
+    gates = [(zz, pair) for pair in edges]
+    gates += [(xgate, ((i, j),)) for i in range(2) for j in range(3)]
+    psi = np.full(64, 1 / 8, dtype=complex)
+    for gate, sites in gates:
+        axes = tuple(i * 3 + j for i, j in sites)
+        order = axes + tuple(i for i in range(6) if i not in axes)
+        value = psi.reshape((2,) * 6).transpose(order).reshape(2 ** len(axes), -1)
+        psi = (gate @ value).reshape((2,) * 6).transpose(np.argsort(order)).reshape(-1)
+    target = np.outer(psi, psi.conj())
+    opt = PepoOptimizer(qtn.PEPO_product_operator([[rho] * 3 for _ in range(2)]), gates,
+                        chi=4, mode="dmt", regions="L", boundary_chi=8,
+                        dmt_refine=False, dmt_max_map_elements=4000000)
+    output = opt.run().to_dense()
+    assert len(opt.get_step_records()) == len(edges)
+    assert max(r["max_density_residual"] for r in opt.get_step_records()) < 1e-8
+    for region in l_regions((2, 3)):
+        positions = tuple(i * 3 + j for i, j in region)
+        np.testing.assert_allclose(_reduced(output, positions, 6),
+                                   _reduced(target, positions, 6), atol=1e-10)
+
+
 @pytest.mark.parametrize("method", ["direct", "dmrg"])
 def test_4x4_boundary_map_converges_to_exact(method):
     from pepsy.optimizers._pepo_dmt import _boundary_map, _map

@@ -1,12 +1,72 @@
 """Exact gate targets followed by protected ordinary-MPO compression."""
 
+from dataclasses import dataclass
 from numbers import Integral
 
 import autoray as ar
 
 from ...backends import infer_backend_converter_from_sample
-from ...operators.mpo_dmt import _compress_mpo_dmt, _gate_mpo_dmt, _gate_mpo_dmt_routed
+from ...operators.mpo_dmt import (
+    _compress_mpo_dmt, _gate_mpo_dmt, _gate_mpo_dmt_routed, _gate_mpo_dmt_single,
+)
 from ...operators.pauli_dmt_geometry import _normalize_regions
+from ...operators.pauli_mpo import _array_state_token
+
+
+def _state_token(p):
+    return p.L, p.cyclic, p.exponent, p.site_tag_id, p.upper_ind_id, p.lower_ind_id
+
+
+def _tensor_token(tensor):
+    return tensor.inds, tensor.left_inds, _array_state_token(tensor.data)
+
+
+@dataclass(frozen=True)
+class _CanonicalCache:
+    workspace: object
+    state: object
+    info: dict
+    tensors: tuple
+    arrays: tuple
+    structure: tuple
+    state_token: tuple
+    options: tuple
+
+    def matches(self, opt, options):
+        if (self.state is not opt.p or self.info is not opt.info_c or self.options != options
+                or opt.info_c.get("cur_orthog") != (self.workspace.center,) * 2
+                or self.state_token != _state_token(opt.p)
+                or len(self.tensors) != opt.p.num_tensors):
+            return False
+        for site, (old_tensor, old_array, structure) in enumerate(
+                zip(self.tensors, self.arrays, self.structure)):
+            tensor = opt.p[site]
+            if (tensor is not old_tensor or tensor.data is not old_array
+                    or _tensor_token(tensor) != structure):
+                return False
+        return True
+
+
+def _cache_options(chi, cutoff, cutoff_mode, variant, regions, diagnostics, truncation,
+                   max_refinement_sweeps, region_selection, constraint_mode,
+                   constraint_weight, check_regions, preservation_check):
+    return (chi, cutoff, cutoff_mode, variant, regions, diagnostics or constraint_mode == "relaxed",
+            truncation, max_refinement_sweeps, region_selection, constraint_mode,
+            constraint_weight, check_regions and preservation_check != "off", preservation_check)
+
+
+def _remember(opt, workspace):
+    tensors = tuple(opt.p[i] for i in range(opt.p.L))
+    options = _cache_options(
+        opt.chi, workspace.mpo_cutoff, workspace.cutoff_mode, workspace.variant,
+        workspace.regions, workspace.diagnostics, workspace.truncation,
+        workspace.max_refinement_sweeps, workspace.region_selection, workspace.constraint_mode,
+        workspace.constraint_weight, workspace.check_regions, workspace.preservation_check)
+    # Hold the objects themselves: bare ids can be recycled after a caller
+    # replaces tensor data. Arrays are shared, not copied or densified.
+    opt._dmt_canonical_cache = _CanonicalCache(
+        workspace, opt.p, opt.info_c, tensors, tuple(t.data for t in tensors),
+        tuple(_tensor_token(t) for t in tensors), _state_token(opt.p), options)
 
 
 def validate_state(opt, regions, variant):
@@ -62,9 +122,10 @@ def _promote(p, gates=()):
 
 def _compress(opt, candidate, *, cutoff, cutoff_mode, variant, regions, diagnostics,
               truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-              constraint_mode="strict", constraint_weight=100., check_regions=True):
-    # The kernel writes only after its complete marginal check. This candidate
-    # owns tensor wrappers and is never the currently committed operator.
+              constraint_mode="strict", constraint_weight=100., check_regions=True,
+              preservation_check="raise"):
+    # The kernel writes only after the selected verification policy accepts
+    # the candidate. Its wrappers are separate from the committed operator.
     _promote(candidate)
     result = opt._timed_call(
         "dmt.compress", _compress_mpo_dmt, candidate, max_bond=opt.chi,
@@ -73,7 +134,7 @@ def _compress(opt, candidate, *, cutoff, cutoff_mode, variant, regions, diagnost
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
         constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-        check_regions=check_regions,
+        check_regions=check_regions, preservation_check=preservation_check,
     )
     return result
 
@@ -82,18 +143,22 @@ def _commit(opt, candidate, *, center=None):
     # Validate metadata before any write to the live state. Public Quimb
     # removal/addition keeps tensor owners, index maps and tags consistent.
     opt._backend_info_for(candidate)
+    opt._dmt_canonical_cache = None
     if opt.inplace:
         for tid in tuple(opt.p.tensor_map):
             opt.p.pop_tensor(tid)
         opt.p.add_tensor_network(candidate, virtual=False, check_collisions=False)
         opt.p.exponent = candidate.exponent
+        if hasattr(candidate, "compression_report") or hasattr(opt.p, "compression_report"):
+            opt.p.compression_report = getattr(candidate, "compression_report", None)
         for name in ("pepsy_first_degree", "pepsy_block_plan", "pepsy_pauli_mpo"):
             if hasattr(opt.p, name):
                 setattr(opt.p, name, None)
     else:
         opt.p = candidate
     center = opt.p.L - 1 if center is None else center
-    opt.info_c = {"cur_orthog": (center, center)}
+    opt.info_c.clear()
+    opt.info_c["cur_orthog"] = (center, center)
     if opt._replay_rank_cache is not None:
         opt._replay_rank_cache.clear()
     opt.backend_info()
@@ -102,17 +167,19 @@ def _commit(opt, candidate, *, center=None):
 
 def compress_current(opt, *, cutoff, cutoff_mode, variant, regions, return_report,
                      truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-                     constraint_mode="strict", constraint_weight=100., check_regions=True):
+                     constraint_mode="strict", constraint_weight=100., check_regions=True,
+                     preservation_check="raise"):
     regions = validate_state(opt, regions, variant)
-    candidate, report, _ = _compress(
+    candidate, report, workspace = _compress(
         opt, opt.p.copy(), cutoff=cutoff, cutoff_mode=cutoff_mode,
         variant=variant, regions=regions, diagnostics=return_report,
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
         constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-        check_regions=check_regions,
+        check_regions=check_regions, preservation_check=preservation_check,
     )
     _commit(opt, candidate)
+    _remember(opt, workspace)
     opt._dmt_reports = [report] if report is not None else []
     opt._append_norm_proxy_sample(opt.p)
     return (opt.p, report) if return_report else opt.p
@@ -121,11 +188,18 @@ def compress_current(opt, *, cutoff, cutoff_mode, variant, regions, return_repor
 def replay(opt, gates, wheres, *, progbar, cutoff, cutoff_mode,
            fidelity_samples, finite_check, regions, variant, diagnostics,
            truncation="paper", max_refinement_sweeps=8, region_selection="smallest",
-           constraint_mode="strict", constraint_weight=100., check_regions=True):
+           constraint_mode="strict", constraint_weight=100., check_regions=False,
+           preservation_check="raise", update="canonical"):
     from tqdm.auto import tqdm
 
     opt._dmt_reports = []
-    workspace = None
+    options = _cache_options(
+        opt.chi, cutoff, cutoff_mode, variant, regions, diagnostics, truncation,
+        max_refinement_sweeps, region_selection, constraint_mode, constraint_weight,
+        check_regions, preservation_check)
+    cache = opt._dmt_canonical_cache
+    workspace = (cache.workspace if update == "canonical" and cache is not None
+                 and cache.matches(opt, options) else None)
     sample_steps = opt._sampling_steps(len(gates), fidelity_samples)
     with tqdm(total=len(gates), desc="dmt", disable=not progbar, leave=False) as bar:
         for step, (payload, where) in enumerate(zip(gates, wheres), 1):
@@ -133,9 +207,13 @@ def replay(opt, gates, wheres, *, progbar, cutoff, cutoff_mode,
             source = opt.p.copy()
             gate, bra_gate = _promote(source, (gate, bra_gate))
             next_workspace = None
-            if (workspace is not None and len(where) == 2
+            if (workspace is not None and update == "canonical"
                     and ar.get_dtype_name(source[0].data) == ar.get_dtype_name(workspace.cores[0])):
-                if abs(where[0] - where[1]) == 1:
+                if len(where) == 1:
+                    candidate, report, next_workspace = opt._timed_call(
+                        "dmt.single", _gate_mpo_dmt_single, source, workspace, gate, bra_gate, where,
+                    )
+                elif abs(where[0] - where[1]) == 1:
                     candidate, report, next_workspace = opt._timed_call(
                         "dmt.local", _gate_mpo_dmt, source, workspace, gate, bra_gate, where,
                     )
@@ -152,7 +230,7 @@ def replay(opt, gates, wheres, *, progbar, cutoff, cutoff_mode,
                             raise
             if next_workspace is None:
                 # Start with a full sweep to cap every bond. This is also the
-                # reference route for one-site gates, dtype changes and a
+                # reference route for cache misses, dtype changes and a
                 # failed protected routing attempt. Targets stay untruncated.
                 target = opt._timed_call(
                     "dmt.target", opt._build_mpo_target, source, gate, where,
@@ -164,10 +242,11 @@ def replay(opt, gates, wheres, *, progbar, cutoff, cutoff_mode,
                     truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
                     region_selection=region_selection,
                     constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-                    check_regions=check_regions,
+                    check_regions=check_regions, preservation_check=preservation_check,
                 )
             opt._check_finite(finite_check, candidate)
             _commit(opt, candidate, center=next_workspace.center)
+            _remember(opt, next_workspace)
             workspace = next_workspace
             if report is not None:
                 opt._dmt_reports.append(report)

@@ -465,7 +465,7 @@ class MpsBatchSampleResult:
     ----------
     configs
         Array-like object with shape ``(n_samples, L)``. With the native
-        sampler this can be a NumPy array, Torch tensor, or CuPy array.
+        sampler this can be a NumPy array, Torch tensor, CuPy array, or JAX array.
         Symmray MPS samples use the backend of their underlying blocks.
     probs
         Born probabilities for ``configs`` with shape ``(n_samples,)``.
@@ -475,8 +475,8 @@ class MpsBatchSampleResult:
     one_d_to_two_d
         Mapping from 1D site index to ``(x, y)`` coordinate.
     backend
-        Backend of ``configs`` and ``probs``: ``"numpy"``, ``"torch"``, or
-        ``"cupy"``.
+        Backend of ``configs`` and ``probs``: ``"numpy"``, ``"torch"``,
+        ``"cupy"``, or ``"jax"``.
     basis
         Pauli basis used at each site, when the sampler supplies it.
     basis_probability
@@ -554,6 +554,10 @@ class MpsBatchSampleResult:
     def magnetizations(self, *, to_numpy: bool = False):
         """Per-sample magnetization ``(1 / L) * sum_i (1 - 2 * spin_i)``."""
         backend = _mps_array_backend(self.configs)
+        if backend == "jax":
+            configs = self.configs.astype(self.probs.dtype)
+            out = (1 - 2 * configs).mean(axis=1)
+            return ar.to_numpy(out) if to_numpy else out
         if backend == "torch":
             configs = self.configs.to(dtype=self.probs.dtype)
             out = (1 - 2 * configs).sum(dim=1) / float(self.L)

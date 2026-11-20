@@ -43,7 +43,8 @@ the existing router instead of adding a duplicate writing skill.
 ## Domain workflows
 
 - [MPO DMT](mpo-dmt/SKILL.md): protected density-matrix truncation, local-density
-  constraints, connected-residual SVD, and ordinary/Pauli MPO replay.
+  constraints, larger windows, fast verification, ordinary/Pauli replay and
+  independent accuracy/performance validation.
 - [Belief propagation](belief-propagation/SKILL.md)
 - [Direct PEPS sampling](peps-sampler/SKILL.md)
 - [Fermion operators](pepsy-fermion-operators/SKILL.md)

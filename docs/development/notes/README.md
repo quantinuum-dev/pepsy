@@ -7,6 +7,54 @@ and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
+- [Canonical metadata ownership](2026-11-19-dmt-canonical-info.md) —
+  Independent Pauli state/driver info, a common synchronization convention,
+  validated native gauge reuse and mutation/failure checks.
+
+- [Persistent canonical DMT replay](2026-11-19-dmt-canonical-cache.md) —
+  Default canonical reuse, stable `info_c`, invalidation/rollback checks and
+  a complex128 field-layer benchmark.
+
+- [6×6 real-Pauli interval DMT](2026-11-19-dmt-2d-window.md) —
+  Reused gauges, real coefficients, chi sweeps, exact local/static oracles,
+  profile costs and unresolved large-chi numerical failures.
+
+- [4×4 and rectangular 2D dynamics](2026-11-19-dmt-2d-scaling.md) —
+  Sparse/local exact references through 16 spins, t=20 shape comparisons,
+  exact Ising target construction and decomposition/runtime profiles.
+
+- [Exact-reference 2D DMT dynamics](2026-11-19-dmt-2d-dynamics.md) —
+  Genuine square-lattice Hamiltonians, long finite-size trajectories,
+  bond/timestep convergence, positivity and variational MPO comparisons.
+
+- [DMT API and verification costs](2026-11-19-dmt-check-api.md) —
+  Fast replay defaults, retained trace guards, one strict full-sweep check,
+  measured cost reduction and synchronized DMT skill guidance.
+
+- [Larger DMT windows, bonds and chains](2026-11-19-dmt-window-scaling.md) —
+  Four-/five-site protection, exact local accuracy, L=256/512 scaling,
+  crossing-region planning speedup and CPU SVD robustness.
+
+- [Direct L=64 comparison with the paper](2026-11-19-dmt-l64-paper-comparison.md) —
+  Fig. 7 energy overlay, DMT zoom, endpoint values and errors against
+  the published DMT/MPS curves at chi=16.
+
+- [DMT verification policy and L=64 continuation](2026-11-19-dmt-preservation-policy.md) —
+  Warning/error records, optional verification cost, full-time continuations
+  and independent confirmation of early precision loss.
+
+- [Pepsy versus White et al. Figs. 7 and 8](2026-11-19-dmt-white-figures.md) —
+  Recovered figure conventions, reproduced semiexact reference, completed
+  L=16 comparisons and explicit L=64 guard failures.
+
+- [DMT complex128, positivity, and paper-style benchmarks](2026-11-19-dmt-complex128-positivity.md) —
+  Torch CPU runs, global-to-local negativity traces, energy Fourier errors,
+  convention checks and an unresolved L=64 trace-guard failure.
+
+- [L=16 Ising DMT versus MPS dynamics](2026-11-19-dmt-ising-dynamics.md) —
+  Exact state-vector references, every-gate Pauli preservation audits,
+  energy versus local accuracy, Hermiticity/positivity and timestep checks.
+
 - [1D and lattice DMT API/performance](2026-11-16-dmt-performance.md) —
   Reproducible compression/evolution profiles, protected-region checks and
   measured CPU improvements.

@@ -434,7 +434,8 @@ class MpoOptimizer:
         ``sqrt(<O|O> / <O0|O0>)`` appended at sampled steps during a run.
     info_c : dict
         Cached canonicalization metadata (``cur_orthog`` tracks the current
-        orthogonality center / span).
+        orthogonality center / span). This dictionary keeps its identity
+        across commits, resets and rollback. Scratch targets use separate info.
     """
 
     _DMRG_MODE_ALIASES = {"dmrg1": 2, "dmrg2": 2, "dmrg3": 3}
@@ -655,6 +656,7 @@ class MpoOptimizer:
         self._norm_log_survival = 0.0
         self._dmt_compression_seen = False
         self._dmt_reports = []
+        self._dmt_canonical_cache = None
         self.fit_diagnostics = []
         self._last_dmrg_fit_diagnostics = None
         self.last_run_timing = None
@@ -984,7 +986,8 @@ class MpoOptimizer:
     def _init_canonicalization(self):
         """Put ``self.p`` into mixed-canonical form with center at ``L // 2``."""
         center = self.p.L // 2
-        self.info_c = {}
+        self._dmt_canonical_cache = None
+        self.info_c.clear()
         with self._dmt_backend_context():
             self.p.canonicalize_([center], cur_orthog="calc", info=self.info_c)
         self._current_orthog(self.p)
@@ -1051,6 +1054,7 @@ class MpoOptimizer:
         self.mode = new_mode
         if old_mode != new_mode or old_alias != new_alias:
             self._dmrg1_one_site_locked = False
+            self._dmt_canonical_cache = None
         return self
 
     def set_gates(self, gates):
@@ -3381,7 +3385,9 @@ class MpoOptimizer:
     def _restore_run_state(self, snapshot):
         """Restore an atomic replay snapshot."""
         self.p = snapshot["p"]
-        self.info_c = snapshot["info_c"]
+        self.info_c.clear()
+        self.info_c.update(snapshot["info_c"])
+        self._dmt_canonical_cache = None
         self.losses = snapshot["losses"]
         self.norm_events = snapshot["norm_events"]
         self._norm_log_survival = snapshot["norm_log_survival"]
@@ -4543,7 +4549,9 @@ class MpoOptimizer:
         dmt_region_selection="smallest",
         dmt_constraint_mode="strict",
         dmt_constraint_weight=100.,
-        dmt_check_regions=True,
+        dmt_check_regions=False,
+        dmt_preservation_check="raise",
+        dmt_update="canonical",
         fidelity_samples=10,
         k_2q_batch=1,
         fit_block_size=2,
@@ -4659,6 +4667,9 @@ class MpoOptimizer:
             Connected density construction or raw-operator protected SVD.
         dmt_diagnostics : bool, default=False
             Retain detailed per-gate reports in :meth:`get_dmt_reports`.
+        dmt_update : {"canonical", "full"}, default="canonical"
+            Reuse canonical DMT workspaces across gates and run calls.
+            Full forces a complete post-gate sweep for reference comparisons.
         dmt_truncation : {"paper", "optimized"}, default="paper"
             Optional compatible-border SVD and constrained bond refinement.
         dmt_max_refinement_sweeps : int, default=8
@@ -4669,8 +4680,13 @@ class MpoOptimizer:
             Allow a trace-preserving approximate fallback for insufficient bonds.
         dmt_constraint_weight : float, default=100
             Weight for protected directions in the relaxed fallback.
-        dmt_check_regions : bool, default=True
-            Contract physical regions to verify and measure density defects.
+        dmt_check_regions : bool, default=False
+            Opt into full physical-region verification. Default replay keeps
+            bond checks and density trace checks without full-region scans.
+        dmt_preservation_check : {"raise", "warn", "off"}, default="raise"
+            Raise on finite preservation violations, warn and record them
+            while continuing, or skip outer preservation verification.
+            Protected construction and numerical feasibility checks remain.
         fit_min_iter : int | None, default=2
             Minimum FIT sweeps before ``fit_rtol`` can stop a DMRG update.
         fit_rtol : float | {"auto"} | None, default="auto"
@@ -4756,17 +4772,22 @@ class MpoOptimizer:
         """
         if mode is not None:
             self.set_mode(mode)
+        if self.mode != "dmt":
+            self._dmt_canonical_cache = None
 
         fit_finite_check = finite_check
 
         if self.mode == "dmt":
             from .dmt import validate_replay
-            from ...operators._pauli_dmt import _refinement_options
+            from ...operators._pauli_dmt import _preservation_policy, _refinement_options
 
             _refinement_options(dmt_truncation, dmt_max_refinement_sweeps, dmt_region_selection,
                                 dmt_constraint_mode, dmt_constraint_weight)
             if not isinstance(dmt_check_regions, bool):
                 raise ValueError("dmt_check_regions must be True or False.")
+            _preservation_policy(dmt_preservation_check)
+            if dmt_update not in {"canonical", "full"}:
+                raise ValueError("dmt_update must be 'canonical' or 'full'.")
 
             dmt_regions = validate_replay(
                 self, dmt_regions, dmt_variant, target_cutoff=target_cutoff,
@@ -4776,7 +4797,8 @@ class MpoOptimizer:
         elif (dmt_regions is not None or dmt_variant != "density" or dmt_diagnostics
               or dmt_truncation != "paper" or dmt_max_refinement_sweeps != 8
               or dmt_region_selection != "smallest" or dmt_constraint_mode != "strict"
-              or dmt_constraint_weight != 100. or dmt_check_regions is not True):
+              or dmt_constraint_weight != 100. or dmt_check_regions is not False
+              or dmt_preservation_check != "raise" or dmt_update != "canonical"):
             raise ValueError("dmt_* options require mode='dmt'")
 
         compression_method = self._resolve_mpo_method(submpo_method)
@@ -4961,7 +4983,9 @@ class MpoOptimizer:
                         dmt_region_selection=dmt_region_selection,
                         dmt_constraint_mode=dmt_constraint_mode,
                         dmt_constraint_weight=dmt_constraint_weight,
-                        dmt_check_regions=dmt_check_regions) if self.mode == "dmt" else {}),
+                        dmt_check_regions=dmt_check_regions,
+                        dmt_preservation_check=dmt_preservation_check,
+                        dmt_update=dmt_update) if self.mode == "dmt" else {}),
             )
 
         supported = ", ".join(sorted(self._ALLOWED_MODES))
@@ -5206,7 +5230,9 @@ class MpoOptimizer:
         dmt_regions=None, dmt_variant="density", dmt_diagnostics=False,
         dmt_truncation="paper", dmt_max_refinement_sweeps=8, dmt_region_selection="smallest",
         dmt_constraint_mode="strict", dmt_constraint_weight=100.,
-        dmt_check_regions=True,
+        dmt_check_regions=False,
+        dmt_preservation_check="raise",
+        dmt_update="canonical",
     ):
         """Execute direct/SVD replay with one success and rollback boundary."""
         # Generic layer compression loses native charge-sector metadata.
@@ -5231,7 +5257,8 @@ class MpoOptimizer:
                     truncation=dmt_truncation, max_refinement_sweeps=dmt_max_refinement_sweeps,
                     region_selection=dmt_region_selection,
                     constraint_mode=dmt_constraint_mode, constraint_weight=dmt_constraint_weight,
-                    check_regions=dmt_check_regions,
+                    check_regions=dmt_check_regions, preservation_check=dmt_preservation_check,
+                    update=dmt_update,
                 )
             elif use_svd:
                 stage = "svd.replay"
@@ -5282,6 +5309,8 @@ class MpoOptimizer:
             raise ValueError("where must be an int, (int,), or (int, int).")
 
         info = self.info_c if p is self.p else {}
+        if p is self.p:
+            self._dmt_canonical_cache = None
         p.canonize(where_canon, cur_orthog=self._current_orthog(p, info=info), info=info)
         info["cur_orthog"] = target_orthog
 
@@ -5292,9 +5321,14 @@ class MpoOptimizer:
         centre without updating the optimizer-owned ``info_c`` dictionary.
         Discover the actual live centre, move it to a single site, and bind
         the resulting metadata back to this optimizer before replay resumes.
+        This also invalidates cached DMT cores/environments. Call it after
+        raw NumPy buffer edits, which cannot be tracked by array identity.
         """
+        self._dmt_canonical_cache = None
         if self._replay_rank_cache is not None:
             self._replay_rank_cache.clear()
+        self.info_c.clear()
+        self.info_c["cur_orthog"] = None
         if not hasattr(self.p, "calc_current_orthog_center"):
             raise TypeError("the live MPO does not expose canonical metadata.")
 
@@ -5460,7 +5494,8 @@ class MpoOptimizer:
     def compress_dmt(self, *, cutoff="auto", cutoff_mode="auto", variant="density",
                      regions=None, return_report=False, truncation="paper",
                      max_refinement_sweeps=8, region_selection="smallest",
-                     constraint_mode="strict", constraint_weight=100., check_regions=True):
+                     constraint_mode="strict", constraint_weight=100., check_regions=True,
+                     preservation_check="raise"):
         """Protect local reduced operators while compressing the live MPO to chi.
 
         ``regions`` are physical storage positions, including noncontiguous
@@ -5473,6 +5508,9 @@ class MpoOptimizer:
         Return the current MPO, or ``(MPO, MPODMTReport)`` when requested.
         This invalidates norm-survival fidelity estimates until ``set_mpo``;
         DMT reports and the absolute norm remain available independently.
+        ``preservation_check='warn'`` continues after finite preservation
+        failures and retains their reports; ``'off'`` skips outer verification.
+        The default ``'raise'`` rejects failed checks before committing.
         """
         from .dmt import compress_current
 
@@ -5483,7 +5521,7 @@ class MpoOptimizer:
                 truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
                 region_selection=region_selection,
                 constraint_mode=constraint_mode, constraint_weight=constraint_weight,
-                check_regions=check_regions,
+                check_regions=check_regions, preservation_check=preservation_check,
             )
 
     def get_dmt_reports(self):

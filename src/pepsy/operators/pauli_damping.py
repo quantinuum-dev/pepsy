@@ -185,5 +185,6 @@ class PauliDampingMPO:
             operator._cores = result._cores
             operator._terms = result._terms
             operator.compression_report = None
+            operator._invalidate_canonicalization()
             return operator
         return result

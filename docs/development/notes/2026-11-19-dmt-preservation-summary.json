@@ -1,0 +1,423 @@
+{
+  "fig7": [
+    {
+      "config": {
+        "length": 64,
+        "chi": 16,
+        "time": 40.0,
+        "dt": 0.0625,
+        "sample_every": 16,
+        "backend": "torch",
+        "preservation_check": "warn",
+        "cpu_svd": "torch",
+        "initial": "near-y-figure",
+        "methods": [
+          "pauli-dmt"
+        ],
+        "output": "/tmp/pepsy-white-fig7-warn-recorded",
+        "energy_scale": 0.25,
+        "gate_time_scale": 0.5,
+        "J": 1.0,
+        "hx": 0.9045,
+        "hz": 0.809,
+        "turnaround": "two separately compressed half gates",
+        "cutoff": 0.0,
+        "truncation": "paper",
+        "reference": null
+      },
+      "method": "pauli-dmt",
+      "chi": 16,
+      "backend": "torch",
+      "dtype": "complex128",
+      "preservation_check": "warn",
+      "benchmark_warnings": [
+        "pauli-dmt: benchmark preservation thresholds exceeded: audit={'checked_gates': 9, 'max_triple_defect': 1.4967635644334403e-15, 'max_energy_jump': 1.1102240473227422e-15, 'max_trace_defect': 6.661338147750939e-16, 'seconds': 0.07777516800160811}, max_trace_drift=7.023408437478729e-05"
+      ],
+      "gate_dtype": "torch.complex128",
+      "device": "cpu",
+      "evolution_seconds": 299.77874318400245,
+      "readout_seconds": 0.15806512599192502,
+      "final_max_bond": 16,
+      "audit": {
+        "checked_gates": 9,
+        "max_triple_defect": 1.4967635644334403e-15,
+        "max_energy_jump": 1.1102240473227422e-15,
+        "max_trace_defect": 6.661338147750939e-16,
+        "seconds": 0.07777516800160811
+      },
+      "discarded_physical_norm_max": 0.038136285500726015,
+      "constraint_relative_max": 1.5851553768669494e-06,
+      "lossy_splits": 75384,
+      "preservation_error_count": 21,
+      "preservation_error_examples": [
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 5.28e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 1.4e-06 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 59 cannot preserve the trace at this precision (relative defect 5.49e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 7.62e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 4.84e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 1.03e-06 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 5.99e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 59 cannot preserve the trace at this precision (relative defect 6.99e-07 > 4.77e-07). Try a higher working precision or bond dimension."
+      ],
+      "max_reported_trace_error": 1.4019709270524792e-06,
+      "energy_initial_paper": 0.30389177531614575,
+      "energy_final_paper": 0.302482105961503,
+      "max_total_energy_drift_paper": 0.0016101847952219583,
+      "max_local_hermiticity_defect": 0.0,
+      "min_triple_eigenvalue": -1.1847308782272161,
+      "figure_energy_real_rmse_vs_published_dmt": 0.00011593404567061641,
+      "figure_energy_real_max_error_vs_published_dmt": 0.00031669907924603,
+      "max_absolute_imaginary_energy_paper": 0.0,
+      "max_absolute_trace_drift": 7.023408437478729e-05,
+      "final_trace_real": 1.0000702340843748,
+      "final_trace_imag": 0.0
+    },
+    {
+      "config": {
+        "length": 64,
+        "chi": 16,
+        "time": 40.0,
+        "dt": 0.0625,
+        "sample_every": 16,
+        "backend": "torch",
+        "preservation_check": "warn",
+        "cpu_svd": "scipy_gesvd",
+        "initial": "near-y-figure",
+        "methods": [
+          "pauli-dmt"
+        ],
+        "output": "/tmp/pepsy-white-fig7-warn-gesvd",
+        "energy_scale": 0.25,
+        "gate_time_scale": 0.5,
+        "J": 1.0,
+        "hx": 0.9045,
+        "hz": 0.809,
+        "turnaround": "two separately compressed half gates",
+        "cutoff": 0.0,
+        "truncation": "paper",
+        "reference": null
+      },
+      "method": "pauli-dmt",
+      "chi": 16,
+      "backend": "torch",
+      "dtype": "complex128",
+      "preservation_check": "warn",
+      "benchmark_warnings": [
+        "pauli-dmt: benchmark preservation thresholds exceeded: audit={'checked_gates': 9, 'max_triple_defect': 7.560893965980925e-16, 'max_energy_jump': 1.776356839637619e-15, 'max_trace_defect': 6.661338147750939e-16, 'seconds': 0.08120558399059519}, max_trace_drift=7.81279929773504e-05"
+      ],
+      "gate_dtype": "torch.complex128",
+      "device": "cpu",
+      "evolution_seconds": 332.4206126200497,
+      "readout_seconds": 0.16201932799594942,
+      "final_max_bond": 16,
+      "audit": {
+        "checked_gates": 9,
+        "max_triple_defect": 7.560893965980925e-16,
+        "max_energy_jump": 1.776356839637619e-15,
+        "max_trace_defect": 6.661338147750939e-16,
+        "seconds": 0.08120558399059519
+      },
+      "discarded_physical_norm_max": 0.034804391483568925,
+      "constraint_relative_max": 1.0794753484728895e-06,
+      "lossy_splits": 75377,
+      "preservation_error_count": 35,
+      "preservation_error_examples": [
+        "DMT bond 58 cannot preserve the trace at this precision (relative defect 5.25e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 59 cannot preserve the trace at this precision (relative defect 9.32e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 9.97e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 59 cannot preserve the trace at this precision (relative defect 4.77e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 6.36e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 5.61e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 59 cannot preserve the trace at this precision (relative defect 7.34e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 8.97e-07 > 4.77e-07). Try a higher working precision or bond dimension."
+      ],
+      "max_reported_trace_error": 9.971016119952173e-07,
+      "energy_initial_paper": 0.30389177531614575,
+      "energy_final_paper": 0.30240862590810835,
+      "max_total_energy_drift_paper": 0.0016085828799667912,
+      "max_local_hermiticity_defect": 0.0,
+      "min_triple_eigenvalue": -0.09676451009285271,
+      "figure_energy_real_rmse_vs_published_dmt": 9.328064743239412e-05,
+      "figure_energy_real_max_error_vs_published_dmt": 0.0002520542479489962,
+      "max_absolute_imaginary_energy_paper": 0.0,
+      "max_absolute_trace_drift": 7.81279929773504e-05,
+      "final_trace_real": 1.0000781279929774,
+      "final_trace_imag": 0.0
+    },
+    {
+      "config": {
+        "length": 64,
+        "chi": 16,
+        "time": 40.0,
+        "dt": 0.0625,
+        "sample_every": 16,
+        "backend": "torch",
+        "preservation_check": "warn",
+        "cpu_svd": "torch",
+        "initial": "near-y-figure",
+        "methods": [
+          "pauli-dmt-real"
+        ],
+        "output": "/tmp/pepsy-white-fig7-warn-real",
+        "energy_scale": 0.25,
+        "gate_time_scale": 0.5,
+        "J": 1.0,
+        "hx": 0.9045,
+        "hz": 0.809,
+        "turnaround": "two separately compressed half gates",
+        "cutoff": 0.0,
+        "truncation": "paper",
+        "reference": null
+      },
+      "method": "pauli-dmt-real",
+      "chi": 16,
+      "backend": "torch",
+      "dtype": "float64",
+      "preservation_check": "warn",
+      "benchmark_warnings": [
+        "pauli-dmt-real: benchmark preservation thresholds exceeded: audit={'checked_gates': 9, 'max_triple_defect': 1.0349099507950179e-15, 'max_energy_jump': 2.8869911287044977e-15, 'max_trace_defect': 4.440892098500626e-16, 'seconds': 0.08497170900773199}, max_trace_drift=5.990049245374607e-05"
+      ],
+      "gate_dtype": "torch.complex128",
+      "device": "cpu",
+      "evolution_seconds": 167.51181729000746,
+      "readout_seconds": 0.1642308740010776,
+      "final_max_bond": 16,
+      "audit": {
+        "checked_gates": 9,
+        "max_triple_defect": 1.0349099507950179e-15,
+        "max_energy_jump": 2.8869911287044977e-15,
+        "max_trace_defect": 4.440892098500626e-16,
+        "seconds": 0.08497170900773199
+      },
+      "discarded_physical_norm_max": 0.03702658275769926,
+      "constraint_relative_max": 1.3430925264501094e-06,
+      "lossy_splits": 75384,
+      "preservation_error_count": 30,
+      "preservation_error_examples": [
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 5.1e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 9.83e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 59 cannot preserve the trace at this precision (relative defect 5.97e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 6.81e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 59 cannot preserve the trace at this precision (relative defect 7.04e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 1.11e-06 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 5.15e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT bond 60 cannot preserve the trace at this precision (relative defect 9.49e-07 > 4.77e-07). Try a higher working precision or bond dimension."
+      ],
+      "max_reported_trace_error": 1.1058574131362377e-06,
+      "energy_initial_paper": 0.30389177531614575,
+      "energy_final_paper": 0.30247496728129186,
+      "max_total_energy_drift_paper": 0.0016188806223756402,
+      "max_local_hermiticity_defect": 0.0,
+      "min_triple_eigenvalue": -1.1717247659963417,
+      "figure_energy_real_rmse_vs_published_dmt": 9.712884720875749e-05,
+      "figure_energy_real_max_error_vs_published_dmt": 0.0002594258002629468,
+      "max_absolute_imaginary_energy_paper": 0.0,
+      "max_absolute_trace_drift": 5.990049245374607e-05,
+      "final_trace_real": 1.0000599004924537,
+      "final_trace_imag": 0.0
+    },
+    {
+      "config": {
+        "length": 64,
+        "chi": 16,
+        "time": 40.0,
+        "dt": 0.0625,
+        "sample_every": 16,
+        "backend": "torch",
+        "preservation_check": "warn",
+        "skip_region_checks": true,
+        "cpu_svd": "torch",
+        "initial": "near-y-figure",
+        "methods": [
+          "mpo-dmt"
+        ],
+        "output": "/tmp/pepsy-white-fig7-warn-fast-mpo",
+        "energy_scale": 0.25,
+        "gate_time_scale": 0.5,
+        "J": 1.0,
+        "hx": 0.9045,
+        "hz": 0.809,
+        "turnaround": "two separately compressed half gates",
+        "cutoff": 0.0,
+        "truncation": "paper",
+        "reference": null
+      },
+      "method": "mpo-dmt",
+      "chi": 16,
+      "backend": "torch",
+      "dtype": "complex128",
+      "preservation_check": "warn",
+      "check_regions": false,
+      "benchmark_warnings": [
+        "mpo-dmt: benchmark preservation thresholds exceeded: audit={'checked_gates': 9, 'max_triple_defect': 3.43344079088284e-14, 'max_energy_jump': 6.209658761703675e-14, 'max_trace_defect': 6.784111254328417e-14, 'seconds': 0.05983975100207317}, max_trace_drift=8.317062511715232e-05"
+      ],
+      "gate_dtype": "torch.complex128",
+      "device": "cpu",
+      "evolution_seconds": 384.9541146479769,
+      "readout_seconds": 0.14270333000422397,
+      "final_max_bond": 16,
+      "audit": {
+        "checked_gates": 9,
+        "max_triple_defect": 3.43344079088284e-14,
+        "max_energy_jump": 6.209658761703675e-14,
+        "max_trace_defect": 6.784111254328417e-14,
+        "seconds": 0.05983975100207317
+      },
+      "discarded_physical_norm_max": 0.11009025865303762,
+      "constraint_relative_max": 1.503606216809166e-06,
+      "lossy_splits": 75385,
+      "preservation_error_count": 0,
+      "preservation_error_examples": [],
+      "max_reported_trace_error": null,
+      "energy_initial_paper": 0.3038917753161456,
+      "energy_final_paper": 0.30249048684864305,
+      "max_total_energy_drift_paper": 0.0016134108021078996,
+      "max_local_hermiticity_defect": 4.953973723302148,
+      "min_triple_eigenvalue": -1.2513465761272762,
+      "figure_energy_real_rmse_vs_published_dmt": 9.345587976165816e-05,
+      "figure_energy_real_max_error_vs_published_dmt": 0.00024200080509245714,
+      "max_absolute_imaginary_energy_paper": 0.00011523956836974499,
+      "max_absolute_trace_drift": 8.317062511715232e-05,
+      "final_trace_real": 1.0000831684066187,
+      "final_trace_imag": 6.074725372798295e-07
+    }
+  ],
+  "timing": {
+    "length": 64,
+    "chi": 16,
+    "backend": "torch",
+    "dtype": "complex128",
+    "gate_dtype": "complex128",
+    "threads": 1,
+    "warmup_steps": 2,
+    "timed_steps": 5,
+    "gates_per_step": 126,
+    "rows": [
+      {
+        "method": "pauli-dmt",
+        "preservation_check": "warn",
+        "check_regions": true,
+        "median_seconds": 0.3851464590006799,
+        "sample_seconds": [
+          0.3827574999995704,
+          0.3851464590006799,
+          0.38392141700023785,
+          0.38700279099975887,
+          0.3900120420003077
+        ],
+        "trace_defect": 7.549199807499463e-06,
+        "max_triple_difference_vs_checked": 0.0
+      },
+      {
+        "method": "pauli-dmt",
+        "preservation_check": "off",
+        "check_regions": true,
+        "median_seconds": 0.36227491600038775,
+        "sample_seconds": [
+          0.3562334580001334,
+          0.3603754169998865,
+          0.36227491600038775,
+          0.36545254200063937,
+          0.370060959001421
+        ],
+        "trace_defect": 7.549199807499463e-06,
+        "max_triple_difference_vs_checked": 0.0
+      },
+      {
+        "method": "mpo-dmt",
+        "preservation_check": "warn",
+        "check_regions": true,
+        "median_seconds": 2.4646122909998667,
+        "sample_seconds": [
+          2.424576999999772,
+          2.4206010839989176,
+          2.4646122909998667,
+          2.468334834000416,
+          2.6342267079999147
+        ],
+        "trace_defect": 1.2227341906201424e-05,
+        "max_triple_difference_vs_checked": 0.0
+      },
+      {
+        "method": "mpo-dmt",
+        "preservation_check": "warn",
+        "check_regions": false,
+        "median_seconds": 0.5381252500010305,
+        "sample_seconds": [
+          0.5358413329995528,
+          0.5631868330001453,
+          0.5381252500010305,
+          0.5377117079988238,
+          0.543677249999746
+        ],
+        "trace_defect": 1.2227341906201424e-05,
+        "max_triple_difference_vs_checked": 0.0
+      },
+      {
+        "method": "mpo-dmt",
+        "preservation_check": "off",
+        "check_regions": true,
+        "median_seconds": 0.5188100830000621,
+        "sample_seconds": [
+          0.5133775419999438,
+          0.5178010840008938,
+          0.5188100830000621,
+          0.5498336250002467,
+          0.5831398330010416
+        ],
+        "trace_defect": 1.2227341906201424e-05,
+        "max_triple_difference_vs_checked": 0.0
+      }
+    ]
+  },
+  "early_all_gate_audit": {
+    "method": "pauli-dmt",
+    "chi": 16,
+    "backend": "torch",
+    "dtype": "complex128",
+    "preservation_check": "warn",
+    "benchmark_warnings": [
+      "pauli-dmt: benchmark preservation thresholds exceeded: audit={'checked_gates': 504, 'max_triple_defect': 1.6165529293904332e-06, 'max_energy_jump': 3.5734095682471434e-07, 'max_trace_defect': 1.4019715062207894e-06, 'seconds': 4.586521769044339}, max_trace_drift=3.853537144271613e-06"
+    ],
+    "gate_dtype": "torch.complex128",
+    "device": "cpu",
+    "evolution_seconds": 1.597160647956116,
+    "readout_seconds": 0.015805667000677204,
+    "final_max_bond": 16,
+    "audit": {
+      "checked_gates": 504,
+      "max_triple_defect": 1.6165529293904332e-06,
+      "max_energy_jump": 3.5734095682471434e-07,
+      "max_trace_defect": 1.4019715062207894e-06,
+      "seconds": 4.586521769044339
+    },
+    "discarded_physical_norm_max": 8.006935022992726e-07,
+    "constraint_relative_max": 1.1706146992126029e-06,
+    "lossy_splits": 336,
+    "preservation_error_count": 4,
+    "preservation_error_examples": [
+      "DMT bond 60 cannot preserve the trace at this precision (relative defect 5.28e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+      "DMT bond 60 cannot preserve the trace at this precision (relative defect 1.4e-06 > 4.77e-07). Try a higher working precision or bond dimension.",
+      "DMT bond 59 cannot preserve the trace at this precision (relative defect 5.49e-07 > 4.77e-07). Try a higher working precision or bond dimension.",
+      "DMT bond 60 cannot preserve the trace at this precision (relative defect 7.62e-07 > 4.77e-07). Try a higher working precision or bond dimension."
+    ],
+    "max_reported_trace_error": 1.4019709270524792e-06
+  },
+  "operator_variant_probe": {
+    "variant": "operator",
+    "steps": 4,
+    "audit": {
+      "checked_gates": 504,
+      "max_triple_defect": 1.0916474393069178e-06,
+      "max_energy_jump": 3.6861068184457224e-06,
+      "max_trace_defect": 2.250448411511563e-06,
+      "seconds": 3.1103615570191323
+    },
+    "preservation_errors": 10,
+    "max_relative_trace_error": 2.250447338715002e-06,
+    "final_trace_defect": 2.3831365679738425e-06,
+    "min_local_eigenvalue": -1.0168170811468414e-06
+  },
+  "warn_off_max_saved_array_difference": 0.0,
+  "note": "Full-time ordinary MPO run skips full-region verification. Nine sparse late audits do not certify all gates; see early all-gate audit."
+}

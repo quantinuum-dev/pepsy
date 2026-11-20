@@ -1,6 +1,6 @@
 ---
 name: mpo-dmt
-description: 'Explain, implement, review, and validate Pepsy density-matrix truncation (DMT), protected SVD, ordinary or Pauli MPO compression, DMT gate replay, and protected regions on chains or mapped 2D lattices. Use for local-density preservation and DMT optimality questions; compose tensor-fitting only for explicitly requested variational fitting.'
+description: 'Explain, implement, review, and profile Pepsy density-matrix truncation (DMT), ordinary or Pauli MPO replay, larger protected regions, and verification controls. Use for local-density preservation, DMT accuracy, numerical stability, and optimality questions; compose tensor-fitting for explicitly requested variational fitting.'
 ---
 
 # MPO density-matrix truncation
@@ -9,6 +9,12 @@ Maintain DMT's local-density guarantees while distinguishing the full
 constrained approximation problem from the residual SVD actually implemented.
 Follow repository scope and environment instructions in
 [`AGENTS.md`](../../../AGENTS.md).
+
+For API changes, verification costs, larger windows, backend failures or
+benchmarks, read [operations and validation](references/operations.md).
+It distinguishes fast replay checks, full sweep verification and actual
+trajectory accuracy. Use the mathematical reference below when changing
+the protected construction itself.
 
 ## Mathematical contract
 
@@ -87,13 +93,16 @@ Check current source and callers when API defaults or historical notes differ.
   operators). Neither generally guarantees positivity or global Hermiticity.
 - Retain protected data independently of the physics cutoff. Apply cutoff
   policies only to the free spectrum. Preserve backend, dtype, scale/exponent,
-  tags, index order, centre metadata, precision guards and transactional writes.
+  tags, index order, centre metadata and transactional writes. Keep numerical
+  feasibility guards; select optional verification through the public controls.
 - Keep physical region inventories explicit for mapped 2D systems. They
   replace default chain protection unless both are supplied. This is an MPO
   construction, not a proof of canonical isometries for a loopy PEPO.
-- Verify local preservation after every lossy split against that split's
-  target. A sweep preserves windows by induction; its error is not generally
-  the sum of squared one-bond tails against the initial target.
+- Compare preservation with each split's current target in independent
+  validation. Runtime replay defaults to bond/trace checks; full-region
+  scans are opt-in. Strict standalone compression checks the original and
+  final windows once, avoiding redundant full scans after every bond.
+  A sweep's error is not generally the sum of squared one-bond tails.
 - The current adaptive compressor uses host decisions. Do not describe it
   as fully JIT compiled or smoothly differentiable through all rank changes.
   Follow the public guide's existing gradient/precision policies when relevant.
@@ -122,6 +131,10 @@ required environment and upstream checks. Use independent dense partial traces,
 actual lossy truncation, bond caps, and physical error units. Add complex-valued
 cases that distinguish a transpose from an adjoint. Do not infer global
 optimality, positivity, or full-suite success from preservation tests.
+
+Wider protection and larger chi need not improve trajectory accuracy
+monotonically. Keep the protected budget, chosen truncation and unphysical
+outliers visible. Energy agreement alone does not validate local dynamics.
 
 Compose [tensor-fitting](../tensor-fitting/SKILL.md) for changes to FIT-based
 variational sweeps. The optional direct bond refiner lives with DMT and uses

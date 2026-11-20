@@ -105,6 +105,31 @@ must not exceed twice the seed error. Set a different factor (at least one),
 or `None` to disable this safeguard. The guard changes the explored feasible
 set and does not make the pair error a physical global error.
 
+For small lattices, using all sites as a soft region makes this objective the
+full PEPO Frobenius error (up to the common network exponent). Its map has
+`4**N` output entries for qubits and becomes impractical as the lattice grows.
+`dmt_svd_mix_seeds=1` optionally mixes one discarded singular direction into
+the feasible factors before refinement. Cross terms can be invisible to a
+loopy PEPO environment; the seed is accepted only if it improves the chosen
+objective and passes all hard constraints and the pair-error safeguard. Up to
+eight directions can be requested. Disabling the pair safeguard can permit
+large gauge-dependent factors, even when the measured objective is small.
+
+```python
+# Small-system experiment: protect every L and optimize the full density.
+all_sites = tuple(rho.gen_site_coos())
+opt = PepoOptimizer(
+    rho, gates, chi=1, mode="dmt", regions="L",
+    dmt_refine_method="als", dmt_objective_regions=[(all_sites, 1.0)],
+    dmt_svd_mix_seeds=1,
+)
+```
+
+In the parity-density experiments, the default pair-error guard rejected a
+physically accurate mixed seed because its pair-coordinate error grew. The
+tests explicitly set `dmt_objective_max_pair_growth=None` and independently
+check the full density; disabling the guard is not generally safe.
+
 Records report `seed_objective`, `objective_value`, and `objective_exponent`.
 The first two use the PEPO mantissa; multiply by `10**(2*objective_exponent)`
 to obtain the corresponding absolute squared cost when representable. See

@@ -107,6 +107,21 @@ for bond in report.bond_reports:
     print(bond.bond, bond.final_bond, bond.discarded_weight)
 ```
 
+Every `PauliMPO` owns a stable `info_c` dictionary. Its `"cur_orthog"` entry
+is `(center, center)` for an established native gauge and `None` when unknown.
+Constructing sparse terms or sorting/pruning words does not claim a numerical
+gauge. `canonicalize_native`, non-flat native compression and DMT record
+their actual centers. Native canonicalization reuses a validated center and
+moves only the required distance; an in-place request for the same center
+does no QR work.
+
+Copies and DMT snapshots have independent dictionaries. Managed operations
+that can break isometries invalidate the entry. After directly editing a
+shared buffer, `op.sync_canonicalization(site)` rebuilds its gauge and returns
+the `(site, site)` pair; a failed rebuild leaves an unknown entry. Merely
+assigning a center into the dictionary does not establish that gauge.
+See the [common ownership contract](../optimizers/pauli_dmt.md#canonical-metadata-ownership).
+
 The native cores have shape `(left_bond, right_bond, 4)` with physical order
 `I, X, Y, Z`. QR canonicalization and SVD rounding act on the coefficient
 tensor train, never on a dense Hilbert-space matrix. The result remains a
@@ -301,18 +316,25 @@ The centre and norms are rescaled to avoid underflow for long normalized
 density matrices. Standalone `compress_dmt` additionally checks every
 three-site marginal after the sweep using log-scaled trace environments,
 with linear chain cost and a tolerance proportional to chain length and
-machine precision. It raises `FloatingPointError` when this check fails;
+machine precision. By default it raises `FloatingPointError` when this check fails;
 increase `max_bond` or use double precision. Strongly correlated 128-site
 mixtures at cap 12 can fail this check; cap 24 recovers their exact rank.
 Neither floating-point arithmetic nor DMT guarantees preservation at an
 arbitrarily small bond dimension.
 
-With default **1D** protection, the full marginal check applies to
-`compress_dmt` only. With explicit `regions`, every split also checks all
-selected reduced operators, including gated updates. `apply_gate_dmt` and
+Strict `compress_dmt` compares original and final marginals once, including
+explicit `regions`, without rescanning them after every split. Gated updates
+default to `check_regions=False`. Set it to `True` to check every selected
+region after each gate, including the default contiguous triples. Density
+compression keeps scalar trace checks even with full checks disabled.
+`apply_gate_dmt` and
 `PauliDMT` also offer `trace_guard`, a per-gate comparison of the gated
 target's trace with the split result. It raises `FloatingPointError` if a
-single relative trace defect exceeds `32 * sqrt(machine_epsilon)`.
+single relative trace defect exceeds `32 * sqrt(machine_epsilon)` under the
+default `preservation_check="raise"` policy. Use `"warn"` to continue and
+record finite errors in `compression_report.preservation_errors`, or `"off"`
+to skip outer bond/trace and full marginal verification. The protected
+construction remains active. See the [shared verification policy](mpo_dmt.md#preservation-verification-policy).
 
 - `trace_guard="auto"` enables the guard for `variant="density"`. For
   `variant="operator"`, it enables the guard only when the initial trace

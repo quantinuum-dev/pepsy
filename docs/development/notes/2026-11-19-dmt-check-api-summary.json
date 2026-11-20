@@ -1,0 +1,171 @@
+{
+  "standalone_sweeps": [
+    {
+      "length": 16,
+      "chi": 24,
+      "width": 4,
+      "check_regions": true,
+      "backend": "torch",
+      "dtype": "complex128",
+      "sample_seconds": {
+        "before": [
+          0.13585075000082725,
+          0.13722516699999687,
+          0.13891554200017708
+        ],
+        "after": [
+          0.05058520799866528,
+          0.05252850000033504,
+          0.05010495800161152
+        ]
+      },
+      "median_before": 0.13722516699999687,
+      "median_after": 0.05058520799866528,
+      "speedup": 2.712752846713957,
+      "bitwise_identical_cores": true,
+      "max_window_error": 2.269785329746742e-15
+    },
+    {
+      "length": 32,
+      "chi": 32,
+      "width": 5,
+      "check_regions": true,
+      "backend": "torch",
+      "dtype": "complex128",
+      "sample_seconds": {
+        "before": [
+          0.7134823749984207,
+          0.7261574579970329,
+          0.7367603330021666
+        ],
+        "after": [
+          0.15463816600095015,
+          0.15617512500102748,
+          0.15799741700175218
+        ]
+      },
+      "median_before": 0.7261574579970329,
+      "median_after": 0.15617512500102748,
+      "speedup": 4.649635836643355,
+      "bitwise_identical_cores": true,
+      "max_window_error": 2.686875254434508e-15
+    },
+    {
+      "length": 64,
+      "chi": 32,
+      "width": 5,
+      "check_regions": true,
+      "backend": "torch",
+      "dtype": "complex128",
+      "sample_seconds": {
+        "before": [
+          2.888877459001378,
+          2.8925494169998274,
+          2.907499209002708
+        ],
+        "after": [
+          0.34181770800205413,
+          0.34045324999897275,
+          0.34572345900232904
+        ]
+      },
+      "median_before": 2.8925494169998274,
+      "median_after": 0.34181770800205413,
+      "speedup": 8.462257364918159,
+      "bitwise_identical_cores": true,
+      "max_window_error": 3.615056202547266e-15
+    }
+  ],
+  "replay": {
+    "length": 64,
+    "chi": 16,
+    "backend": "torch",
+    "dtype": "complex128",
+    "gate_dtype": "complex128",
+    "threads": 1,
+    "warmup_steps": 2,
+    "timed_steps": 3,
+    "gates_per_step": 126,
+    "rows": [
+      {
+        "method": "pauli-dmt",
+        "preservation_check": "warn",
+        "check_regions": true,
+        "median_seconds": 3.0530864579995978,
+        "sample_seconds": [
+          3.0478772919996118,
+          3.067715707999014,
+          3.0530864579995978
+        ],
+        "trace_defect": 6.299450862057299e-06,
+        "max_triple_difference_vs_checked": 0.0
+      },
+      {
+        "method": "pauli-dmt",
+        "preservation_check": "warn",
+        "check_regions": false,
+        "median_seconds": 0.6227141670024139,
+        "sample_seconds": [
+          0.6227141670024139,
+          0.622998833998281,
+          0.602433750002092
+        ],
+        "trace_defect": 6.299450862057299e-06,
+        "max_triple_difference_vs_checked": 0.0
+      },
+      {
+        "method": "pauli-dmt",
+        "preservation_check": "off",
+        "check_regions": false,
+        "median_seconds": 0.5552083750008023,
+        "sample_seconds": [
+          0.5504597920007654,
+          0.5563002080016304,
+          0.5552083750008023
+        ],
+        "trace_defect": 6.299450862057299e-06,
+        "max_triple_difference_vs_checked": 0.0
+      },
+      {
+        "method": "mpo-dmt",
+        "preservation_check": "warn",
+        "check_regions": true,
+        "median_seconds": 3.839869000003091,
+        "sample_seconds": [
+          3.839869000003091,
+          3.824769582999579,
+          3.853684957997757
+        ],
+        "trace_defect": 8.636864418202186e-06,
+        "max_triple_difference_vs_checked": 0.0
+      },
+      {
+        "method": "mpo-dmt",
+        "preservation_check": "warn",
+        "check_regions": false,
+        "median_seconds": 0.8417138329969021,
+        "sample_seconds": [
+          0.8363135829968087,
+          0.8417138329969021,
+          0.8429982500019833
+        ],
+        "trace_defect": 8.636864418202186e-06,
+        "max_triple_difference_vs_checked": 0.0
+      },
+      {
+        "method": "mpo-dmt",
+        "preservation_check": "off",
+        "check_regions": false,
+        "median_seconds": 0.7848092920030467,
+        "sample_seconds": [
+          0.7810213750017283,
+          0.7848092920030467,
+          0.7866343749992666
+        ],
+        "trace_defect": 8.636864418202186e-06,
+        "max_triple_difference_vs_checked": 0.0
+      }
+    ]
+  },
+  "scope": "Standalone before/after snapshots differ only in verification API/check implementation. Timings are CPU complex128; full standalone check retained; replay measurements are cost comparisons, not physical accuracy claims."
+}

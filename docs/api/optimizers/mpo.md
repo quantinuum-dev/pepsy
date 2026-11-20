@@ -29,8 +29,16 @@ dmt_region_selection="min_cover")` enables improved bond approximation and
 shared region protection. Manual `compress_dmt` uses the same names without
 the `dmt_` prefix. The fast paper method and smaller-half selection remain
 the defaults; see [mathematics and limits](../operators/mpo_dmt.md#optional-improved-bond-truncation).
-For small χ and fast checking, use `dmt_constraint_mode="relaxed"` and
-`dmt_check_regions=False`; reports then do not measure full-region errors.
+Replay defaults to `dmt_check_regions=False`, retaining cheap bond and density
+trace checks. Set it to `True` for full-region verification and measurements.
+Use `dmt_constraint_mode="relaxed"` only when allowing local-density errors
+to fit a small cap; disabling expensive verification does not require relaxation.
+To continue and record finite preservation failures without relaxing the
+protected constraints, use `run(dmt_preservation_check="warn")` and read
+`get_dmt_reports()` after each call. `dmt_preservation_check="off"` skips
+outer bond/trace and full marginal verification. Manual `compress_dmt` takes
+`preservation_check` without the prefix. The library default is `"raise"`;
+see the [verification policy](../operators/mpo_dmt.md#preservation-verification-policy).
 
 ```python
 import numpy as np
@@ -51,26 +59,53 @@ edges = [((0, 0), (1, 0)), ((0, 1), (1, 1)), ((1, 0), (2, 0))]
 # Existing MPO payload convention: U.T gives the physical action U rho U†.
 gates = [(U.T, (sites[a], sites[b])) for a, b in edges]
 opt = MpoOptimizer(rho, gates, chi=40, mode="dmt", contraction_opt="greedy")
-rho_t = opt.run(dmt_regions=regions, dmt_diagnostics=True)
-rho_t = opt.run(dmt_regions=regions)
+settings = dict(dmt_regions=regions, dmt_diagnostics=True)
+rho_t = opt.run(**settings)
+rho_t = opt.run(**settings)  # Reuse the committed canonical workspace.
 
 # Compress the current state without replaying its queue:
 rho_t, report = opt.compress_dmt(regions=regions, return_report=True)
 ```
 
-Each gate is applied **without target truncation**, followed by protected
-SVD compression. The first gate uses a full target and protected sweep to
-cap every bond. Later gates on adjacent MPO sites reuse canonical cores and
-trace environments, splitting only the acted-on bond. Later distant gates
+`run(dmt_update="canonical")` is the default. Each gate is applied
+**without target truncation**. The first uncached gate uses a full target and
+protected SVD sweep to cap every bond. Later gates on adjacent MPO sites reuse
+canonical cores and trace environments, splitting only the acted-on bond.
+One-site gates move the cached center to that site and act exactly, with no
+DMT split or full-chain compression. Later distant gates
 use **exact forward SWAPs**, apply the gate, then protect the correspondingly
 permuted regions during return SWAPs. Temporary protected ranks may exceed
 `chi`; any enlarged bonds are capped after restoring the original order.
-The first gate, one-site gates, dtype changes and failed routed checks use
-the full-target route, which refreshes the workspace. Gate-MPO factorization and intermediate target
+Matching replay settings retain the workspace across `run()` and gate-queue
+changes. Cache misses, dtype changes and failed routed checks use the
+full-target route, which refreshes the workspace. Gate-MPO factorization and intermediate target
 construction use zero cutoff. DMT alone applies
 `chi` and the requested residual cutoff. One- and two-site gates accept distant
 or reversed supports, explicit ket/bra pairs and ket-only/bra-only payloads;
 they retain the existing [MPO matrix convention](#gate-conventions).
+
+Compression order can change unprotected correlations, so canonical and full
+routes need not give identical global approximants after actual truncation.
+
+`info_c` remains the same dictionary across commits, resets and rollback;
+`info_c["cur_orthog"]` reflects the live committed gauge. Scratch targets
+have separate canonical metadata. Cache validation checks state/tensor/array
+identity, index order, isometry hints, shape, dtype/device, exponent, DMT
+settings and available array version counters. This needs no tensor-content
+hash or numerical isometry scan. Manual canonicalization and `set_mpo()`
+invalidate the DMT cache. After writing directly into a NumPy buffer, call
+`opt.sync_canonicalization()` before replay; such writes cannot be detected
+from array identity alone. Manual `compress_dmt()` seeds a reusable workspace
+when its settings match the next replay call.
+
+`PauliMPO` and `PauliDMT` expose their own dictionaries using the same
+[canonical metadata convention](pauli_dmt.md#canonical-metadata-ownership).
+These dictionaries and their numerical states remain independently owned.
+
+Use `run(dmt_update="full")` to force the full-target/sweep route after every
+gate for reference comparisons. The protected SVD rule, default `"paper"`
+truncation, dtype and preservation policy are unchanged. See the
+[cache benchmark and validation](../../development/notes/2026-11-19-dmt-canonical-cache.md).
 
 The preservation condition for every requested region is
 
@@ -93,7 +128,8 @@ exactness guarantee for the entire untruncated circuit trajectory.
   global Hermiticity are not guaranteed by ordinary complex-basis truncation.
   Density routing removes bounded trace roundoff relative to the gate's
   computed two-site target, including nonunitary trace changes; it does not
-  force trace one. Physical marginal checks run again after this correction.
+  force trace one. With `dmt_check_regions=True`, physical marginal checks run
+  again after this correction.
 - `run` and `compress_dmt` default to `cutoff="auto"`,
   `cutoff_mode="auto"`: `1e-12` for double precision, `1e-6` for single
   precision, with `"rel"` applied only to the free residual spectrum.
@@ -102,8 +138,9 @@ exactness guarantee for the entire untruncated circuit trajectory.
   the [physical-unit contract](../operators/mpo_dmt.md#contract).
 - `dmt_diagnostics=True` collects reports returned by `get_dmt_reports()` for
   the latest DMT operation. The default avoids extra split diagnostics;
-  full marginal checks are on by default and may be disabled with
-  `dmt_check_regions=False`. Manual `compress_dmt(return_report=True)`
+  full marginal checks are opt-in with `dmt_check_regions=True`. Cheap bond
+  and density trace checks stay active. `report.check_regions` records the
+  selected full-check mode. Manual `compress_dmt(return_report=True)`
   returns and retains one report. A full-sweep report contains all visited
   bonds; a local-update report contains one bond. Workspace updates report
   pre-gate source bond dimensions. Routed reports include temporary-order
@@ -137,6 +174,20 @@ a fallback. Long spans, target bond growth, SVDs and region-panel
 checks can still dominate 2D cost. This is MPO storage, not native PEPO
 evolution or a fully JIT-compiled algorithm. Use the reproducible
 [CPU benchmark](../../../examples/mpo_dmt_benchmark.py) for measured costs.
+
+For physical 2D dynamics, use the [exact-reference benchmark](../../../examples/dmt_2d_dynamics.py).
+It includes every square-lattice edge and separates continuous-time,
+uncompressed Trotter and compressed trajectories. The
+[finite-size results](../../development/notes/2026-11-19-dmt-2d-dynamics.md)
+compare DMT with unconstrained variational MPO compression; per-gate marginal
+preservation and energy accuracy alone do not certify long-time local accuracy.
+
+For 4×4 and rectangles through 16 spins, the
+[scalable companion](../../../examples/dmt_2d_scaling.py) uses sparse
+statevector references and local readout without a global density matrix.
+Its [runtime/accuracy record](../../development/notes/2026-11-19-dmt-2d-scaling.md)
+distinguishes routed replay from full protected sweeps with exact rank-two
+Ising targets. These update orders can produce different truncated trajectories.
 
 | Purpose | Controls | What to keep in mind |
 | --- | --- | --- |

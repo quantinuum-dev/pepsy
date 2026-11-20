@@ -9,6 +9,25 @@ from pepsy.backends.convert import _small_matrix_precision
 from pepsy.optimizers.mps.compression import _apply_dense_gate_with_method
 
 
+@pytest.mark.parametrize("where", [(0, 1), (1, 0), (0, 3), (3, 0)])
+def test_numpy_zero_cutoff_keeps_small_operator_schmidt_components(where):
+    """The output cutoff must not hide a separate gate-MPO truncation."""
+    from scipy.linalg import expm
+    from pepsy.optimizers import MpsOptimizer
+
+    x = np.array([[0., 1.], [1., 0.]])
+    z = np.diag([1., -1.])
+    h = np.kron(z, z) + .45225 * (np.kron(x, np.eye(2)) + np.kron(np.eye(2), x))
+    gate = expm(-.055j * h)
+    state = qtn.MPS_rand_state(4, 4, seed=731, dtype="complex128")
+    original = state.to_dense().reshape((2,) * 4)
+    order = tuple(where) + tuple(j for j in range(4) if j not in where)
+    expected = (gate @ original.transpose(order).reshape(4, -1)).reshape((2,) * 4)
+    expected = expected.transpose(np.argsort(order)).reshape(-1)
+    output = MpsOptimizer(state, [(gate, where)], chi=4, mode="direct").run(cutoff=0., cutoff_mode="rel")
+    np.testing.assert_allclose(output.to_dense().reshape(-1), expected, atol=2e-13, rtol=2e-13)
+
+
 @pytest.mark.parametrize("backend", ["torch", "cuda", "jax", "jax-x64"])
 def test_small_gate_factorization_preserves_gradient_and_state_dtype(backend):
     if backend in {"torch", "cuda"}:
