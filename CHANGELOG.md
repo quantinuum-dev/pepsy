@@ -8,10 +8,28 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Canonical metadata parity:** add independent, stable `info_c` dictionaries
+  to `PauliMPO` and `PauliDMT`, with the same center/synchronization convention
+  as `MpoOptimizer`. Reuse validated native gauges, record QR/SVD/DMT centers,
+  invalidate on managed changes and retain correct metadata after failures.
+
+- **Cached canonical DMT replay:** default to `dmt_update="canonical"`,
+  retaining owned cores and trace environments across run calls and exact
+  one-site actions. Keep `info_c` stable and invalidate caches on detected
+  tensor, metadata or option changes. `dmt_update="full"` remains an explicit
+  reference route; protected-SVD and dtype defaults stay unchanged.
+
+- **DMT interval prototype:** reuse canonical/trace workspaces for affected
+  transfer-MPO intervals; add real-Pauli 6×6 benchmarks, independent trace
+  guarding, chi/cost comparisons and explicit large-chi failure records.
+  Keep the protected splitting rule unchanged.
+
 - **2D DMT accuracy benchmarks:** add complete square-lattice Ising gate
   schedules with continuous-time and uncompressed-circuit references,
   bond/timestep sweeps, ordinary variational MPO comparisons, independent
   preservation audits and positivity diagnostics in complex128.
+  Extend local exact references through 4×4 without global densities;
+  add t=20 shape/runtime comparisons and exact rank-two Ising target probes.
 
 - **DMT check costs and API:** replay now defaults to cheap bond/trace checks
   (`check_regions=False`, or `dmt_check_regions=False`). Full-region replay

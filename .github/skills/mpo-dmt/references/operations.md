@@ -40,9 +40,32 @@ Warning reports survive without full diagnostics. Collect
 `report.preservation_errors` during a trajectory: reports describe the latest
 operation, not a persistent error history.
 
+Ordinary replay defaults to `dmt_update="canonical"`: retain its owned
+workspace across matching calls; handle one-site actions at the tracked
+center without a new compression sweep. `info_c` is a stable dictionary for
+the live MPO, with scratch-target info kept separate. Invalidate reuse on
+state/tensor/array, index/gauge, exponent, backend/dtype/device or DMT-setting
+changes, and after manual canonicalization or rollback. Check object/version
+metadata without hashing buffers or scanning numerical isometries. Raw NumPy
+buffer writes require `sync_canonicalization()` before replay. Keep
+`dmt_update="full"` for an explicit every-gate reference; this is still
+protected SVD, not variational DMRG. See the
+[cache record](../../../../docs/development/notes/2026-11-19-dmt-canonical-cache.md).
+
 Ordinary MPO payloads follow the optimizer's transposed-gate convention:
 use `U.T` for physical ket action `U`. Verify nonunitary target scale and
 support order, not just trace-one unitary examples.
+
+Keep canonical metadata ownership consistent: `PauliMPO`, `PauliDMT` and
+`MpoOptimizer` each own a stable `info_c` dictionary; copies/snapshots never
+share dictionaries. `cur_orthog=None` means unknown. Record a native center
+only after an owned QR/SVD/DMT establishes it, and bind reuse to actual
+cores/version metadata. Symbolic Pauli-word sorting establishes no gauge.
+Native canonicalization moves only the known center distance. Explicit raw
+buffer synchronization invalidates an untrusted state gauge before rebuilding;
+a failed rebuild must not leave a reusable old claim. Persistent-driver
+metadata mirrors its workspace even after a partial failing evolution.
+See the [common contract](../../../../docs/api/optimizers/pauli_dmt.md#canonical-metadata-ownership).
 
 ## Larger contiguous regions
 
@@ -65,8 +88,9 @@ Keep bad chi/width combinations in results. Neither mode enforces positivity;
 real Pauli coefficients maintain Hermiticity, not positive semidefiniteness.
 
 Crossing-region planning is indexed once per workspace. Preserve its exact
-string ordering and cover tie-breaking. Do not cache tensor-dependent
-environments, projected vectors or SVD support across writes/gauge moves.
+string ordering and cover tie-breaking. Cache trace environments only with
+correct changed-range invalidation. Never reuse projected protection vectors
+or SVD support across tensor writes or gauge moves.
 
 ## Profile without changing the scientific comparison
 
@@ -117,6 +141,24 @@ The [finite-size 2D record](../../../../docs/development/notes/2026-11-19-dmt-2d
 compares ordinary DMT and unconstrained FIT. Do not promote energy agreement,
 roundoff-level preservation, or the largest tested chi to a long-time accuracy
 guarantee, or describe mapped MPO evidence as native PEPO validation.
+
+For 4×4/rectangular trajectories, use the
+[scalable benchmark](../../../../examples/dmt_2d_scaling.py) and
+[measured scope](../../../../docs/development/notes/2026-11-19-dmt-2d-scaling.md).
+Use sparse statevectors plus local marginals for the stated depolarized pure
+family; do not allocate a full 16-spin density. Global HS Hermiticity overlaps
+have a cancellation floor and are not a PSD certificate. Label the exact
+rank-two Ising target/full-sweep variant separately from routed replay and
+separate timestep, target construction, compression, audits and readout costs.
+
+For the [6×6 real-Pauli interval prototype](../../../../docs/development/notes/2026-11-19-dmt-2d-window.md),
+reuse the canonical workspace and exactly prepare only the changed interval
+before its protected splits. Real coefficient storage enforces Hermiticity,
+not positivity. Retain the independent fresh scalar trace guard; cached
+protection-vector checks alone missed large-chi failures. Warn-and-continue
+applies to finite preservation defects, not native process faults. Keep
+failed runs out of convergence references and distinguish uncontrolled Apple
+Accelerate pilot timings from explicitly VECLIB-limited runs.
 
 For White et al. comparisons reuse the
 [figure convention record](../../../../docs/development/notes/2026-11-19-dmt-white-figures.md)

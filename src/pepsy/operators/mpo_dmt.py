@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import copy
 from dataclasses import replace
 import math
 
@@ -25,8 +24,9 @@ from ._pauli_dmt import (
     _region_pattern,
     _relative_density_defect,
     _region_trace_data,
+    _traced,
 )
-from .pauli_mpo import _array_like, _copy_array, _core_bond_dimensions, _einsum, _reshape, _transpose
+from .pauli_mpo import _array_like, _copy_array, _einsum, _host_array, _reshape, _transpose
 
 __all__ = ["compress_mpo_dmt", "MPODMTReport", "MPODMTBondReport"]
 
@@ -236,17 +236,41 @@ def _gate_mpo_dmt(mpo, previous, gate, bra_gate, where):
 
 
 def _copy_workspace(previous):
-    workspace = copy(previous)
-    workspace.cores = list(previous.cores)
-    workspace.environments = copy(previous.environments)
-    workspace.environments.cores = workspace.cores
-    workspace.environments.left = list(previous.environments.left)
-    workspace.environments.right = list(previous.environments.right)
-    workspace.original_bonds = _core_bond_dimensions(workspace.cores)
-    workspace.reports = []
-    workspace.warned_checks = set(previous.warned_checks)
-    workspace.relative_density_error = None
-    return workspace
+    return previous.copy()
+
+
+def _gate_mpo_dmt_single(mpo, previous, gate, bra_gate, where):
+    """Exact one-site action; only its canonical centre can lose isometry."""
+    workspace = previous.copy()
+    site, = where
+    d = workspace.mpo_dimension
+
+    def ordered(operator):
+        if operator is None:
+            return _array_like(np.eye(d), workspace.cores[0])
+        if tuple(operator.shape) != (d, d):
+            raise ValueError(f"One-site DMT gate must have shape {(d, d)}")
+        return _transpose(operator, (1, 0))
+
+    transfer = _reshape(_einsum("Aa,Cc->ACac", ordered(gate), ar.do("conj", ordered(bra_gate))),
+                        (d * d, d * d))
+    workspace.move_center(site)
+    value = _einsum("PQ,abQ->abP", transfer, workspace.cores[site])
+    value_norm = _float(_norm(value))
+    if not np.isfinite(value_norm):
+        raise FloatingPointError("DMT produced nonfinite one-site gate data.")
+    if workspace.variant == "density":
+        # Exact local gates need no truncation, but the density construction
+        # still requires a resolved nonzero trace for subsequent DMT steps.
+        left, right = workspace.environments.at(site, site + 1)
+        trace = left @ _traced(value, workspace.trace_vector) @ right
+        bound = _float(_norm(left)) * value_norm * _float(_norm(right))
+        if abs(_host_array(trace).item()) <= 32 * max(value.shape) * _epsilon(value) * bound:
+            raise ValueError("density DMT requires a numerically resolved nonzero trace.")
+    workspace.cores[site] = value
+    workspace.environments.invalidate(site, site + 1)
+    report = _physical_report(workspace) if workspace.diagnostics else None
+    return _write_workspace(mpo, workspace, report), report, workspace
 
 
 def _mpo_gate_transfer(gate, bra_gate, where, workspace):

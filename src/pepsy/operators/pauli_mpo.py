@@ -254,6 +254,15 @@ def _host_array(value):
         return np.asarray(value)
 
 
+def _array_state_token(array):
+    """Cheap shape/type/device/version metadata; no numerical buffer scan."""
+    try:
+        version = getattr(array, "_version", None)
+    except RuntimeError:  # Torch inference tensors do not track versions.
+        version = None
+    return tuple(array.shape), ar.get_dtype_name(array), str(getattr(array, "device", None)), version
+
+
 def _host_shape(value):
     return tuple(int(size) for size in getattr(value, "shape", np.shape(value)))
 
@@ -539,11 +548,22 @@ def _left_canonicalize_cores(cores):
     return tuple(cores)
 
 
-def _canonicalize_core_chain(cores, center):
+def _canonicalize_core_chain(cores, center, *, current_center=None):
     """Canonicalize Pauli-label cores around ``center`` using QR factors."""
 
-    cores = list(_left_canonicalize_cores(cores))
-    for site in range(len(cores) - 1, center, -1):
+    if current_center is None:
+        cores = list(_left_canonicalize_cores(cores))
+        current_center = len(cores) - 1
+    else:
+        cores = [_copy_array(core) for core in cores]
+    for site in range(current_center, center):
+        left, right, physical = _host_shape(cores[site])
+        matrix = _reshape(_transpose(cores[site], (0, 2, 1)), (left * physical, right))
+        q, r = ar.do("linalg.qr", matrix, mode="reduced")
+        rank = _host_shape(q)[1]
+        cores[site] = _transpose(_reshape(q, (left, physical, rank)), (0, 2, 1))
+        cores[site + 1] = _einsum("ab,bcp->acp", r, cores[site + 1])
+    for site in range(current_center, center, -1):
         left, right, physical = _host_shape(cores[site])
         matrix = _reshape(_transpose(cores[site], (0, 2, 1)), (left, physical * right))
         q, r = ar.do("linalg.qr", _transpose(matrix, (1, 0)), mode="reduced")
@@ -1266,6 +1286,11 @@ class PauliMPO:
     Its cores remain Pauli-basis tensors, while its virtual bonds can become
     dense numerical factors.  This is the same operator compression problem
     as MPO SVD rounding, but the physical legs never leave the Pauli basis.
+
+    Each instance owns a stable ``info_c`` dictionary. ``cur_orthog`` is a
+    verified native-core center pair or None when unknown. Native QR/SVD/DMT
+    operations maintain it; copies own independent dictionaries. Symbolic
+    word canonicalization does not establish a numerical MPO gauge.
     """
 
     def __init__(self, nsites, terms=(), *, boundary="open"):
@@ -1276,6 +1301,8 @@ class PauliMPO:
         self._terms = _canonical_terms(terms, self.nsites)
         self._cores = None
         self.compression_report = None
+        self.info_c = {"cur_orthog": None}
+        self._canonical_cache = None
 
     @classmethod
     def from_pauli_cores(cls, cores, *, boundary="open", copy=True):
@@ -1295,7 +1322,30 @@ class PauliMPO:
         result._terms = None
         result._cores = tuple(cores)
         result.compression_report = None
+        result.info_c = {"cur_orthog": None}
+        result._canonical_cache = None
         return result
+
+    def _invalidate_canonicalization(self):
+        self.info_c.clear()
+        self.info_c["cur_orthog"] = None
+        self._canonical_cache = None
+
+    def _record_canonical_center(self, center):
+        """Record a gauge established by an owned numerical operation."""
+        span = (int(center), int(center))
+        self.info_c.clear()
+        self.info_c["cur_orthog"] = span
+        self._canonical_cache = (span, self._cores, tuple(_array_state_token(a) for a in self._cores))
+
+    def _known_canonical_center(self):
+        cache = self._canonical_cache
+        if (cache is not None and self.info_c.get("cur_orthog") == cache[0]
+                and self._cores is cache[1]
+                and tuple(_array_state_token(a) for a in self._cores) == cache[2]):
+            return cache[0][0]
+        self._invalidate_canonicalization()
+        return None
 
     @classmethod
     def from_terms(cls, nsites, terms, *, boundary="open", translate=True):
@@ -1427,6 +1477,8 @@ class PauliMPO:
         )
 
     def copy(self):
+        """Copy storage and independent canonical metadata."""
+        center = self._known_canonical_center()
         if self._cores is not None:
             result = type(self).from_pauli_cores(
                 self._cores,
@@ -1435,6 +1487,8 @@ class PauliMPO:
         else:
             result = type(self)(self.nsites, self.terms, boundary=self.boundary)
         result.compression_report = self.compression_report
+        if center is not None:
+            result._record_canonical_center(center)
         return result
 
     def canonicalize(
@@ -1560,23 +1614,48 @@ class PauliMPO:
         The physical index remains exactly the four-element Pauli basis.  The
         returned object is core-backed, so its Pauli-word expansion is not
         materialized unless a word-oriented method such as ``terms`` is read.
+        A validated known gauge moves only the required center distance;
+        ``info_c['cur_orthog']`` records the resulting pair.
         """
 
         if center is None:
             center = self.nsites - 1
         if not isinstance(center, Integral) or not 0 <= int(center) < self.nsites:
             raise ValueError(f"center must lie in the range 0..{self.nsites - 1}.")
-        cores = _canonicalize_core_chain(
-            self.to_pauli_cores(copy=True),
-            int(center),
-        )
+        current = self._known_canonical_center()
+        if inplace and current == int(center):
+            return self
+        cores = _canonicalize_core_chain(self.to_pauli_cores(copy=False), int(center),
+                                         current_center=current)
         if inplace:
             self._cores = cores
             self._terms = None
+            self._record_canonical_center(center)
             return self
-        return type(self).from_pauli_cores(cores, boundary=self.boundary)
+        result = type(self).from_pauli_cores(cores, boundary=self.boundary, copy=False)
+        result._record_canonical_center(center)
+        return result
 
     canonize_native = canonicalize_native
+
+    def sync_canonicalization(self, site=None):
+        """Rebuild the gauge after raw buffer edits; return ``(site, site)``.
+
+        Each PauliMPO owns its info dictionary. Explicit synchronization
+        ignores any cached proof of isometry and prepares the cores afresh.
+        """
+        if site is None:
+            span = self.info_c.get("cur_orthog")
+            site = span[1] if span is not None else self.nsites - 1
+        if not isinstance(site, Integral) or not 0 <= int(site) < self.nsites:
+            raise ValueError(f"site must lie in the range 0..{self.nsites - 1}.")
+        # Explicit sync may follow an untracked buffer edit. If preparation
+        # fails, the previous gauge claim must not remain reusable.
+        self._invalidate_canonicalization()
+        cores = _canonicalize_core_chain(self.to_pauli_cores(copy=False), int(site))
+        self._cores, self._terms = cores, None
+        self._record_canonical_center(site)
+        return self.info_c["cur_orthog"]
 
     def compress_pauli(
         self,
@@ -1700,7 +1779,7 @@ class PauliMPO:
                 seed=seed,
             )
             if isinstance(form, Integral) and form:
-                compressed = _canonicalize_core_chain(compressed, form)
+                compressed = _canonicalize_core_chain(compressed, form, current_center=0)
         discarded_weight *= physical_scale
         bond_reports = tuple(
             replace(
@@ -1730,10 +1809,17 @@ class PauliMPO:
             bond_reports=bond_reports,
         )
         result.compression_report = report
+        center = None if form == "flat" else (form if isinstance(form, Integral)
+                                               else self.nsites - 1 if form == "left" else 0)
+        if center is not None:
+            result._record_canonical_center(center)
         if inplace:
             self._cores = result.to_pauli_cores(copy=False)
             self._terms = None
             self.compression_report = report
+            self._invalidate_canonicalization()
+            if center is not None:
+                self._record_canonical_center(center)
             result = self
         if return_report:
             return result, report
@@ -2202,6 +2288,7 @@ class PauliMPO:
                 self._cores = result.to_pauli_cores(copy=False)
                 self._terms = None
                 self.compression_report = None
+                self._invalidate_canonicalization()
                 return self
             return result
 
@@ -2240,6 +2327,7 @@ class PauliMPO:
             self._terms = result.terms
             self._cores = None
             self.compression_report = None
+            self._invalidate_canonicalization()
             return self
         return result
 
@@ -2310,6 +2398,7 @@ class PauliMPO:
             self._terms = result._terms
             self._cores = result._cores
             self.compression_report = None
+            self._invalidate_canonicalization()
             return self
         return result
 

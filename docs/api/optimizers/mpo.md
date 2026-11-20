@@ -59,26 +59,53 @@ edges = [((0, 0), (1, 0)), ((0, 1), (1, 1)), ((1, 0), (2, 0))]
 # Existing MPO payload convention: U.T gives the physical action U rho U†.
 gates = [(U.T, (sites[a], sites[b])) for a, b in edges]
 opt = MpoOptimizer(rho, gates, chi=40, mode="dmt", contraction_opt="greedy")
-rho_t = opt.run(dmt_regions=regions, dmt_diagnostics=True)
-rho_t = opt.run(dmt_regions=regions)
+settings = dict(dmt_regions=regions, dmt_diagnostics=True)
+rho_t = opt.run(**settings)
+rho_t = opt.run(**settings)  # Reuse the committed canonical workspace.
 
 # Compress the current state without replaying its queue:
 rho_t, report = opt.compress_dmt(regions=regions, return_report=True)
 ```
 
-Each gate is applied **without target truncation**, followed by protected
-SVD compression. The first gate uses a full target and protected sweep to
-cap every bond. Later gates on adjacent MPO sites reuse canonical cores and
-trace environments, splitting only the acted-on bond. Later distant gates
+`run(dmt_update="canonical")` is the default. Each gate is applied
+**without target truncation**. The first uncached gate uses a full target and
+protected SVD sweep to cap every bond. Later gates on adjacent MPO sites reuse
+canonical cores and trace environments, splitting only the acted-on bond.
+One-site gates move the cached center to that site and act exactly, with no
+DMT split or full-chain compression. Later distant gates
 use **exact forward SWAPs**, apply the gate, then protect the correspondingly
 permuted regions during return SWAPs. Temporary protected ranks may exceed
 `chi`; any enlarged bonds are capped after restoring the original order.
-The first gate, one-site gates, dtype changes and failed routed checks use
-the full-target route, which refreshes the workspace. Gate-MPO factorization and intermediate target
+Matching replay settings retain the workspace across `run()` and gate-queue
+changes. Cache misses, dtype changes and failed routed checks use the
+full-target route, which refreshes the workspace. Gate-MPO factorization and intermediate target
 construction use zero cutoff. DMT alone applies
 `chi` and the requested residual cutoff. One- and two-site gates accept distant
 or reversed supports, explicit ket/bra pairs and ket-only/bra-only payloads;
 they retain the existing [MPO matrix convention](#gate-conventions).
+
+Compression order can change unprotected correlations, so canonical and full
+routes need not give identical global approximants after actual truncation.
+
+`info_c` remains the same dictionary across commits, resets and rollback;
+`info_c["cur_orthog"]` reflects the live committed gauge. Scratch targets
+have separate canonical metadata. Cache validation checks state/tensor/array
+identity, index order, isometry hints, shape, dtype/device, exponent, DMT
+settings and available array version counters. This needs no tensor-content
+hash or numerical isometry scan. Manual canonicalization and `set_mpo()`
+invalidate the DMT cache. After writing directly into a NumPy buffer, call
+`opt.sync_canonicalization()` before replay; such writes cannot be detected
+from array identity alone. Manual `compress_dmt()` seeds a reusable workspace
+when its settings match the next replay call.
+
+`PauliMPO` and `PauliDMT` expose their own dictionaries using the same
+[canonical metadata convention](pauli_dmt.md#canonical-metadata-ownership).
+These dictionaries and their numerical states remain independently owned.
+
+Use `run(dmt_update="full")` to force the full-target/sweep route after every
+gate for reference comparisons. The protected SVD rule, default `"paper"`
+truncation, dtype and preservation policy are unchanged. See the
+[cache benchmark and validation](../../development/notes/2026-11-19-dmt-canonical-cache.md).
 
 The preservation condition for every requested region is
 
@@ -154,6 +181,13 @@ uncompressed Trotter and compressed trajectories. The
 [finite-size results](../../development/notes/2026-11-19-dmt-2d-dynamics.md)
 compare DMT with unconstrained variational MPO compression; per-gate marginal
 preservation and energy accuracy alone do not certify long-time local accuracy.
+
+For 4×4 and rectangles through 16 spins, the
+[scalable companion](../../../examples/dmt_2d_scaling.py) uses sparse
+statevector references and local readout without a global density matrix.
+Its [runtime/accuracy record](../../development/notes/2026-11-19-dmt-2d-scaling.md)
+distinguishes routed replay from full protected sweeps with exact rank-two
+Ising targets. These update orders can produce different truncated trajectories.
 
 | Purpose | Controls | What to keep in mind |
 | --- | --- | --- |

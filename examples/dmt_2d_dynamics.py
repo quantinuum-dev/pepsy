@@ -22,6 +22,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 from scipy.linalg import eigh, expm
+from scipy.sparse import coo_matrix
 from threadpoolctl import threadpool_limits
 
 from pepsy.operators import square_lattice_dmt_regions
@@ -37,10 +38,13 @@ except ModuleNotFoundError:
 
 
 def problem(lx, ly, dt, *, hx=1.05, hz=.5, pure_weight=.6, map_mode="snake-row-major",
-            initial_kind="depolarized-pure", polarization=.4):
+            initial_kind="depolarized-pure", polarization=.4, dense_reference=True):
     """Distribute each site's field over its incident physical edges once."""
-    if min(lx, ly) < 2 or lx * ly > 10:
-        raise ValueError("Dense-reference benchmark requires both sides >=2 and at most 10 sites")
+    limit = 10 if dense_reference else 20
+    if min(lx, ly) < 2 or lx * ly > limit:
+        raise ValueError(f"Benchmark requires both sides >=2 and at most {limit} sites in this reference mode")
+    if not dense_reference and initial_kind != "depolarized-pure":
+        raise ValueError("Sparse statevector references require the depolarized-pure input")
     if not 0 <= pure_weight <= 1 or not np.isfinite(dt) or dt <= 0:
         raise ValueError("Require a positive finite dt and pure_weight in [0, 1]")
     if initial_kind not in {"depolarized-pure", "product-mixed"} or not 0 <= polarization <= 1:
@@ -69,7 +73,9 @@ def problem(lx, ly, dt, *, hx=1.05, hz=.5, pure_weight=.6, map_mode="snake-row-m
     psi = ref.product_vector(vectors)
     pure = qtn.MPO_product_operator([np.outer(v, v.conj()) for v in vectors])
     initial = pure_weight * pure + (1 - pure_weight) / 2**n * qtn.MPO_identity(n)
-    initial_density = density(psi, pure_weight)
+    # A 16-spin density has 2^32 entries. The sparse-reference caller uses
+    # only a statevector plus the analytically invariant identity component.
+    initial_density = density(psi, pure_weight) if dense_reference else None
     if initial_kind == "product-mixed":
         factors = [(1 - polarization) * ref.I / 2 + polarization * np.outer(v, v.conj()) for v in vectors]
         initial = qtn.MPO_product_operator(factors)
@@ -79,13 +85,22 @@ def problem(lx, ly, dt, *, hx=1.05, hz=.5, pure_weight=.6, map_mode="snake-row-m
     # Independent bit-flip Hamiltonian, not a sum of the Trotter matrices.
     basis = np.arange(2**n)
     z = [1 - 2 * ((basis >> (n - 1 - j)) & 1) for j in range(n)]
-    hamiltonian = np.diag(sum(z[a] * z[b] for a, b in edges) + hz * sum(z)).astype(complex)
-    for j in range(n):
-        hamiltonian[basis ^ (1 << (n - 1 - j)), basis] += hx
+    zz_diagonal = sum(z[a] * z[b] for a, b in edges)
+    diagonal = zz_diagonal + hz * sum(z)
+    if dense_reference:
+        hamiltonian = np.diag(diagonal).astype(complex)
+        for j in range(n):
+            hamiltonian[basis ^ (1 << (n - 1 - j)), basis] += hx
+    else:
+        rows = [basis] + [basis ^ (1 << (n - 1 - j)) for j in range(n)]
+        data = [diagonal] + [np.full(2**n, hx)] * n
+        hamiltonian = coo_matrix((np.concatenate(data), (np.concatenate(rows), np.tile(basis, n + 1))),
+                                 shape=(2**n, 2**n)).tocsr().astype(complex)
     regions = square_lattice_dmt_regions(lx, ly, mapper=mapper, kind="plaquettes")
     return dict(n=n, edges=edges, terms=terms, gates=gates, psi=psi, initial=initial,
                 hamiltonian=hamiltonian, regions=regions, pure_weight=pure_weight,
-                initial_kind=initial_kind, initial_density=initial_density)
+                initial_kind=initial_kind, initial_density=initial_density,
+                hx=hx, hz=hz, zz_diagonal=zz_diagonal)
 
 
 def density(psi, weight):

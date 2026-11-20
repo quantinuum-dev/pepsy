@@ -7,6 +7,7 @@ or Pauli-word expansion are used by the compression kernel.
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass, replace
 from itertools import product
 import math
@@ -168,7 +169,31 @@ def _traced(core, trace_vector=None):
     return _einsum("abp,p->ab", core, trace_vector)
 
 
-def _trace_fraction(cores, trace_vector=None):
+def _trace_scalar_data(cores, trace_vector=None):
+    """Fresh normalized scalar contraction, independent of cached directions."""
+    value = _array_like(np.ones(1), cores[0])
+    logarithm = ar.do("zeros_like", _norm(value))
+    for core in reversed(cores):
+        value = _traced(core, trace_vector) @ value
+        scale = _norm(value)
+        safe = ar.do("where", scale > 0, scale, ar.do("ones_like", scale))
+        value = value / safe
+        logarithm = logarithm + ar.do("log", safe)
+    phase, logarithm = _host_array(value).item(), _float(logarithm)
+    if not np.isfinite(phase) or not np.isfinite(logarithm):
+        raise FloatingPointError("DMT produced nonfinite scalar trace data.")
+    return phase, logarithm
+
+
+def _relative_scalar_defect(target, actual):
+    phase, logarithm = target
+    new_phase, new_logarithm = actual
+    if not phase:
+        return 0. if not new_phase else math.inf
+    return abs(new_phase * math.exp(min(709., new_logarithm - logarithm)) - phase) / abs(phase)
+
+
+def _trace_fraction(cores, trace_vector=None, *, center=0):
     """Global identity coefficient relative to the canonical centre norm.
 
     Per-bond environments are normalized and lose their magnitude, so they
@@ -186,7 +211,7 @@ def _trace_fraction(cores, trace_vector=None):
         safe = ar.do("where", norm > 0, norm, ar.do("ones_like", norm))
         v = v / safe
         log_scale = log_scale + ar.do("log", safe)
-    centre_norm = _norm(cores[0])
+    centre_norm = _norm(cores[center])
     nonzero = nonzero & (centre_norm > 0)
     safe = ar.do("where", centre_norm > 0, centre_norm, ar.do("ones_like", centre_norm))
     exponent = ar.do("minimum", log_scale - ar.do("log", safe), ar.do("zeros_like", log_scale))
@@ -999,14 +1024,19 @@ class _PauliDMTWorkspace:
             self.eye = self.eye - 2 * _einsum("p,q->pq", v, ar.do("conj", v)) / safe
         self.protected_physical = self.eye
         # One exact preparation, then move only as far as the next active pair.
-        self.center = len(self.cores) - 1
+        # Trust only a gauge bound to these actual cores/version tokens;
+        # an arbitrary user-written info dictionary is not such a proof.
+        known_center = (operator._known_canonical_center()
+                        if operator is not None and _cores is None else None)
+        self.center = len(self.cores) - 1 if known_center is None else known_center
         self.environments = _TraceEnvironments(self.cores, _trace_vector)
-        self.move_center(0)
+        if known_center is None:
+            self.move_center(0)
         if variant == "density":
-            _, right = self.environments.at(0, 1)
-            a = self.cores[0]
-            value = _traced(a, _trace_vector)[0, :] @ right
-            bound = _float(_norm(a)) * _float(_norm(right))
+            left, right = self.environments.at(self.center, self.center + 1)
+            a = self.cores[self.center]
+            value = left @ _traced(a, _trace_vector) @ right
+            bound = _float(_norm(left)) * _float(_norm(a)) * _float(_norm(right))
             if abs(_host_array(value).item()) <= 32 * max(a.shape) * _epsilon(a) * bound:
                 raise ValueError(
                     "density DMT requires a numerically resolved nonzero trace. "
@@ -1019,15 +1049,22 @@ class _PauliDMTWorkspace:
             # A connected density calculation declares nonzero trace. For raw
             # operators, do not divide by a trace that is only roundoff noise.
             self.monitor_trace = variant == "density" or (
-                _trace_fraction(self.cores, _trace_vector) > 8 * _epsilon(self.cores[0])
+                _trace_fraction(self.cores, _trace_vector, center=self.center) > 8 * _epsilon(self.cores[0])
             )
         else:
             self.monitor_trace = trace_guard
 
     def move_center(self, target):
+        # Commit each exact step so a later QR failure retains valid metadata.
+        while self.center != target:
+            following = self.center + (1 if target > self.center else -1)
+            self._factor_interval(self.center, following)
+            self.center = following
+
+    def _factor_interval(self, start, target):
+        """Exact QR transport, also usable after expanding a local window."""
         p = self.physical_dim
-        while self.center < target:
-            i = self.center
+        for i in range(start, target):
             a = self.cores[i]
             dl, dr, _ = a.shape
             q, r = _qr(_reshape(_transpose(a, (0, 2, 1)), (dl * p, dr)))
@@ -1039,9 +1076,7 @@ class _PauliDMTWorkspace:
                 r @ _reshape(neighbor, (dr, -1)), (r.shape[0], neighbor.shape[1], p),
             )
             self.environments.invalidate(i, i + 2)
-            self.center += 1
-        while self.center > target:
-            i = self.center
+        for i in range(start, target, -1):
             a = self.cores[i]
             dl, dr, _ = a.shape
             left, _, right = array_split(
@@ -1055,7 +1090,73 @@ class _PauliDMTWorkspace:
                 _reshape(matrix, (neighbor.shape[0], p, left.shape[1])), (0, 2, 1),
             )
             self.environments.invalidate(i - 1, i + 1)
-            self.center -= 1
+
+    def copy(self):
+        """Copy mutable sweep metadata; array updates always replace cores."""
+        workspace = copy(self)
+        workspace.cores = list(self.cores)
+        workspace.environments = copy(self.environments)
+        workspace.environments.cores = workspace.cores
+        workspace.environments.left = list(self.environments.left)
+        workspace.environments.right = list(self.environments.right)
+        workspace.original_bonds = _core_bond_dimensions(workspace.cores)
+        workspace.reports = []
+        workspace.warned_checks = set(self.warned_checks)
+        workspace.relative_density_error = None
+        return workspace
+
+    def apply_window(self, start, operator_cores, *, absorb="right"):
+        """Apply a physical transfer MPO and compress its affected interval.
+
+        Transfer cores have axes (left, right, output, input). Outside the
+        window the existing mixed canonical gauge is reused. Mutates this
+        workspace: callers needing rollback must operate on ``copy()``.
+        """
+        operators = list(operator_cores)
+        stop = start + len(operators) - 1
+        p = self.physical_dim
+        if (not operators or not 0 <= start <= stop < len(self.cores)
+                or absorb not in {"left", "right"}):
+            raise ValueError("Invalid DMT window or absorption direction.")
+        bond = 1
+        for op in operators:
+            if (len(op.shape) != 4 or op.shape[0] != bond or tuple(op.shape[2:]) != (p, p)
+                    or ar.infer_backend(op) != ar.infer_backend(self.cores[0])
+                    or ar.get_dtype_name(op) != ar.get_dtype_name(self.cores[0])):
+                raise ValueError("Transfer cores must have matching bonds, physical shape, backend and dtype.")
+            if not bool(_host_array(ar.do("all", ar.do("isfinite", op))).item()):
+                raise ValueError("Transfer cores must be finite.")
+            bond = op.shape[1]
+        if bond != 1:
+            raise ValueError("Transfer MPO must have open boundary bonds of dimension one.")
+        near, far = (start, stop) if absorb == "right" else (stop, start)
+        self.move_center(near)
+        for i, op in enumerate(operators, start):
+            a = self.cores[i]
+            self.cores[i] = _reshape(_einsum("abp,xyqp->axbyq", a, op),
+                                     (a.shape[0] * op.shape[0], a.shape[1] * op.shape[1], p))
+        self.environments.invalidate(start, stop + 1)
+        # Cached maps also define the local guards. Check their scalar target
+        # independently, without paying for a complete regional-density scan.
+        target_trace = (_trace_scalar_data(self.cores, self.trace_vector)
+                        if self.monitor_trace else None)
+        self._factor_interval(far, near)
+        self.center = near
+        bonds = range(start, stop) if absorb == "right" else range(stop - 1, start - 1, -1)
+        for i in bonds:
+            self.split_pair(i, absorb=absorb)
+        if target_trace is not None:
+            actual_trace = _trace_scalar_data(self.cores, self.trace_vector)
+            error = _relative_scalar_defect(target_trace, actual_trace)
+            if not np.isfinite(error) or error > 32 * math.sqrt(_epsilon(self.cores[0])):
+                message = _preservation_failure(
+                    self.preservation_check, "trace",
+                    f"DMT window [{start}, {stop}] changed its target trace "
+                    f"(fresh relative defect {error:.3g}).", self.warned_checks)
+                if self.reports:
+                    last = self.reports[-1]
+                    self.reports[-1] = replace(
+                        last, preservation_errors=last.preservation_errors + (message,))
 
     def split_pair(self, bond, transfer=None, *, absorb="right"):
         p = self.physical_dim
@@ -1228,7 +1329,7 @@ def compress_dmt(operator, *, max_bond, cutoff=0.0, cutoff_mode="rel", variant="
     before = ((_local_trace_data(operator.to_pauli_cores(copy=False)) if workspace.regions is None
                else _region_trace_data(operator.to_pauli_cores(copy=False), workspace.regions))
               if check_regions else None)
-    norm = _float(_norm(workspace.cores[0]))
+    norm = _float(_norm(workspace.cores[workspace.center]))
     workspace.compress_sweep()
     after = ((_local_trace_data(workspace.cores) if workspace.regions is None
               else _region_trace_data(workspace.cores, workspace.regions)) if check_regions else None)
@@ -1247,6 +1348,7 @@ def _finish(operator, workspace, inplace, return_report):
         operator._cores, operator._terms = result._cores, None
         operator.compression_report = report
         result = operator
+    result._record_canonical_center(workspace.center)
     return (result, report) if return_report else result
 
 

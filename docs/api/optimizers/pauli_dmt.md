@@ -22,6 +22,50 @@ across overlapping regions. Both retain the original defaults. See the
 `check_regions=False` have the same meaning for this persistent driver and
 ordinary MPO compression; see the same guide for reporting limitations.
 
+## Canonical metadata ownership
+
+Each object owns its dictionary and numerical state, using the same convention:
+
+| Object | `info_c` describes | Synchronization |
+| --- | --- | --- |
+| `MpoOptimizer` | Its live ordinary MPO | `opt.sync_canonicalization(site)` |
+| `PauliMPO` | Native coefficient cores; unknown on raw construction | `op.sync_canonicalization(site)` |
+| `PauliDMT` | Its live persistent workspace | `run.sync_canonicalization(site)` |
+
+`info_c["cur_orthog"]` uses Quimb's `(lo, hi)` span convention, normally
+`(center, center)` after a one-center operation, or `None` when unknown.
+Managed updates maintain/invalidate it automatically. Raw buffer writes need
+explicit synchronization; reading metadata performs no buffer hash or
+numerical isometry scan. A raw Quimb MPO uses the caller-supplied `info`
+argument; this API does not attach an automatically managed `info_c` field.
+
+```python
+rho = rho.canonicalize_native(center=2)
+run = PauliDMT(rho, max_bond=32)
+snapshot = run.state
+assert rho.info_c["cur_orthog"] == run.info_c["cur_orthog"] == (2, 2)
+assert snapshot.info_c is not run.info_c
+assert rho.info_c is not run.info_c
+```
+
+The workspace remains the driver's gauge authority. Its public dictionary
+updates after gate/evolution calls, including exceptions after partial work.
+Snapshots record the actual center in independent dictionaries. Exact
+synchronization retains the last DMT diagnostics. Native state canonicalization
+reuses only metadata bound to its actual cores/version tokens; editing the
+dictionary alone cannot assert a gauge.
+
+Keeping an input's known center can change the nearest-end compression order
+at finite bond dimension. Preservation still refers to each current target;
+it does not imply identical global trajectories for different sweep orders.
+
+`PauliMPO.canonicalize()` retains its symbolic-word meaning for sparse inputs;
+`canonicalize_native()` explicitly requests native-core QR. `MpoOptimizer`
+can already use `rho.to_mpo()` through the matrix-unit conversion boundary.
+Automatic native-Pauli dispatch inside that optimizer is a separate adapter
+feature; the protected DMT kernel is already shared. See the
+[implementation and checks](../../development/notes/2026-11-19-dmt-canonical-info.md).
+
 ## Choose an operation
 
 | Task | API | Result and mutation |
@@ -226,6 +270,13 @@ oracle for compression.
 Use profiles to separate centre movement, SVD/protected splitting, and region
 verification. See [measured bottlenecks](../../development/notes/2026-11-16-dmt-performance.md)
 and the [full numerical contract](../operators/pauli_mpo.md#protected-density-matrix-truncation-dmt).
+
+For the experimental real-Pauli interval update on mapped 6×6 lattices,
+see [the benchmark](../../../examples/dmt_2d_window.py) and
+[measured limits](../../development/notes/2026-11-19-dmt-2d-window.md).
+It reuses private canonical workspaces and is not a new public nonlocal
+`PauliDMT` gate API. Real coefficients enforce Hermiticity, while positivity,
+chi convergence and large-chi numerical failures require separate checks.
 
 For an accuracy comparison with `MpsOptimizer`, run
 [`dmt_ising_dynamics.py`](../../../examples/dmt_ising_dynamics.py). It evolves

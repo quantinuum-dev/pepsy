@@ -7,6 +7,22 @@ and [tutorials](../../tutorials/index.md).
 
 ## Contents
 
+- [Canonical metadata ownership](2026-11-19-dmt-canonical-info.md) —
+  Independent Pauli state/driver info, a common synchronization convention,
+  validated native gauge reuse and mutation/failure checks.
+
+- [Persistent canonical DMT replay](2026-11-19-dmt-canonical-cache.md) —
+  Default canonical reuse, stable `info_c`, invalidation/rollback checks and
+  a complex128 field-layer benchmark.
+
+- [6×6 real-Pauli interval DMT](2026-11-19-dmt-2d-window.md) —
+  Reused gauges, real coefficients, chi sweeps, exact local/static oracles,
+  profile costs and unresolved large-chi numerical failures.
+
+- [4×4 and rectangular 2D dynamics](2026-11-19-dmt-2d-scaling.md) —
+  Sparse/local exact references through 16 spins, t=20 shape comparisons,
+  exact Ising target construction and decomposition/runtime profiles.
+
 - [Exact-reference 2D DMT dynamics](2026-11-19-dmt-2d-dynamics.md) —
   Genuine square-lattice Hamiltonians, long finite-size trajectories,
   bond/timestep convergence, positivity and variational MPO comparisons.

@@ -107,6 +107,21 @@ for bond in report.bond_reports:
     print(bond.bond, bond.final_bond, bond.discarded_weight)
 ```
 
+Every `PauliMPO` owns a stable `info_c` dictionary. Its `"cur_orthog"` entry
+is `(center, center)` for an established native gauge and `None` when unknown.
+Constructing sparse terms or sorting/pruning words does not claim a numerical
+gauge. `canonicalize_native`, non-flat native compression and DMT record
+their actual centers. Native canonicalization reuses a validated center and
+moves only the required distance; an in-place request for the same center
+does no QR work.
+
+Copies and DMT snapshots have independent dictionaries. Managed operations
+that can break isometries invalidate the entry. After directly editing a
+shared buffer, `op.sync_canonicalization(site)` rebuilds its gauge and returns
+the `(site, site)` pair; a failed rebuild leaves an unknown entry. Merely
+assigning a center into the dictionary does not establish that gauge.
+See the [common ownership contract](../optimizers/pauli_dmt.md#canonical-metadata-ownership).
+
 The native cores have shape `(left_bond, right_bond, 4)` with physical order
 `I, X, Y, Z`. QR canonicalization and SVD rounding act on the coefficient
 tensor train, never on a dense Hilbert-space matrix. The result remains a
