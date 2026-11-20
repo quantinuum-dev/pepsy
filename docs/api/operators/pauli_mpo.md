@@ -198,6 +198,65 @@ MPO-site index sequences for other shapes, arbitrary ordering, or periodic
 neighbors. The mapping must match the order actually used to construct `rho`.
 The same `regions` argument is accepted by `apply_gate_dmt` and `PauliDMT`.
 
+Preserving a region also preserves every subset by further partial tracing.
+On an open rectangular lattice with both dimensions at least two, all
+elementary plaquettes therefore cover single sites, nearest-neighbor and
+plaquette-diagonal pairs, and L-shaped triples. They do not cover straight
+three-site lines or joint marginals spanning several plaquettes. Add those
+requests explicitly; `plaquettes + square_lattice_dmt_regions(...,
+kind="triples")` covers straight triples too. Contained requests are removed
+from protection planning, so listing L-shapes alongside their parent
+plaquettes adds no constraints. Explicit regions still replace the default
+three-site inventory along the MPO chain.
+
+Use `complete_dmt_regions(nsites, regions, required=supports)` to add uncovered
+observable supports and remove contained requests without inferring any
+joint marginal from overlapping parents:
+
+```python
+from pepsy.operators import complete_dmt_regions
+
+triples = square_lattice_dmt_regions(3, 3, mapper=mapper, kind="triples")
+regions = complete_dmt_regions(9, plaquettes, required=triples)
+```
+
+All entries are MPO storage positions. The helper preserves every supplied
+requirement; it does not find a globally cheapest region cover or add implicit
+chain triples. Build a new workspace after changing the inventory.
+
+For example, a joint marginal on two separated triples is requested as
+`regions=[(0, 1, 2, 5, 6, 7)]`. It preserves the full joint correlations as
+well as each triple and its subsets; protecting the triples separately would
+not preserve those joint correlations.
+
+Each workspace plans crossing regions and physical strings once. Numerical
+protection vectors use its current canonical tensors: normalized partial
+contractions are shared across strings only within one bond-vector assembly.
+They are not reused after tensor writes or gauge moves. Trace environments
+are separately cached with changed-range invalidation. Selection depends on
+the actual MPO positions and inventory, not just a region's shape.
+
+Rank-aware replay also retains immutable candidate covers and column indices
+per visited bond, recomputing numerical directions/ranks at each use. Copies
+own separate cache dictionaries. A changed routed ordering replaces that
+bond's latest plan rather than accumulating plans for every past gate.
+
+At a cut, let $p,q$ be the numerical protected ranks. The paper construction
+uses the sufficient budget
+
+$$
+{\color{blue}\chi\ge p+q},\qquad
+{\color{purple}r_{\mathrm{free}}=\chi-p-q}.
+$$
+
+This is not a minimum feasible-rank theorem: an already fitting target or a
+different constrained completion can need less. Inspect bond reports rather
+than inferring a universal cap from plaquette size. Numerical ranks depend
+on the current state and combined constraints; geometry only bounds their
+string counts. Zero protected ranks in an exact pass-through report mean
+the ranks were not computed. See the
+[protected-SVD contract](mpo_dmt.md#contract) for finite-precision behavior.
+
 `map_mode="snake"` follows `OneDMap`'s default column-oriented snake; it is
 not the same as `"snake-row-major"` or `"row-major"`. For a 3-by-2 lattice,
 the entries below are MPO indices at coordinates `(x, y)`, with `x` as the

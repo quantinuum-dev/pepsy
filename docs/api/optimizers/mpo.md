@@ -211,6 +211,39 @@ undo an installed layout. Inspect `last_run_status`, `last_run_error`, and
 Use `finite_check` in new code. The retained `fit_finite_check` alias is
 resolved at the public call boundary; explicitly conflicting values raise.
 
+## Exact interval transfer maps
+
+`opt.apply_transfer_mpo(start, transfer_cores, *, absorb="auto",
+update="interval", regions=None, return_report=False, ...)` applies a supplied
+physical map exactly, then uses the shared protected-SVD compressor. Each
+open-boundary core has axes `(left, right, output, input)`, where each physical
+axis uses fused matrix-unit order `(ket, bra)`. Unlike gate-stream payloads,
+these cores have **no gate transpose convention**. NumPy constants are aligned
+with the MPO's native backend and common dtype.
+
+`update="interval"` compresses the changed interval; `update="full"` visits
+all chain bonds. An uncached oversized source is prepared exactly and capped
+only after the map, including oversized spectator bonds. Matching subsequent
+calls reuse owned canonical cores and environments. `absorb="auto"` starts
+at the nearer endpoint; `"left"` and `"right"` fix the sweep direction.
+
+Options match `compress_dmt`, except `check_regions=False` by default.
+Full strict checks compare post-action and final panels once. Bond and scalar
+trace checks remain active; a one-site interval action has no post-target
+factorization, so it retains finite/nonzero-density checks without duplicate
+trace contractions. Use `preservation_check="warn"` to continue on finite
+preservation failures and collect `get_dmt_reports()` after each call.
+Reports include update-level failures even when no bond split occurred.
+
+Returns the live MPO, or `(MPO, MPODMTReport)` with `return_report=True`.
+State, `info_c` and reports commit together after success. Gate queues are
+unchanged; the operation invalidates norm-survival fidelity estimates.
+This method is separate from `.run()` and does not add an interval option to
+that gate-stream API. The [Pauli counterpart](pauli_dmt.md#exact-interval-transfer-mpos)
+uses coefficient coordinates and the same splitting kernel. The
+[Torch example](../../../examples/dmt_torch_lattice.py) constructs both maps
+for the same physical 2D Hamiltonian.
+
 ## Supported representations and compression
 
 Dense direct replay accepts `run(mpo_factorization="projector")` to use

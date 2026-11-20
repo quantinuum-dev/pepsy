@@ -26,6 +26,7 @@ import numpy as np
 
 from .._internal.validation import is_strict_integer, normalize_integer_tuple
 from ..backends.convert import infer_backend_converter_from_sample
+from ..backends._numpy_qr import _qr_reduced
 from .mpo_semantic import FirstDegreeMPO, MPOProductTerm
 
 __all__ = [
@@ -537,7 +538,7 @@ def _left_canonicalize_cores(cores):
     for site in range(len(cores) - 1):
         left, right, physical = _host_shape(cores[site])
         matrix = _reshape(_transpose(cores[site], (0, 2, 1)), (left * physical, right))
-        q, r = ar.do("linalg.qr", matrix, mode="reduced")
+        q, r = _qr_reduced(matrix)
         rank = _host_shape(q)[1]
         cores[site] = _transpose(_reshape(q, (left, physical, rank)), (0, 2, 1))
         cores[site + 1] = _einsum(
@@ -559,14 +560,14 @@ def _canonicalize_core_chain(cores, center, *, current_center=None):
     for site in range(current_center, center):
         left, right, physical = _host_shape(cores[site])
         matrix = _reshape(_transpose(cores[site], (0, 2, 1)), (left * physical, right))
-        q, r = ar.do("linalg.qr", matrix, mode="reduced")
+        q, r = _qr_reduced(matrix)
         rank = _host_shape(q)[1]
         cores[site] = _transpose(_reshape(q, (left, physical, rank)), (0, 2, 1))
         cores[site + 1] = _einsum("ab,bcp->acp", r, cores[site + 1])
     for site in range(current_center, center, -1):
         left, right, physical = _host_shape(cores[site])
         matrix = _reshape(_transpose(cores[site], (0, 2, 1)), (left, physical * right))
-        q, r = ar.do("linalg.qr", _transpose(matrix, (1, 0)), mode="reduced")
+        q, r = _qr_reduced(_transpose(matrix, (1, 0)))
         rank = _host_shape(q)[1]
         cores[site] = _transpose(
             _reshape(_transpose(q, (1, 0)), (rank, physical, right)),
@@ -587,7 +588,7 @@ def _right_canonicalize_cores(cores):
     for site in range(len(cores) - 1, 0, -1):
         left, right, physical = _host_shape(cores[site])
         matrix = _reshape(_transpose(cores[site], (0, 2, 1)), (left, physical * right))
-        q, r = ar.do("linalg.qr", _transpose(matrix, (1, 0)), mode="reduced")
+        q, r = _qr_reduced(_transpose(matrix, (1, 0)))
         rank = _host_shape(q)[1]
         cores[site] = _transpose(
             _reshape(_transpose(q, (1, 0)), (rank, physical, right)),
@@ -840,9 +841,9 @@ def _randomized_svd(matrix, *, max_rank=None, oversample=8, n_iter=2, seed=None)
     probe = _array_like(rng.standard_normal((ncols, width)), matrix)
     y = matrix @ probe
     for _ in range(int(n_iter)):
-        q, _ = ar.do("linalg.qr", y, mode="reduced")
+        q, _ = _qr_reduced(y)
         y = matrix @ (_conjugate(_transpose(matrix, (1, 0))) @ q)
-    q, _ = ar.do("linalg.qr", y, mode="reduced")
+    q, _ = _qr_reduced(y)
     reduced = _conjugate(_transpose(q, (1, 0))) @ matrix
     u_small, singular_values, vh = ar.do(
         "linalg.svd",

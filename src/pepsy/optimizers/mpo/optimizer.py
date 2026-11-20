@@ -5573,6 +5573,39 @@ class MpoOptimizer:
                 check_regions=check_regions, preservation_check=preservation_check,
             )
 
+    def apply_transfer_mpo(self, start, transfer_cores, *, absorb="auto", update="interval",
+                           cutoff="auto", cutoff_mode="auto", variant="density",
+                           regions=None, return_report=False, truncation="paper",
+                           max_refinement_sweeps=8, region_selection="smallest",
+                           constraint_mode="strict", constraint_weight=100.,
+                           check_regions=False, preservation_check="raise"):
+        """Apply an exact physical transfer MPO and DMT-compress its interval.
+
+        Transfer cores have axes ``(left, right, output, input)`` with fused
+        local matrix-unit order ``(ket, bra)``; they are physical maps, not
+        gate payloads, so there is no transposed-gate convention here.
+        NumPy constants are converted to the state backend/common dtype.
+        Existing canonical workspaces are reused when all settings match.
+        ``update='interval'`` visits affected bonds, while ``update='full'``
+        performs a full protected sweep. ``absorb='auto'`` starts at the
+        nearer interval endpoint.
+        An uncached oversized input is capped only after the exact action.
+        Failure leaves the committed state/info/reports unchanged. Returns
+        the MPO, or ``(MPO, MPODMTReport)`` when requested. Gate queues are
+        unchanged. This invalidates norm-survival fidelity estimates.
+        """
+        from .dmt import transfer_current
+
+        with self._dmt_backend_context(mode="dmt"):
+            return transfer_current(
+                self, start, transfer_cores, absorb=absorb, update=update,
+                cutoff=cutoff, cutoff_mode=cutoff_mode,
+                variant=variant, regions=regions, return_report=return_report,
+                truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+                region_selection=region_selection, constraint_mode=constraint_mode,
+                constraint_weight=constraint_weight, check_regions=check_regions,
+                preservation_check=preservation_check)
+
     def get_dmt_reports(self):
         """Return immutable reports from the latest diagnostic DMT operation."""
         return tuple(self._dmt_reports)

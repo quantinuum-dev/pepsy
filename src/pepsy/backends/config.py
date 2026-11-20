@@ -61,6 +61,12 @@ class TorchLinalgConfig:
         CPU forward SVD implementation. SciPy choices are useful for explicit
         LAPACK experimentation and forward-only MPS runs. With
         ``stabilized=True``, the custom backward remains available.
+    cpu_qr : {"torch", "scipy_pivoted"}, default="torch"
+        Explicit CPU QR implementation. ``scipy_pivoted`` is forward-only,
+        accepts 2D float32/64 or complex64/128 matrices, and absorbs the column
+        permutation into R. It preserves Q @ R and the Q isometry, but R is
+        not generally triangular. Inputs requiring gradients are rejected.
+        CUDA tensors retain the configured Torch route.
     svd_fallback : {"auto", "none", "scipy_gesdd", "scipy_gesvd"}, default="auto"
         Backend used after a Torch SVD failure. ``"auto"`` means no fallback
         for native SVD and ``"scipy_gesvd"`` for stabilized SVD.
@@ -103,6 +109,7 @@ class TorchLinalgConfig:
     qr_rank_tol_factor: float = 1.0
     quimb_split_drivers: bool = False
     svd_gap_rtol: float = 1.0e-6
+    cpu_qr: str = "torch"
 
     def __post_init__(self):
         mode = str(self.mode).strip().lower()
@@ -115,6 +122,7 @@ class TorchLinalgConfig:
         object.__setattr__(self, "cpu_svd", cpu_svd)
         object.__setattr__(self, "svd_fallback", svd_fallback)
         object.__setattr__(self, "qr_rank_policy", qr_rank_policy)
+        object.__setattr__(self, "cpu_qr", str(self.cpu_qr))
         self.validate()
 
     def validate(self):
@@ -142,6 +150,8 @@ class TorchLinalgConfig:
             )
         if self.qr_rank_policy not in {"warn", "native", "adaptive", "error"}:
             raise ValueError("qr_rank_policy must be one of: warn, native, adaptive, error")
+        if self.cpu_qr not in {"torch", "scipy_pivoted"}:
+            raise ValueError("cpu_qr must be 'torch' or 'scipy_pivoted'")
         try:
             qr_factor = float(self.qr_rank_tol_factor)
         except (TypeError, ValueError) as exc:
@@ -182,6 +192,7 @@ class TorchLinalgConfig:
             "stabilized": self.stabilized,
             "svd_driver": self.svd_driver,
             "cpu_svd": self.cpu_svd,
+            "cpu_qr": self.cpu_qr,
             "svd_fallback": self.svd_fallback,
             "resolved_svd_fallback": self.resolved_svd_fallback,
             "allow_approximate": self.allow_approximate,
@@ -708,6 +719,9 @@ def _install_torch_linalg_config(config):
         )
         lr.reg_complex_qr_torch()
 
+    if config.cpu_qr != "torch":
+        lr.reg_cpu_qr_torch(config.cpu_qr)
+
     # Quimb registration: raw Symmray blocks bypass Autoray, so PEPS
     # autodiff needs the same stabilized SVD/QR choices installed in Quimb's
     # ``svd_truncated`` and ``qr_stabilized`` registries as well.
@@ -716,6 +730,7 @@ def _install_torch_linalg_config(config):
             mode=config.mode,
             svd_driver=config.svd_driver,
             cpu_svd=config.cpu_svd,
+            cpu_qr=config.cpu_qr,
             # Quimb's optional raw-block driver is the stabilized custom
             # split path even when the ordinary Autoray path is native.
             svd_fallback=fallback if config.stabilized else "scipy_gesvd",
@@ -739,6 +754,7 @@ def register_torch_linalg(
     qr_rank_policy="warn",
     qr_rank_tol_factor=1.0,
     quimb_split_drivers=False,
+    cpu_qr="torch",
 ):
     """Configure the canonical Torch linalg rules used by Pepsy.
 
@@ -760,6 +776,10 @@ def register_torch_linalg(
     cpu_svd : {"torch", "scipy_gesdd", "scipy_gesvd"}, default="torch"
         CPU SVD implementation. SciPy choices are forward-only for native
         ``stabilized=False`` registration, and require SciPy at runtime.
+    cpu_qr : {"torch", "scipy_pivoted"}, default="torch"
+        Explicit forward-only CPU QR policy; see :class:`TorchLinalgConfig`.
+        The pivoted option preserves paired factors but does not produce a
+        triangular R. CUDA behavior is unchanged.
     svd_fallback : {"auto", "none", "scipy_gesdd", "scipy_gesvd"}, default="auto"
         SVD failure fallback. ``"auto"`` means ``"none"`` for native SVD and
         ``"scipy_gesvd"`` for stabilized SVD.
@@ -793,6 +813,7 @@ def register_torch_linalg(
         qr_rank_policy=qr_rank_policy,
         qr_rank_tol_factor=qr_rank_tol_factor,
         quimb_split_drivers=quimb_split_drivers,
+        cpu_qr=cpu_qr,
     )
     return config.register()
 

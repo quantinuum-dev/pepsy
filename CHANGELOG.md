@@ -8,6 +8,30 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Lattice-DMT transport benchmark:** add the decoupled-chain Fig. 2 physics
+  from arXiv:2610.40776, traceless energy-operator evolution, physical-path versus
+  chain protection, independent sparse typicality and exact small references,
+  plus a provenance-labeled PDF curve fixture. Keep TEBD/TDVP distinctions explicit.
+
+- **Public DMT interval maps:** add transactional `apply_transfer_mpo` to
+  ordinary `MpoOptimizer` and native `PauliDMT`, with canonical reuse,
+  exact post-action targets, interval/full controls and update-level warning
+  reports. Add double-precision Torch lattice comparisons. Expose explicit
+  forward-only CPU `cpu_qr="scipy_pivoted"` through `TorchLinalgConfig`, and
+  avoid subnormal complex QR phase overflow without clipping pivots.
+
+- **DMT robustness:** isolate macOS 26 Accelerate real-QR heap corruption and
+  use scoped exact pivoted QR in managed DMT/native Pauli paths. Skip unused
+  region maps for exact zero-cutoff splits, cache immutable rank-aware plans,
+  and add `complete_dmt_regions` for explicit physical-support coverage.
+  Add matched timestep/bond studies and a separate positive-factor research
+  control; the latter does not preserve DMT's exact marginal constraints.
+
+- **DMT protection assembly:** share normalized partial contractions across
+  overlapping protection strings within each bond update, in ordinary and
+  Pauli coordinates. Keep numerical vectors local to the current tensors and
+  gauge; document inherited subregions and conservative protected-rank budgets.
+
 - **Canonical metadata parity:** add independent, stable `info_c` dictionaries
   to `PauliMPO` and `PauliDMT`, with the same center/synchronization convention
   as `MpoOptimizer`. Reuse validated native gauges, record QR/SVD/DMT centers,

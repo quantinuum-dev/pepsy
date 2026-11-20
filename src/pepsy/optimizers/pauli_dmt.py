@@ -53,7 +53,8 @@ class PauliDMT:
     Storage and gate positions always refer to an open 1D MPO. ``regions``
     can protect physical 2D neighborhoods after mapping them to MPO positions;
     it does not change the gate schedule or interpret lattice coordinates.
-    Only adjacent increasing gate sites are supported. An
+    ``apply_gate`` supports adjacent increasing sites; ``apply_transfer_mpo``
+    accepts an explicitly compiled interval map. An
     adjacent gate caps only its updated bond; compress an oversized input
     before constructing the driver if all bonds must obey ``max_bond``. An
     evolution call commits successful gates as it proceeds, so after a
@@ -126,6 +127,7 @@ class PauliDMT:
     def _begin(self):
         self._workspace.original_bonds = _core_bond_dimensions(self._workspace.cores)
         self._workspace.reports.clear()
+        self._workspace.update_errors.clear()
         self._workspace.relative_density_error = None
 
     @_tracks_canonical_info
@@ -142,6 +144,30 @@ class PauliDMT:
         transfer = _gate_transfer(gate, self._workspace.cores[0], self.mode)
         self._begin()
         return self._workspace.split_pair(where[0], transfer)
+
+    @_tracks_canonical_info
+    def apply_transfer_mpo(self, start, transfer_cores, *, absorb='auto', update='interval'):
+        """Apply an exact physical transfer MPO, then DMT its affected interval.
+
+        Each native core has axes ``(left, right, output_pauli, input_pauli)``
+        with physical order I/X/Y/Z, matching the state backend/dtype. No
+        factorization or truncation of the supplied transfer is performed.
+        ``absorb='auto'`` starts from the nearer interval endpoint. Only
+        affected bonds are capped with ``update='interval'``; prepare an
+        oversized input separately. ``update='full'`` caps every chain bond.
+        Returns a complete ``PauliDMTReport``. Failure leaves the live state
+        and reports untouched; success updates info_c without advancing time.
+        """
+        if isinstance(start, bool) or not isinstance(start, Integral):
+            raise ValueError('start must be an integer MPO storage position.')
+        operators = tuple(transfer_cores)
+        if absorb == 'auto':
+            stop = start + len(operators) - 1
+            absorb = 'right' if abs(self._workspace.center-start) <= abs(self._workspace.center-stop) else 'left'
+        candidate = self._workspace.copy()
+        candidate.apply_window(start, operators, absorb=absorb, update=update)
+        self._workspace = candidate
+        return self.report
 
     @_tracks_canonical_info
     def evolve(self, bond_hamiltonians, *, dt, steps=1):

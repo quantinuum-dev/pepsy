@@ -55,6 +55,7 @@ _GATE_EXPORTS = [
 ]
 _SYMBOL_MODULES = {name: ".gates" for name in _GATE_EXPORTS}
 _SYMBOL_MODULES["square_lattice_dmt_regions"] = ".pauli_dmt_geometry"
+_SYMBOL_MODULES["complete_dmt_regions"] = ".pauli_dmt_geometry"
 _SYMBOL_MODULES['PreparedSimpleUpdate'] = '.simple_update'
 _SYMBOL_MODULES["GraphPEPOClusterProductExpansion"] = ".graph_pepo_product"
 _SYMBOL_MODULES["SquarePEPOClusterProductExpansion"] = ".square_pepo_product"
@@ -222,6 +223,7 @@ __all__ = [
     "MPODMTReport",
     "MPODMTBondReport",
     "square_lattice_dmt_regions",
+    "complete_dmt_regions",
     *_SUBMODULES,
 ]
 

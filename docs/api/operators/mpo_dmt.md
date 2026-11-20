@@ -21,6 +21,13 @@ preserve those reduced operators. Region entries are **MPO positions**;
 builds physical neighborhoods for a 2D lattice mapped to an MPO.
 Larger regions can require much larger protected bond budgets.
 
+[`complete_dmt_regions`](pauli_mpo.md#physical-lattice-regions) adds explicit
+required supports to an inventory while eliminating contained requests.
+Ordinary and Pauli DMT use the same geometry and numerical planning rules.
+The [robustness study](../../development/notes/2026-11-20-dmt-robustness.md)
+records the scoped Accelerate QR workaround, exact-split shortcut,
+rank-aware plan cache and matched convergence/positive-factor controls.
+
 The original-paper path is `variant="density"`, `truncation="paper"`,
 and `constraint_mode="strict"`. At a canonical cut, it protects the boundary
 trace maps, subtracts the disconnected density baseline, and truncates the
@@ -103,6 +110,12 @@ need not produce identical tensors across bases.
   `MPODMTBondReport` share the Pauli schema. Ordinary MPO discarded weights
   and absolute constraint errors use physical Hilbert–Schmidt units;
   Pauli reports use coefficient units.
+
+For exact compiled nonlocal maps, use the public
+[`MpoOptimizer.apply_transfer_mpo`](../optimizers/mpo.md#exact-interval-transfer-maps)
+or [`PauliDMT.apply_transfer_mpo`](../optimizers/pauli_dmt.md#exact-interval-transfer-mpos).
+Their reports include additive `update_errors` for checks without a bond split;
+`preservation_errors` combines update-level and bond-level failures.
 
 ## Preservation verification policy
 

@@ -178,6 +178,17 @@ CPU experiments when `stabilized=False`, or for stabilized autodiff when
 `stabilized=True`. `svd_fallback="auto"` means no fallback for native mode
 and SciPy `gesvd` for stabilized mode.
 
+`cpu_qr="scipy_pivoted"` is an explicit forward-only CPU factorization
+alternative for 2D float32/64 and complex64/128 matrices. It keeps Torch
+storage and returns exact paired factors with the column permutation absorbed
+into R: Q is isometric, but R is generally **not triangular**. Use it for
+paired tensor factorizations, not triangular linear solves. Gradient-bearing
+inputs are rejected even with `stabilized=True`; use `cpu_qr="torch"` for
+autodiff. CUDA keeps the configured Torch QR route. The default is `"torch"`.
+Set `quimb_split_drivers=True` when Quimb's raw QR/SVD paths must use this
+same policy. See the [DMT CPU evidence](../../development/notes/2026-11-20-dmt-torch-interval.md)
+for the platform-specific motivation and measured limits.
+
 The non-approximate choices are CUDA `gesvdj` and `gesvd`, plus CPU Torch,
 SciPy `gesdd`, and SciPy `gesvd`. For `complex64`, benchmark CUDA
 `gesvdj` against the default `gesvd` route on your hardware; on CPU,

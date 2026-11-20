@@ -8,7 +8,9 @@ import autoray as ar
 from ...backends import infer_backend_converter_from_sample
 from ...operators.mpo_dmt import (
     _compress_mpo_dmt, _gate_mpo_dmt, _gate_mpo_dmt_routed, _gate_mpo_dmt_single,
+    _prepare_mpo_dmt, _transfer_mpo_dmt,
 )
+from ...operators._pauli_dmt import _options
 from ...operators.pauli_dmt_geometry import _normalize_regions
 from ...operators.pauli_mpo import _array_state_token
 
@@ -179,6 +181,43 @@ def compress_current(opt, *, cutoff, cutoff_mode, variant, regions, return_repor
         check_regions=check_regions, preservation_check=preservation_check,
     )
     _commit(opt, candidate)
+    _remember(opt, workspace)
+    opt._dmt_reports = [report] if report is not None else []
+    opt._append_norm_proxy_sample(opt.p)
+    return (opt.p, report) if return_report else opt.p
+
+
+def transfer_current(opt, start, transfer_cores, *, absorb, update, cutoff, cutoff_mode, variant,
+                     regions, return_report, truncation, max_refinement_sweeps,
+                     region_selection, constraint_mode, constraint_weight, check_regions,
+                     preservation_check):
+    if isinstance(start, bool) or not isinstance(start, Integral):
+        raise ValueError('start must be an integer MPO storage position.')
+    regions = validate_state(opt, regions, variant)
+    source = opt.p.copy()
+    operators = _promote(source, tuple(transfer_cores))
+    _, cutoff, cutoff_mode, variant = _options(
+        opt.chi, cutoff, cutoff_mode, variant, ar.get_dtype_name(source[0].data))
+    options = _cache_options(
+        opt.chi, cutoff, cutoff_mode, variant, regions, return_report, truncation,
+        max_refinement_sweeps, region_selection, constraint_mode, constraint_weight,
+        check_regions, preservation_check)
+    cache = opt._dmt_canonical_cache
+    workspace = (cache.workspace if cache is not None and cache.matches(opt, options)
+                 and ar.get_dtype_name(source[0].data) == ar.get_dtype_name(cache.workspace.cores[0]) else None)
+    if workspace is None:
+        # Exact preparation only: compressing before a nonlocal action would
+        # let discarded source information contaminate the protected target.
+        workspace, _ = _prepare_mpo_dmt(
+            source, max_bond=opt.chi, cutoff=cutoff, cutoff_mode=cutoff_mode,
+            variant=variant, regions=regions, diagnostics=return_report,
+            truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
+            region_selection=region_selection, constraint_mode=constraint_mode,
+            constraint_weight=constraint_weight, check_regions=check_regions,
+            preservation_check=preservation_check)
+    candidate, report, workspace = _transfer_mpo_dmt(source, workspace, start, operators,
+                                                   absorb=absorb, update=update)
+    _commit(opt, candidate, center=workspace.center)
     _remember(opt, workspace)
     opt._dmt_reports = [report] if report is not None else []
     opt._append_norm_proxy_sample(opt.p)

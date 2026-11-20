@@ -23,6 +23,7 @@ inside an older plan describe that record, not a fresh package-wide validation.
 | Area | Design or progress record |
 | --- | --- |
 | Operators and exponentials | [Operator API](operator_api.md) |
+| DMT robustness and positive representations | [Ordered workstream](dmt_robustness.md) |
 | Native fermionic PEPO construction | [Deferred proposal](native_fermionic_pepo.md) |
 | Package and import costs | [Lightweight package](lightweight-package.md) |
 | Boundary providers and sweeps | [Optimizer boundaries](optimizers.md), [PEPS split](peps_optimizer.md), [sweep providers](sweep_optimizer.md) |

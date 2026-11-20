@@ -1128,6 +1128,37 @@ def reg_complex_qr_torch(
     _register_once("linalg.qr", _get_stabilized_qr_call(QR_complex_safe))
 
 
+def _scipy_pivoted_qr(A):
+    """Exact forward-only CPU QR with its column permutation absorbed in R."""
+    if A.requires_grad:
+        raise RuntimeError("cpu_qr='scipy_pivoted' is forward-only; use cpu_qr='torch' for autodiff.")
+    if A.ndim != 2:
+        raise NotImplementedError("cpu_qr='scipy_pivoted' currently requires a 2D matrix.")
+    if A.dtype not in (torch.float32, torch.float64, torch.complex64, torch.complex128):
+        raise TypeError("cpu_qr='scipy_pivoted' requires float32/64 or complex64/128.")
+    if scipy_linalg is None:
+        raise ImportError("SciPy is required for cpu_qr='scipy_pivoted'.")
+    q, r, permutation = scipy_linalg.qr(
+        A.detach().resolve_conj().resolve_neg().numpy(), mode='economic', pivoting=True,
+    )
+    return torch.from_numpy(q), torch.from_numpy(r[:, np.argsort(permutation)].copy())
+
+
+def reg_cpu_qr_torch(cpu_qr):
+    """Internal CPU override, installed only by TorchLinalgConfig."""
+    if cpu_qr != 'scipy_pivoted':
+        raise ValueError('Unknown explicit CPU QR implementation')
+    native = ar.get_lib_fn('torch', 'linalg.qr')
+
+    def qr(A, *args, **kwargs):
+        if A.device.type != 'cpu':
+            return native(A, *args, **kwargs)
+        _validate_reduced_qr_call(args, kwargs)
+        return _scipy_pivoted_qr(A)
+
+    _register_once('linalg.qr', qr)
+
+
 def reg_quimb_torch_split_drivers(
     mode="real",
     *,
@@ -1136,6 +1167,7 @@ def reg_quimb_torch_split_drivers(
     svd_fallback="scipy_gesvd",
     qr_rank_policy=None,
     qr_rank_tol_factor=None,
+    cpu_qr="torch",
 ):
     """Advanced helper for Quimb raw-block split drivers.
 
@@ -1168,7 +1200,9 @@ def reg_quimb_torch_split_drivers(
             x = x.swapaxes(-2, -1)
             absorb_i = qd._ABSORB_TRANSPOSE_MAP[absorb_i]
 
-        if mode == "real" and not x.is_complex():
+        if cpu_qr == 'scipy_pivoted' and x.device.type == 'cpu':
+            Q, R = _scipy_pivoted_qr(x)
+        elif mode == "real" and not x.is_complex():
             Q, R = QR_real_safe.apply(x)
         elif mode == "complex" and x.is_complex():
             Q, R = QR_complex_safe.apply(x)
@@ -1182,11 +1216,18 @@ def reg_quimb_torch_split_drivers(
             # so the nominally lossless QR split no longer reconstructs its
             # input. This matches Quimb's backend-generic ``sgn`` rule.
             diagonal = torch.diagonal(R, dim1=-2, dim2=-1)
-            phase = torch.where(
-                diagonal == 0,
-                torch.ones_like(diagonal),
-                torch.sgn(diagonal),
-            ).detach()
+            if diagonal.is_complex():
+                # Complex division/sgn can overflow for nonzero subnormal
+                # pivots. Normalize real components first, so the final
+                # complex denominator is order one. phase(0) remains one.
+                scale = torch.maximum(diagonal.real.abs(), diagonal.imag.abs())
+                safe = torch.where(scale > 0, scale, torch.ones_like(scale))
+                unit = diagonal.real / safe + 1j * (diagonal.imag / safe)
+                magnitude = unit.abs()
+                phase = unit / torch.where(magnitude > 0, magnitude, torch.ones_like(magnitude))
+                phase = torch.where(scale > 0, phase, torch.ones_like(phase)).detach()
+            else:
+                phase = torch.where(diagonal == 0, torch.ones_like(diagonal), torch.sign(diagonal)).detach()
             Q = Q * torch.conj(phase)[..., None, :]
             R = phase[..., :, None] * R
 

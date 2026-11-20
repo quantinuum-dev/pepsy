@@ -1,0 +1,4979 @@
+{
+  "runs": [
+    {
+      "shape": [
+        3,
+        3
+      ],
+      "chi": 64,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 20,
+      "representation": "mpo",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "update": "full",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 4.443360254219338e-16,
+          "energy_per_site": 0.3336666524418629,
+          "max_local_hermiticity": 6.294355588826935e-17,
+          "min_local_eigenvalue": 0.024999999999999866,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 3.6686427076851554e-15,
+          "energy_per_site": 0.3318253154303277,
+          "max_local_hermiticity": 1.6795588415950176e-15,
+          "min_local_eigenvalue": 0.024999999999999512,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.0006351996264225e-14,
+          "energy_per_site": 0.3278489818725631,
+          "max_local_hermiticity": 6.24510205053187e-06,
+          "min_local_eigenvalue": 0.024989392201748083,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 7.536676414611962e-15,
+          "energy_per_site": 0.32428576047345437,
+          "max_local_hermiticity": 6.382504077245919e-05,
+          "min_local_eigenvalue": 0.024923858984060222,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.1790767018792182e-14,
+          "energy_per_site": 0.32305953847663765,
+          "max_local_hermiticity": 0.00020676511595063722,
+          "min_local_eigenvalue": 0.02477826665591828,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 1.9202489416907785e-14,
+          "energy_per_site": 0.32422577914631245,
+          "max_local_hermiticity": 0.00048270517618305084,
+          "min_local_eigenvalue": 0.024579924245736108,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 3.2924301506314546e-14,
+          "energy_per_site": 0.32646199913703966,
+          "max_local_hermiticity": 0.0009219022390790915,
+          "min_local_eigenvalue": 0.024313543861314568,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 4.187459578415422e-14,
+          "energy_per_site": 0.32834373111623105,
+          "max_local_hermiticity": 0.001553261808348726,
+          "min_local_eigenvalue": 0.023930051853313806,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 5.352281131184839e-14,
+          "energy_per_site": 0.32914270390412237,
+          "max_local_hermiticity": 0.0023989453372936604,
+          "min_local_eigenvalue": 0.023524982460294528,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 6.5172989859776e-14,
+          "energy_per_site": 0.3289732338653934,
+          "max_local_hermiticity": 0.0033623181486935423,
+          "min_local_eigenvalue": 0.023281321206299093,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 7.73882559191228e-14,
+          "energy_per_site": 0.328464971882564,
+          "max_local_hermiticity": 0.004263166039071593,
+          "min_local_eigenvalue": 0.022697878730762296,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 9.171950870839505e-14,
+          "energy_per_site": 0.32807756992839465,
+          "max_local_hermiticity": 0.005038226128012567,
+          "min_local_eigenvalue": 0.02204415244848312,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.2000000000000002,
+          "step": 12,
+          "trace_error": 1.0825331702576587e-13,
+          "energy_per_site": 0.32778981474462027,
+          "max_local_hermiticity": 0.00572845316852836,
+          "min_local_eigenvalue": 0.021675588965234725,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.3,
+          "step": 13,
+          "trace_error": 1.1746553627747946e-13,
+          "energy_per_site": 0.3275332981466533,
+          "max_local_hermiticity": 0.006292540070849871,
+          "min_local_eigenvalue": 0.021867238099587752,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.4000000000000001,
+          "step": 14,
+          "trace_error": 1.1880182078399358e-13,
+          "energy_per_site": 0.32753017053427147,
+          "max_local_hermiticity": 0.0068528144330957065,
+          "min_local_eigenvalue": 0.02070018427313989,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.5,
+          "step": 15,
+          "trace_error": 1.2558151804543059e-13,
+          "energy_per_site": 0.32795816744831996,
+          "max_local_hermiticity": 0.007815052383014207,
+          "min_local_eigenvalue": 0.01863298958585559,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.6,
+          "step": 16,
+          "trace_error": 1.3115599505151273e-13,
+          "energy_per_site": 0.3285515381019706,
+          "max_local_hermiticity": 0.009351408032911065,
+          "min_local_eigenvalue": 0.017409213309738155,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.7000000000000002,
+          "step": 17,
+          "trace_error": 1.4493330900915826e-13,
+          "energy_per_site": 0.3287934009148331,
+          "max_local_hermiticity": 0.010946024968665667,
+          "min_local_eigenvalue": 0.017517107391335766,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.8,
+          "step": 18,
+          "trace_error": 1.5325447306126814e-13,
+          "energy_per_site": 0.3284518040882137,
+          "max_local_hermiticity": 0.012103202646091304,
+          "min_local_eigenvalue": 0.016657949313072424,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.9000000000000001,
+          "step": 19,
+          "trace_error": 1.5704610011515874e-13,
+          "energy_per_site": 0.32781264756661543,
+          "max_local_hermiticity": 0.013043885856659098,
+          "min_local_eigenvalue": 0.015244038689044986,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 2.0,
+          "step": 20,
+          "trace_error": 1.6464620732641352e-13,
+          "energy_per_site": 0.32739908984947896,
+          "max_local_hermiticity": 0.014775638614445388,
+          "min_local_eigenvalue": 0.01471481224150054,
+          "actual_max_bond": 64
+        }
+      ],
+      "step_seconds": [
+        0.19211795799492393,
+        0.7876662080016104,
+        0.8063750840010471,
+        0.7697102500023902,
+        0.7552937090003979,
+        0.8213259160038433,
+        0.8063582920003682,
+        1.368942415996571,
+        0.9938204580030288,
+        0.776644124998711,
+        0.7977694170040195,
+        0.8660609169965028,
+        0.9840783749968978,
+        1.6584180830031983,
+        1.5600110000013956,
+        0.8050073339982191,
+        0.810645208999631,
+        0.7937890829998651,
+        0.7678748329999507,
+        0.7681700840039412
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 12,
+        "plaquettes": 4
+      },
+      "canonical_info": [
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "reference_errors": {
+        "max_plaquette_vs_continuous": 0.1075387017892316,
+        "max_plaquette_vs_identical_circuit": 0.10796337401986883
+      },
+      "source": "pepsy-public3-mpo-full.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        3,
+        3
+      ],
+      "chi": 64,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 20,
+      "representation": "mpo",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "update": "interval",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 4.443360254219338e-16,
+          "energy_per_site": 0.3336666524418629,
+          "max_local_hermiticity": 6.294355588826935e-17,
+          "min_local_eigenvalue": 0.024999999999999866,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 3.664413776941028e-15,
+          "energy_per_site": 0.33182531543032645,
+          "max_local_hermiticity": 1.4691826735843842e-15,
+          "min_local_eigenvalue": 0.024999999999999578,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.2444168647687158e-14,
+          "energy_per_site": 0.32784898307638477,
+          "max_local_hermiticity": 6.2283495143177026e-06,
+          "min_local_eigenvalue": 0.02498939277782272,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.5434740452002013e-14,
+          "energy_per_site": 0.32428575397479675,
+          "max_local_hermiticity": 6.274293644041542e-05,
+          "min_local_eigenvalue": 0.024923736898988812,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.85359892351163e-14,
+          "energy_per_site": 0.3230594333205403,
+          "max_local_hermiticity": 0.00019552153422487507,
+          "min_local_eigenvalue": 0.024780300021582394,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 2.4827249794470003e-14,
+          "energy_per_site": 0.3242254309275742,
+          "max_local_hermiticity": 0.0004507985521374044,
+          "min_local_eigenvalue": 0.02459450243520928,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 2.712788529790917e-14,
+          "energy_per_site": 0.32646148928436397,
+          "max_local_hermiticity": 0.0008663077629430352,
+          "min_local_eigenvalue": 0.024350901695365985,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 3.036944507941845e-14,
+          "energy_per_site": 0.32834316497534677,
+          "max_local_hermiticity": 0.001476279136708296,
+          "min_local_eigenvalue": 0.02399548684247761,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 3.278815961239747e-14,
+          "energy_per_site": 0.3291416619222385,
+          "max_local_hermiticity": 0.002305871081599049,
+          "min_local_eigenvalue": 0.023601285765455914,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 3.47998255012508e-14,
+          "energy_per_site": 0.32897179201852605,
+          "max_local_hermiticity": 0.003276658577917489,
+          "min_local_eigenvalue": 0.02331744913513898,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 3.789448347824769e-14,
+          "energy_per_site": 0.328463816092621,
+          "max_local_hermiticity": 0.004244193431822997,
+          "min_local_eigenvalue": 0.022660393718533844,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 4.1098791944772927e-14,
+          "energy_per_site": 0.3280778897515238,
+          "max_local_hermiticity": 0.005167370077966533,
+          "min_local_eigenvalue": 0.022060475739197668,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.2000000000000002,
+          "step": 12,
+          "trace_error": 4.844505267433503e-14,
+          "energy_per_site": 0.32779070234594077,
+          "max_local_hermiticity": 0.0060248620017255535,
+          "min_local_eigenvalue": 0.021722550613624072,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.3,
+          "step": 13,
+          "trace_error": 4.9570038035942797e-14,
+          "energy_per_site": 0.32753258707443156,
+          "max_local_hermiticity": 0.006671733944989707,
+          "min_local_eigenvalue": 0.021895544930508593,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.4000000000000001,
+          "step": 14,
+          "trace_error": 5.688037277130899e-14,
+          "energy_per_site": 0.32752597823281504,
+          "max_local_hermiticity": 0.007186299923256025,
+          "min_local_eigenvalue": 0.02077015344287762,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.5,
+          "step": 15,
+          "trace_error": 6.68743162030217e-14,
+          "energy_per_site": 0.327953467703104,
+          "max_local_hermiticity": 0.00812680614720413,
+          "min_local_eigenvalue": 0.01865822081777506,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.6,
+          "step": 16,
+          "trace_error": 6.587281503094518e-14,
+          "energy_per_site": 0.3285517211270393,
+          "max_local_hermiticity": 0.00976353253394196,
+          "min_local_eigenvalue": 0.017396769348133258,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.7000000000000002,
+          "step": 17,
+          "trace_error": 6.842923165033786e-14,
+          "energy_per_site": 0.32880020190811826,
+          "max_local_hermiticity": 0.011541832868222223,
+          "min_local_eigenvalue": 0.017477798618417747,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.8,
+          "step": 18,
+          "trace_error": 6.054511681770742e-14,
+          "energy_per_site": 0.3284617313095671,
+          "max_local_hermiticity": 0.012859941016475418,
+          "min_local_eigenvalue": 0.016834396380067125,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.9000000000000001,
+          "step": 19,
+          "trace_error": 5.422274629093958e-14,
+          "energy_per_site": 0.32782202361446144,
+          "max_local_hermiticity": 0.01384045265098467,
+          "min_local_eigenvalue": 0.015251246551443685,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 2.0,
+          "step": 20,
+          "trace_error": 4.489477064603306e-14,
+          "energy_per_site": 0.3274066246021507,
+          "max_local_hermiticity": 0.015359050731733302,
+          "min_local_eigenvalue": 0.014661178478770376,
+          "actual_max_bond": 64
+        }
+      ],
+      "step_seconds": [
+        0.12902170899906196,
+        0.6910554579953896,
+        0.6725970830011647,
+        0.6761898749973625,
+        1.0056439170002704,
+        1.3851690420051455,
+        1.382775624995702,
+        1.3914331249980023,
+        1.3904560000009951,
+        1.3869732079983805,
+        1.3904597500004456,
+        1.3996517500054324,
+        1.4251729590032483,
+        1.0477680830008467,
+        0.965028209000593,
+        0.9592887500039069,
+        0.6602389169929666,
+        1.2286250830002245,
+        0.9218712919973768,
+        0.7020314170003985
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 12,
+        "plaquettes": 4
+      },
+      "canonical_info": [
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "reference_errors": {
+        "max_plaquette_vs_continuous": 0.10684112552409245,
+        "max_plaquette_vs_identical_circuit": 0.10726994488342619
+      },
+      "source": "pepsy-public3-mpo-interval.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        3,
+        3
+      ],
+      "chi": 64,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 20,
+      "representation": "pauli",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "update": "full",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 4.440892098500626e-16,
+          "energy_per_site": 0.3336666524418627,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024999999999999842,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 1.354472090042691e-14,
+          "energy_per_site": 0.33182531543032395,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024999999999999172,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 4.318767565791859e-14,
+          "energy_per_site": 0.32784898128757367,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02498937014283981,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 5.062616992290714e-14,
+          "energy_per_site": 0.3242857566309184,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024923257771186348,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 6.539213615042172e-14,
+          "energy_per_site": 0.3230594935214948,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024776782265973712,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 7.327471962526033e-14,
+          "energy_per_site": 0.32422566666318064,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024582484697715987,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 7.37188088351104e-14,
+          "energy_per_site": 0.32646187634645707,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024330620426024675,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 7.926992395823618e-14,
+          "energy_per_site": 0.3283435839827077,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.023957096508128894,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 8.681944052568724e-14,
+          "energy_per_site": 0.32914243690094036,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02353695367491667,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 1.0269562977782698e-13,
+          "energy_per_site": 0.328972594612939,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.023256371969467574,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 1.176836406102666e-13,
+          "energy_per_site": 0.32846443921707574,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.022715558974115247,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 1.233457780358549e-13,
+          "energy_per_site": 0.3280781703528418,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02203153170139021,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.2000000000000002,
+          "step": 12,
+          "trace_error": 1.368904989362818e-13,
+          "energy_per_site": 0.3277921838617581,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02163812188707674,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.3,
+          "step": 13,
+          "trace_error": 1.4921397450962104e-13,
+          "energy_per_site": 0.32753707319459946,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.021822264780639124,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.4000000000000001,
+          "step": 14,
+          "trace_error": 1.5765166949677223e-13,
+          "energy_per_site": 0.32753335057925087,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020680270450052725,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.5,
+          "step": 15,
+          "trace_error": 1.6464607455191071e-13,
+          "energy_per_site": 0.32795900980993287,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01859111673617213,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.6,
+          "step": 16,
+          "trace_error": 1.7996715229173788e-13,
+          "energy_per_site": 0.328549603155295,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01730724081527602,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.7000000000000002,
+          "step": 17,
+          "trace_error": 1.91402449445377e-13,
+          "energy_per_site": 0.3287905828831291,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.017366438702939215,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.8,
+          "step": 18,
+          "trace_error": 1.98507876802978e-13,
+          "energy_per_site": 0.32845081922078023,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.016546153210519363,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.9000000000000001,
+          "step": 19,
+          "trace_error": 2.077227279073668e-13,
+          "energy_per_site": 0.32781295309762004,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.015038944083919875,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 2.0,
+          "step": 20,
+          "trace_error": 2.2248869413488137e-13,
+          "energy_per_site": 0.3273977160754852,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.014439689214846771,
+          "actual_max_bond": 64
+        }
+      ],
+      "step_seconds": [
+        0.12394887499976903,
+        0.699404584003787,
+        0.6915845830008038,
+        0.7005665409960784,
+        0.7281999590049963,
+        1.3103502910016687,
+        1.6943004170025233,
+        1.5981736249959795,
+        1.6467789169983007,
+        1.6392012090000208,
+        0.8485029590010527,
+        0.7227664999954868,
+        1.0770767079957295,
+        1.5547481250032433,
+        1.519072374998359,
+        1.5168525420012884,
+        0.7905321669968544,
+        0.7201088340007118,
+        0.7214312080031959,
+        0.7202178329971503
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 12,
+        "plaquettes": 4
+      },
+      "canonical_info": [
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "reference_errors": {
+        "max_plaquette_vs_continuous": 0.10836639199134197,
+        "max_plaquette_vs_identical_circuit": 0.10877603467620876
+      },
+      "source": "pepsy-public3-pauli-full.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        3,
+        3
+      ],
+      "chi": 64,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 20,
+      "representation": "pauli",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "update": "interval",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 4.440892098500626e-16,
+          "energy_per_site": 0.3336666524418627,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024999999999999842,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 9.658940314238862e-15,
+          "energy_per_site": 0.33182531543032734,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024999999999998905,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.0103029524088925e-14,
+          "energy_per_site": 0.32784898262770734,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02498935427701257,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.0658141036401503e-14,
+          "energy_per_site": 0.3242857770447519,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02492328579062507,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.3766765505351941e-14,
+          "energy_per_site": 0.32305959454500455,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024773128241412853,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 2.0650148258027912e-14,
+          "energy_per_site": 0.3242258882989505,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02455907413259968,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 2.708944180085382e-14,
+          "energy_per_site": 0.3264621631198506,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024265461427851145,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 3.907985046680551e-14,
+          "energy_per_site": 0.32834390658570445,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.023845981766969383,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 3.907985046680551e-14,
+          "energy_per_site": 0.32914303493508634,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02342109643143449,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 3.9968028886505635e-14,
+          "energy_per_site": 0.32897415233496097,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02320022996117624,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 4.773959005888173e-14,
+          "energy_per_site": 0.3284667623860497,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02265435997876442,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 5.6621374255882984e-14,
+          "energy_per_site": 0.32808013087073096,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.021989987620917115,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.2000000000000002,
+          "step": 12,
+          "trace_error": 6.17284001691587e-14,
+          "energy_per_site": 0.32779201421307747,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.021609247134887346,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.3,
+          "step": 13,
+          "trace_error": 7.038813976123492e-14,
+          "energy_per_site": 0.3275351469709653,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.021789651688971297,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.4000000000000001,
+          "step": 14,
+          "trace_error": 7.427392034742297e-14,
+          "energy_per_site": 0.32753256087588273,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020555471693917172,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.5,
+          "step": 15,
+          "trace_error": 7.827072323607354e-14,
+          "energy_per_site": 0.32796248122607696,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01853380750388758,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.6,
+          "step": 16,
+          "trace_error": 9.037215420448774e-14,
+          "energy_per_site": 0.32855681622410277,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01731698473510446,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.7000000000000002,
+          "step": 17,
+          "trace_error": 9.037215420448774e-14,
+          "energy_per_site": 0.32879925496659507,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.017410304151839907,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.8,
+          "step": 18,
+          "trace_error": 9.725553695716371e-14,
+          "energy_per_site": 0.3284588032479362,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.016523542373546866,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 1.9000000000000001,
+          "step": 19,
+          "trace_error": 1.0014211682118912e-13,
+          "energy_per_site": 0.3278212655179438,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.015095154429010308,
+          "actual_max_bond": 64
+        },
+        {
+          "time": 2.0,
+          "step": 20,
+          "trace_error": 1.1002310174035301e-13,
+          "energy_per_site": 0.32740766336577537,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.014558901776650944,
+          "actual_max_bond": 64
+        }
+      ],
+      "step_seconds": [
+        0.08886262500163866,
+        0.7799673749977956,
+        1.1365953749991604,
+        0.6250949169989326,
+        0.6202102500028559,
+        0.6124282500022673,
+        0.6173227079998469,
+        0.6276708750010584,
+        0.6320608749956591,
+        0.6219900000069174,
+        0.6160303329961607,
+        0.6181025830010185,
+        1.5077550409987452,
+        0.7107443330023671,
+        0.9517348750014207,
+        1.4628567090039724,
+        1.1013597499986645,
+        1.4343954580035643,
+        1.0505212499992922,
+        0.6066489999939222
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 12,
+        "plaquettes": 4
+      },
+      "canonical_info": [
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "reference_errors": {
+        "max_plaquette_vs_continuous": 0.10884446128583751,
+        "max_plaquette_vs_identical_circuit": 0.10927746360001839
+      },
+      "source": "pepsy-public3-pauli-interval.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 96,
+      "dt": 0.1,
+      "requested_steps": 3,
+      "completed_steps": 3,
+      "representation": "mpo",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "cpu_qr": "scipy_pivoted",
+      "update": "interval",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 1.332268929223045e-15,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 7.497932156935738e-17,
+          "min_local_eigenvalue": 0.02499999999999981,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 1.1996744055597232e-11,
+          "energy_per_site": 0.32013554943079103,
+          "max_local_hermiticity": 0.0001330399107014712,
+          "min_local_eigenvalue": 0.024637348604741423,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 4.377506597078562e-11,
+          "energy_per_site": 0.3139660896500084,
+          "max_local_hermiticity": 0.0007114570718222146,
+          "min_local_eigenvalue": 0.02333353381829703,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 7.577903925773555e-11,
+          "energy_per_site": 0.30941771359386994,
+          "max_local_hermiticity": 0.0008762749742971872,
+          "min_local_eigenvalue": 0.020434591377901868,
+          "actual_max_bond": 96
+        }
+      ],
+      "step_seconds": [
+        24.315166874999704,
+        48.139125499998045,
+        47.99943012499716
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-mpo-c96-safe.json",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 96,
+      "dt": 0.1,
+      "requested_steps": 3,
+      "completed_steps": 3,
+      "representation": "mpo",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesvd",
+      "update": "interval",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 4.44639376493098e-16,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 7.477975603645297e-17,
+          "min_local_eigenvalue": 0.0249999999999998,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 3.183542712866007e-12,
+          "energy_per_site": 0.32013507585744416,
+          "max_local_hermiticity": 0.00033655870993606825,
+          "min_local_eigenvalue": 0.024675420468568268,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.0480178576216753e-10,
+          "energy_per_site": 0.3139649503126766,
+          "max_local_hermiticity": 0.0013433776924643777,
+          "min_local_eigenvalue": 0.023381316399250947,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 2.00974434226049e-10,
+          "energy_per_site": 0.30941641189612057,
+          "max_local_hermiticity": 0.0013312137001558252,
+          "min_local_eigenvalue": 0.020411435551125026,
+          "actual_max_bond": 96
+        }
+      ],
+      "step_seconds": [
+        49.08163074999902,
+        99.23642445800215,
+        120.21577070800413
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-mpo-complex96.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 128,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 9,
+      "representation": "pauli",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "update": "interval",
+      "status": "time_budget",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 6.661338147750939e-16,
+          "energy_per_site": 0.3232496540493783,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024999999999999762,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 1.674349547897691e-11,
+          "energy_per_site": 0.32013588806782545,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024942720252865827,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.3072387616830383e-10,
+          "energy_per_site": 0.313954032334691,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.023750607869534854,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 5.903844080279441e-11,
+          "energy_per_site": 0.3093782941652148,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02083355436140487,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.879296718243495e-11,
+          "energy_per_site": 0.3090967802948628,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.017056750941525128,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 1.500288782096959e-11,
+          "energy_per_site": 0.312260570409303,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.012907838513032621,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 5.544342762675569e-11,
+          "energy_per_site": 0.31591658563493685,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.008768607528856887,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 8.404232865188987e-11,
+          "energy_per_site": 0.31763360809301006,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.005463461896167471,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 1.579183450672872e-10,
+          "energy_per_site": 0.3171643776247945,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.003930530635182147,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 2.0000245903872838e-10,
+          "energy_per_site": 0.31582680169886523,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.004396191455294677,
+          "actual_max_bond": 128
+        }
+      ],
+      "step_seconds": [
+        42.40334299999813,
+        82.75548416599486,
+        79.43167749999702,
+        81.01328733300033,
+        73.14043954200315,
+        81.86107537499629,
+        83.6951680830025,
+        74.10500687499734,
+        88.28470858399669
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-pauli-c128-dd.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 192,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 4,
+      "representation": "pauli",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "update": "interval",
+      "status": "time_budget",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 6.661338147750939e-16,
+          "energy_per_site": 0.3232496540493783,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024999999999999762,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 1.533881910376067e-10,
+          "energy_per_site": 0.3201369606884726,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02496371469624607,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 7.575429172845816e-11,
+          "energy_per_site": 0.3139246610399545,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02439455705505546,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 9.908318610030165e-11,
+          "energy_per_site": 0.30934177555624126,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02275306507051606,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.7273382724170006e-10,
+          "energy_per_site": 0.3091213153991632,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020370509636112186,
+          "actual_max_bond": 192
+        }
+      ],
+      "step_seconds": [
+        86.99278758299624,
+        228.32581124999706,
+        186.8331812500037,
+        190.62428499999805
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-pauli-c192-dd.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 96,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 11,
+      "representation": "pauli",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "update": "interval",
+      "status": "failed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 6.661338147750939e-16,
+          "energy_per_site": 0.3232496540493783,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024999999999999762,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 1.2865286613816806e-10,
+          "energy_per_site": 0.32013550413144287,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024637467239496072,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.5633183636509784e-10,
+          "energy_per_site": 0.31396651448975166,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.023332526547921305,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.5858603319429676e-10,
+          "energy_per_site": 0.3094195658523266,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02039226323899061,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 2.1042101394641577e-10,
+          "energy_per_site": 0.3091475882512845,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01617112984868388,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 2.528826037462295e-10,
+          "energy_per_site": 0.31227360520768255,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.011363354764461235,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 2.461080228499668e-10,
+          "energy_per_site": 0.31582812336911675,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.006838516205756739,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 3.246261037759268e-10,
+          "energy_per_site": 0.31749540639037604,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.003526962622046808,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 2.676752153263351e-10,
+          "energy_per_site": 0.31710455673963583,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0014120171472005432,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 2.489140005224044e-10,
+          "energy_per_site": 0.31589980537519824,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.001083877214277964,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 3.334683640332514e-10,
+          "energy_per_site": 0.3150246184809022,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0029120442726077137,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 3.3878944094567487e-10,
+          "energy_per_site": 0.31481311990264454,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.006280559795215523,
+          "actual_max_bond": 96
+        }
+      ],
+      "step_seconds": [
+        20.87732416599465,
+        38.16537600000447,
+        38.10475512500125,
+        39.513697834001505,
+        41.531871708000835,
+        36.39540795799985,
+        39.837044959000195,
+        39.847705166001106,
+        36.965837374998955,
+        32.40000587499526,
+        41.65115016699565
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "error": "LinAlgError: SVD did not converge for slice = 0.",
+      "source": "pepsy-public6-pauli-c96-dd.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": false
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 96,
+      "dt": 0.1,
+      "requested_steps": 8,
+      "completed_steps": 6,
+      "representation": "pauli",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesvd",
+      "cpu_qr": "scipy_pivoted",
+      "update": "interval",
+      "status": "time_budget",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 1.1102230246251565e-15,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02499999999999983,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 3.428479722344946e-11,
+          "energy_per_site": 0.3201358976788151,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024636642989329337,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.1370415720080018e-10,
+          "energy_per_site": 0.31396583372062664,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.023341545753941016,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.4303092044087862e-10,
+          "energy_per_site": 0.3094154971696768,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020441417372968586,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.713611474940535e-10,
+          "energy_per_site": 0.3091459783764884,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.016241956164412638,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 1.8182078065365204e-10,
+          "energy_per_site": 0.31228470518776075,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.011433196547112978,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 1.9177259780178701e-10,
+          "energy_per_site": 0.3158413290009798,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0068730787765817975,
+          "actual_max_bond": 96
+        }
+      ],
+      "step_seconds": [
+        34.91436033300124,
+        75.775181625002,
+        75.91988937499991,
+        79.77989499999967,
+        79.6899110000013,
+        80.10932224999851
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-pauli-c96-gesvd-safe.json",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 96,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 6,
+      "representation": "pauli",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "cpu_qr": "scipy_pivoted",
+      "update": "interval",
+      "status": "failed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 1.1102230246251565e-15,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02499999999999983,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 4.1903147618427283e-11,
+          "energy_per_site": 0.32013544833977153,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024636416617627763,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.3177081648052535e-10,
+          "energy_per_site": 0.3139654500032838,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02332833280986883,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.3705836465760513e-10,
+          "energy_per_site": 0.30941559386433065,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020363674528426277,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.7721957235039554e-10,
+          "energy_per_site": 0.30914266104886556,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.016109577177413705,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 2.077484850815381e-10,
+          "energy_per_site": 0.3122894702841055,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.011261086426039927,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 2.4048696367628963e-10,
+          "energy_per_site": 0.3158461139177942,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.006723760783572951,
+          "actual_max_bond": 96
+        }
+      ],
+      "step_seconds": [
+        28.931581874996482,
+        45.116433250004775,
+        47.99171629200282,
+        41.418524458997126,
+        40.17237254200154,
+        39.60872845799895
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "error": "LinAlgError: SVD did not converge for slice = 0.",
+      "source": "pepsy-public6-pauli-c96-safe.json",
+      "comparison_eligible": false
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 96,
+      "dt": 0.1,
+      "requested_steps": 3,
+      "completed_steps": 3,
+      "representation": "pauli",
+      "dtype": "complex128",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "cpu_qr": "scipy_pivoted",
+      "update": "interval",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 1.1102230246251565e-15,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02499999999999983,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 4.1903147618427283e-11,
+          "energy_per_site": 0.32013544833977153,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024636416617627763,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.3177081648052535e-10,
+          "energy_per_site": 0.3139654500032838,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02332833280986883,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.3705836465760513e-10,
+          "energy_per_site": 0.30941559386433065,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020363674528426277,
+          "actual_max_bond": 96
+        }
+      ],
+      "step_seconds": [
+        17.24222495900176,
+        30.221138708999206,
+        29.230886416997237
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-pauli-c96-short-safe.json",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 128,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 17,
+      "representation": "pauli",
+      "dtype": "float64",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "cpu_qr": "scipy_pivoted",
+      "update": "interval",
+      "status": "time_budget",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 8.881784197001252e-16,
+          "energy_per_site": 0.3232496540493784,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0249999999999998,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 7.39708294617003e-11,
+          "energy_per_site": 0.3201358425684775,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024943101942933362,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.281528216878769e-10,
+          "energy_per_site": 0.3139538819622148,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.023752806786778546,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.468496435563793e-10,
+          "energy_per_site": 0.3093802616407142,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020791138196746214,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.6971979377444768e-10,
+          "energy_per_site": 0.30910176300766334,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01695857104705021,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 1.7750734215837838e-10,
+          "energy_per_site": 0.3122665369268215,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.012687613555616338,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 2.05711003786746e-10,
+          "energy_per_site": 0.3159319847038702,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.00848025374490627,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 2.1755219847818807e-10,
+          "energy_per_site": 0.31766541748913507,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.005243142221489973,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 2.450035729850697e-10,
+          "energy_per_site": 0.31720147512192093,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.00383938316973278,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 2.551416855567368e-10,
+          "energy_per_site": 0.3158512489064922,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0044321570722819625,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 2.6108848416583896e-10,
+          "energy_per_site": 0.31489070856467144,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.006257709035743653,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 2.7119817502807564e-10,
+          "energy_per_site": 0.3147007084514992,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.00750859424959794,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.2000000000000002,
+          "step": 12,
+          "trace_error": 2.7497648602547997e-10,
+          "energy_per_site": 0.3149911740292615,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0071173631647254475,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.3,
+          "step": 13,
+          "trace_error": 2.7773694455390796e-10,
+          "energy_per_site": 0.3153354114413467,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.004922465638260172,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.4000000000000001,
+          "step": 14,
+          "trace_error": 2.818372202284536e-10,
+          "energy_per_site": 0.3154751468280583,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.003454449885427514,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.5,
+          "step": 15,
+          "trace_error": 2.841145096965647e-10,
+          "energy_per_site": 0.31539302187179086,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0030197603615936875,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.6,
+          "step": 16,
+          "trace_error": 2.8528046591702605e-10,
+          "energy_per_site": 0.3152204705937609,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.003566226146696702,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.7000000000000002,
+          "step": 17,
+          "trace_error": 2.853934866209329e-10,
+          "energy_per_site": 0.3150929262933573,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.004874367006558078,
+          "actual_max_bond": 128
+        }
+      ],
+      "step_seconds": [
+        14.849735291005345,
+        28.242160209003487,
+        26.54171833300643,
+        26.52677649999532,
+        24.713748041001963,
+        31.90236658300273,
+        32.038581499997235,
+        29.701450374996057,
+        28.939534917000856,
+        24.370959082996706,
+        23.104571249998116,
+        22.826592707999225,
+        22.29477670799679,
+        22.55141420900327,
+        22.79619258299499,
+        22.9362885409937,
+        24.632630791995325
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-pauli-r128-safe.json",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 192,
+      "dt": 0.1,
+      "requested_steps": 3,
+      "completed_steps": 3,
+      "representation": "pauli",
+      "dtype": "float64",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "update": "interval",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 1.1102230246251565e-15,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0249999999999998,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 3.1214808515755976e-11,
+          "energy_per_site": 0.3201369691350838,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024963728752376638,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 3.1347049337236843,
+          "energy_per_site": -0.7252004985106937,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -37.25338884011462,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 0.6642150980347147,
+          "energy_per_site": 0.1630098349413547,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -1.3259267535736678,
+          "actual_max_bond": 192
+        }
+      ],
+      "step_seconds": [
+        21.18028137499641,
+        60.95327879199613,
+        60.89281774999836
+      ],
+      "preservation_errors": [
+        "DMT window [14, 21] changed its target trace (fresh relative defect 10.5).",
+        "DMT window [8, 15] changed its target trace (fresh relative defect 0.905).",
+        "DMT window [19, 28] changed its target trace (fresh relative defect 1.35).",
+        "DMT window [22, 25] changed its target trace (fresh relative defect 14.1).",
+        "DMT window [25, 34] changed its target trace (fresh relative defect 0.591).",
+        "DMT window [4, 7] changed its target trace (fresh relative defect 1.05).",
+        "DMT window [6, 17] changed its target trace (fresh relative defect 1.54)."
+      ],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-pauli-r192-dd.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": false
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 192,
+      "dt": 0.1,
+      "requested_steps": 10,
+      "completed_steps": 10,
+      "representation": "pauli",
+      "dtype": "float64",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "cpu_qr": "scipy_pivoted",
+      "update": "interval",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 8.881784197001252e-16,
+          "energy_per_site": 0.3232496540493784,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0249999999999998,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 6.511502448347528e-11,
+          "energy_per_site": 0.32013695682940324,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024963781435388882,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 9.743050810584464e-11,
+          "energy_per_site": 0.3139246515764865,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02439487062603524,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.3525625064403357e-10,
+          "energy_per_site": 0.309341848950796,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.022743306193378377,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.5684475940247466e-10,
+          "energy_per_site": 0.3091215955701693,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02034684850425915,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 1.671625060595261e-10,
+          "energy_per_site": 0.3123946779272802,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01773703355111967,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 1.917290770592217e-10,
+          "energy_per_site": 0.31611916870140266,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.014940609885444158,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 1.9444201804219574e-10,
+          "energy_per_site": 0.31778743158004485,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.012655928772678574,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 2.0738810668774477e-10,
+          "energy_per_site": 0.3171743836730568,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.011561849960762566,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 2.1349433332318313e-10,
+          "energy_per_site": 0.3157064751900416,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01192683485135434,
+          "actual_max_bond": 192
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 2.262536824559902e-10,
+          "energy_per_site": 0.31473697156470515,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.013579659111143507,
+          "actual_max_bond": 192
+        }
+      ],
+      "step_seconds": [
+        28.075661207993107,
+        62.56391395800165,
+        56.45342008300213,
+        72.85104841700377,
+        79.47891904100106,
+        78.10198541700083,
+        70.46514158399805,
+        67.45481854100217,
+        48.54988183299429,
+        47.56983941599901
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-pauli-r192-safe.json",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 96,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 11,
+      "representation": "pauli",
+      "dtype": "float64",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "update": "interval",
+      "status": "failed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 1.1102230246251565e-15,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0249999999999998,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 5.741784825374907e-11,
+          "energy_per_site": 0.32013587166404245,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024636789002963205,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 1.1034950730959281e-10,
+          "energy_per_site": 0.3139662550587625,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.023346447567919735,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.4841727846715003e-10,
+          "energy_per_site": 0.30942016694889624,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020380351730331942,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.4585932461841367e-10,
+          "energy_per_site": 0.3091455895677286,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.016120709475795997,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 8.709077903290563e-11,
+          "energy_per_site": 0.3122800905758047,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.011275809213570819,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 9.73450209329485e-11,
+          "energy_per_site": 0.315844490760689,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.006747805175742261,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 9.206746476309036e-11,
+          "energy_per_site": 0.317490656963802,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0034608029603687995,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 1.1152367918043637e-10,
+          "energy_per_site": 0.3170926573882483,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0018116920515985357,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 1.3208545368570412e-10,
+          "energy_per_site": 0.31590029768758743,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.001462788329146749,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 1.2592704656810838e-10,
+          "energy_per_site": 0.3150461578866476,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0032202842950303603,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 1.2375322988589232e-10,
+          "energy_per_site": 0.3148574635869972,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.006490557079725465,
+          "actual_max_bond": 96
+        }
+      ],
+      "step_seconds": [
+        7.453934958997706,
+        11.891937959000643,
+        14.098754041995562,
+        10.845374292002816,
+        10.13742895899486,
+        10.426481959002558,
+        10.498076750001928,
+        10.05685433299368,
+        10.112390042006155,
+        12.069087332994968,
+        10.621284041000763
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "error": "LinAlgError: SVD did not converge for slice = 0.",
+      "source": "pepsy-public6-pauli-r96-dd.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": false
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 96,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 20,
+      "representation": "pauli",
+      "dtype": "float64",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "scipy_gesdd",
+      "cpu_qr": "scipy_pivoted",
+      "update": "interval",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 8.881784197001252e-16,
+          "energy_per_site": 0.3232496540493784,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0249999999999998,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 5.7370774797504964e-11,
+          "energy_per_site": 0.32013563869185235,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024637740685663368,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 9.93276572103241e-11,
+          "energy_per_site": 0.31396644581201766,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.02332780886075987,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 1.6292989180044515e-10,
+          "energy_per_site": 0.3094221381263298,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020391385686109095,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 1.93072891008228e-10,
+          "energy_per_site": 0.3091477442666897,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01616828478715496,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 2.3204815846611382e-10,
+          "energy_per_site": 0.3122852635920942,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.011375357576687964,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 2.505842200406505e-10,
+          "energy_per_site": 0.31584794166948627,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.006842870207558833,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 2.6783553153109096e-10,
+          "energy_per_site": 0.3175035962493847,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0034996136817930456,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 2.7834445859298285e-10,
+          "energy_per_site": 0.3171163267619641,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0015802961350665108,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 2.934887888272897e-10,
+          "energy_per_site": 0.3159364945094253,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0010413978450475468,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 2.990270253633298e-10,
+          "energy_per_site": 0.31507640383065383,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0024361885946298624,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 2.9949998037182013e-10,
+          "energy_per_site": 0.31488584264891334,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.005308860352569945,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.2000000000000002,
+          "step": 12,
+          "trace_error": 3.062590181457381e-10,
+          "energy_per_site": 0.31512004379327835,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.005184141978364811,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.3,
+          "step": 13,
+          "trace_error": 3.0973246190058035e-10,
+          "energy_per_site": 0.3154010739035078,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0033284161043819448,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.4000000000000001,
+          "step": 14,
+          "trace_error": 3.1095770403055667e-10,
+          "energy_per_site": 0.3154996894616873,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0022130060113524056,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.5,
+          "step": 15,
+          "trace_error": 3.128786119077631e-10,
+          "energy_per_site": 0.3154027086514692,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.002138097483089239,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.6,
+          "step": 16,
+          "trace_error": 3.131908066222877e-10,
+          "energy_per_site": 0.3152387139341276,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0028726272750238565,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.7000000000000002,
+          "step": 17,
+          "trace_error": 3.1237701314523747e-10,
+          "energy_per_site": 0.3151375328057629,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.004162255487912533,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.8,
+          "step": 18,
+          "trace_error": 3.1226132790607153e-10,
+          "energy_per_site": 0.31513051850126206,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.005666153838749313,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.9000000000000001,
+          "step": 19,
+          "trace_error": 3.1268387878924386e-10,
+          "energy_per_site": 0.3151647855189046,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.006883210302842127,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 2.0,
+          "step": 20,
+          "trace_error": 3.1182079140990027e-10,
+          "energy_per_site": 0.31518462837776107,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.007940092910418736,
+          "actual_max_bond": 96
+        }
+      ],
+      "step_seconds": [
+        6.4692295839995495,
+        14.083478375003324,
+        12.128569917003915,
+        11.537973292004608,
+        11.344207875001302,
+        10.70614470900182,
+        10.611936666995462,
+        10.461868083002628,
+        12.60121154099761,
+        10.48006466699735,
+        11.024290499997733,
+        11.036584334004147,
+        12.220168749998265,
+        11.788249290999374,
+        12.685039957999834,
+        12.038574207996135,
+        12.639414749995922,
+        12.534066583997628,
+        11.501850290995208,
+        11.939115749999473
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-pauli-r96-safe.json",
+      "comparison_eligible": true
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 128,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 17,
+      "representation": "pauli",
+      "dtype": "float64",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "torch",
+      "update": "interval",
+      "status": "failed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 1.1102230246251565e-15,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0249999999999998,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 1.2724199471847442e-10,
+          "energy_per_site": 0.32013591212715975,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.024942814531606308,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 9.008749302097385e-11,
+          "energy_per_site": 0.3139531185192386,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.023763494047523887,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 4.20319334892838e-11,
+          "energy_per_site": 0.30937704573417374,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.020815210074907,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 2.4858337610567105e-11,
+          "energy_per_site": 0.309091094523859,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.016930926827437142,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 1.8134382884227307e-12,
+          "energy_per_site": 0.31225659880063206,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.01259871726294436,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 1.3240519791679617e-12,
+          "energy_per_site": 0.31591283202790493,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.008303088162541848,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 5.936806601880562e-12,
+          "energy_per_site": 0.31763455682016817,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0049625117306276185,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 1.4833245742806866e-11,
+          "energy_per_site": 0.3171804767234472,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.003462535862862808,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 3.2118974147010704e-11,
+          "energy_per_site": 0.31585516288517956,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0039565038430114455,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 4.4329651061048025e-11,
+          "energy_per_site": 0.31490824123714883,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.00569602406998339,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 2.379274555153188e-11,
+          "energy_per_site": 0.31472054182980624,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.007016055008964115,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.2000000000000002,
+          "step": 12,
+          "trace_error": 1.720601439103575e-11,
+          "energy_per_site": 0.31500487096842106,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.006101471348283758,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.3,
+          "step": 13,
+          "trace_error": 1.5558665467096944e-12,
+          "energy_per_site": 0.3153427400487812,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.005662629235262114,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.4000000000000001,
+          "step": 14,
+          "trace_error": 4.9675819013828004e-12,
+          "energy_per_site": 0.31548418492283925,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.004083044878189121,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.5,
+          "step": 15,
+          "trace_error": 4.2308379022415465e-12,
+          "energy_per_site": 0.315399554717308,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.0017825284549953628,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.6,
+          "step": 16,
+          "trace_error": 1.503819291315267e-11,
+          "energy_per_site": 0.3152120207629816,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.006343699293448955,
+          "actual_max_bond": 128
+        },
+        {
+          "time": 1.7000000000000002,
+          "step": 17,
+          "trace_error": 1.4978907003637687e-11,
+          "energy_per_site": 0.31507481127806797,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.007765698266368365,
+          "actual_max_bond": 128
+        }
+      ],
+      "step_seconds": [
+        10.984125708004285,
+        22.75062308300403,
+        18.75759787500283,
+        26.685370792001777,
+        26.22819095900195,
+        21.202204500004882,
+        18.168013291993702,
+        18.995168000001286,
+        18.28732545800449,
+        18.350698292000743,
+        18.410460874998535,
+        22.501190542003314,
+        21.400656874997367,
+        22.8847933750003,
+        25.325082292001753,
+        24.315077250001195,
+        23.67934483299905
+      ],
+      "preservation_errors": [],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "error": "ValueError: array must not contain infs or NaNs",
+      "source": "pepsy-public6-pauli-real128.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": false
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 192,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 1,
+      "representation": "pauli",
+      "dtype": "float64",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "torch",
+      "update": "interval",
+      "status": "native_process_failure",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 1.1102230246251565e-15,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0249999999999998,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 0.5493011348672614,
+          "energy_per_site": 0.20927642263091464,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.5419241790872107,
+          "actual_max_bond": 192
+        }
+      ],
+      "step_seconds": [
+        22.503783000000112
+      ],
+      "preservation_errors": [
+        "DMT window [4, 7] changed its target trace (fresh relative defect 0.941).",
+        "DMT window [6, 17] changed its target trace (fresh relative defect 6.58)."
+      ],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "last_checkpoint_status": "running",
+      "process_exit_code": 139,
+      "source": "pepsy-public6-pauli-real192.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": false
+    },
+    {
+      "shape": [
+        6,
+        6
+      ],
+      "chi": 96,
+      "dt": 0.1,
+      "requested_steps": 20,
+      "completed_steps": 20,
+      "representation": "pauli",
+      "dtype": "float64",
+      "backend": "torch",
+      "device": "cpu",
+      "cpu_svd": "torch",
+      "update": "interval",
+      "status": "completed",
+      "samples": [
+        {
+          "time": 0.0,
+          "step": 0,
+          "trace_error": 1.1102230246251565e-15,
+          "energy_per_site": 0.32324965404937833,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": 0.0249999999999998,
+          "actual_max_bond": 2
+        },
+        {
+          "time": 0.1,
+          "step": 1,
+          "trace_error": 2.0118928745205267e-10,
+          "energy_per_site": 0.3209618221754106,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.02360207065274146,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.2,
+          "step": 2,
+          "trace_error": 2.9170177384685303e-10,
+          "energy_per_site": 0.31476069684200647,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.014939309233175956,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.30000000000000004,
+          "step": 3,
+          "trace_error": 4.3704639907105047e-10,
+          "energy_per_site": 0.31025147832392386,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.008078374328182486,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.4,
+          "step": 4,
+          "trace_error": 5.617826204229459e-10,
+          "energy_per_site": 0.310080875485878,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.004882109437536214,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.5,
+          "step": 5,
+          "trace_error": 7.76630759702357e-10,
+          "energy_per_site": 0.31324862508142004,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.016787352381175666,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.6000000000000001,
+          "step": 6,
+          "trace_error": 6.070803859614671e-10,
+          "energy_per_site": 0.3167406122591526,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -0.0813577959697032,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.7000000000000001,
+          "step": 7,
+          "trace_error": 5.49243561742685e-09,
+          "energy_per_site": 0.32245252088799603,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -102.23348099326606,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.8,
+          "step": 8,
+          "trace_error": 8.67515947966524e-09,
+          "energy_per_site": 0.33681182343709243,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -161.44008062825185,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 0.9,
+          "step": 9,
+          "trace_error": 1.0842573727742888e-08,
+          "energy_per_site": 0.34543294295863747,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -188.87460658478795,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.0,
+          "step": 10,
+          "trace_error": 1.2236555768652124e-08,
+          "energy_per_site": 0.3574786545942899,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -190.25708860241502,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.1,
+          "step": 11,
+          "trace_error": 1.4118881175306797e-08,
+          "energy_per_site": 0.3357166157359354,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -183.03529921464173,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.2000000000000002,
+          "step": 12,
+          "trace_error": 1.6090224708165124e-08,
+          "energy_per_site": 0.2527173792551586,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -180.78860226807615,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.3,
+          "step": 13,
+          "trace_error": 0.18113362025243107,
+          "energy_per_site": 45.790934195606546,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -2324.021021163156,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.4000000000000001,
+          "step": 14,
+          "trace_error": 0.1811336205404359,
+          "energy_per_site": 46.271324234533594,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -2256.808424236792,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.5,
+          "step": 15,
+          "trace_error": 0.1811336203275573,
+          "energy_per_site": 47.438142196018944,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -2172.821991151509,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.6,
+          "step": 16,
+          "trace_error": 1.3951199435848594,
+          "energy_per_site": 44.249986446804975,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -2140.470088327462,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.7000000000000002,
+          "step": 17,
+          "trace_error": 1.3951199439751463,
+          "energy_per_site": 44.725041191626126,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -2090.810579647221,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.8,
+          "step": 18,
+          "trace_error": 4.21465659642314,
+          "energy_per_site": 46.60933602608719,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -2016.4474465746882,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 1.9000000000000001,
+          "step": 19,
+          "trace_error": 4.214656597236257,
+          "energy_per_site": 45.73198152847894,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -1959.929161615602,
+          "actual_max_bond": 96
+        },
+        {
+          "time": 2.0,
+          "step": 20,
+          "trace_error": 4.659278441391621,
+          "energy_per_site": 42.89201905738223,
+          "max_local_hermiticity": 0.0,
+          "min_local_eigenvalue": -1877.928875925887,
+          "actual_max_bond": 96
+        }
+      ],
+      "step_seconds": [
+        5.752047957998002,
+        10.525997834003647,
+        9.818454000000202,
+        10.056967708005686,
+        9.975012292001338,
+        8.94857291700464,
+        10.407906332999119,
+        10.4866322079979,
+        9.201942792002228,
+        9.332850250000774,
+        13.864597790998232,
+        10.017467833997216,
+        9.395367833996715,
+        8.835559833001753,
+        8.547699084003398,
+        8.649106917000609,
+        8.588133707999077,
+        8.57392662500206,
+        8.981240208995587,
+        9.472503666998819
+      ],
+      "preservation_errors": [
+        "DMT bond 4 cannot preserve local trace data at this precision (relative defect 0.0249 > 4.55e-13). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 30 cannot preserve local trace data at this precision (relative defect 0.0943 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 30 cannot preserve the trace at this precision (relative defect 0.181 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT window [24, 35] changed its target trace (fresh relative defect 0.181).",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 2.17e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 1.89e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 4.36e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 2.66e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 2.35e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 1.66e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 3.86e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 1.77e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 3.43e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 2.45e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.4e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 1.58e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 1.76e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 7.53e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 2.56e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.45e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 1.49e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 3.37e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 3.43e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 3.03e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.74e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 3.02e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2.33e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 1.47e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 4.27e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.49e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2.22e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 2.01e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 2.03e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 1.39e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2.2e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 3.09e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 2.8e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.47e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2.45e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 1.37e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 2.12e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 1.87e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.55e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 2.77e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.8e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2.04e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 2.39e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 2.67e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 2.43e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 1.62e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 27 cannot preserve local trace data at this precision (relative defect 2.67e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 2.17e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 1.99e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 1.87e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 1.87e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 1.74e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2.31e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 2.32e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 3.28e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 1.67e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 26 cannot preserve local trace data at this precision (relative defect 1.41e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.7e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 1.88e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 2.87e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 1.37e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 27 cannot preserve local trace data at this precision (relative defect 1.37e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 2.44e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2.44e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 2.1e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 2.44e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2.02e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 1.96e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 1.84e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 1.5e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.64e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 2.56e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 2.22e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 25 cannot preserve local trace data at this precision (relative defect 1.44e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 3.35e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 2.25e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 2.02e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 1.85e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 24 cannot preserve local trace data at this precision (relative defect 1.93e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 21 cannot preserve local trace data at this precision (relative defect 1.59e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 22 cannot preserve local trace data at this precision (relative defect 1.65e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 23 cannot preserve local trace data at this precision (relative defect 2.02e-12 > 1.36e-12). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 31 cannot preserve local trace data at this precision (relative defect 0.0245 > 9.09e-13). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 31 cannot preserve the trace at this precision (relative defect 1.92 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT window [25, 34] changed its target trace (fresh relative defect 1.92).",
+        "DMT bond 31 cannot preserve local trace data at this precision (relative defect 0.0433 > 9.09e-13). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 31 cannot preserve the trace at this precision (relative defect 1.18 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT window [27, 32] changed its target trace (fresh relative defect 1.18).",
+        "DMT bond 31 cannot preserve local trace data at this precision (relative defect 0.0168 > 9.09e-13). Increase max_bond; for single precision, try float64/complex128.",
+        "DMT bond 31 cannot preserve the trace at this precision (relative defect 0.0853 > 4.77e-07). Try a higher working precision or bond dimension.",
+        "DMT window [27, 32] changed its target trace (fresh relative defect 0.0853)."
+      ],
+      "physics": {
+        "Jzz": 1.0,
+        "hx": 1.05,
+        "hz": 0.5,
+        "initial_pure_weight": 0.6,
+        "edges": 60,
+        "plaquettes": 25
+      },
+      "canonical_info": [
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ],
+        [
+          35,
+          35
+        ]
+      ],
+      "global_positivity": "unmeasured",
+      "source": "pepsy-public6-pauli-real96.json",
+      "cpu_qr": "torch",
+      "comparison_eligible": false
+    }
+  ],
+  "comparisons": [
+    {
+      "a": "pepsy-public3-mpo-full.json",
+      "b": "pepsy-public3-mpo-interval.json",
+      "varied": "update",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 0.0
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 3.053918568197461e-15
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 4.392796205764662e-06
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 3.212557812246155e-05
+        },
+        {
+          "step": 4,
+          "time": 0.4,
+          "max_plaquette_difference": 0.00010101995950414983
+        },
+        {
+          "step": 5,
+          "time": 0.5,
+          "max_plaquette_difference": 0.00022588479516564002
+        },
+        {
+          "step": 6,
+          "time": 0.6000000000000001,
+          "max_plaquette_difference": 0.0004181179342021014
+        },
+        {
+          "step": 7,
+          "time": 0.7000000000000001,
+          "max_plaquette_difference": 0.0006769404812505562
+        },
+        {
+          "step": 8,
+          "time": 0.8,
+          "max_plaquette_difference": 0.0009626089351783473
+        },
+        {
+          "step": 9,
+          "time": 0.9,
+          "max_plaquette_difference": 0.0012357396567395718
+        },
+        {
+          "step": 10,
+          "time": 1.0,
+          "max_plaquette_difference": 0.0016568151289213257
+        },
+        {
+          "step": 11,
+          "time": 1.1,
+          "max_plaquette_difference": 0.002032818888883331
+        },
+        {
+          "step": 12,
+          "time": 1.2000000000000002,
+          "max_plaquette_difference": 0.0024470055401932043
+        },
+        {
+          "step": 13,
+          "time": 1.3,
+          "max_plaquette_difference": 0.0029222978498459557
+        },
+        {
+          "step": 14,
+          "time": 1.4000000000000001,
+          "max_plaquette_difference": 0.00331533326269893
+        },
+        {
+          "step": 15,
+          "time": 1.5,
+          "max_plaquette_difference": 0.003537897314083132
+        },
+        {
+          "step": 16,
+          "time": 1.6,
+          "max_plaquette_difference": 0.003676356270011996
+        },
+        {
+          "step": 17,
+          "time": 1.7000000000000002,
+          "max_plaquette_difference": 0.003858012875836686
+        },
+        {
+          "step": 18,
+          "time": 1.8,
+          "max_plaquette_difference": 0.004140086906015653
+        },
+        {
+          "step": 19,
+          "time": 1.9000000000000001,
+          "max_plaquette_difference": 0.004489061405145872
+        },
+        {
+          "step": 20,
+          "time": 2.0,
+          "max_plaquette_difference": 0.004791086522105534
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public3-mpo-full.json",
+      "b": "pepsy-public3-pauli-full.json",
+      "varied": "representation",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 4.769117368664483e-16
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 8.317779296298599e-15
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 3.4209709726183257e-06
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 3.576486060478715e-05
+        },
+        {
+          "step": 4,
+          "time": 0.4,
+          "max_plaquette_difference": 0.00011630296216548087
+        },
+        {
+          "step": 5,
+          "time": 0.5,
+          "max_plaquette_difference": 0.0002731542274212347
+        },
+        {
+          "step": 6,
+          "time": 0.6000000000000001,
+          "max_plaquette_difference": 0.0005201392660374281
+        },
+        {
+          "step": 7,
+          "time": 0.7000000000000001,
+          "max_plaquette_difference": 0.0008647214266363792
+        },
+        {
+          "step": 8,
+          "time": 0.8,
+          "max_plaquette_difference": 0.0013116822079286953
+        },
+        {
+          "step": 9,
+          "time": 0.9,
+          "max_plaquette_difference": 0.0018180597712188105
+        },
+        {
+          "step": 10,
+          "time": 1.0,
+          "max_plaquette_difference": 0.002306758362510819
+        },
+        {
+          "step": 11,
+          "time": 1.1,
+          "max_plaquette_difference": 0.0027460253718971112
+        },
+        {
+          "step": 12,
+          "time": 1.2000000000000002,
+          "max_plaquette_difference": 0.003137304194713395
+        },
+        {
+          "step": 13,
+          "time": 1.3,
+          "max_plaquette_difference": 0.0034464719162508816
+        },
+        {
+          "step": 14,
+          "time": 1.4000000000000001,
+          "max_plaquette_difference": 0.003737960744338642
+        },
+        {
+          "step": 15,
+          "time": 1.5,
+          "max_plaquette_difference": 0.004226361091909145
+        },
+        {
+          "step": 16,
+          "time": 1.6,
+          "max_plaquette_difference": 0.005026435470963724
+        },
+        {
+          "step": 17,
+          "time": 1.7000000000000002,
+          "max_plaquette_difference": 0.005919486542469644
+        },
+        {
+          "step": 18,
+          "time": 1.8,
+          "max_plaquette_difference": 0.006639971852830562
+        },
+        {
+          "step": 19,
+          "time": 1.9000000000000001,
+          "max_plaquette_difference": 0.007232980198590206
+        },
+        {
+          "step": 20,
+          "time": 2.0,
+          "max_plaquette_difference": 0.008236471093912892
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public3-mpo-interval.json",
+      "b": "pepsy-public3-pauli-interval.json",
+      "varied": "representation",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 4.769117368664483e-16
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 3.598642103038103e-15
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 4.782244480293111e-06
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 4.286770673817568e-05
+        },
+        {
+          "step": 4,
+          "time": 0.4,
+          "max_plaquette_difference": 0.00013689712550935055
+        },
+        {
+          "step": 5,
+          "time": 0.5,
+          "max_plaquette_difference": 0.0003188918366341461
+        },
+        {
+          "step": 6,
+          "time": 0.6000000000000001,
+          "max_plaquette_difference": 0.0006157563131040127
+        },
+        {
+          "step": 7,
+          "time": 0.7000000000000001,
+          "max_plaquette_difference": 0.0010533454649267933
+        },
+        {
+          "step": 8,
+          "time": 0.8,
+          "max_plaquette_difference": 0.0016341444222122907
+        },
+        {
+          "step": 9,
+          "time": 0.9,
+          "max_plaquette_difference": 0.002272363983096125
+        },
+        {
+          "step": 10,
+          "time": 1.0,
+          "max_plaquette_difference": 0.002880597329680068
+        },
+        {
+          "step": 11,
+          "time": 1.1,
+          "max_plaquette_difference": 0.0034443420599118727
+        },
+        {
+          "step": 12,
+          "time": 1.2000000000000002,
+          "max_plaquette_difference": 0.0039470653075397
+        },
+        {
+          "step": 13,
+          "time": 1.3,
+          "max_plaquette_difference": 0.0043052319028053215
+        },
+        {
+          "step": 14,
+          "time": 1.4000000000000001,
+          "max_plaquette_difference": 0.004799623891102014
+        },
+        {
+          "step": 15,
+          "time": 1.5,
+          "max_plaquette_difference": 0.00514727495171812
+        },
+        {
+          "step": 16,
+          "time": 1.6,
+          "max_plaquette_difference": 0.005888284385330538
+        },
+        {
+          "step": 17,
+          "time": 1.7000000000000002,
+          "max_plaquette_difference": 0.006883779936438972
+        },
+        {
+          "step": 18,
+          "time": 1.8,
+          "max_plaquette_difference": 0.007810053026382742
+        },
+        {
+          "step": 19,
+          "time": 1.9000000000000001,
+          "max_plaquette_difference": 0.008826266695666047
+        },
+        {
+          "step": 20,
+          "time": 2.0,
+          "max_plaquette_difference": 0.009718914112197354
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public3-pauli-full.json",
+      "b": "pepsy-public3-pauli-interval.json",
+      "varied": "update",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 0.0
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 7.733329309902539e-15
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 2.6145739222655473e-06
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 2.4830846061518135e-05
+        },
+        {
+          "step": 4,
+          "time": 0.4,
+          "max_plaquette_difference": 8.342306957643e-05
+        },
+        {
+          "step": 5,
+          "time": 0.5,
+          "max_plaquette_difference": 0.00020023225768411886
+        },
+        {
+          "step": 6,
+          "time": 0.6000000000000001,
+          "max_plaquette_difference": 0.00038715403269257815
+        },
+        {
+          "step": 7,
+          "time": 0.7000000000000001,
+          "max_plaquette_difference": 0.0006533521176094939
+        },
+        {
+          "step": 8,
+          "time": 0.8,
+          "max_plaquette_difference": 0.0009872842701902803
+        },
+        {
+          "step": 9,
+          "time": 0.9,
+          "max_plaquette_difference": 0.0013268492994953959
+        },
+        {
+          "step": 10,
+          "time": 1.0,
+          "max_plaquette_difference": 0.0016378516473846735
+        },
+        {
+          "step": 11,
+          "time": 1.1,
+          "max_plaquette_difference": 0.0019120514054289713
+        },
+        {
+          "step": 12,
+          "time": 1.2000000000000002,
+          "max_plaquette_difference": 0.002128637375898733
+        },
+        {
+          "step": 13,
+          "time": 1.3,
+          "max_plaquette_difference": 0.0022613610727857227
+        },
+        {
+          "step": 14,
+          "time": 1.4000000000000001,
+          "max_plaquette_difference": 0.002367979779469604
+        },
+        {
+          "step": 15,
+          "time": 1.5,
+          "max_plaquette_difference": 0.0025641259936048603
+        },
+        {
+          "step": 16,
+          "time": 1.6,
+          "max_plaquette_difference": 0.0028716116634846683
+        },
+        {
+          "step": 17,
+          "time": 1.7000000000000002,
+          "max_plaquette_difference": 0.003358941689120935
+        },
+        {
+          "step": 18,
+          "time": 1.8,
+          "max_plaquette_difference": 0.003933517070276062
+        },
+        {
+          "step": 19,
+          "time": 1.9000000000000001,
+          "max_plaquette_difference": 0.004380374070710039
+        },
+        {
+          "step": 20,
+          "time": 2.0,
+          "max_plaquette_difference": 0.004693716059076595
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public6-mpo-c96-safe.json",
+      "b": "pepsy-public6-pauli-c96-short-safe.json",
+      "varied": "representation",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 4.1998711203824064e-16
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 0.0002436136086957261
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 0.0009780696374490395
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 0.0015791561727491645
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public6-pauli-c128-dd.json",
+      "b": "pepsy-public6-pauli-c192-dd.json",
+      "varied": "chi",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 0.0
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 0.00038764218574637385
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 0.00362103568657993
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 0.010928068887612165
+        },
+        {
+          "step": 4,
+          "time": 0.4,
+          "max_plaquette_difference": 0.021208620733906707
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public6-pauli-c96-gesvd-safe.json",
+      "b": "pepsy-public6-pauli-c96-short-safe.json",
+      "varied": "cpu_svd",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 0.0
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 0.0004518215420251646
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 0.0012063280595058538
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 0.0018313007252477949
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public6-pauli-c96-short-safe.json",
+      "b": "pepsy-public6-pauli-r96-safe.json",
+      "varied": "dtype",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 4.722145448560269e-17
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 0.00015578605114672354
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 0.0009410229635832822
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 0.0011306986750337603
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public6-pauli-r128-safe.json",
+      "b": "pepsy-public6-pauli-r192-safe.json",
+      "varied": "chi",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 0.0
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 0.00038947765393627167
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 0.0034579244500061988
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 0.010773691214106717
+        },
+        {
+          "step": 4,
+          "time": 0.4,
+          "max_plaquette_difference": 0.02118354047584828
+        },
+        {
+          "step": 5,
+          "time": 0.5,
+          "max_plaquette_difference": 0.03187388507610533
+        },
+        {
+          "step": 6,
+          "time": 0.6000000000000001,
+          "max_plaquette_difference": 0.04032111006458837
+        },
+        {
+          "step": 7,
+          "time": 0.7000000000000001,
+          "max_plaquette_difference": 0.04570539948813418
+        },
+        {
+          "step": 8,
+          "time": 0.8,
+          "max_plaquette_difference": 0.048731081409945386
+        },
+        {
+          "step": 9,
+          "time": 0.9,
+          "max_plaquette_difference": 0.050562521026642424
+        },
+        {
+          "step": 10,
+          "time": 1.0,
+          "max_plaquette_difference": 0.051485588009763245
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public6-pauli-r128-safe.json",
+      "b": "pepsy-public6-pauli-r96-safe.json",
+      "varied": "chi",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 0.0
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 0.0020365815594159836
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 0.004832614204512542
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 0.009895887949657825
+        },
+        {
+          "step": 4,
+          "time": 0.4,
+          "max_plaquette_difference": 0.020141829539982326
+        },
+        {
+          "step": 5,
+          "time": 0.5,
+          "max_plaquette_difference": 0.029338160043933147
+        },
+        {
+          "step": 6,
+          "time": 0.6000000000000001,
+          "max_plaquette_difference": 0.035816061767050905
+        },
+        {
+          "step": 7,
+          "time": 0.7000000000000001,
+          "max_plaquette_difference": 0.04023045936742435
+        },
+        {
+          "step": 8,
+          "time": 0.8,
+          "max_plaquette_difference": 0.044574309422849914
+        },
+        {
+          "step": 9,
+          "time": 0.9,
+          "max_plaquette_difference": 0.0535977572720648
+        },
+        {
+          "step": 10,
+          "time": 1.0,
+          "max_plaquette_difference": 0.06232513597754113
+        },
+        {
+          "step": 11,
+          "time": 1.1,
+          "max_plaquette_difference": 0.06667624999161893
+        },
+        {
+          "step": 12,
+          "time": 1.2000000000000002,
+          "max_plaquette_difference": 0.07223375561085395
+        },
+        {
+          "step": 13,
+          "time": 1.3,
+          "max_plaquette_difference": 0.07549097900722351
+        },
+        {
+          "step": 14,
+          "time": 1.4000000000000001,
+          "max_plaquette_difference": 0.0747776462333765
+        },
+        {
+          "step": 15,
+          "time": 1.5,
+          "max_plaquette_difference": 0.07284565747637661
+        },
+        {
+          "step": 16,
+          "time": 1.6,
+          "max_plaquette_difference": 0.0708686249764559
+        },
+        {
+          "step": 17,
+          "time": 1.7000000000000002,
+          "max_plaquette_difference": 0.06925285482268363
+        }
+      ]
+    },
+    {
+      "a": "pepsy-public6-pauli-r192-safe.json",
+      "b": "pepsy-public6-pauli-r96-safe.json",
+      "varied": "chi",
+      "samples": [
+        {
+          "step": 0,
+          "time": 0.0,
+          "max_plaquette_difference": 0.0
+        },
+        {
+          "step": 1,
+          "time": 0.1,
+          "max_plaquette_difference": 0.0021556111873533104
+        },
+        {
+          "step": 2,
+          "time": 0.2,
+          "max_plaquette_difference": 0.007155646352588998
+        },
+        {
+          "step": 3,
+          "time": 0.30000000000000004,
+          "max_plaquette_difference": 0.01615232032984614
+        },
+        {
+          "step": 4,
+          "time": 0.4,
+          "max_plaquette_difference": 0.028561392959507877
+        },
+        {
+          "step": 5,
+          "time": 0.5,
+          "max_plaquette_difference": 0.04179569234351969
+        },
+        {
+          "step": 6,
+          "time": 0.6000000000000001,
+          "max_plaquette_difference": 0.053315271567679255
+        },
+        {
+          "step": 7,
+          "time": 0.7000000000000001,
+          "max_plaquette_difference": 0.06203445642772585
+        },
+        {
+          "step": 8,
+          "time": 0.8,
+          "max_plaquette_difference": 0.06916224858364226
+        },
+        {
+          "step": 9,
+          "time": 0.9,
+          "max_plaquette_difference": 0.08010226455306507
+        },
+        {
+          "step": 10,
+          "time": 1.0,
+          "max_plaquette_difference": 0.08624678243399356
+        }
+      ]
+    }
+  ],
+  "norm": "max physical plaquette Frobenius norm; raw unnormalized marginals",
+  "timing": "concurrent CPU jobs; not an isolated speed benchmark",
+  "global_positivity": "unmeasured",
+  "environment": {
+    "numpy": "2.5.2",
+    "scipy": "1.18.0",
+    "quimb": "1.15.0",
+    "autoray": "0.8.4",
+    "torch": "2.9.1",
+    "cuda_available": false,
+    "torch_cpu_blas": "Apple Accelerate"
+  },
+  "native_svd_primitive_control": {
+    "shape": [
+      128,
+      128
+    ],
+    "dtype": "complex128",
+    "input_finite": true,
+    "norm": 0.4706,
+    "native_torch_factors_finite": false,
+    "scipy_gesdd_reconstruction_defect": 8e-16,
+    "scipy_gesvd_reconstruction_defect": 6e-16,
+    "qualification": "Captured residual reproduces native SVD NaNs; approximate diagnostic values."
+  }
+}

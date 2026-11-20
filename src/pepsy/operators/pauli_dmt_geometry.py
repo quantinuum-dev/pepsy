@@ -4,6 +4,23 @@ from itertools import combinations
 from numbers import Integral
 
 
+def complete_dmt_regions(nsites, regions, *, required):
+    """Cover explicit required supports without retaining contained requests.
+
+    All sites are MPO storage positions. The returned maximal inventory
+    preserves every input region and required support by partial tracing;
+    overlapping parents do not imply protection of their union. Supply the
+    default chain triples explicitly if those are also required.
+    """
+    if isinstance(nsites, bool) or not isinstance(nsites, Integral) or nsites < 1:
+        raise ValueError('nsites must be a positive integer.')
+    try:
+        combined = tuple(regions) + tuple(required)
+    except TypeError as exc:
+        raise ValueError('regions and required must be iterables of site sequences.') from exc
+    return _maximal_regions(_normalize_regions(combined, int(nsites)))
+
+
 def square_lattice_dmt_regions(
     lx, ly, *, kind="plaquettes", mapper=None, map_mode="snake", site_order=None,
 ):

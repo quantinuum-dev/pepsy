@@ -19,6 +19,7 @@ import numpy as np
 from quimb.tensor.decomp import array_split
 
 from .._internal.cutoff import dtype_auto_cutoff
+from ..backends._numpy_qr import _numpy_qr_workaround
 from .pauli_mpo import (
     _array_like,
     _core_bond_dimensions,
@@ -98,11 +99,12 @@ class PauliDMTReport:
     relative_density_error: float | None = None
     preservation_check: str = "raise"
     check_regions: bool = False
+    update_errors: tuple[str, ...] = ()
 
     @property
     def preservation_errors(self):
         """Failed checks from this operation; warning mode still returns data."""
-        return tuple(error for bond in self.bond_reports for error in bond.preservation_errors)
+        return self.update_errors + tuple(error for bond in self.bond_reports for error in bond.preservation_errors)
 
     @property
     def max_relative_trace_error(self):
@@ -226,8 +228,20 @@ def _cat(xs, axis):
 
 
 def _qr(x):
+    result = _numpy_qr_workaround(x)
+    if result is not None:
+        return result
     q, _, r = array_split(x, method="qr", absorb="right", cutoff=0.0)
     return q, r
+
+
+def _lq(x):
+    result = _numpy_qr_workaround(_transpose(x, (1, 0)))
+    if result is not None:
+        q, r = result
+        return _transpose(r, (1, 0)), _transpose(q, (1, 0))
+    left, _, right = array_split(x, method="qr", absorb="left", cutoff=0.0)
+    return left, right
 
 
 def _svd(x, *, cutoff=0.0, cutoff_mode="rel", max_bond=None):
@@ -687,20 +701,37 @@ def _region_vectors(cores, bond, patterns, eye, environments):
         return transfers[key]
 
     environments.at(bond, bond + 2)
+    # Many strings differ only on a site closer to the cut. Share their
+    # normalized partial contractions, including the intervening traced gaps.
+    # These arrays belong only to this call: a tensor write or gauge move can
+    # change every projected direction even when the physical plan is unchanged.
+    prefixes, suffixes = {}, {}
     for pattern in left_patterns:
         labels = dict(pattern)
         first = next((site for site, _ in pattern if site < bond), bond)
         v = environments.left[first]
+        end = 0
         for j in range(first, bond):
-            v = _unit(v @ transfer(j, labels))
+            if end < len(pattern) and pattern[end][0] == j:
+                end += 1
+            key = j, pattern[:end]
+            if key not in prefixes:
+                prefixes[key] = _unit(v @ transfer(j, labels))
+            v = prefixes[key]
         v = _einsum("a,p->ap", ar.do("conj", v), physical(bond, labels))
         left.append(_reshape(v, (-1,)))
     for pattern in right_patterns:
         labels = dict(pattern)
         last = max((site for site, _ in pattern if site > bond + 1), default=bond + 1)
         v = environments.right[last + 1]
+        start = len(pattern)
         for j in range(last, bond + 1, -1):
-            v = _unit(transfer(j, labels) @ v)
+            if start and pattern[start - 1][0] == j:
+                start -= 1
+            key = j, pattern[start:]
+            if key not in suffixes:
+                suffixes[key] = _unit(transfer(j, labels) @ v)
+            v = suffixes[key]
         v = _einsum("p,b->pb", physical(bond + 1, labels), v)
         right.append(_reshape(v, (-1,)))
     return ar.do("stack", left, axis=1), ar.do("stack", right, axis=1)
@@ -752,7 +783,7 @@ def _split_scaled(matrix, left_vectors, right_vectors, *, max_bond, cutoff,
                 "use variant='operator' for genuinely traceless operators."
             )
     if k <= max_bond and (cutoff == 0.0 or _fully_protected):
-        left, _, right = array_split(m, method="qr", absorb=absorb, cutoff=0.0)
+        left, right = _qr(m) if absorb == "right" else _lq(m)
         violation, relative = _constraints(left, right, m, lv, rv) if diagnostics else (None, None)
         return left, right, PauliDMTBondReport(
             bond, k, 0, 0, 0, k, 0.0, support_error,
@@ -778,7 +809,7 @@ def _split_scaled(matrix, left_vectors, right_vectors, *, max_bond, cutoff,
         # A complete protected side leaves no unprotected block to truncate.
         # Reconstructing it anyway adds avoidable roundoff, notably at chain
         # edges when a positive/automatic cutoff disables the early QR path.
-        left, _, right = array_split(matrix, method="qr", absorb=absorb, cutoff=0.0)
+        left, right = _qr(matrix) if absorb == "right" else _lq(matrix)
         violation, relative = _constraints(left, right, matrix, left_vectors, right_vectors) if diagnostics else (None, None)
         return left, right, PauliDMTBondReport(
             bond, k, p, q, 0, k, 0.0, support_error,
@@ -787,7 +818,7 @@ def _split_scaled(matrix, left_vectors, right_vectors, *, max_bond, cutoff,
     if k <= max_bond and p + q >= max_bond:
         # An already fitting operator is feasible even when the conservative
         # protected-plus-residual rank construction has no available budget.
-        left, _, right = array_split(matrix, method="qr", absorb=absorb, cutoff=0.0)
+        left, right = _qr(matrix) if absorb == "right" else _lq(matrix)
         violation, relative = _constraints(left, right, matrix, left_vectors, right_vectors) if diagnostics else (None, None)
         return left, right, PauliDMTBondReport(
             bond, k, p, q, 0, k, 0.0, support_error,
@@ -982,9 +1013,10 @@ class _PauliDMTWorkspace:
         self.physical_dim = self.cores[0].shape[2]
         self.pauli_units = _trace_vector is None
         self.regions = _normalize_regions(regions, len(self.cores))
+        self.region_candidate_plans = {}
         self.region_patterns = (_region_patterns(
             self.regions, len(self.cores), self.physical_dim, selection=region_selection)
-                                if self.regions is not None else None)
+                                if self.regions is not None and region_selection != "rank_aware" else None)
         backends = {ar.infer_backend(a) for a in self.cores}
         if len(backends) != 1 or "symmray" in backends:
             raise TypeError("DMT requires homogeneous dense backend arrays.")
@@ -1011,6 +1043,7 @@ class _PauliDMTWorkspace:
         self.original_bonds = _core_bond_dimensions(self.cores)
         self.diagnostics = diagnostics or constraint_mode == "relaxed"
         self.reports = []
+        self.update_errors = []
         self.eye = _array_like(np.eye(self.physical_dim), self.cores[0])
         if not self.pauli_units:
             # Householder columns span matrix units with the trace direction
@@ -1079,10 +1112,7 @@ class _PauliDMTWorkspace:
         for i in range(start, target, -1):
             a = self.cores[i]
             dl, dr, _ = a.shape
-            left, _, right = array_split(
-                _reshape(_transpose(a, (0, 2, 1)), (dl, p * dr)),
-                method="qr", absorb="left", cutoff=0.0,
-            )
+            left, right = _lq(_reshape(_transpose(a, (0, 2, 1)), (dl, p * dr)))
             self.cores[i] = _transpose(_reshape(right, (right.shape[0], p, dr)), (0, 2, 1))
             neighbor = self.cores[i - 1]
             matrix = _reshape(_transpose(neighbor, (0, 2, 1)), (-1, dl)) @ left
@@ -1101,11 +1131,13 @@ class _PauliDMTWorkspace:
         workspace.environments.right = list(self.environments.right)
         workspace.original_bonds = _core_bond_dimensions(workspace.cores)
         workspace.reports = []
+        workspace.update_errors = []
         workspace.warned_checks = set(self.warned_checks)
+        workspace.region_candidate_plans = dict(self.region_candidate_plans)
         workspace.relative_density_error = None
         return workspace
 
-    def apply_window(self, start, operator_cores, *, absorb="right"):
+    def apply_window(self, start, operator_cores, *, absorb="right", update="interval"):
         """Apply a physical transfer MPO and compress its affected interval.
 
         Transfer cores have axes (left, right, output, input). Outside the
@@ -1115,8 +1147,9 @@ class _PauliDMTWorkspace:
         operators = list(operator_cores)
         stop = start + len(operators) - 1
         p = self.physical_dim
-        if (not operators or not 0 <= start <= stop < len(self.cores)
-                or absorb not in {"left", "right"}):
+        if (isinstance(start, bool) or not isinstance(start, Integral)
+                or not operators or not 0 <= start <= stop < len(self.cores)
+                or absorb not in {"left", "right"} or update not in {'interval', 'full'}):
             raise ValueError("Invalid DMT window or absorption direction.")
         bond = 1
         for op in operators:
@@ -1138,13 +1171,38 @@ class _PauliDMTWorkspace:
         self.environments.invalidate(start, stop + 1)
         # Cached maps also define the local guards. Check their scalar target
         # independently, without paying for a complete regional-density scan.
+        # A one-site interval action performs no post-target factorization or
+        # truncation. Its finite/resolved-density check below is sufficient;
+        # two identical full-chain trace contractions would add no check.
         target_trace = (_trace_scalar_data(self.cores, self.trace_vector)
-                        if self.monitor_trace else None)
+                        if self.monitor_trace and (len(operators) > 1 or update == 'full') else None)
+        before = None
+        if self.check_regions:
+            before = (_local_trace_data(self.cores, self.trace_vector) if self.regions is None
+                      else _region_trace_data(self.cores, self.regions, self.trace_vector))
         self._factor_interval(far, near)
         self.center = near
+        norm = _float(_norm(self.cores[near]))
+        if not np.isfinite(norm):
+            raise FloatingPointError('DMT transfer produced a nonfinite canonical center.')
+        if len(operators) == 1 and self.variant == 'density':
+            left, right = self.environments.at(near, near + 1)
+            a = self.cores[near]
+            trace = left @ _traced(a, self.trace_vector) @ right
+            bound = _float(_norm(left))*norm*_float(_norm(right))
+            if abs(_host_array(trace).item()) <= 32*max(a.shape)*_epsilon(a)*bound:
+                raise ValueError('density DMT requires a numerically resolved nonzero trace.')
         bonds = range(start, stop) if absorb == "right" else range(stop - 1, start - 1, -1)
-        for i in bonds:
-            self.split_pair(i, absorb=absorb)
+        if update == 'full':
+            bonds = range(len(self.cores)-1) if absorb == 'right' else range(len(self.cores)-2, -1, -1)
+        checks = self.check_regions
+        if self.constraint_mode == 'strict':
+            self.check_regions = False
+        try:
+            for i in bonds:
+                self.split_pair(i, absorb=absorb)
+        finally:
+            self.check_regions = checks
         if target_trace is not None:
             actual_trace = _trace_scalar_data(self.cores, self.trace_vector)
             error = _relative_scalar_defect(target_trace, actual_trace)
@@ -1157,6 +1215,16 @@ class _PauliDMTWorkspace:
                     last = self.reports[-1]
                     self.reports[-1] = replace(
                         last, preservation_errors=last.preservation_errors + (message,))
+                else:
+                    self.update_errors.append(message)
+        if before is not None:
+            after = (_local_trace_data(self.cores, self.trace_vector) if self.regions is None
+                     else _region_trace_data(self.cores, self.regions, self.trace_vector))
+            if self.constraint_mode == 'strict':
+                self.check_marginals(before, after, norm=norm)
+            else:
+                self.relative_density_error = _relative_density_defect(before, after)
+        return before, norm
 
     def split_pair(self, bond, transfer=None, *, absorb="right"):
         p = self.physical_dim
@@ -1174,23 +1242,36 @@ class _PauliDMTWorkspace:
                 left_map, matrix = _qr(am)
                 right_map = bm
             else:
-                matrix, _, right_map = array_split(bm, method="qr", absorb="left", cutoff=0.0)
+                matrix, right_map = _lq(bm)
                 left_map = am
         else:
             theta = _einsum("abp,bcq->apqc", a, b)
             theta = _einsum("PQpq,apqb->aPQb", _reshape(transfer, (p, p, p, p)), theta)
             matrix = _reshape(theta, (p * dl, p * dr))
-        if self.regions is None:
+        # An exact zero-cutoff factorization cannot change a requested
+        # marginal. Keep its trace/finite guards but avoid constructing the
+        # potentially exponential region maps when no diagnostics need them.
+        exact_pair = (not self.diagnostics and self.cutoff == 0.0
+                      and min(matrix.shape) <= self.max_bond)
+        rank_aware = self.regions is not None and self.region_selection == "rank_aware" and not exact_pair
+        if self.regions is None or exact_pair:
             left_env, right_env = self.environments.at(bond, bond + 2)
-            eye = self.protected_physical
+            eye = self.protected_physical[:, :1] if exact_pair else self.protected_physical
             lv = _reshape(_einsum("a,pm->apm", ar.do("conj", left_env), eye), (dl * p, eye.shape[1]))
             rv = _reshape(_einsum("pm,b->pbm", eye, right_env), (dr * p, eye.shape[1]))
-        elif self.region_selection == "rank_aware":
-            from ._dmt_region_selection import rank_aware_vectors
+        elif rank_aware:
+            from ._dmt_region_selection import rank_aware_plan, rank_aware_vectors
 
+            cached = self.region_candidate_plans.get(bond)
+            if cached is None or cached[0] != self.regions:
+                # Routing can change the physical site sets at the same cut.
+                # Retain only its latest immutable plan, bounding cache size
+                # by chain length rather than by the number of routed gates.
+                cached = self.regions, rank_aware_plan(self.regions, bond, p)
+                self.region_candidate_plans[bond] = cached
             lv, rv = rank_aware_vectors(
                 self.cores, bond, self.regions, self.eye, self.environments,
-                matrix, left_map, right_map,
+                matrix, left_map, right_map, plan=cached[1],
             )
         else:
             lv, rv = _region_vectors(self.cores, bond, self.region_patterns[bond], self.eye,
@@ -1210,7 +1291,7 @@ class _PauliDMTWorkspace:
                 target_cores[bond] = _transpose(_reshape(exact_left, (dl, p, exact_rank)), (0, 2, 1))
                 target_cores[bond + 1] = _transpose(_reshape(exact_right, (exact_rank, p, dr)), (0, 2, 1))
             before_regions = panels(target_cores)
-        if left_map is not None and not (self.regions is not None and self.region_selection == "rank_aware"):
+        if left_map is not None and not rank_aware:
             lv, rv = _dag(left_map) @ lv, right_map @ rv
         left, right, report = _split(
             matrix, lv, rv, max_bond=self.max_bond, cutoff=self.cutoff,
@@ -1275,6 +1356,7 @@ class _PauliDMTWorkspace:
             self.variant, self.max_bond, self.cutoff, self.original_bonds,
             _core_bond_dimensions(self.cores), tuple(self.reports), self.cutoff_mode,
             self.constraint_mode, self.relative_density_error, self.preservation_check, self.check_regions,
+            tuple(self.update_errors),
         )
 
     def check_marginals(self, before, after, *, norm):
@@ -1285,6 +1367,8 @@ class _PauliDMTWorkspace:
         if errors and self.reports:
             last = self.reports[-1]
             self.reports[-1] = replace(last, preservation_errors=last.preservation_errors + errors)
+        elif errors:
+            self.update_errors.extend(errors)
 
 
 def _gate_transfer(gate, like, mode):

@@ -118,12 +118,12 @@ def compress_mpo_dmt(mpo, *, max_bond, cutoff="auto", cutoff_mode="auto",
     return (result, report) if return_report else result
 
 
-def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
-                      variant, regions, inplace, return_report, truncation="paper",
+def _prepare_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
+                      variant, regions, diagnostics, truncation="paper",
                       max_refinement_sweeps=8, region_selection="smallest",
                       constraint_mode="strict", constraint_weight=100., check_regions=True,
                       preservation_check="raise"):
-    """Full protected sweep, retaining owned canonical state for replay."""
+    """Own exact canonical cores without compressing the pre-gate source."""
     cores, layouts, d = _extract_cores(mpo)
     max_bond, cutoff, cutoff_mode, variant = _options(
         max_bond, cutoff, cutoff_mode, variant, ar.get_dtype_name(cores[0]),
@@ -140,14 +140,33 @@ def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
     trace_vector = _array_like(np.eye(d).reshape(-1), cores[0])
     workspace = _PauliDMTWorkspace(
         max_bond=max_bond, cutoff=working_cutoff, cutoff_mode=cutoff_mode, variant=variant,
-        diagnostics=return_report, trace_guard=variant == "density", regions=regions,
+        diagnostics=diagnostics, trace_guard=variant == "density", regions=regions,
         _cores=cores, _trace_vector=trace_vector,
         truncation=truncation, max_refinement_sweeps=max_refinement_sweeps,
         region_selection=region_selection,
         constraint_mode=constraint_mode, constraint_weight=constraint_weight,
         check_regions=check_regions, preservation_check=preservation_check,
     )
-    check_regions = workspace.check_regions
+    workspace.mpo_layouts = layouts
+    workspace.mpo_dimension = d
+    workspace.mpo_log_scale = log_scale
+    workspace.mpo_cutoff = cutoff
+    return workspace, cores
+
+
+def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
+                      variant, regions, inplace, return_report, truncation="paper",
+                      max_refinement_sweeps=8, region_selection="smallest",
+                      constraint_mode="strict", constraint_weight=100., check_regions=True,
+                      preservation_check="raise"):
+    """Full protected sweep, retaining owned canonical state for replay."""
+    workspace, cores = _prepare_mpo_dmt(
+        mpo, max_bond=max_bond, cutoff=cutoff, cutoff_mode=cutoff_mode, variant=variant,
+        regions=regions, diagnostics=return_report, truncation=truncation,
+        max_refinement_sweeps=max_refinement_sweeps, region_selection=region_selection,
+        constraint_mode=constraint_mode, constraint_weight=constraint_weight,
+        check_regions=check_regions, preservation_check=preservation_check)
+    check_regions, trace_vector = workspace.check_regions, workspace.trace_vector
 
     def panels(values):
         if workspace.regions is None:
@@ -164,10 +183,6 @@ def _compress_mpo_dmt(mpo, *, max_bond, cutoff, cutoff_mode,
         workspace.check_marginals(before, after, norm=norm)
     elif check_regions:
         workspace.relative_density_error = _relative_density_defect(before, after)
-    workspace.mpo_layouts = layouts
-    workspace.mpo_dimension = d
-    workspace.mpo_log_scale = log_scale
-    workspace.mpo_cutoff = cutoff
     report = _physical_report(workspace) if return_report or _retain_report(workspace) else None
     result = _write_workspace(mpo if inplace else mpo.copy(), workspace, report)
     return result, report, workspace
@@ -186,7 +201,7 @@ def _physical_report(workspace):
 
 def _retain_report(workspace):
     """Keep warning evidence even when full diagnostics were not requested."""
-    return (workspace.constraint_mode == "relaxed"
+    return (workspace.constraint_mode == "relaxed" or bool(workspace.update_errors)
             or any(b.preservation_errors for b in workspace.reports))
 
 
@@ -237,6 +252,28 @@ def _gate_mpo_dmt(mpo, previous, gate, bra_gate, where):
 
 def _copy_workspace(previous):
     return previous.copy()
+
+
+def _transfer_mpo_dmt(mpo, previous, start, operators, *, absorb='auto', update='interval'):
+    """Transactional exact interval transfer in matrix-unit coordinates."""
+    workspace = previous.copy()
+    if absorb == 'auto':
+        stop = start + len(operators) - 1
+        absorb = 'right' if abs(workspace.center-start) <= abs(workspace.center-stop) else 'left'
+    target_panels, target_norm = workspace.apply_window(start, operators, absorb=absorb, update=update)
+    # An uncached source may have oversized spectator bonds. Cap them only
+    # after the gate, so discarded source correlations cannot alter its target.
+    if any(a.shape[1] > workspace.max_bond for a in workspace.cores[:-1]):
+        workspace.compress_sweep()
+        if target_panels is not None:
+            after = (_local_trace_data(workspace.cores, workspace.trace_vector) if workspace.regions is None
+                     else _region_trace_data(workspace.cores, workspace.regions, workspace.trace_vector))
+            if workspace.constraint_mode == 'strict':
+                workspace.check_marginals(target_panels, after, norm=target_norm)
+            else:
+                workspace.relative_density_error = _relative_density_defect(target_panels, after)
+    report = _physical_report(workspace) if workspace.diagnostics or _retain_report(workspace) else None
+    return _write_workspace(mpo, workspace, report), report, workspace
 
 
 def _gate_mpo_dmt_single(mpo, previous, gate, bra_gate, where):
@@ -357,9 +394,10 @@ def _gate_mpo_dmt_routed(mpo, previous, gate, bra_gate, where):
         workspace.regions = tuple(tuple(sorted(positions[s] for s in r)) for r in regions)
         # Only this cut is split before the next permutation changes regions.
         workspace.region_patterns = [None] * (n - 1)
-        workspace.region_patterns[bond] = _region_pattern(
-            workspace.regions, bond, p, selection=workspace.region_selection,
-        )
+        if workspace.region_selection != "rank_aware":
+            workspace.region_patterns[bond] = _region_pattern(
+                workspace.regions, bond, p, selection=workspace.region_selection,
+            )
         return positions
 
     for bond in range(a, b - 1):

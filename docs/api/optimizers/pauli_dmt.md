@@ -10,6 +10,16 @@ their 1D meaning.
 Supported storage uses dense `float32`, `float64`, `complex64` or `complex128`
 cores on an open chain.
 
+On macOS 26 arm64 with NumPy Accelerate, large real QR can corrupt unrelated
+memory despite returning valid factors. Managed DMT and native Pauli QR
+paths conservatively use exact pivoted SciPy QR for real matrices with a
+dimension at least 544, absorbing the permutation into the companion factor.
+A warning identifies the workaround on first use. Small arrays, complex
+arrays and other backends retain their existing routes. This can change the
+finite-precision gauge/trajectory; it does not truncate additional data or
+patch installed libraries. See the
+[reproducer and validation](../../development/notes/2026-11-20-dmt-robustness.md).
+
 For ordinary MPO gate-stream replay, use
 [`MpoOptimizer(mode="dmt")`](mpo.md#dmt-gate-stream-replay), which applies each
 gate exactly before protected compression.
@@ -74,6 +84,7 @@ feature; the protected DMT kernel is already shared. See the
 | Compress ordinary MPO tensors | `compress_mpo_dmt(mpo, max_bond=..., regions=...)` | New Quimb MPO; optional transactional `inplace=True` |
 | Apply one adjacent gate | `rho.apply_gate_dmt(U, (j, j+1), max_bond=..., regions=...)` | New `PauliMPO`; optional `inplace=True` |
 | Reuse environments across adjacent gates | `run = PauliDMT(rho, max_bond=..., regions=...)`; `run.apply_gate(U, (j, j+1))` | Updates `run`; returns one `PauliDMTBondReport` |
+| Apply an exact compiled interval map | `run.apply_transfer_mpo(start, cores, update="interval")` | Transactional update; returns a `PauliDMTReport`; time unchanged |
 | Evolve a nearest-neighbor chain | `run.evolve(bond_hamiltonians, dt=..., steps=...)` | Updates `run` and `run.time`; returns an independent `PauliMPO` |
 | Choose physical square-lattice regions | `square_lattice_dmt_regions(lx, ly, mapper=..., kind=...)` | MPO-position tuples; no state mutation or gate schedule |
 
@@ -87,6 +98,36 @@ Replay defaults to `check_regions=False`: bond and resolved trace checks
 remain active, while full-region scans are opt-in. Set `check_regions=True`
 to verify all regions after each gate, including default contiguous triples.
 Standalone `compress_dmt` instead defaults to a full input/output sweep check.
+
+## Exact interval transfer MPOs
+
+`PauliDMT.apply_transfer_mpo(start, cores, *, absorb="auto", update="interval")`
+accepts open-boundary transfer cores with axes
+`(left, right, output_pauli, input_pauli)`, in raw `I, X, Y, Z` coefficient
+order. Cores must match the state's backend and dtype. Supply the physical
+linear map itself; this entry point has no transposed-gate convention and
+performs no approximation of the supplied map.
+
+The exact action is applied before protected splitting. `update="interval"`
+caps bonds within the supplied interval and reuses the outside canonical
+state; `update="full"` visits every chain bond. An interval update does not
+cap oversized spectator bonds. `absorb="right"` or `"left"` fixes the sweep
+direction; `"auto"` starts from the endpoint nearest the current center.
+Regions refer to this exact post-action target, not the original trajectory.
+
+Successful calls update the live state and its stable `info_c`, without
+advancing `run.time`. A failed call leaves state, metadata and reports intact.
+Strict full checks compare post-action and final panels once; relaxed checks
+retain their per-bond measurements. `report.update_errors` records failed
+checks without a bond report, and `report.preservation_errors` includes both
+update and bond failures. Collect this tuple at each call for a trajectory log.
+
+The driver does not compile a dense nonlocal gate or schedule a 2D lattice.
+The public [Torch lattice example](../../../examples/dmt_torch_lattice.py)
+supplies exact rank-four ZZ conjugation maps across distant MPO positions,
+plus one-site field maps. It compares ordinary and Pauli coordinates with
+physical plaquette protection. See the
+[measured scope](../../development/notes/2026-11-20-dmt-torch-interval.md).
 
 Use `preservation_check="warn"` to continue after finite verification errors:
 
@@ -104,6 +145,11 @@ default remains `"raise"`. See the
 [policy contract](../operators/mpo_dmt.md#preservation-verification-policy)
 for cost, diagnostics and computational failures that can still raise.
 `run.report.check_regions` records the resolved full-check setting.
+
+Exact zero-cutoff splits that fit the cap skip numerical region-map assembly
+when split diagnostics are disabled. Density trace/finite checks remain
+active, as do full-region checks when requested. Actual lossy splits retain
+the complete requested protection construction.
 
 `apply_gate_dmt` and `PauliDMT.apply_gate` cap only the updated bond; they do
 not compress other bonds of an initially oversized operator. If a global cap

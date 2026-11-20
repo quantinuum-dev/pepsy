@@ -23,6 +23,8 @@ contains the MPS magnetization example:
 - [Ordinary MPO DMT replay/compression benchmark](../examples/mpo_dmt_benchmark.py),
   with [gate-stream usage](api/optimizers/mpo.md#dmt-gate-stream-replay) and
   independent local-density checks outside timing.
+- [Lattice-DMT energy transport, Fig. 2 physics](../examples/dmt_lattice_fig2.py),
+  with [measured scope and reference conventions](development/notes/2026-11-20-dmt-lattice-fig2.md).
 
 For operator construction, use the [API reference](api/index.md). For
 qMERA workflows, use the examples in the [qMERA API guide](api/optimizers/qmera.md).
