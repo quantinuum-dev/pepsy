@@ -233,6 +233,38 @@ def _attach_mpo_product_metadata(mpo, metadata):
     return mpo
 
 
+def _fit_lazy_mpo_target(
+    target, *, chi, block_size, cutoff, cutoff_mode, guess_method, guess_seed, n_iter=4,
+):
+    """Fit a capped MPO to an exact tagged 1D target."""
+    import quimb.tensor as qtn
+
+    from ..fitting import FIT
+
+    guess_kwargs = {"max_bond": chi, "method": guess_method, "inplace": False}
+    if guess_method.startswith("src"):
+        guess_kwargs["cutoff"] = 0.0
+    else:
+        guess_kwargs["cutoff"] = cutoff
+        guess_kwargs["cutoff_mode"] = cutoff_mode
+    guess = run_seeded_quimb(
+        guess_seed if guess_method.startswith("src") else None,
+        qtn.tensor_network_1d_compress,
+        target.copy(),
+        **guess_kwargs,
+    )
+    fitter = FIT(target, p=guess, cutoffs=cutoff, copy_target=False, inplace=False)
+    fitter.run_eff(
+        n_iter=n_iter,
+        block_size=block_size,
+        max_bond=chi,
+        cutoff=cutoff,
+        cutoff_mode=cutoff_mode,
+        adaptive_block_sweeps=2 if block_size in {2, 3} else None,
+    )
+    return fitter.p, int(getattr(fitter, "_sweep_environment_reuse_count", 0))
+
+
 def compress_mpo_product(
     A,
     B,
@@ -415,8 +447,6 @@ def compress_mpo_product(
             inplace=False,
         )
     elif resolved_method in {"dmrg", "dmrg2", "dmrg3", "fit"}:
-        from pepsy.fitting import FIT  # pylint: disable=import-outside-toplevel
-
         block_size = {
             "dmrg": 1,
             "fit": 2,
@@ -438,51 +468,15 @@ def compress_mpo_product(
                 "SRC warm starts are not currently sector-aware for native "
                 "Symmray MPOs; use guess_method='sdc' or 'direct'."
             )
-        guess_kwargs = {
-            "max_bond": chi,
-            "method": resolved_guess_method,
-            "inplace": False,
-        }
-        if resolved_guess_method.startswith("src"):
-            # SRC is rank-controlled and its base implementation does not
-            # accept cutoff_mode on all supported Quimb versions.
-            guess_kwargs["cutoff"] = 0.0
-            if guess_seed is not None:
-                guess_kwargs["seed"] = guess_seed
-        else:
-            guess_kwargs["cutoff"] = resolved_cutoff
-            guess_kwargs["cutoff_mode"] = resolved_cutoff_mode
-        # The warm start is disposable. The exact lazy target remains the
-        # variational objective passed to FIT, and FIT.run_eff is the only
-        # DMRG refinement entry point so its cached sweep environments are
-        # reused across the full-chain sweeps.
-        guess = run_seeded_quimb(
-            guess_kwargs.pop("seed", None),
-            qtn.tensor_network_1d_compress,
-            target.copy(),
-            **guess_kwargs,
-        )
-        fitter = FIT(
+        result, fit_environment_reuse_count = _fit_lazy_mpo_target(
             target,
-            p=guess,
-            cutoffs=resolved_cutoff,
-            copy_target=False,
-            inplace=False,
-        )
-        fitter.run_eff(
-            n_iter=4,
+            chi=chi,
             block_size=block_size,
-            max_bond=chi,
             cutoff=resolved_cutoff,
             cutoff_mode=resolved_cutoff_mode,
-            adaptive_block_sweeps=(
-                2 if block_size in {2, 3} else None
-            ),
+            guess_method=resolved_guess_method,
+            guess_seed=guess_seed,
         )
-        fit_environment_reuse_count = int(
-            getattr(fitter, "_sweep_environment_reuse_count", 0)
-        )
-        result = fitter.p
     else:
         if target_sector_summary is not None and resolved_method.startswith("src"):
             raise NotImplementedError(

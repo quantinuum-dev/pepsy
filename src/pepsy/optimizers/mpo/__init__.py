@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING
 _SYMBOL_MODULES = {
     "MpoChannelEvent": ".optimizer",
     "MpoOptimizer": ".optimizer",
+    "MpoErrorMit": ".error_mitigation",
+    "PauliShots": ".error_mitigation",
+    "TemEstimate": ".error_mitigation",
 }
 
 # Preserve explicit and historically accessible child-module paths.
@@ -18,6 +21,9 @@ _SUBMODULES = (
 __all__ = [
     "MpoOptimizer",
     "MpoChannelEvent",
+    "MpoErrorMit",
+    "PauliShots",
+    "TemEstimate",
     "compression",
     "optimizer",
     "targets",
@@ -42,4 +48,5 @@ def __getattr__(name):
 
 
 if TYPE_CHECKING:
+    from .error_mitigation import MpoErrorMit, PauliShots, TemEstimate  # noqa: F401
     from .optimizer import MpoChannelEvent, MpoOptimizer  # noqa: F401
