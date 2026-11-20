@@ -8,6 +8,16 @@ patch versions remain compatible.
 
 ## [Unreleased]
 
+- **Noisy MPO queues:** accept named unitary gates and local noise in the MPS
+  tuple syntax. Fit dense two-site channels as exact local layers in DMRG,
+  keeping the exterior MPO bonds compatible with the active fit window.
+  Apply the same FIT initialization policy to gates and two-site channels,
+  with SRC as the default warm start.
+
+- **MPO channel diagnostics:** measure the exact Kraus target trace before
+  compression so trace lost to truncation is reported separately. Trace the
+  physical legs locally before planning the dense virtual contraction.
+
 - **2D DMT accuracy benchmarks:** add complete square-lattice Ising gate
   schedules with continuous-time and uncompressed-circuit references,
   bond/timestep sweeps, ordinary variational MPO comparisons, independent

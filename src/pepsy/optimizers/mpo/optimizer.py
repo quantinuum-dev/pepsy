@@ -63,6 +63,7 @@ from numbers import Integral
 
 import autoray as ar
 import numpy as np
+from quimb.tensor import TensorNetwork, tensor_network_1d_compress
 
 from ..._internal.quimb import quimb_compression_options, quimb_fit_guess_method, run_seeded_quimb
 from ..._internal.random import backend_random_array
@@ -80,6 +81,7 @@ from ...backends import (
 from ...tensors.contractions import tn_norm
 from ...tensors.observables import tn_fidelity
 from ...fitting.local import FIT
+from ..mps._streams import _resolve_symbolic_gate_entry
 from ..mps.diagnostics import _summarize_fit_timing
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
 
@@ -285,10 +287,35 @@ class _MpoStreamPlan:
             return value
 
 
-def _normalize_gate_queue(gates):
-    """Return ``(gate_list, where_list)`` from canonical bundled stream input."""
+def _normalize_gate_queue(gates, *, backend_sample=None):
+    """Lower named events and normalize the bundled MPO stream."""
     if isinstance(gates, MpoChannelEvent):
         return [gates], [gates.where]
+
+    if isinstance(gates, (tuple, list)):
+        if gates and isinstance(gates[0], str):
+            gates = (gates,)
+        convert = infer_backend_converter_from_sample(backend_sample)
+
+        def mpo_gate(matrix):
+            # The shared symbolic resolver yields the physical operator U,
+            # whereas an MPO matrix payload represents U.T.
+            dimension = math.isqrt(matrix.size)
+            matrix = matrix.reshape(dimension, dimension).T
+            return matrix if convert is None else convert(matrix)
+
+        resolved = []
+        for entry in gates:
+            gate = _resolve_symbolic_gate_entry(entry, mpo_gate)
+            if gate is entry and isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
+                from ..noise import _trajectory_event_from_stochastic_entry
+
+                event = _trajectory_event_from_stochastic_entry(entry)
+                if event is not None:
+                    gate = MpoChannelEvent.from_channel(event.channel, event.where)
+            resolved.append(gate)
+        gates = tuple(resolved)
+
     if isinstance(gates, (tuple, list)) and any(
         isinstance(entry, MpoChannelEvent) for entry in gates
     ):
@@ -316,9 +343,9 @@ def _normalize_gate_queue(gates):
     return list(gate_list), [normalize_where(where) for where in where_list]
 
 
-def _prepare_mpo_stream(gates):
+def _prepare_mpo_stream(gates, *, backend_sample=None):
     """Compile immutable MPO stream metadata once at queue boundaries."""
-    gate_list, where_list = _normalize_gate_queue(gates)
+    gate_list, where_list = _normalize_gate_queue(gates, backend_sample=backend_sample)
     entries = tuple(zip(gate_list, where_list))
     event_types = []
     arities = []
@@ -603,7 +630,7 @@ class MpoOptimizer:
         self._replay_array_kinds = None
         # Work on a copy by default so the user's input MPO stays unchanged.
         self.p = mpo if self.inplace else mpo.copy()
-        self._stream_plan = _prepare_mpo_stream(gates)
+        self._stream_plan = _prepare_mpo_stream(gates, backend_sample=self._state_backend_like())
         self.G = list(self._stream_plan.gates)
         self.where = list(self._stream_plan.where)
         if not isinstance(chi, Integral) or int(chi) < 1:
@@ -1027,15 +1054,15 @@ class MpoOptimizer:
         return self
 
     def set_gates(self, gates):
-        """Replace the current gate queue with canonical bundled entries."""
-        self._stream_plan = _prepare_mpo_stream(gates)
+        """Replace the current gate queue with bundled gates or named events."""
+        self._stream_plan = _prepare_mpo_stream(gates, backend_sample=self._state_backend_like())
         self.G = list(self._stream_plan.gates)
         self.where = list(self._stream_plan.where)
         return self
 
     def add_gates(self, gates):
-        """Append canonical bundled entries to the existing gate queue."""
-        new_plan = _prepare_mpo_stream(gates)
+        """Append bundled gates or named events to the existing gate queue."""
+        new_plan = _prepare_mpo_stream(gates, backend_sample=self._state_backend_like())
         self._stream_plan = _prepare_mpo_stream(
             self._stream_plan.entries + new_plan.entries
         )
@@ -2014,6 +2041,35 @@ class MpoOptimizer:
             guess.canonize([xmax], cur_orthog=(xmin, xmax))
         return guess
 
+    def _build_channel_fit_guess(self, target, where, *, method, cutoff, cutoff_mode, seed):
+        """Compress a disposable copy of the channel layer inside its active interval."""
+        site_tags = [target.site_tag(site) for site in range(min(where), max(where) + 1)]
+        guess = target.copy()
+        _, active = guess.partition(site_tags, which="any", inplace=True)
+        # A nested compressor may permute its arrays. The active network
+        # still carries exterior bond indices, so it is not a full MPO.
+        active.view_as_(TensorNetwork)
+        options = self._submpo_compress_options(
+            method, cutoff=cutoff, cutoff_mode=cutoff_mode, max_bond=self.chi, seed=seed,
+        )
+        if method == "fit-projector":
+            # Match the sub-MPO route and avoid inverting zero channel gauges.
+            options["canonize"] = False
+        active = run_seeded_quimb(
+            options.pop("seed", None),
+            tensor_network_1d_compress,
+            active,
+            method=method,
+            site_tags=site_tags,
+            permute_arrays=False,
+            sweep_reverse=True,
+            optimize=self.contraction_opt,
+            inplace=True,
+            **options,
+        )
+        guess |= active
+        return guess
+
     @staticmethod
     def _fit_random_data(data, shape, *, strength, rng):
         """Generate deterministic random data on the tensor's backend."""
@@ -2178,6 +2234,7 @@ class MpoOptimizer:
         cutoff,
         cutoff_mode,
         layer_order="lower_upper",
+        channel_target=None,
     ):
         """Select a disposable FIT initial guess for an MPO update."""
         requested_strategy = self._validate_fit_init_strategy(strategy)
@@ -2234,16 +2291,27 @@ class MpoOptimizer:
             guess_method = None
 
         if guess_method is not None:
-            fit_guess = self._build_mpo_fit_guess(
-                p,
-                gates,
-                wheres,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                layer_order=layer_order,
-                method=guess_method,
-                seed=seed,
-            )
+            if channel_target is None:
+                fit_guess = self._build_mpo_fit_guess(
+                    p,
+                    gates,
+                    wheres,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    layer_order=layer_order,
+                    method=guess_method,
+                    seed=seed,
+                )
+            else:
+                guess_method = quimb_fit_guess_method(guess_method, p)
+                fit_guess = self._build_channel_fit_guess(
+                    channel_target,
+                    wheres[0],
+                    method=guess_method,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    seed=seed,
+                )
             result.update(
                 fit_guess=fit_guess,
                 strategy=selected_strategy,
@@ -2952,10 +3020,21 @@ class MpoOptimizer:
                 "MPO replay produced non-finite tensor data."
             )
 
-    @staticmethod
-    def _measure_trace(p):
-        """Return the real trace of an MPO, with a scalar backend fallback."""
-        value = p.trace()
+    def _measure_trace(self, p):
+        """Trace physical legs locally before contracting the virtual network."""
+        if self._has_symmray_data(p):
+            return float(np.real(ar.to_numpy(p.trace())))
+        traced = p.copy()
+        for site in p.gen_sites_present():
+            upper, lower = p.upper_ind(site), p.lower_ind(site)
+            tids = p.ind_map[upper]
+            if len(tids) != 1 or tids != p.ind_map[lower]:
+                return float(np.real(ar.to_numpy(p.trace(optimize=self.contraction_opt))))
+            tensor = traced.tensor_map[next(iter(tids))]
+            # Resolving the diagonal here prevents the contraction planner
+            # from grouping disconnected MPO cores into a large outer product.
+            tensor.trace(upper, lower, preserve_tensor=True, inplace=True)
+        value = traced.contract(..., optimize=self.contraction_opt)
         return float(np.real(ar.to_numpy(value)))
 
     @staticmethod
@@ -2965,7 +3044,11 @@ class MpoOptimizer:
         return abs(float(value) - float(reference)) / scale
 
     def _build_channel_target(self, p, event, *, cutoff_mode="rsum2"):
-        """Build the exact deterministic channel sum before output compression."""
+        """Materialize the exact deterministic channel sum for direct compression."""
+        sample = self._state_backend_like_for(p)
+        convert = None
+        if ar.infer_backend(sample) != "numpy":
+            convert = infer_backend_converter_from_sample(sample)
         target = None
         for operator, weight in zip(event.kraus, event.weights):
             if weight == 0.0:
@@ -2976,7 +3059,7 @@ class MpoOptimizer:
             # their Kraus matrices in the ordinary linear-algebra convention
             # ``K O K.H``. Transpose the payload once so the two conventions
             # meet at the exact target.
-            channel_operator = operator.T
+            channel_operator = (operator if convert is None else convert(operator)).T
             branch = self._build_dmrg_target(
                 p,
                 channel_operator,
@@ -3001,10 +3084,49 @@ class MpoOptimizer:
             raise ValueError("channel event has no nonzero outcome weight.")
         return target
 
-    def _record_trace_event(self, p_before, target, p_after, event):
+    def _build_layered_channel_target(self, p, event):
+        """Leave a two-site channel on top of the MPO's physical index pairs."""
+        from quimb.tensor import Tensor, rand_uuid
+
+        physical = [
+            (self.ind_id_k.format(site), self.ind_id_b.format(site)) for site in event.where
+        ]
+        dimensions = tuple(p.ind_size(ket) for ket, _ in physical)
+        if (
+            any(p.ind_size(bra) != dim for (_, bra), dim in zip(physical, dimensions))
+            or event.kraus[0].shape[0] != math.prod(dimensions)
+        ):
+            raise ValueError("Kraus dimensions must match the MPO's local ket and bra dimensions.")
+        terms = [
+            weight * np.einsum("ac,bd->abcd", matrix, matrix.conj())
+            for matrix, weight in zip(event.kraus, event.weights)
+            if weight
+        ]
+        if not terms:
+            raise ValueError("channel event has no nonzero outcome weight.")
+        channel = sum(terms)
+        left_dim, right_dim = dimensions
+        # Group both input and output legs by site. An identity on the shared
+        # index gives an exact factorization without splitting the target MPO.
+        channel = channel.reshape(dimensions * 4).transpose(0, 2, 4, 6, 1, 3, 5, 7)
+        link_dim = left_dim**4
+        left = np.eye(link_dim, dtype=channel.dtype).reshape((left_dim,) * 4 + (link_dim,))
+        right = np.moveaxis(channel.reshape((link_dim,) + (right_dim,) * 4), 0, -1)
+        link = rand_uuid()
+        target = p.copy()
+        convert = infer_backend_converter_from_sample(self._state_backend_like_for(p))
+        for site, outputs, layer in zip(event.where, physical, (left, right), strict=True):
+            inputs = (rand_uuid(), rand_uuid())
+            target.reindex_(dict(zip(outputs, inputs, strict=True)))
+            target.add_tensor(Tensor(
+                layer if convert is None else convert(layer),
+                inds=(*outputs, *inputs, link),
+                tags=(p.site_tag(site),),
+            ))
+        return target
+
+    def _record_trace_event(self, input_trace, target_trace, p_after, event):
         """Record channel trace preservation separately from norm survival."""
-        input_trace = self._measure_trace(p_before)
-        target_trace = self._measure_trace(target)
         observed_trace = self._measure_trace(p_after)
         completeness = sum(
             float(weight) * matrix.conj().T @ matrix
@@ -3047,6 +3169,10 @@ class MpoOptimizer:
         backend,
         fit_runner=None,
         fit_block_size=2,
+        fit_init_strategy=_DEFAULT_FIT_INIT_STRATEGY,
+        fit_mpo_guess=True,
+        fit_init_rand_strength=0.0,
+        fit_init_seed=0,
         step=None,
         transactional_steps=True,
         fit_fallback=None,
@@ -3062,41 +3188,54 @@ class MpoOptimizer:
             if backend == "dmrg" and (transactional_steps or fit_fallback is not None)
             else None
         )
-        # Target construction works on branch copies, so the live ``p`` is
-        # still the pre-channel state when trace diagnostics are evaluated.
-        # FIT and direct compression are intentionally allowed to mutate their
-        # input MPO in place. Keep an immutable pre-channel witness so the
-        # trace-preservation report compares input -> target -> retained output
-        # rather than accidentally comparing the output to itself.
-        p_before = p.copy()
-        target = self._timed_call(
-            "dmrg.target" if backend == "dmrg" else "channel.target",
-            self._build_channel_target,
-            p,
-            event,
-            cutoff_mode=cutoff_mode,
-        )
-        expected_norm = self._timed_call(
-            "norm.expected",
-            self._canonical_norm_measurement,
-            target,
-        )
-        fit = None
-        if backend == "dmrg" and max(event.where) > min(event.where):
+        # FIT can overwrite the input MPO and direct compression can overwrite
+        # the exact channel target. Measure each trace while its state is intact.
+        input_trace = self._measure_trace(p)
+        use_fit = backend == "dmrg" and len(event.where) == 2
+        layered = use_fit and not self._has_symmray_data(p)
+        if use_fit:
             xmin, xmax = min(event.where), max(event.where)
             self.canonize_mpo(p, (xmin, xmax))
-            fit = FIT(
-                target,
-                p=p,
-                cutoffs=cutoff,
-                contraction_opt=self.contraction_opt,
-                retag=False,
-                range_int=[xmin, xmax],
-                inplace=True,
-                copy_target=False,
+        if layered:
+            target = self._timed_call("dmrg.target", self._build_layered_channel_target, p, event)
+            expected_norm = self._norm_measurement_from_squared(
+                self._timed_call("norm.expected", self._measure_norm, target)
             )
+        else:
+            target = self._timed_call(
+                "dmrg.target" if backend == "dmrg" else "channel.target",
+                self._build_channel_target, p, event, cutoff_mode=cutoff_mode,
+            )
+            expected_norm = self._timed_call("norm.expected", self._canonical_norm_measurement, target)
+        target_trace = self._measure_trace(target)
+        if use_fit:
             active_block_size = min(int(fit_block_size), xmax - xmin + 1)
             try:
+                initialization = self._timed_call(
+                    "dmrg.fit_guess",
+                    self._prepare_fit_initial_guess,
+                    p,
+                    (),
+                    (event.where,),
+                    block_size=active_block_size,
+                    strategy=fit_init_strategy,
+                    fit_mpo_guess=fit_mpo_guess,
+                    rand_strength=fit_init_rand_strength,
+                    seed=fit_init_seed + 1000003 * ((step or 1) - 1) + 1009 * xmin + xmax,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    channel_target=target,
+                )
+                fit = FIT(
+                    target,
+                    p=initialization["fit_guess"],
+                    cutoffs=cutoff,
+                    contraction_opt=self.contraction_opt,
+                    retag=False,
+                    range_int=[xmin, xmax],
+                    inplace=True,
+                    copy_target=False,
+                )
                 fit_runner(fit, active_block_size, event.where)
             except Exception as exc:
                 if snapshot is None:
@@ -3145,6 +3284,8 @@ class MpoOptimizer:
                 where=event.where,
                 block_size=active_block_size,
                 step=step or 0,
+                mpo_fit_guess_used=initialization["guess_used"],
+                fit_initialization=initialization,
             )
         else:
             p_after = target
@@ -3171,7 +3312,7 @@ class MpoOptimizer:
             target_norm=expected_norm,
             where=event.where,
         )
-        trace_record = self._record_trace_event(p_before, target, p_after, event)
+        trace_record = self._record_trace_event(input_trace, target_trace, p_after, event)
         self.channel_events.append(
             {
                 "kind": "channel_sum",
@@ -3855,6 +3996,10 @@ class MpoOptimizer:
                     backend="dmrg",
                     fit_runner=run_local_fit,
                     fit_block_size=fit_block_size,
+                    fit_init_strategy=fit_init_strategy,
+                    fit_mpo_guess=fit_mpo_guess,
+                    fit_init_rand_strength=fit_init_rand_strength,
+                    fit_init_seed=fit_init_seed,
                     step=idx + 1,
                     transactional_steps=transactional_steps,
                     fit_fallback=fit_fallback,
